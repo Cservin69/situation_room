@@ -1,0 +1,9 @@
+# LME Warehouse Stocks — daily inventory data
+[source]
+id = "lme_warehouse"
+enabled = true
+cadence = { daily_at = { hour = 13, minute = 0 } }
+license = "personal_use_only"
+authoritative_for = [
+  { metric = "warehouse_stock" },
+]

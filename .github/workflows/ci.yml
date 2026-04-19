@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Disable telemetry in dependencies that opportunistically send it
+  DO_NOT_TRACK: 1
+
+jobs:
+  rust:
+    name: Rust workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  security:
+    name: Security checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: cargo deny
+        run: cargo deny check
+
+      - name: cargo audit
+        run: cargo audit --deny warnings
+
+      - name: Check for hardcoded secrets
+        run: |
+          # Belt-and-suspenders grep. Real secret scanning (gitleaks,
+          # trufflehog) should run as a separate pre-push / pre-commit hook.
+          if git grep -nE '(sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{40,}|xai-[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{35})' -- ':!.github/' ':!docs/' ':!crates/secure/'; then
+            echo "::error::Possible hardcoded API key committed."
+            exit 1
+          fi

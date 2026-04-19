@@ -1,0 +1,49 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Runtime data — DuckDB files, archived articles, exports
+/data/cache/*
+/data/archive/*
+/data/exports/*
+!/data/cache/.gitkeep
+!/data/archive/.gitkeep
+!/data/exports/.gitkeep
+
+# Secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Frontend (Tauri)
+node_modules
+dist
+.svelte-kit
+build
+
+# Tauri build outputs
+src-tauri/target
+src-tauri/WixTools
+
+# IDE
+.idea
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Misc
+*.swp
+*.swo
+*~

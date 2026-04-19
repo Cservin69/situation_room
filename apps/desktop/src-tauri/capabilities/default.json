@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Minimal capabilities — only what the frontend actually needs.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-maximize"
+  ],
+  "//": "Explicitly NOT enabled: core:shell (no shell commands), core:fs (no arbitrary FS), core:http (frontend cannot make arbitrary HTTP — all backend calls go through IPC to validated Rust code), core:process (no process spawning), core:updater-until-signed."
+}

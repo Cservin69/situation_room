@@ -1,0 +1,2 @@
+-- Indexes for the hot query paths.
+-- Phase 2.

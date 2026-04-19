@@ -1,0 +1,24 @@
+[package]
+name = "stockpile-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pipeline orchestration for Stockpile: ingest → normalize → extract → promote, plus the research planner."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+stockpile-core = { workspace = true }
+stockpile-storage = { workspace = true }
+stockpile-sources = { workspace = true }
+stockpile-llm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }

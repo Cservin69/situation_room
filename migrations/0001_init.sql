@@ -1,0 +1,9 @@
+-- Stockpile schema, version 1.
+-- Phase 2 fills this in. Phase 1 ships the file so the migration runner has
+-- a starting point to find.
+--
+-- Design notes:
+--  - One table per record type, sharing a common envelope columns prefix.
+--  - JSONB columns for record-specific payloads to avoid cross-type joins.
+--  - Subjects stored in a separate junction table for fast subject-filtered queries.
+--  - All timestamps UTC, stored as TIMESTAMPTZ.

@@ -1,0 +1,32 @@
+# Tunable thresholds for anomaly detectors.
+# Edit to change detector sensitivity without recompiling.
+
+[inventory_divergence]
+# Window over which to compute stocks-vs-price correlation
+window_days = 30
+# Sign-flip in correlation triggers anomaly
+min_correlation_change = 0.5
+
+[guidance_dispersion]
+# Cross-producer guidance variance triggering anomaly
+min_dispersion_stddev = 0.15
+
+[flow_rerouting]
+# Minimum flow change (%) between countries to flag as rerouting
+min_flow_change_pct = 25.0
+# Time window for matching offsetting changes
+matching_window_months = 3
+
+[concentration]
+# HHI change YoY triggering anomaly
+min_hhi_change = 500
+
+[news_latency]
+# Hours after a high-impact event for price to react before flagging
+max_reaction_hours = 12
+
+[filing_language]
+# Word frequency change vs baseline (multiplier) triggering anomaly
+min_frequency_multiplier = 2.0
+# Words tracked
+watched_terms = ["uncertainty", "force majeure", "permitting", "curtail", "headwind"]

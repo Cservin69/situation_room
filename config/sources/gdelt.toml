@@ -1,0 +1,7 @@
+# GDELT — global news event firehose
+[source]
+id = "gdelt"
+enabled = true
+cadence = { minutes = 15 }
+license = "open_with_attribution"
+license_id = "GDELT-TOS"

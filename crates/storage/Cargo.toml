@@ -1,0 +1,21 @@
+[package]
+name = "stockpile-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DuckDB persistence layer for Stockpile records."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+stockpile-core = { workspace = true }
+duckdb = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }

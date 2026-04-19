@@ -1,0 +1,11 @@
+# USGS Mineral Commodity Summaries
+# https://www.usgs.gov/centers/national-minerals-information-center/mineral-commodity-summaries
+[source]
+id = "usgs_mcs"
+enabled = true
+cadence = { yearly_on = { month = 1, day = 31 } }
+license = "public_domain"
+authoritative_for = [
+  { metric = "production" },
+  { metric = "reserves" },
+]

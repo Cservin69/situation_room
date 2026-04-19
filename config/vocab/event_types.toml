@@ -1,0 +1,52 @@
+# Controlled vocabulary of event types.
+# Used by extraction and by the events panel to filter/color-code.
+
+[[event_type]]
+id = "export_restriction"
+description = "Government action restricting exports"
+typical_direction = "supply_negative"
+
+[[event_type]]
+id = "production_cut"
+description = "Producer reduces output"
+typical_direction = "supply_negative"
+
+[[event_type]]
+id = "production_increase"
+description = "Producer expands output"
+typical_direction = "supply_positive"
+
+[[event_type]]
+id = "force_majeure"
+description = "Unplanned outage at production facility"
+typical_direction = "supply_negative"
+
+[[event_type]]
+id = "regulatory_approval"
+description = "Permit/approval granted for project"
+typical_direction = "supply_positive"
+
+[[event_type]]
+id = "discovery"
+description = "New deposit discovered"
+typical_direction = "supply_positive"
+
+[[event_type]]
+id = "strike"
+description = "Labor action affecting production"
+typical_direction = "supply_negative"
+
+[[event_type]]
+id = "sanctions_designation"
+description = "Sanctions imposed on entity"
+typical_direction = "context"
+
+[[event_type]]
+id = "acquisition"
+description = "M&A activity"
+typical_direction = "context"
+
+[[event_type]]
+id = "guidance_change"
+description = "Producer revises guidance"
+typical_direction = "context"

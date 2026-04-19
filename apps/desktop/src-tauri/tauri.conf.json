@@ -1,0 +1,65 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Stockpile",
+  "version": "0.1.0",
+  "identifier": "io.stockpile.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Stockpile",
+        "width": 1600,
+        "height": 1000,
+        "minWidth": 1200,
+        "minHeight": 800,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "//": "Strict CSP. Every relaxation below must be justified in ADR 0009 or a follow-up.",
+      "//": "default-src 'self' — only bundled assets load by default.",
+      "//": "connect-src 'ipc:' http://ipc.localhost — only Tauri IPC for backend calls. External data fetch happens in Rust, not JS.",
+      "//": "img-src data: allows embedded SVG/PNG used in the design system.",
+      "//": "style-src 'unsafe-inline' is required by Svelte's scoped styles; the compiled bundle contains no remote styles.",
+      "csp": {
+        "default-src": "'self'",
+        "connect-src": "'self' ipc: http://ipc.localhost",
+        "img-src": "'self' data: asset: http://asset.localhost",
+        "style-src": "'self' 'unsafe-inline'",
+        "script-src": "'self'",
+        "font-src": "'self' data:",
+        "object-src": "'none'",
+        "frame-src": "'none'",
+        "base-uri": "'self'",
+        "form-action": "'none'"
+      },
+      "//": "freezePrototype blocks prototype pollution attacks.",
+      "freezePrototype": true,
+      "//": "assetProtocol: only serve assets from the designated scope; no arbitrary file:// reads.",
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPDATA/archive/*"]
+      }
+    },
+    "//": "Tauri 2 uses capabilities — see capabilities/ directory for the allowlist of IPC commands the frontend can invoke."
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png"
+    ],
+    "//": "macOS hardened runtime — required for notarization, disables library injection.",
+    "macOS": {
+      "hardenedRuntime": true,
+      "entitlements": "entitlements.plist"
+    }
+  }
+}

@@ -1,0 +1,34 @@
+# Build-level hardening.
+# This applies to every `cargo build` in this workspace.
+
+[build]
+# Reproducible-ish builds — same source, same binary (modulo compiler).
+rustflags = [
+    # Enable overflow checks even in release. Slight perf cost; integer
+    # overflow in security-adjacent code is a common bug class.
+    "-C", "overflow-checks=on",
+]
+
+[target.'cfg(target_os = "linux")']
+rustflags = [
+    "-C", "overflow-checks=on",
+    # Position-independent executable
+    "-C", "relocation-model=pic",
+    # Stack protection
+    "-C", "link-arg=-Wl,-z,relro,-z,now",
+    # Disable executable stack
+    "-C", "link-arg=-Wl,-z,noexecstack",
+]
+
+[target.'cfg(target_os = "macos")']
+rustflags = [
+    "-C", "overflow-checks=on",
+]
+
+# Enforce the pinned registry; no ambient registries.
+[registries.crates-io]
+protocol = "sparse"
+
+[net]
+# Explicitly disable git fetches of deps (all our deps come from crates.io).
+git-fetch-with-cli = true

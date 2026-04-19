@@ -1,0 +1,110 @@
+/* Global design layer for Stockpile. Component CSS extends from here. */
+
+:root {
+  /* Background hierarchy */
+  --bg-canvas: #0E1014;
+  --bg-panel: #161A21;
+  --bg-panel-alt: #1B2029;
+  --bg-inset: #10131A;
+  --bg-overlay: rgba(14, 16, 20, 0.85);
+
+  /* Foreground hierarchy */
+  --fg-primary: #E8EBF0;
+  --fg-secondary: #A8AFBC;
+  --fg-tertiary: #6B7280;
+  --fg-quaternary: #3F4654;
+  --fg-inverse: #0E1014;
+
+  /* Borders */
+  --border-subtle: #1F2530;
+  --border-strong: #2C3340;
+  --border-accent: #3D4555;
+
+  /* Signal */
+  --signal-positive: #5BC685;
+  --signal-negative: #E5604A;
+  --signal-warning: #E0A52E;
+  --signal-info: #5B9CE6;
+  --signal-contrarian: #B57FE5;
+
+  /* Typography */
+  --font-mono: "JetBrains Mono", "Berkeley Mono", "SF Mono", Menlo, monospace;
+  --font-sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+
+  /* Motion */
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --duration-ambient: 1200ms;
+  --duration-ui: 180ms;
+  --duration-pulse: 600ms;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg-canvas);
+  color: var(--fg-primary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-feature-settings: "tnum" 1, "ss01" 1;  /* tabular nums, stylistic set */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Numbers always tabular-aligned and monospace */
+.num, .number {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* Anomaly pulse animation — used by panels when an anomaly fires */
+@keyframes anomaly-pulse {
+  0%   { box-shadow: 0 0 0 0 var(--signal-warning); }
+  50%  { box-shadow: 0 0 0 8px rgba(224, 165, 46, 0.0); }
+  100% { box-shadow: 0 0 0 0 rgba(224, 165, 46, 0.0); }
+}
+
+.anomaly-pulse {
+  animation: anomaly-pulse var(--duration-pulse) var(--ease);
+}
+
+/* Panel base — every panel inherits this */
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.panel-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--fg-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.panel-coord {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--fg-quaternary);
+}
+
+/* Freshness dot — green/amber/red based on data age */
+.freshness-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  vertical-align: middle;
+  margin-right: 4px;
+}
+.freshness-dot.fresh { background: var(--signal-positive); }
+.freshness-dot.stale { background: var(--signal-warning); }
+.freshness-dot.down  { background: var(--signal-negative); }

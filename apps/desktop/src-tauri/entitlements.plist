@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- We need outbound network for source fetching and LLM calls. -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- Explicitly NO inbound network - we're a client, not a server. -->
+    <key>com.apple.security.network.server</key>
+    <false/>
+
+    <!-- No hardware access we don't need. -->
+    <key>com.apple.security.device.camera</key>
+    <false/>
+    <key>com.apple.security.device.microphone</key>
+    <false/>
+
+    <!-- Hardened runtime specifics -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <false/>
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <false/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <false/>
+</dict>
+</plist>

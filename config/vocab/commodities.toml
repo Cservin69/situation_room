@@ -1,0 +1,45 @@
+# Controlled vocabulary of commodities Stockpile knows about.
+# Add entries here to extend coverage; no code changes required.
+
+[[commodity]]
+id = "Li"
+name = "Lithium"
+hs_codes = ["283691", "282520", "253090"]
+notes = "Lithium carbonate, hydroxide, and ores"
+
+[[commodity]]
+id = "Cu"
+name = "Copper"
+hs_codes = ["7403", "260300"]
+
+[[commodity]]
+id = "Co"
+name = "Cobalt"
+hs_codes = ["8105", "260500"]
+
+[[commodity]]
+id = "Ni"
+name = "Nickel"
+hs_codes = ["7502", "260400"]
+
+[[commodity]]
+id = "REE"
+name = "Rare Earth Elements"
+hs_codes = ["280530", "284690"]
+notes = "Aggregated category; individual elements (Nd, Dy, Pr) are tracked separately"
+
+[[commodity]]
+id = "Nd"
+name = "Neodymium"
+
+[[commodity]]
+id = "Dy"
+name = "Dysprosium"
+
+[[commodity]]
+id = "Ga"
+name = "Gallium"
+
+[[commodity]]
+id = "Ge"
+name = "Germanium"

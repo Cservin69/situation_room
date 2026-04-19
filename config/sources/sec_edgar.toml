@@ -1,0 +1,10 @@
+# SEC EDGAR — US-listed company filings (10-K, 10-Q, 8-K)
+[source]
+id = "sec_edgar"
+enabled = true
+cadence = { hours = 6 }
+license = "public_domain"
+user_agent_env = "SEC_EDGAR_USER_AGENT"
+
+# Tickers to track. Add or remove freely.
+tickers = ["ALB", "SQM", "PLL", "FCX", "RIO", "BHP", "MP", "LYC.AX"]
