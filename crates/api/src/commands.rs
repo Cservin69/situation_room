@@ -17,8 +17,8 @@
 //! Examples (Phase 4):
 //! - `research_topic(topic: String) -> ResearchPlan`  (topic bounded by
 //!   `Bounds::RESEARCH_TOPIC`)
-//! - `get_commodity_screen(commodity: CommodityId) -> CommodityScreen`
-//!   (commodity validated against vocab)
+//! - `get_topic_screen(topic: Topic) -> TopicScreen`
+//!   (topic validated via Topic::new)
 //! - `open_article(url: String) -> ArticleView`  (url via UrlGuard, file
 //!   target via FsGuard)
 //! - `toggle_offline_mode(enabled: bool) -> ()`  (no input validation needed)

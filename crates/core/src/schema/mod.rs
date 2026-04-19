@@ -15,6 +15,8 @@ pub use content::{
     AssertedContent, AttributeValue, EntityAttributeContent, EventContent, EventDirection,
     ObservationContent, ObservationPeriod, RelationContent,
 };
-pub use envelope::{DerivationRole, DerivedFrom, Envelope, Provenance, Subjects};
+pub use envelope::{
+    DerivationRole, DerivedFrom, Envelope, PlaceRef, Provenance, Subjects, TimeScope,
+};
 pub use geometry::{Geometry, LineStringGeom, MultiPolygonGeom, PointGeom, PolygonGeom, Position};
 pub use records::{Assertion, Document, Entity, Event, Observation, Record, Relation};

@@ -15,7 +15,8 @@
 //! orders by timestamps, and surfaces confidence the same way regardless
 //! of whether it's rendering an Observation or an Assertion.
 
-use crate::vocab::{CommodityId, Confidence, CountryCode, EntityId};
+use crate::schema::geometry::{Geometry, Position};
+use crate::vocab::{Confidence, CountryCode, EntityId, Topic};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -34,8 +35,9 @@ pub struct Envelope {
 
     /// Free-form categorical attributes. Lowercase `key:value` pairs.
     /// Examples: `direction:supply_negative`, `severity:high`,
-    /// `sentiment:bearish`. The controlled set lives in
-    /// `config/vocab/` — but new tags can be added without code change.
+    /// `sentiment:bearish`. Distinct from [`Subjects::topics`]:
+    /// topics answer *what is this about*, tags describe *attributes of
+    /// the record itself* (its stance, impact, provenance quality).
     #[serde(default)]
     pub tags: Vec<String>,
 
@@ -73,6 +75,155 @@ impl Envelope {
             confidence: Confidence::ONE,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Subjects — what is this record about?
+// ---------------------------------------------------------------------------
+
+/// The subjects a record concerns.
+///
+/// The design is **four universal dimensions** (entities, places, time,
+/// topics), applied uniformly across every domain Stockpile is used for.
+/// The first three are typed — they answer structural queries well
+/// (entity-joins, geographic intersection, time windowing). The fourth,
+/// [`topics`](Self::topics), is an open bag of free-form [`Topic`] tags
+/// that carries all domain-specific categorization.
+///
+/// **There is no hardcoded "commodity" dimension** — commodities are
+/// topics, just like sectors, technologies, and policy areas. See the
+/// module-level documentation of [`crate::vocab`] for the full
+/// rationale.
+///
+/// All fields are vectors because a single record legitimately
+/// concerns multiple of each (a trade-flow relation mentions two
+/// countries; a joint-venture event names multiple entities; an
+/// article discussing chip exports tags both `semiconductors` and
+/// `export_controls`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Subjects {
+    /// Actors the record concerns: companies, mines, vessels, agencies,
+    /// people. The heaviest-queried subject dimension in practice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<EntityId>,
+
+    /// Geographic subjects. See [`PlaceRef`] for the variants.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub places: Vec<PlaceRef>,
+
+    /// Temporal scope the record addresses. Optional because many records
+    /// are point-in-time (captured by [`Envelope::valid_at`]) and don't
+    /// need a scope. Use this when a record is *about* a period or event
+    /// rather than *occurring at* one — e.g. "Q3 2025 earnings" or
+    /// "the 2028 election cycle".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<TimeScope>,
+
+    /// Open-namespace topical tags. Populated by the research planner
+    /// (or by source-specific ingest logic) to categorize what the
+    /// record is about. Examples: `"Li"`, `"semiconductors"`,
+    /// `"euv_lithography"`, `"tw_2028_presidential"`,
+    /// `"ai_export_controls"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<Topic>,
+}
+
+impl Subjects {
+    /// Build Subjects with a single topic. Convenience for the common
+    /// "this record is about one thing" case.
+    pub fn topic(t: Topic) -> Self {
+        Self {
+            topics: vec![t],
+            ..Default::default()
+        }
+    }
+
+    /// Build Subjects with a single entity.
+    pub fn entity(e: EntityId) -> Self {
+        Self {
+            entities: vec![e],
+            ..Default::default()
+        }
+    }
+
+    /// Build Subjects with a single country place.
+    pub fn country(c: CountryCode) -> Self {
+        Self {
+            places: vec![PlaceRef::Country(c)],
+            ..Default::default()
+        }
+    }
+
+    /// True if the subjects overlap on at least one dimension.
+    pub fn intersects(&self, other: &Self) -> bool {
+        self.entities.iter().any(|e| other.entities.contains(e))
+            || self.places.iter().any(|p| other.places.contains(p))
+            || self.topics.iter().any(|t| other.topics.contains(t))
+    }
+
+    /// True if the subjects are completely empty.
+    pub fn is_empty(&self) -> bool {
+        self.entities.is_empty()
+            && self.places.is_empty()
+            && self.time.is_none()
+            && self.topics.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PlaceRef — geographic subjects
+// ---------------------------------------------------------------------------
+
+/// A reference to a place. Ranges from coarse (country) to fine (polygon).
+///
+/// The enum variants are ordered roughly by granularity. A country record
+/// can match a polygon-query if the polygon intersects the country, but
+/// that's a query-layer concern; the schema just stores what it was told.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum PlaceRef {
+    /// ISO 3166-1 country.
+    Country(CountryCode),
+    /// Region identifier. Free-form — examples: `"eu"`, `"cis"`, `"latam"`,
+    /// `"asean"`, `"pilbara"`, `"lithium_triangle"`. The registry is open,
+    /// managed the same way as [`Topic`] — the research planner introduces
+    /// region names as needed. No governance.
+    Region(String),
+    /// Named sub-national place: city, province, basin. Free-form.
+    Named(String),
+    /// Precise point. Use for asset-level records (a specific mine, a vessel
+    /// at a specific moment).
+    Point(Position),
+    /// Polygon boundary. Use for records scoped to a specific geographic
+    /// area with a known shape (a sanction zone, a protected basin).
+    Polygon(Geometry),
+}
+
+impl Eq for PlaceRef {}
+
+// ---------------------------------------------------------------------------
+// TimeScope — temporal subjects
+// ---------------------------------------------------------------------------
+
+/// The temporal scope a record addresses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum TimeScope {
+    /// A specific point in time the record is about. Use when `valid_at`
+    /// already captures the when of the record but you want to mark that
+    /// the record is *about* a different specific moment (e.g. an Assertion
+    /// made today about what happened on a specific historical date).
+    Instant(DateTime<Utc>),
+    /// A closed time range `[start, end]`.
+    Range {
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    },
+    /// A named period — free-form identifier. Examples: `"q3_2025"`,
+    /// `"2028_election_cycle"`, `"post_covid_recovery"`, `"2020s"`. Use
+    /// when the time scope is conceptual (a named era) rather than a
+    /// precise range.
+    Named(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -136,58 +287,13 @@ pub enum DerivationRole {
 }
 
 // ---------------------------------------------------------------------------
-// Subjects — what is this record about?
-// ---------------------------------------------------------------------------
-
-/// The subjects a record concerns. The UI uses these for filtering and
-/// cross-referencing: "show me everything about Chile" or "everything
-/// about copper mentioning Chinese entities."
-///
-/// Empty fields are legal and common: a price observation has exactly
-/// one commodity and no country; a sanctions event has one country and
-/// no commodity.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct Subjects {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub commodities: Vec<CommodityId>,
-
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub countries: Vec<CountryCode>,
-
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub entities: Vec<EntityId>,
-}
-
-impl Subjects {
-    /// Build a Subjects containing exactly one commodity.
-    pub fn commodity(c: CommodityId) -> Self {
-        Self {
-            commodities: vec![c],
-            ..Default::default()
-        }
-    }
-
-    /// True if the subjects overlap on at least one commodity/country/entity.
-    pub fn intersects(&self, other: &Self) -> bool {
-        self.commodities.iter().any(|c| other.commodities.contains(c))
-            || self.countries.iter().any(|c| other.countries.contains(c))
-            || self.entities.iter().any(|e| other.entities.contains(e))
-    }
-
-    /// True if the subjects are completely empty.
-    pub fn is_empty(&self) -> bool {
-        self.commodities.is_empty() && self.countries.is_empty() && self.entities.is_empty()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vocab::CommodityId;
+    use crate::vocab::Topic;
 
     fn test_provenance() -> Provenance {
         Provenance {
@@ -201,22 +307,107 @@ mod tests {
 
     #[test]
     fn envelope_minimal_roundtrip() {
-        let li = CommodityId::new("Li").unwrap();
-        let env = Envelope::minimal(test_provenance(), Subjects::commodity(li.clone()));
+        let li = Topic::new("Li").unwrap();
+        let env = Envelope::minimal(test_provenance(), Subjects::topic(li.clone()));
         let json = serde_json::to_string(&env).unwrap();
         let back: Envelope = serde_json::from_str(&json).unwrap();
         assert_eq!(env, back);
     }
 
     #[test]
-    fn subjects_intersects() {
-        let li = CommodityId::new("Li").unwrap();
-        let cu = CommodityId::new("Cu").unwrap();
-        let a = Subjects::commodity(li.clone());
-        let b = Subjects::commodity(li);
-        let c = Subjects::commodity(cu);
+    fn subjects_intersect_on_topic() {
+        let li = Topic::new("Li").unwrap();
+        let cu = Topic::new("Cu").unwrap();
+        let a = Subjects::topic(li.clone());
+        let b = Subjects::topic(li);
+        let c = Subjects::topic(cu);
         assert!(a.intersects(&b));
         assert!(!a.intersects(&c));
+    }
+
+    #[test]
+    fn subjects_intersect_on_entity() {
+        let tsmc = EntityId::new("tsmc").unwrap();
+        let samsung = EntityId::new("samsung").unwrap();
+        let a = Subjects::entity(tsmc.clone());
+        let b = Subjects::entity(tsmc);
+        let c = Subjects::entity(samsung);
+        assert!(a.intersects(&b));
+        assert!(!a.intersects(&c));
+    }
+
+    #[test]
+    fn subjects_intersect_on_place() {
+        let tw = CountryCode::new("TW").unwrap();
+        let kr = CountryCode::new("KR").unwrap();
+        let a = Subjects::country(tw.clone());
+        let b = Subjects::country(tw);
+        let c = Subjects::country(kr);
+        assert!(a.intersects(&b));
+        assert!(!a.intersects(&c));
+    }
+
+    #[test]
+    fn multi_dimensional_record() {
+        // A realistic record about TSMC's fab capacity, tagging both
+        // semiconductor and export-controls topics, geolocated to Taiwan
+        // and Arizona, mentioning entities.
+        let subjects = Subjects {
+            entities: vec![
+                EntityId::new("tsmc").unwrap(),
+                EntityId::new("fab:TSMC-Arizona-F21").unwrap(),
+            ],
+            places: vec![
+                PlaceRef::Country(CountryCode::new("TW").unwrap()),
+                PlaceRef::Named("Arizona".into()),
+            ],
+            time: Some(TimeScope::Named("q3_2025".into())),
+            topics: vec![
+                Topic::new("semiconductors").unwrap(),
+                Topic::new("ai_export_controls").unwrap(),
+            ],
+        };
+        let json = serde_json::to_string(&subjects).unwrap();
+        let back: Subjects = serde_json::from_str(&json).unwrap();
+        assert_eq!(subjects, back);
+    }
+
+    #[test]
+    fn empty_subjects_omitted_from_json() {
+        let subjects = Subjects::default();
+        let json = serde_json::to_string(&subjects).unwrap();
+        // All fields are empty/none; skip_serializing_if should elide them.
+        assert_eq!(json, "{}");
+        assert!(subjects.is_empty());
+    }
+
+    #[test]
+    fn time_scope_variants() {
+        let s = TimeScope::Named("q3_2025".into());
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"kind\":\"named\""));
+        let back: TimeScope = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+
+        let r = TimeScope::Range {
+            start: Utc::now(),
+            end: Utc::now(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"kind\":\"range\""));
+    }
+
+    #[test]
+    fn place_ref_variants() {
+        let p = PlaceRef::Country(CountryCode::new("TW").unwrap());
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"kind\":\"country\""));
+        let back: PlaceRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+
+        let n = PlaceRef::Named("Pilbara".into());
+        let json = serde_json::to_string(&n).unwrap();
+        assert!(json.contains("\"kind\":\"named\""));
     }
 
     #[test]
@@ -229,13 +420,5 @@ mod tests {
         });
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("promotion"));
-    }
-
-    #[test]
-    fn empty_subjects_omitted_from_json() {
-        let subjects = Subjects::default();
-        let json = serde_json::to_string(&subjects).unwrap();
-        // All three fields are empty; skip_serializing_if should elide them.
-        assert_eq!(json, "{}");
     }
 }

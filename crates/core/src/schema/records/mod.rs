@@ -119,7 +119,7 @@ mod tests {
     use super::*;
     use crate::schema::content::{AssertedContent, ObservationContent, ObservationPeriod};
     use crate::schema::envelope::{Provenance, Subjects};
-    use crate::vocab::{CommodityId, Confidence, EntityId, Stance, Unit};
+    use crate::vocab::{Confidence, EntityId, Stance, Topic, Unit};
     use chrono::{TimeZone, Utc};
 
     fn test_envelope() -> Envelope {
@@ -131,7 +131,7 @@ mod tests {
                 license: "public_domain".into(),
                 derived_from: Vec::new(),
             },
-            subjects: Subjects::commodity(CommodityId::new("Li").unwrap()),
+            subjects: Subjects::topic(Topic::new("Li").unwrap()),
             tags: vec![],
             valid_at: Some(Utc.with_ymd_and_hms(2025, 12, 31, 0, 0, 0).unwrap()),
             observed_at: Utc::now(),

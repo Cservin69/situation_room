@@ -19,7 +19,7 @@
 //! unchanged; the metadata layer changes.
 
 use crate::schema::geometry::Geometry;
-use crate::vocab::{CommodityId, CountryCode, Currency, EntityId, EventType, Unit};
+use crate::vocab::{CountryCode, Currency, EntityId, EventType, Topic, Unit};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -192,12 +192,16 @@ pub enum AttributeValue {
         unit: Option<Unit>,
     },
     Country(CountryCode),
-    Commodity(CommodityId),
+    /// A tag / categorical value drawn from the open [`Topic`] namespace.
+    /// Use this for attributes like "primary commodity", "sector",
+    /// "technology area" — anything that was previously a commodity
+    /// reference is now a Topic.
+    Topic(Topic),
     Entity(EntityId),
     Boolean(bool),
     /// For attributes that are lists (e.g. "subsidiaries").
     EntityList(Vec<EntityId>),
-    CommodityList(Vec<CommodityId>),
+    TopicList(Vec<Topic>),
 }
 
 // ---------------------------------------------------------------------------

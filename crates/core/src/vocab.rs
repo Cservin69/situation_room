@@ -1,23 +1,40 @@
 //! Controlled vocabularies.
 //!
-//! These are the typed identifiers Stockpile uses for commodities, countries,
-//! entities, event types, units, currencies, and stance. They reuse existing
-//! standards wherever possible:
+//! These are the typed identifiers Stockpile uses for countries, entities,
+//! event types, units, currencies, topics, stance, and confidence. They
+//! reuse existing standards wherever possible:
 //!
 //! - **Countries**: ISO 3166-1 alpha-2 (e.g. "CL", "AU", "CN")
 //! - **Currencies**: ISO 4217 (e.g. "USD", "EUR", "CNY")
 //! - **Units**: UCUM (Unified Code for Units of Measure). Common ones:
 //!   "t" (metric ton), "kt" (kiloton), "USD/t", "%", "1" (dimensionless)
-//! - **Commodity codes**: element symbols from the periodic table where
-//!   applicable ("Li", "Cu", "Ni"), or project-specific codes for
-//!   categories and compounds.
 //!
-//! Vocabularies are **extensible at runtime** via `config/vocab/*.toml`.
-//! Adding a new commodity does not require a code change.
+//! ## On topics (and why there is no `CommodityId`)
 //!
-//! All types here are newtypes around `String` for ergonomics, not around
-//! interned symbols — if interning becomes a performance concern we can
-//! switch later without changing the public surface.
+//! Stockpile does not hardcode a schema for "commodities", "sectors",
+//! "technologies", "elections", etc. The six record types
+//! ([Observation](crate::schema::records::Observation),
+//! [Event](crate::schema::records::Event), [Entity](crate::schema::records::Entity),
+//! [Relation](crate::schema::records::Relation), [Document](crate::schema::records::Document),
+//! [Assertion](crate::schema::records::Assertion)) are the universal
+//! schema. Topical categorization — "this record is about lithium /
+//! semiconductors / Taiwan's 2028 election" — happens through free-form
+//! [`Topic`] tags that live in the record's
+//! [`Subjects`](crate::schema::envelope::Subjects).
+//!
+//! The LLM research-planner populates these tags at classification time
+//! (see `pipeline::research`). It is instructed to reuse existing topic
+//! strings across sessions, but the topic namespace is open — no
+//! registry, no governance, no schema-per-domain. The six record types
+//! are the governance.
+//!
+//! This keeps the schema light and the project fully general: you can
+//! research any subject that decomposes into facts.
+//!
+//! Vocabularies that *do* have registries (countries, currencies) keep
+//! their validation here. Vocabularies that are user-curated lists
+//! (commodity seed list, event type taxonomy) live in `config/vocab/`
+//! as plain data, not as code.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -28,8 +45,6 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum VocabError {
-    #[error("commodity id must be non-empty ASCII (1-16 chars): got {0:?}")]
-    InvalidCommodity(String),
     #[error("country code must be ISO 3166-1 alpha-2 (two uppercase letters): got {0:?}")]
     InvalidCountry(String),
     #[error("entity id must be non-empty (1-128 chars): got {0:?}")]
@@ -40,30 +55,38 @@ pub enum VocabError {
     InvalidUnit(String),
     #[error("currency must be ISO 4217 alpha code (three uppercase letters): got {0:?}")]
     InvalidCurrency(String),
+    #[error("topic must be non-empty ASCII (1-64 chars, alphanumeric + _ / -): got {0:?}")]
+    InvalidTopic(String),
 }
 
 // ---------------------------------------------------------------------------
-// Commodity
+// Topic — the general-purpose subject tag.
 // ---------------------------------------------------------------------------
 
-/// Commodity identifier. Element symbol ("Li", "Cu") or compound code
-/// ("REE" for rare earth elements).
+/// A free-form topic tag for categorizing records.
 ///
-/// Validation is deliberately permissive (ASCII, 1-16 chars) because the
-/// vocabulary is user-extensible. The authoritative list lives in
-/// `config/vocab/commodities.toml`.
+/// Examples: `"Li"` (lithium, the commodity), `"semiconductors"` (a sector),
+/// `"euv_lithography"` (a technology), `"tw_2028_presidential"` (an event),
+/// `"ai_export_controls"` (a policy area), `"co2_removal"` (a scientific
+/// domain).
+///
+/// Validation is intentionally permissive (ASCII alphanumeric plus `_` and
+/// `-`, 1–64 chars) because the namespace is user/LLM-curated per research
+/// session, not schema-enforced. The research planner is instructed via
+/// prompt to reuse existing strings when possible; synonym drift is managed
+/// there, not in the type system.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct CommodityId(String);
+pub struct Topic(String);
 
-impl CommodityId {
+impl Topic {
     pub fn new(s: impl Into<String>) -> Result<Self, VocabError> {
         let s = s.into();
         if s.is_empty()
-            || s.len() > 16
+            || s.len() > 64
             || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         {
-            return Err(VocabError::InvalidCommodity(s));
+            return Err(VocabError::InvalidTopic(s));
         }
         Ok(Self(s))
     }
@@ -73,7 +96,7 @@ impl CommodityId {
     }
 }
 
-impl std::fmt::Display for CommodityId {
+impl std::fmt::Display for Topic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
@@ -113,8 +136,8 @@ impl std::fmt::Display for CountryCode {
 // ---------------------------------------------------------------------------
 
 /// Stable identifier for an Entity (company, mine, vessel, port, person,
-/// agency, etc.). Use LEI when available for companies, project slugs
-/// ("sqm", "albemarle", "mine_kathleen_valley") otherwise.
+/// agency, fab, facility, etc.). Use LEI when available for companies,
+/// project slugs ("sqm", "tsmc", "mine_kathleen_valley") otherwise.
 ///
 /// Validation: non-empty, ≤128 chars, ASCII-printable minus whitespace.
 /// Deliberately more permissive than other vocabs because entity naming
@@ -152,7 +175,12 @@ impl std::fmt::Display for EntityId {
 
 /// Event type. Lowercase snake_case, drawn from the controlled vocabulary
 /// in `config/vocab/event_types.toml`. Examples: "export_restriction",
-/// "production_cut", "force_majeure", "guidance_change".
+/// "production_cut", "force_majeure", "guidance_change", "fab_announcement",
+/// "election_result".
+///
+/// Like [`Topic`], the event type namespace is open — the research planner
+/// introduces new types as needed. The config file is a seed and a naming
+/// suggestion, not a hard allowlist.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EventType(String);
@@ -190,7 +218,7 @@ impl std::fmt::Display for EventType {
 ///
 /// Common units in Stockpile: "t" (metric ton), "kt" (kiloton),
 /// "USD/t" (price), "%" (percent), "1" (dimensionless),
-/// "USD" (raw currency amount).
+/// "USD" (raw currency amount), "units/month", "MWh".
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Unit(String);
@@ -355,16 +383,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn commodity_id_accepts_common() {
-        for s in ["Li", "Cu", "REE", "Nd", "Cu-cathode"] {
-            assert!(CommodityId::new(s).is_ok(), "should accept {}", s);
+    fn topic_accepts_common() {
+        for s in ["Li", "semiconductors", "euv_lithography", "tw_2028", "co2-removal", "Cu"] {
+            assert!(Topic::new(s).is_ok(), "should accept {}", s);
         }
     }
 
     #[test]
-    fn commodity_id_rejects_bad() {
-        for s in ["", "lith ium", "li\nth", &"A".repeat(17)] {
-            assert!(CommodityId::new(s).is_err(), "should reject {:?}", s);
+    fn topic_rejects_bad() {
+        for s in ["", "has spaces", "ünicode", &"x".repeat(65), "with/slash"] {
+            assert!(Topic::new(s).is_err(), "should reject {:?}", s);
         }
     }
 
@@ -396,7 +424,7 @@ mod tests {
 
     #[test]
     fn unit_permissive() {
-        for s in ["t", "kt", "USD/t", "%", "1", "mol/L", "m^3"] {
+        for s in ["t", "kt", "USD/t", "%", "1", "mol/L", "m^3", "MWh"] {
             assert!(Unit::new(s).is_ok(), "should accept {}", s);
         }
         assert!(Unit::new("").is_err());
@@ -408,9 +436,11 @@ mod tests {
         for s in [
             "sqm",
             "albemarle",
-            "LEI:549300PPXHEU2JF0AM85",  // colons allowed
+            "tsmc",
+            "LEI:549300PPXHEU2JF0AM85",
             "mine_kathleen_valley",
             "vessel:IMO-9876543",
+            "fab:TSMC-Arizona-F21",
         ] {
             assert!(EntityId::new(s).is_ok(), "should accept {:?}", s);
         }
@@ -448,9 +478,9 @@ mod tests {
 
     #[test]
     fn newtype_serialization_is_transparent() {
-        let c = CommodityId::new("Li").unwrap();
-        assert_eq!(serde_json::to_string(&c).unwrap(), "\"Li\"");
-        let c: CommodityId = serde_json::from_str("\"Cu\"").unwrap();
-        assert_eq!(c.as_str(), "Cu");
+        let t = Topic::new("Li").unwrap();
+        assert_eq!(serde_json::to_string(&t).unwrap(), "\"Li\"");
+        let t: Topic = serde_json::from_str("\"semiconductors\"").unwrap();
+        assert_eq!(t.as_str(), "semiconductors");
     }
 }

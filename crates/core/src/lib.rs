@@ -12,12 +12,22 @@
 //!   share one shape.
 //! - [`Geometry`] as an optional field on Entity/Event/Observation
 //!   (NOT a top-level record type — see ADR 0003).
-//! - Controlled vocabularies in [`vocab`]: commodities, countries,
-//!   entities, event types, units, currencies, stance, confidence.
+//! - Controlled vocabularies in [`vocab`]: countries, entities, event
+//!   types, units, currencies, topics, stance, confidence.
 //!
 //! `stockpile-core` has zero dependencies on other workspace crates by
 //! design: if you want to know what Stockpile *is*, you read this crate
 //! and you have the full picture.
+//!
+//! ## Design note: "general by default"
+//!
+//! Stockpile does not hardcode any domain — there is no first-class
+//! "commodity", "sector", or "technology" concept in the schema. The
+//! six record types are the universal schema. Domain categorization
+//! happens through free-form [`Topic`] tags in
+//! [`Subjects`](schema::envelope::Subjects), populated by the LLM research
+//! planner at classification time. Commodities and sectors are equally
+//! first-class — they're both topics. See [`vocab`] for the rationale.
 //!
 //! ## Quick tour
 //!
@@ -28,7 +38,7 @@
 //!         envelope::{Envelope, Provenance, Subjects},
 //!         Observation, Record,
 //!     },
-//!     vocab::{CommodityId, Confidence, Unit},
+//!     vocab::{Confidence, Topic, Unit},
 //! };
 //!
 //! let envelope = Envelope {
@@ -39,7 +49,7 @@
 //!         license: "public_domain".into(),
 //!         derived_from: vec![],
 //!     },
-//!     subjects: Subjects::commodity(CommodityId::new("Li")?),
+//!     subjects: Subjects::topic(Topic::new("Li")?),
 //!     tags: vec![],
 //!     valid_at: None,
 //!     observed_at: chrono::Utc::now(),
@@ -69,12 +79,12 @@ pub use schema::{
     // Content types
     AssertedContent, EntityAttributeContent, EventContent, ObservationContent, RelationContent,
     // Envelope + parts
-    Envelope, Provenance, Subjects,
+    Envelope, PlaceRef, Provenance, Subjects, TimeScope,
     // Geometry
     Geometry,
     // Record types + enum
     Assertion, Document, Entity, Event, Observation, Record, Relation,
 };
 pub use vocab::{
-    CommodityId, Confidence, CountryCode, Currency, EntityId, EventType, Stance, Unit,
+    Confidence, CountryCode, Currency, EntityId, EventType, Stance, Topic, Unit,
 };

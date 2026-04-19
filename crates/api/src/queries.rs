@@ -2,6 +2,6 @@
 //! that get TS-exported via `types_export`.
 //!
 //! Examples (Phase 4):
-//! - `by_subject(commodity: CommodityId) -> Vec<Record>`
+//! - `by_subject(topic: Topic) -> Vec<Record>`
 //! - `by_metric(metric: String, since: DateTime<Utc>) -> Vec<Observation>`
 //! - `by_event_type(et: EventType) -> Vec<Event>`
