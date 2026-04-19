@@ -123,11 +123,15 @@ impl SecureHttpClient {
             .redirect(redirect_policy)
             // rustls-tls is the only TLS backend (set via features)
             .min_tls_version(reqwest::tls::Version::TLS_1_2)
-            // No ambient cookies across requests
-            .cookie_store(false)
-            // HSTS is enforced automatically by rustls behavior; no explicit
-            // opt-in needed. We also disable HTTP (not HTTPS) for any
-            // source we mark as sensitive via per-source config.
+            // No ambient cookies across requests — this is the default when
+            // reqwest's `cookies` feature is not enabled, which it isn't.
+            // (We deliberately do NOT call .cookie_store(false) because that
+            // method only exists with the `cookies` feature; its absence is
+            // the enforcement.)
+            //
+            // HSTS is enforced automatically by rustls behavior. For any
+            // source we mark as sensitive in per-source config, we also
+            // disable HTTP (not HTTPS) at the per-source layer.
             ;
 
         if !config.allow_http2 {
