@@ -19,14 +19,15 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
-    #[error("duckdb error: {0}")]
-    DuckDb(#[from] duckdb::Error),
-
+    // DuckDb variant deferred to Phase 2 alongside duckdb dep.
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
     #[error("migration failed: {0}")]
     Migration(String),
+
+    #[error("storage error: {0}")]
+    Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;

@@ -27,7 +27,7 @@ impl Bounds {
     pub const LLM_PROMPT_BODY: usize = 256 * 1024;
 
     /// A single config file (TOML, JSON).
-    pub const CONFIG_FILE: usize = 1 * 1024 * 1024;
+    pub const CONFIG_FILE: usize = 1024 * 1024;
 
     /// A single user-typed research topic.
     pub const RESEARCH_TOPIC: usize = 2_000;

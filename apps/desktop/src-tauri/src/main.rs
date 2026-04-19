@@ -56,8 +56,11 @@ fn load_dotenv() {
             let k = k.trim();
             let v = v.trim().trim_matches('"').trim_matches('\'');
             if std::env::var_os(k).is_none() {
-                // SAFETY: called in main before any threads spawn.
-                unsafe { std::env::set_var(k, v); }
+                // NOTE: env::set_var will become unsafe in edition 2024.
+                // We're on edition 2021 where it's safe. When we migrate to
+                // edition 2024, wrap this in an `unsafe` block with a SAFETY
+                // comment explaining that this runs in main before threads spawn.
+                std::env::set_var(k, v);
             }
         }
     }

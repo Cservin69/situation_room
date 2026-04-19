@@ -12,10 +12,10 @@ path = "src/lib.rs"
 
 [dependencies]
 stockpile-core = { workspace = true }
-duckdb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+# duckdb deferred to Phase 2 — see Cargo.toml workspace comment
