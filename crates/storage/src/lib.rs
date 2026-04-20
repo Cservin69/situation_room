@@ -12,11 +12,19 @@
 
 #![allow(dead_code)]
 
+pub mod assertions;
 pub mod connection;
+pub mod documents;
+pub mod entities;
+pub mod envelope_io;
+pub mod events;
 pub mod migrate;
 pub mod observations;
+pub mod queries;
+pub mod relations;
 
 pub use connection::Store;
+pub use queries::TopicUsage;
 
 use thiserror::Error;
 
