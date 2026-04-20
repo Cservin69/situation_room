@@ -44,10 +44,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # HTTP — rustls only, no system OpenSSL, strict TLS config applied via SecureHttpClient
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "stream"] }
 
-# NOTE: duckdb deferred to Phase 2 — its transitive deps require edition2024
-# which we'll pick up once the toolchain is 1.85+ across all contributor machines.
-# When re-adding, pin explicitly:
-# duckdb = { version = "=1.1", features = ["bundled"] }
+# NOTE: duckdb added in Phase 2e. Bundled to avoid per-platform installs.
+duckdb = { version = "1.1", features = ["bundled", "chrono", "uuid", "serde_json"] }
 
 # JSON Schema generation
 schemars = { version = "0.8", features = ["chrono"] }

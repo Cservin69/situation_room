@@ -18,4 +18,5 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-# duckdb deferred to Phase 2 — see Cargo.toml workspace comment
+duckdb = { workspace = true }
+uuid = { workspace = true }

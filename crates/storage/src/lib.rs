@@ -1,30 +1,38 @@
-// Phase 1: many declared items are stubs. These allow attributes will be
-// removed as Phase 2/3 fill in real implementations.
-#![allow(dead_code, unused_imports, unused_variables)]
-
 //! # stockpile-storage
 //!
-//! DuckDB persistence for Stockpile records. See ADR 0005 for why DuckDB.
+//! DuckDB persistence for Stockpile records. See ADR 0005 (DuckDB) and
+//! ADR 0008 (offline / cache architecture).
 //!
-//! ## Phase 1 status
+//! ## Phase 2e status
 //!
-//! Module stubs only. Connection management, query builder, and the ring-buffer
-//! cache logic land in Phase 2.
+//! Minimal end-to-end path: open a connection, apply migrations, insert
+//! an Observation, query it back. Other record types and the cache /
+//! archive distinction land in subsequent phases once the round-trip
+//! shape is proven.
+
+#![allow(dead_code)]
 
 pub mod connection;
-pub mod query;
-pub mod cache;
+pub mod migrate;
+pub mod observations;
+
+pub use connection::Store;
 
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
-    // DuckDb variant deferred to Phase 2 alongside duckdb dep.
+    #[error("duckdb error: {0}")]
+    DuckDb(#[from] duckdb::Error),
+
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
     #[error("migration failed: {0}")]
     Migration(String),
+
+    #[error("record not found: {0}")]
+    NotFound(String),
 
     #[error("storage error: {0}")]
     Other(String),
