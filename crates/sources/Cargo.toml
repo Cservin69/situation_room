@@ -22,3 +22,8 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 async-trait = { workspace = true }
 toml = { workspace = true }
+pdf-extract = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+stockpile-storage = { workspace = true }

@@ -15,7 +15,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/yourusername/stockpile"
 authors = ["Stockpile contributors"]
@@ -68,6 +68,13 @@ zeroize = { version = "1.8", features = ["derive"] }
 
 # URL parsing (needed for SSRF defense)
 url = { version = "2.5", features = ["serde"] }
+
+# PDF text extraction (pure Rust, best-effort tabular quality).
+# See `crates/sources/src/adapters/usgs/parse.rs` for the layer on top.
+pdf-extract = "0.7"
+
+# Regex for parser line matching
+regex = "1.11"
 
 # IP address parsing (SSRF defense: block private ranges)
 

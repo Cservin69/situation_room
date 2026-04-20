@@ -21,6 +21,7 @@ pub mod events;
 pub mod migrate;
 pub mod observations;
 pub mod queries;
+pub mod record_dispatch;
 pub mod relations;
 
 pub use connection::Store;
