@@ -22,3 +22,5 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }

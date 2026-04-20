@@ -22,6 +22,11 @@
 //! registered sources, and triggers targeted ingestion. This is what makes
 //! Stockpile general-purpose rather than commodity-only.
 //!
+//! [`recipes`] holds the Level-2 output types ([`recipes::FetchRecipe`] et
+//! al.) — deterministic instructions produced by the LLM at authoring time
+//! that the runtime applies without further LLM involvement. See
+//! `docs/adr/0007-research-function.md`.
+//!
 //! ## Phase 1 status
 //!
 //! Module structure declared. Implementations land in Phase 3.
@@ -30,4 +35,5 @@ pub mod ingest;
 pub mod normalize;
 pub mod extract;
 pub mod promote;
+pub mod recipes;
 pub mod research;

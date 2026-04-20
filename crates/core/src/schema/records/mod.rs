@@ -37,6 +37,47 @@ pub enum Record {
     Assertion(Assertion),
 }
 
+/// A standalone tag for the six record types.
+///
+/// Use this when you need to *refer to* a record type without having a
+/// value of that type — e.g. in pipeline configuration, in recipe
+/// production bindings (see `stockpile_pipeline::recipes`), or when
+/// logging type-level decisions. For an actual record, use [`Record`].
+///
+/// The variant set is identical to [`Record`] and the serde
+/// representation matches [`Record::kind`] — an independent string
+/// tag serialized as `"observation"`, `"event"`, etc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordType {
+    Observation,
+    Event,
+    Entity,
+    Relation,
+    Document,
+    Assertion,
+}
+
+impl RecordType {
+    /// String form matching [`Record::kind`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Observation => "observation",
+            Self::Event => "event",
+            Self::Entity => "entity",
+            Self::Relation => "relation",
+            Self::Document => "document",
+            Self::Assertion => "assertion",
+        }
+    }
+}
+
+impl std::fmt::Display for RecordType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl Record {
     /// Get the record's UUID without matching on the variant.
     pub fn id(&self) -> Uuid {
@@ -47,6 +88,21 @@ impl Record {
             Self::Relation(r) => r.id,
             Self::Document(r) => r.id,
             Self::Assertion(r) => r.id,
+        }
+    }
+
+    /// The structural tag for this record's variant.
+    ///
+    /// Complements [`Record::kind`], which returns a `&'static str` for
+    /// logging. This returns the enum form for typed comparisons.
+    pub fn record_type(&self) -> RecordType {
+        match self {
+            Self::Observation(_) => RecordType::Observation,
+            Self::Event(_) => RecordType::Event,
+            Self::Entity(_) => RecordType::Entity,
+            Self::Relation(_) => RecordType::Relation,
+            Self::Document(_) => RecordType::Document,
+            Self::Assertion(_) => RecordType::Assertion,
         }
     }
 

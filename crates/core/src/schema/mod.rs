@@ -19,4 +19,4 @@ pub use envelope::{
     DerivationRole, DerivedFrom, Envelope, PlaceRef, Provenance, Subjects, TimeScope,
 };
 pub use geometry::{Geometry, LineStringGeom, MultiPolygonGeom, PointGeom, PolygonGeom, Position};
-pub use records::{Assertion, Document, Entity, Event, Observation, Record, Relation};
+pub use records::{Assertion, Document, Entity, Event, Observation, Record, RecordType, Relation};

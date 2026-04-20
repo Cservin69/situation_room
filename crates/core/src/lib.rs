@@ -83,7 +83,7 @@ pub use schema::{
     // Geometry
     Geometry,
     // Record types + enum
-    Assertion, Document, Entity, Event, Observation, Record, Relation,
+    Assertion, Document, Entity, Event, Observation, Record, RecordType, Relation,
 };
 pub use vocab::{
     Confidence, CountryCode, Currency, EntityId, EventType, Stance, Topic, Unit,

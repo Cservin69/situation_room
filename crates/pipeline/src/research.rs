@@ -91,14 +91,14 @@ pub struct RecordExpectations {
     /// Metrics the session expects to capture as Observations.
     /// Examples for "chip production": `wafer_starts`,
     /// `fab_utilization`, `capex`, `process_node_rollout`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observation_metrics: Vec<MetricExpectation>,
 
     /// Event types the session expects to capture.
     /// Examples for "chip production": `fab_announcement`,
     /// `equipment_delivery`, `export_control_enacted`,
     /// `supply_chain_disruption`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_types: Vec<EventTypeExpectation>,
 
     /// Kinds of entities the session expects to track. "Kind" here
@@ -107,25 +107,25 @@ pub struct RecordExpectations {
     /// `equipment_vendor`, `government_agency`, etc.). Known exemplars
     /// are listed so source matching can seed ingestion with known
     /// targets.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entity_kinds: Vec<EntityKindExpectation>,
 
     /// Kinds of relations the session expects. Each kind is a free-form
     /// string matching [`RelationContent::kind`](stockpile_core::RelationContent::kind):
     /// `supply_contract`, `fab_operator`, `equipment_source`, `subsidiary`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relation_kinds: Vec<RelationKindExpectation>,
 
     /// Document sources the session wants to monitor. Each hint is
     /// matched against registered sources by the source-matching step.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub document_sources: Vec<DocumentSourceHint>,
 
     /// Notes from the classifier about expected Assertion patterns —
     /// what claims the LLM extraction layer should prioritize extracting
     /// from incoming documents. Free-form; read by the extraction prompt
     /// composer.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assertion_guidance: Option<String>,
 }
 
