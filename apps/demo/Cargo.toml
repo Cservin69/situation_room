@@ -1,0 +1,25 @@
+[package]
+name = "stockpile-demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Console demo — end-to-end fetch → parse → store → query against one USGS commodity."
+
+[[bin]]
+name = "stockpile-demo"
+path = "src/main.rs"
+
+[dependencies]
+stockpile-core = { workspace = true }
+stockpile-secure = { workspace = true }
+stockpile-sources = { workspace = true }
+stockpile-storage = { workspace = true }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }

@@ -10,6 +10,7 @@ members = [
     "crates/api",
     "crates/secure",
     "apps/desktop/src-tauri",
+    "apps/demo",
 ]
 
 [workspace.package]
@@ -69,12 +70,13 @@ zeroize = { version = "1.8", features = ["derive"] }
 # URL parsing (needed for SSRF defense)
 url = { version = "2.5", features = ["serde"] }
 
-# PDF text extraction (pure Rust, best-effort tabular quality).
-# See `crates/sources/src/adapters/usgs/parse.rs` for the layer on top.
+# PDF text extraction — kept because the USGS adapter extracts text
+# into Document.body. The text itself isn't parsed here; that's the
+# Level-2 FetchRecipe apply runtime's job (ADR 0007).
 pdf-extract = "0.7"
 
-# Regex for parser line matching
-regex = "1.11"
+# CLI argument parsing (used by the demo binary)
+clap = { version = "4.5", features = ["derive"] }
 
 # IP address parsing (SSRF defense: block private ranges)
 

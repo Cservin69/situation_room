@@ -4,26 +4,28 @@
 //! Public domain, no API key, authoritative for U.S. mineral
 //! production and reserves.
 //!
-//! Session A (done): fetch PDF bytes, emit a `Document` record.
-//! Session B (this): extract text with [`parse::extract_text`], emit
-//! Observations for recognized production / reserves rows.
+//! ## Current status (post-pivot, 2026-04-20)
 //!
-//! ## Parser quality
+//! This adapter **does not emit Observations**. It fetches the PDF,
+//! extracts text via `pdf-extract`, and emits a single `Document`
+//! record. Observation emission is the job of the Level-2
+//! `FetchRecipe` apply runtime (ADR 0007), which is under
+//! construction in the next phase.
 //!
-//! Pure-Rust PDF text extraction produces imperfect output on tabular
-//! layouts. The parser is best-effort — see [`parse`] module docs.
-//! Rows that don't cleanly match a country × numbers pattern are
-//! silently skipped; missing data is not an error. The robust
-//! extraction path is the Level-2 LLM recipe pipeline (ADR 0007).
-
-pub mod parse;
+//! An earlier Session B attempt shipped a hand-written regex parser
+//! that produced visibly wrong results on real data (wrong years,
+//! wrong metric kinds, non-country rows identified as countries).
+//! That was backed out. **The lesson: we do not shortcut around the
+//! architecture. Deterministic per-source parsers are exactly what
+//! ADR 0007 rejected in favor of LLM-authored recipes.**
+//!
+//! See `STOCKPILE_HANDOFF_SESSION2.md` for the full story.
 
 use async_trait::async_trait;
 use chrono::Utc;
-use stockpile_core::schema::content::{ObservationContent, ObservationPeriod};
 use stockpile_core::schema::envelope::{Envelope, Provenance, Subjects};
-use stockpile_core::vocab::{Confidence, CountryCode, Topic, Unit};
-use stockpile_core::{Document, Observation, Record};
+use stockpile_core::vocab::{Confidence, Topic, Unit};
+use stockpile_core::{Document, Record};
 use stockpile_secure::http::SecureHttpClient;
 
 use crate::traits::{
@@ -31,27 +33,20 @@ use crate::traits::{
     SourceMetadata,
 };
 
-use parse::{ParsedRow, RowKind};
-
 /// USGS MCS source, scoped to one (year, commodity) pair per instance.
 pub struct UsgsMcsAdapter {
     http: SecureHttpClient,
     year: u16,
     commodity_slug: String,
     topic: Topic,
-    /// Unit for this commodity's production values. USGS MCS reports
-    /// most commodities in metric tons; a few (platinum-group metals,
-    /// gemstones) use kilograms or carats. Caller supplies to avoid
-    /// per-commodity guessing in the parser.
+    /// Unit carried for future use by the recipe-apply runtime. Not
+    /// used by this adapter directly — the adapter just fetches.
+    #[allow(dead_code)]
     unit: Unit,
     url_override: Option<String>,
 }
 
 impl UsgsMcsAdapter {
-    /// Construct a USGS MCS adapter. `commodity_slug` is the URL
-    /// slug ("lithium", "copper"). `topic` is the envelope tag
-    /// attached to emitted records. `unit` is the production unit
-    /// (most commodities: `"t"` for metric tons).
     pub fn new(
         http: SecureHttpClient,
         year: u16,
@@ -89,127 +84,6 @@ impl UsgsMcsAdapter {
     pub fn source_id(&self) -> String {
         format!("usgs_mcs:{}:{}", self.year, self.commodity_slug)
     }
-
-    /// Build an Observation record from one parsed table row.
-    /// `country_code` is optional: if we recognized the country label,
-    /// it's attached as a PlaceRef. Otherwise, only topic tagging is
-    /// applied.
-    fn observation_from_row(
-        &self,
-        row: &ParsedRow,
-        country_code: Option<CountryCode>,
-        source_url: &str,
-        pdf_observed_at: chrono::DateTime<chrono::Utc>,
-    ) -> Observation {
-        let metric = match row.kind {
-            RowKind::Production => "production",
-            RowKind::Reserves => "reserves",
-        };
-
-        let period = match row.kind {
-            RowKind::Production => ObservationPeriod::Annual,
-            RowKind::Reserves => ObservationPeriod::Instant,
-        };
-
-        // valid_at: end of the reporting year when we know it; None
-        // otherwise. USGS production numbers are "calendar year"
-        // values, so Dec 31 of `row.year` is the natural choice.
-        let valid_at = row.year.and_then(|y| {
-            use chrono::TimeZone;
-            chrono::NaiveDate::from_ymd_opt(y as i32, 12, 31)
-                .and_then(|d| d.and_hms_opt(23, 59, 59))
-                .and_then(|ndt| chrono::Utc.from_local_datetime(&ndt).single())
-        });
-
-        let places = match country_code {
-            Some(c) => vec![stockpile_core::schema::envelope::PlaceRef::Country(c)],
-            None => vec![],
-        };
-
-        let envelope = Envelope {
-            provenance: Provenance {
-                source_id: self.source_id(),
-                source_url: Some(source_url.to_string()),
-                source_published_at: None,
-                license: "public_domain".into(),
-                derived_from: vec![],
-            },
-            subjects: Subjects {
-                entities: vec![],
-                places,
-                time: None,
-                topics: vec![self.topic.clone()],
-            },
-            tags: vec![
-                "source_tier:authoritative".into(),
-                "parser:best_effort".into(),
-            ],
-            valid_at,
-            observed_at: pdf_observed_at,
-            confidence: Confidence::new(0.95).unwrap_or(Confidence::ONE),
-        };
-
-        let content = ObservationContent {
-            metric: metric.into(),
-            value: row.value,
-            unit: self.unit.clone(),
-            value_uncertainty: None,
-            currency: None,
-            period,
-            geometry: None,
-        };
-
-        let dedup_key = format!(
-            "{}:{}:{}:{}",
-            self.source_id(),
-            metric,
-            row.country_label.replace(' ', "_").to_lowercase(),
-            row.year.map(|y| y.to_string()).unwrap_or_else(|| "unknown".into())
-        );
-
-        Observation::new(envelope, content).with_dedup_key(dedup_key)
-    }
-}
-
-/// Map a USGS country label to an ISO 3166-1 alpha-2 code. Returns
-/// `None` for labels we don't recognize (including sub-country rows
-/// like "United States" subdivisions or "World total").
-///
-/// The list is intentionally short — only major producer countries
-/// that commonly appear in MCS tables. Unknown labels still produce
-/// Observations, just without a `PlaceRef::Country` attached.
-pub(crate) fn label_to_country_code(label: &str) -> Option<CountryCode> {
-    let code = match label.trim() {
-        "Argentina" => "AR",
-        "Australia" => "AU",
-        "Bolivia" => "BO",
-        "Brazil" => "BR",
-        "Canada" => "CA",
-        "Chile" => "CL",
-        "China" => "CN",
-        "Congo (Kinshasa)" | "Democratic Republic of the Congo" => "CD",
-        "Germany" => "DE",
-        "India" => "IN",
-        "Indonesia" => "ID",
-        "Japan" => "JP",
-        "Kazakhstan" => "KZ",
-        "Mexico" => "MX",
-        "Morocco" => "MA",
-        "Peru" => "PE",
-        "Poland" => "PL",
-        "Portugal" => "PT",
-        "Russia" => "RU",
-        "South Africa" => "ZA",
-        "South Korea" | "Korea, Republic of" => "KR",
-        "Spain" => "ES",
-        "Turkey" => "TR",
-        "United States" => "US",
-        "Vietnam" => "VN",
-        "Zambia" => "ZM",
-        "Zimbabwe" => "ZW",
-        _ => return None,
-    };
-    CountryCode::new(code).ok()
 }
 
 #[async_trait]
@@ -258,19 +132,21 @@ impl Source for UsgsMcsAdapter {
         let now = Utc::now();
         let mut notes = vec![format!("fetched {} bytes from {}", bytes.len(), url)];
 
-        // Extract text. On failure, fall back to an empty text body —
-        // the Document still has value as a record-of-fetch even if we
-        // can't parse it.
-        let extracted_text = match parse::extract_text(&bytes) {
+        // Extract text. If extraction fails, the Document still lands —
+        // it's proof-of-fetch even if the body is empty.
+        let extracted_text = match pdf_extract::extract_text_from_mem(&bytes) {
             Ok(t) => t,
             Err(e) => {
                 notes.push(format!("text extraction failed: {e}"));
                 String::new()
             }
         };
+        notes.push(format!(
+            "extracted {} chars of text (awaiting recipe-apply runtime for Observations)",
+            extracted_text.len()
+        ));
 
-        // Build the Document record.
-        let doc_envelope = Envelope {
+        let envelope = Envelope {
             provenance: Provenance {
                 source_id: self.source_id(),
                 source_url: Some(url.clone()),
@@ -290,7 +166,7 @@ impl Source for UsgsMcsAdapter {
             confidence: Confidence::ONE,
         };
 
-        let mut doc = Document::new("report", extracted_text.clone(), doc_envelope);
+        let mut doc = Document::new("report", extracted_text, envelope);
         doc.dedup_key = Some(format!("{}:mcs:{}", self.source_id(), self.year));
         doc.title = Some(format!(
             "USGS Mineral Commodity Summaries {} — {}",
@@ -298,20 +174,8 @@ impl Source for UsgsMcsAdapter {
         ));
         doc.mime = "text/plain".into();
 
-        let mut records: Vec<Record> = vec![Record::Document(doc)];
-
-        // Parse production rows; emit one Observation per recognized row.
-        let rows = parse::parse_production_rows(&extracted_text);
-        let row_count = rows.len();
-        for row in rows {
-            let country = label_to_country_code(&row.country_label);
-            let obs = self.observation_from_row(&row, country, &url, now);
-            records.push(Record::Observation(obs));
-        }
-        notes.push(format!("parsed {} production/reserves rows", row_count));
-
         Ok(FetchOutcome {
-            records,
+            records: vec![Record::Document(doc)],
             new_watermark: Some(now),
             notes,
         })
@@ -343,9 +207,8 @@ mod tests {
 
     #[test]
     fn pdf_url_is_derived_from_year_and_slug() {
-        let adapter = test_adapter();
         assert_eq!(
-            adapter.pdf_url(),
+            test_adapter().pdf_url(),
             "https://pubs.usgs.gov/periodicals/mcs2025/mcs2025-lithium.pdf"
         );
     }
@@ -383,43 +246,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn label_to_country_handles_known_producers() {
-        assert!(label_to_country_code("Chile").is_some());
-        assert!(label_to_country_code("Australia").is_some());
-        assert!(label_to_country_code("China").is_some());
-        assert!(label_to_country_code("United States").is_some());
-        // Sub-country label or unknown → None
-        assert!(label_to_country_code("Nevada").is_none());
-        assert!(label_to_country_code("World total").is_none());
-    }
-
-    #[test]
-    fn observation_from_row_populates_envelope_correctly() {
-        let adapter = test_adapter();
-        let row = ParsedRow {
-            country_label: "Chile".into(),
-            year: Some(2024),
-            value: 53_000.0,
-            kind: RowKind::Production,
-        };
-        let obs = adapter.observation_from_row(
-            &row,
-            label_to_country_code("Chile"),
-            "https://example/test.pdf",
-            Utc::now(),
-        );
-        assert_eq!(obs.content.metric, "production");
-        assert_eq!(obs.content.value, 53_000.0);
-        assert_eq!(obs.envelope.subjects.topics.len(), 1);
-        assert_eq!(obs.envelope.subjects.places.len(), 1);
-        assert!(obs.dedup_key.as_ref().unwrap().contains("chile"));
-        assert!(obs.dedup_key.as_ref().unwrap().contains("2024"));
-        // valid_at should be end-of-year 2024
-        let v = obs.envelope.valid_at.expect("valid_at should be set");
-        assert_eq!(v.naive_utc().date().to_string(), "2024-12-31");
-    }
-
     #[tokio::test]
     async fn fetch_errors_bubble_up_as_source_error() {
         let adapter =
@@ -433,12 +259,11 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // Integration test that actually hits USGS. Ignored by default.
+    // Live test — hits real USGS, ignored by default.
     #[tokio::test]
     #[ignore]
-    async fn live_fetch_returns_document_and_observations() {
-        let adapter = test_adapter();
-        let outcome = adapter
+    async fn live_fetch_returns_document() {
+        let outcome = test_adapter()
             .fetch(FetchContext {
                 since: None,
                 focus: vec![],
@@ -446,34 +271,13 @@ mod tests {
             .await
             .expect("live fetch should succeed");
 
-        // Expect one Document plus some number of Observations.
-        assert!(outcome.records.len() >= 1);
-        let n_docs = outcome
-            .records
-            .iter()
-            .filter(|r| matches!(r, Record::Document(_)))
-            .count();
-        let n_obs = outcome
-            .records
-            .iter()
-            .filter(|r| matches!(r, Record::Observation(_)))
-            .count();
-        assert_eq!(n_docs, 1, "exactly one Document expected");
-        // Best-effort parser: we expect *some* observations but the
-        // exact count depends on USGS's layout that year. A single
-        // recognized country is enough to prove the pipeline works.
-        assert!(
-            n_obs >= 1,
-            "expected at least one parsed Observation, got {n_obs} (parser may need a tweak \
-             for this year's layout). Notes: {:?}",
-            outcome.notes
-        );
-
-        // Spot-check: the Document should have extracted text, not base64.
+        // Expect exactly one Document. No Observations until the
+        // recipe-apply runtime lands.
+        assert_eq!(outcome.records.len(), 1);
+        assert!(matches!(&outcome.records[0], Record::Document(_)));
         if let Record::Document(doc) = &outcome.records[0] {
             assert_eq!(doc.mime, "text/plain");
-            assert!(!doc.body.is_empty(), "extracted text should not be empty");
-            assert!(!doc.body.starts_with("JVBERi"), "body should not be base64 PDF");
+            assert!(!doc.body.is_empty());
         }
     }
 }
