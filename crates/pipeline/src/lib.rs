@@ -36,4 +36,7 @@ pub mod normalize;
 pub mod extract;
 pub mod promote;
 pub mod recipes;
+pub mod recipe_author;
+pub mod recipe_apply;
+pub mod recipes_store;
 pub mod research;

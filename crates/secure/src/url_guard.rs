@@ -24,7 +24,6 @@
 
 
 use std::net::IpAddr;
-use std::str::FromStr;
 use thiserror::Error;
 use url::Url;
 
@@ -100,10 +99,33 @@ impl UrlGuard {
             return Err(UrlViolation::Localhost(host.to_string()));
         }
 
-        // 5. If host is a literal IP, check it's not private / metadata / loopback
-        if let Ok(ip) = IpAddr::from_str(host) {
-            if is_disallowed_ip(&ip) {
-                return Err(UrlViolation::PrivateIp(ip.to_string()));
+        // 5. If host is a literal IP, check it's not private / metadata / loopback.
+        //
+        // We use the typed `url::Host` variant rather than parsing the
+        // output of `host_str()` — the string form of an IPv6 address
+        // carries `[]` brackets (`"[::1]"`) which fail `IpAddr::from_str`
+        // and silently bypass this check. That was a real bug caught by
+        // `rejects_ipv6_loopback`.
+        match url.host() {
+            Some(url::Host::Ipv4(v4)) => {
+                let ip = IpAddr::V4(v4);
+                if is_disallowed_ip(&ip) {
+                    return Err(UrlViolation::PrivateIp(ip.to_string()));
+                }
+            }
+            Some(url::Host::Ipv6(v6)) => {
+                let ip = IpAddr::V6(v6);
+                if is_disallowed_ip(&ip) {
+                    return Err(UrlViolation::PrivateIp(ip.to_string()));
+                }
+            }
+            Some(url::Host::Domain(_)) => {
+                // Domain name: DNS resolution happens later in the HTTP
+                // client, with a resolver that rechecks the resolved IPs.
+                // Nothing to validate at the guard layer.
+            }
+            None => {
+                // Already caught above as NoHost.
             }
         }
         // NOTE: if host is a domain name, DNS resolution happens later in the

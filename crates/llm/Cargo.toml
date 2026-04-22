@@ -22,3 +22,6 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 async-trait = { workspace = true }
 schemars = { workspace = true }
+
+[dev-dependencies]
+dotenvy = { workspace = true }

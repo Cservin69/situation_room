@@ -22,10 +22,12 @@ pub mod migrate;
 pub mod observations;
 pub mod queries;
 pub mod record_dispatch;
+pub mod recipes;
 pub mod relations;
 
 pub use connection::Store;
 pub use queries::TopicUsage;
+pub use recipes::{RecipeRow, StoredRecipe};
 
 use thiserror::Error;
 

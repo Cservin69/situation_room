@@ -78,10 +78,26 @@ pdf-extract = "0.7"
 # CLI argument parsing (used by the demo binary)
 clap = { version = "4.5", features = ["derive"] }
 
+# .env loading for binaries and test harnesses only — never pulled in
+# by library code. See `docs/security/threat_model.md`: secrets live in
+# env vars; .env is a dev convenience on top of that, not a new path.
+dotenvy = "0.15"
+
 # IP address parsing (SSRF defense: block private ranges)
 
 # Constant-time equality for token comparisons
 subtle = "2.6"
+
+# Recipe-apply runtime extractors (ADR 0007 Level-2). Each serves one
+# ExtractionSpec variant — the closed enum in `pipeline::recipes`.
+regex = "1.10"
+csv = "1.3"
+scraper = "0.20"
+# JSONPath extractor for the recipe-apply runtime. jsonpath-rust 1.0+
+# is RFC 9535 compliant and actively maintained; chosen over
+# serde_json_path (which has an upstream version-split bug in 0.6.x
+# that breaks compilation on current rustc).
+jsonpath-rust = "1.0"
 
 # Internal workspace crates
 stockpile-core = { path = "crates/core" }

@@ -172,7 +172,7 @@ Recommended sequence (one sub-task per session, sanity-first):
 ### 3c.1 — LLM provider wiring (ONE session)
 
 Pick a provider (user will decide: Claude via Anthropic SDK, or
-GPT via OpenAI SDK). Wire the `stockpile_llm` crate for real:
+GROK via XAI Console SDK). Wire the `stockpile_llm` crate for real:
 
 - `LlmProvider` trait (probably exists as a stub — check and
   extend, do not replace without a good reason).

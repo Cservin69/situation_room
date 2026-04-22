@@ -64,7 +64,7 @@ impl UsgsMcsAdapter {
         }
     }
 
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     pub fn with_url_override(mut self, url: impl Into<String>) -> Self {
         self.url_override = Some(url.into());
         self
@@ -103,11 +103,11 @@ impl Source for UsgsMcsAdapter {
             license: DataLicense::PublicDomain,
             authoritative_for: vec![
                 AuthoritativeDomain {
-                    commodity: Some(self.commodity_slug.clone()),
+                    topic: Some(self.topic.clone()),
                     metric: "production".into(),
                 },
                 AuthoritativeDomain {
-                    commodity: Some(self.commodity_slug.clone()),
+                    topic: Some(self.topic.clone()),
                     metric: "reserves".into(),
                 },
             ],

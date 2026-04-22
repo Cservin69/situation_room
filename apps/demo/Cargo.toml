@@ -11,11 +11,17 @@ description = "Console demo — end-to-end fetch → parse → store → query a
 name = "stockpile-demo"
 path = "src/main.rs"
 
+[[bin]]
+name = "stockpile-e2e"
+path = "src/bin/e2e_demo.rs"
+
 [dependencies]
 stockpile-core = { workspace = true }
 stockpile-secure = { workspace = true }
 stockpile-sources = { workspace = true }
 stockpile-storage = { workspace = true }
+stockpile-pipeline = { workspace = true }
+stockpile-llm = { workspace = true }
 
 tokio = { workspace = true }
 anyhow = { workspace = true }
@@ -23,3 +29,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 chrono = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+dotenvy = { workspace = true }

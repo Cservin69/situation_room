@@ -15,6 +15,7 @@ stockpile-core = { workspace = true }
 stockpile-storage = { workspace = true }
 stockpile-sources = { workspace = true }
 stockpile-llm = { workspace = true }
+stockpile-secure = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
@@ -22,5 +23,13 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+schemars = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+regex = { workspace = true }
+csv = { workspace = true }
+scraper = { workspace = true }
+jsonpath-rust = { workspace = true }
+
+[dev-dependencies]
+dotenvy = { workspace = true }

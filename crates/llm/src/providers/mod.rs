@@ -12,3 +12,4 @@ pub mod gemini;
 
 pub use trait_def::{LlmProvider, LlmError, ModelTier, CompletionRequest, CompletionResponse, StructuredOutputSchema};
 pub use router::ProviderRouter;
+pub use grok::{XaiProvider, XaiConfig, XAI_API_KEY_ENV};

@@ -462,3 +462,55 @@ captured here for traceability:
 Any of these can be revisited if implementation reveals a problem;
 the commitment is to the two-level split and the LLM-free-runtime
 property, not to every subordinate choice.
+
+---
+
+Reviewed 2026-04-22 (Session 3, Phase 3c.3 kickoff). Before
+beginning the runtime apply work, the architecture was deliberately
+re-tested against an alternative: move extraction to the LLM on
+every refresh, making recipes advisory hints rather than machine-
+executable instructions. The alternative was considered because PDF
+table extraction in pure Rust is genuinely hard and the "closed
+enum of five extraction modes" may eventually hit a source that
+doesn't fit.
+
+The alternative was rejected. Rationale reaffirmed:
+
+- **Runtime determinism and cost are load-bearing.** A workstation
+  whose numbers can shift between refreshes because the LLM
+  interpreted the same source slightly differently is not a
+  workstation we want to build.
+- **Provenance weakens materially under the alternative.** "URL +
+  recipe + field path" degrades to "URL + recipe + LLM model + call
+  id" — and the latter is not trustable enough to support "every
+  number traceable to a source."
+- **The cost shape inverts.** Level 2 is a per-session
+  authoring pass (expensive but bounded); LLM-on-refresh is
+  unbounded and scales with user activity. The first shape is
+  sustainable offline, cacheable, and can run cheaply for months
+  between authoring passes. The second cannot.
+- **Smartness belongs at Level 1.** The product's intelligence
+  should be concentrated in classification — picking the right
+  metrics, the right entities, the right sources — and in Level 2's
+  authoring of precise coordinates. Runtime should be dumb and
+  fast. This is a deliberate choice to push complexity upward,
+  into the prompt and schema surfaces, not sideways into the
+  runtime.
+
+The practical consequence: the closed extraction-mode enum is now
+load-bearing for the runtime. Adding a sixth mode remains an
+ADR-level decision. Where a source doesn't fit an existing mode, the
+right responses are (a) improving Level 1's hints so Level 2 picks
+a better mode, (b) pre-processing the source at authoring time, or
+(c) adding a mode via ADR. Not (d) running an LLM at refresh.
+
+One concession made explicit: `ExtractionSpec::PdfTable` remains in
+the closed enum but its runtime implementation is deferred. Pure-
+Rust positional PDF table extraction is a known hard problem and
+the first runtime ships with four of five modes implemented. The
+`PdfTable` arm returns a structured `NotImplemented` error with a
+clear reason so recipes authored for PDFs are correctly shaped and
+stored, but fail predictably at apply time rather than silently or
+wrongly. The demo binary (Phase 3c.4) will use a non-PDF source to
+demonstrate end-to-end correctness; USGS / PDF sources unblock when
+`PdfTable` extraction lands as its own focused session.

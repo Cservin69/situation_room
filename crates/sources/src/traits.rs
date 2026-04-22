@@ -18,6 +18,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use stockpile_core::schema::Record;
+use stockpile_core::vocab::Topic;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -65,8 +66,10 @@ pub enum DataLicense {
 /// Used by promotion rules to decide which Assertions auto-promote to Observations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthoritativeDomain {
-    /// Commodity this applies to (None = all commodities).
-    pub commodity: Option<String>,
+    /// Topic this applies to (None = any topic — the source is authoritative
+    /// for this metric regardless of subject). Per ADR 0010 the subject axis
+    /// is topic-based; there is no commodity dimension in the schema.
+    pub topic: Option<Topic>,
     /// Metric this applies to (e.g. "production", "price", "warehouse_stock").
     pub metric: String,
 }

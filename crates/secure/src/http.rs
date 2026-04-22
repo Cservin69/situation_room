@@ -30,10 +30,10 @@
 //!   trusted at the host level; DNS poisoning defense is out of scope
 //!   for a desktop app.
 
+use crate::secrets::SecretString;
 use crate::url_guard::{is_disallowed_ip, UrlGuard, UrlViolation};
 use reqwest::{redirect, Client, ClientBuilder};
 use std::net::IpAddr;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -202,19 +202,142 @@ impl SecureHttpClient {
         serde_json::from_slice(&bytes).map_err(|e| HttpError::Request(format!("json parse: {}", e)))
     }
 
+    /// POST a JSON body with optional secret auth headers and optional plain
+    /// extra headers. Returns the raw response bytes, bounded by
+    /// `config.max_response_bytes`. Applies the same URL guard, literal-IP
+    /// check, and bounded read as [`get_bytes`].
+    ///
+    /// The distinction between `auth_headers` and `extra_headers` is
+    /// type-level, not behavioural: both end up as HTTP headers. The split
+    /// exists so API keys travel as [`SecretString`] through the public API
+    /// and are only unwrapped at the single call site here (the reqwest
+    /// builder), making every secret exposure point visible to review.
+    ///
+    /// Header values from `auth_headers` are passed with
+    /// `.sensitive(true)` so reqwest's own logging will redact them.
+    pub async fn post_json_bytes(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        auth_headers: &[(&str, &SecretString)],
+        extra_headers: &[(&str, &str)],
+    ) -> Result<Vec<u8>, HttpError> {
+        let parsed = self.guard.check(url)?;
+        self.check_host_ip(&parsed)?;
+
+        let mut req = self.inner.post(parsed).json(body);
+        for (name, value) in extra_headers {
+            req = req.header(*name, *value);
+        }
+        for (name, secret) in auth_headers {
+            // expose_secret is intentional at this single boundary — the
+            // resulting HeaderValue is marked sensitive so reqwest-internal
+            // logging redacts it, and the SecretString on the caller side
+            // is unchanged.
+            let mut hv = reqwest::header::HeaderValue::from_str(secret.expose_secret())
+                .map_err(|e| HttpError::Request(format!("invalid header value: {}", e)))?;
+            hv.set_sensitive(true);
+            req = req.header(*name, hv);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| Self::classify_err(e, self.config.total_timeout))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            // Best-effort: try to read a small error body for the caller's
+            // diagnostics, but don't exceed a few KB — we don't want a
+            // misbehaving server to blow the response limit on the error path.
+            const ERR_BODY_CAP: usize = 8 * 1024;
+            let body_text = match resp.bytes().await {
+                Ok(b) => {
+                    let slice = &b[..b.len().min(ERR_BODY_CAP)];
+                    String::from_utf8_lossy(slice).into_owned()
+                }
+                Err(_) => String::new(),
+            };
+            if !body_text.is_empty() {
+                tracing::debug!(status = status.as_u16(), body = %body_text, "non-success POST response");
+            }
+            return Err(HttpError::Status(status.as_u16()));
+        }
+
+        // Up-front Content-Length check (same as get_bytes).
+        if let Some(len) = resp.content_length() {
+            if (len as usize) > self.config.max_response_bytes {
+                return Err(HttpError::ResponseTooLarge {
+                    max: self.config.max_response_bytes,
+                    got: len as usize,
+                });
+            }
+        }
+
+        // Bounded stream read — defends against lying Content-Length.
+        let mut bytes = Vec::with_capacity(
+            resp.content_length()
+                .map(|l| (l as usize).min(self.config.max_response_bytes))
+                .unwrap_or(4096),
+        );
+        use futures::StreamExt;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| HttpError::Request(e.to_string()))?;
+            if bytes.len() + chunk.len() > self.config.max_response_bytes {
+                return Err(HttpError::ResponseTooLarge {
+                    max: self.config.max_response_bytes,
+                    got: bytes.len() + chunk.len(),
+                });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+
+    /// POST a JSON body and parse the response as JSON.
+    pub async fn post_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        auth_headers: &[(&str, &SecretString)],
+        extra_headers: &[(&str, &str)],
+    ) -> Result<T, HttpError> {
+        let bytes = self
+            .post_json_bytes(url, body, auth_headers, extra_headers)
+            .await?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| HttpError::Request(format!("json parse: {}", e)))
+    }
+
     /// If the URL's host happens to be a literal IP, recheck it. (A host
     /// name's resolved IPs are checked by a custom DNS resolver — that's
     /// the real defense against DNS-rebinding. For now we at least cover
     /// the literal-IP case here.)
+    ///
+    /// Uses the typed `url::Host` variant rather than parsing `host_str()`
+    /// — IPv6 literals carry `[]` brackets in the string form and would
+    /// silently bypass the check otherwise. Matches the fix in
+    /// `UrlGuard::check`.
     fn check_host_ip(&self, url: &Url) -> Result<(), HttpError> {
-        if let Some(host) = url.host_str() {
-            if let Ok(ip) = IpAddr::from_str(host) {
+        match url.host() {
+            Some(url::Host::Ipv4(v4)) => {
+                let ip = IpAddr::V4(v4);
                 if is_disallowed_ip(&ip) {
                     return Err(HttpError::RedirectRejected(format!(
                         "host resolves to disallowed IP: {}", ip
                     )));
                 }
             }
+            Some(url::Host::Ipv6(v6)) => {
+                let ip = IpAddr::V6(v6);
+                if is_disallowed_ip(&ip) {
+                    return Err(HttpError::RedirectRejected(format!(
+                        "host resolves to disallowed IP: {}", ip
+                    )));
+                }
+            }
+            _ => {}
         }
         Ok(())
     }

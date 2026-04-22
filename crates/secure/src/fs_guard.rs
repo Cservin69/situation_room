@@ -101,16 +101,27 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    fn temp_root() -> PathBuf {
-        let base = std::env::temp_dir().join(format!("fs_guard_test_{}", std::process::id()));
-        if base.exists() { let _ = fs::remove_dir_all(&base); }
+    /// Per-test unique temp dir. Parallel tests share process id and
+    /// working directory, so a shared `temp_dir()/fs_guard_test_{pid}`
+    /// raced: one test's cleanup would vanish the dir out from under
+    /// another test's `canonicalize()`. Threading the test tag through
+    /// gives each test an isolated root.
+    fn temp_root(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "fs_guard_test_{}_{}",
+            std::process::id(),
+            tag
+        ));
+        if base.exists() {
+            let _ = fs::remove_dir_all(&base);
+        }
         fs::create_dir_all(&base).unwrap();
         base
     }
 
     #[test]
     fn rejects_parent_traversal() {
-        let root = temp_root();
+        let root = temp_root("rejects_parent_traversal");
         let guard = FsGuard::new(root.clone()).unwrap();
         let bad = Path::new("../etc/passwd");
         assert!(matches!(guard.resolve(bad), Err(FsViolation::EscapesRoot(_))));
@@ -119,17 +130,30 @@ mod tests {
 
     #[test]
     fn accepts_plain_filename() {
-        let root = temp_root();
+        let root = temp_root("accepts_plain_filename");
         let guard = FsGuard::new(root.clone()).unwrap();
         let ok = Path::new("article_123.html");
         let resolved = guard.resolve(ok).unwrap();
-        assert!(resolved.starts_with(&root));
+        // Compare against the canonicalized root. On macOS, the OS
+        // temp dir lives under `/var/folders/...` which is itself a
+        // symlink to `/private/var/folders/...`. `FsGuard::new`
+        // canonicalizes its input, so `resolved` carries the
+        // `/private/var/...` prefix — comparing against the original
+        // un-canonicalized `root` would produce a spurious failure
+        // on macOS even though the security property holds.
+        let canon_root = root.canonicalize().unwrap();
+        assert!(
+            resolved.starts_with(&canon_root),
+            "resolved={} does not start with canon_root={}",
+            resolved.display(),
+            canon_root.display(),
+        );
         fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn rejects_absolute_path() {
-        let root = temp_root();
+        let root = temp_root("rejects_absolute_path");
         let guard = FsGuard::new(root.clone()).unwrap();
         let bad = Path::new("/etc/passwd");
         assert!(matches!(guard.resolve(bad), Err(FsViolation::EscapesRoot(_))));
@@ -138,7 +162,7 @@ mod tests {
 
     #[test]
     fn rejects_null_byte() {
-        let root = temp_root();
+        let root = temp_root("rejects_null_byte");
         let guard = FsGuard::new(root.clone()).unwrap();
         let bad = Path::new("file\0name");
         assert!(matches!(guard.resolve(bad), Err(FsViolation::NullByte)));

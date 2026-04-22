@@ -1,4 +1,4 @@
-# Sources designated authoritative for specific (commodity, metric) pairs.
+# Sources designated authoritative for specific (topic, metric) pairs.
 # When an Assertion's claimant matches an authoritative source, the
 # promotion pipeline elevates it directly to an Observation/Event without
 # requiring multi-source consensus.
@@ -6,7 +6,7 @@
 [[authority]]
 source_id = "usgs_mcs"
 metric = "production"
-# No commodity = applies to all commodities USGS reports on
+# No topic = applies to any topic this source reports on
 
 [[authority]]
 source_id = "usgs_mcs"
@@ -15,4 +15,4 @@ metric = "reserves"
 [[authority]]
 source_id = "lme_warehouse"
 metric = "warehouse_stock"
-commodity = "Cu"
+topic = "Cu"

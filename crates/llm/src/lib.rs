@@ -20,5 +20,6 @@ pub mod extraction;
 pub mod cache;
 
 pub use providers::{LlmProvider, LlmError, ModelTier, CompletionRequest, CompletionResponse};
+pub use providers::{XaiProvider, XaiConfig, XAI_API_KEY_ENV};
 
 pub type Result<T> = std::result::Result<T, LlmError>;
