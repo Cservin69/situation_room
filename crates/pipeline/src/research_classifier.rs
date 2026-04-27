@@ -55,8 +55,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::research::{
-    DocumentSourceHint, EntityKindExpectation, EventTypeExpectation, MetricExpectation,
-    RecordExpectations, RelationKindExpectation, ResearchPlan,
+    DocumentSourceHint, EntityKindExpectation, EventTypeExpectation, GeoScope,
+    MetricExpectation, RecordExpectations, RelationKindExpectation, ResearchPlan,
 };
 
 // ---------------------------------------------------------------------------
@@ -238,12 +238,15 @@ pub struct AuthoredResearchPlan {
     /// Must contain at least one entry.
     pub topic_tags: Vec<String>,
 
-    /// Free-form region strings or ISO 3166 alpha-2 country codes.
-    /// The schema is permissive (just `String`) because regions like
-    /// "east_asia" or "asean" are legitimate scopes; the prompt
-    /// disciplines the choice toward ISO codes when applicable.
+    /// Geographic scope entries. Each one carries the canonical
+    /// machine code and an optional human display label produced in
+    /// the session's chosen linguistic register. The schema is
+    /// permissive on `code` (just `String`) because regions like
+    /// `east_asia` or `lithium_triangle` are legitimate scopes
+    /// alongside ISO 3166 alpha-2 codes; the prompt disciplines the
+    /// choice toward ISO codes when applicable.
     #[serde(default)]
-    pub geographic_scope: Vec<String>,
+    pub geographic_scope: Vec<AuthoredGeoScope>,
 
     /// Historical window in days. Bounded `1..=365 * 50` at validation
     /// time — anything outside is a classification failure.
@@ -307,6 +310,21 @@ pub struct AuthoredDocumentSourceHint {
     pub preferred_source_ids: Vec<String>,
 }
 
+/// LLM-facing form of a geographic scope entry. Mirrors
+/// [`crate::research::GeoScope`].
+///
+/// `code` is the canonical machine string (ISO 3166-1 alpha-2 like
+/// `HU`, or a `lowercase_snake_case` region label). `display` is the
+/// session-register label the LLM produces (`Magyarország`,
+/// `Hungary`, `Ungarn`). Empty `display` means "no per-session
+/// preference; the renderer falls back to `code`."
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AuthoredGeoScope {
+    pub code: String,
+    #[serde(default)]
+    pub display: String,
+}
+
 // ---------------------------------------------------------------------------
 // Validation + conversion: AuthoredResearchPlan -> ResearchPlan
 // ---------------------------------------------------------------------------
@@ -315,6 +333,14 @@ pub struct AuthoredDocumentSourceHint {
 /// certainly an LLM hallucination ("centuries of context"); bounded so
 /// downstream cadence calculations stay reasonable.
 const MAX_HISTORICAL_WINDOW_DAYS: u32 = 365 * 50;
+
+/// Maximum length of a [`GeoScope::display`] label. Long enough for
+/// "Democratic Republic of the Congo" (32 chars) and most non-Latin
+/// renditions; tight enough to discipline the LLM away from prose
+/// in a field that's meant to be a label. The bound is enforced
+/// in graphemes-approximating chars, not bytes — non-Latin scripts
+/// would otherwise be unfairly truncated by a byte cap.
+const MAX_GEO_DISPLAY_CHARS: usize = 64;
 
 fn build_validated_plan(
     output: AuthoredResearchPlan,
@@ -344,6 +370,11 @@ fn build_validated_plan(
             output.historical_window_days
         )));
     }
+
+    // Geographic scope: per-entry sanity. `code` non-empty; `display`
+    // length-bounded; control characters rejected from `display` so
+    // the renderer can never receive a label that disrupts a TUI.
+    let geographic_scope = convert_geographic_scope(output.geographic_scope)?;
 
     // Expectations: each typed bucket validates through its vocab newtype.
     let expectations = convert_expectations(output.expectations)?;
@@ -376,11 +407,47 @@ fn build_validated_plan(
         topic: user_topic.to_string(),
         interpretation: output.interpretation,
         topic_tags,
-        geographic_scope: output.geographic_scope,
+        geographic_scope,
         historical_window_days: output.historical_window_days,
         expectations,
         created_at: Utc::now(),
     })
+}
+
+fn convert_geographic_scope(
+    raw: Vec<AuthoredGeoScope>,
+) -> Result<Vec<GeoScope>, ClassificationError> {
+    let mut out = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let code = entry.code.trim().to_string();
+        if code.is_empty() {
+            return Err(ClassificationError::InvalidPlan(
+                "geographic_scope entry has empty code".into(),
+            ));
+        }
+
+        // Display: empty is the "no preference" wire form. When set,
+        // bound the length and reject control characters. We don't
+        // enforce a script or language — the whole point is that the
+        // LLM picked the register and we trust its choice.
+        let display = entry.display.trim().to_string();
+        if !display.is_empty() {
+            if display.chars().count() > MAX_GEO_DISPLAY_CHARS {
+                return Err(ClassificationError::InvalidPlan(format!(
+                    "geographic_scope display label for {code:?} is {} chars (limit {MAX_GEO_DISPLAY_CHARS})",
+                    display.chars().count()
+                )));
+            }
+            if display.chars().any(|c| c.is_control()) {
+                return Err(ClassificationError::InvalidPlan(format!(
+                    "geographic_scope display label for {code:?} contains control characters"
+                )));
+            }
+        }
+
+        out.push(GeoScope { code, display });
+    }
+    Ok(out)
 }
 
 fn convert_expectations(
@@ -507,7 +574,20 @@ mod tests {
                              trade flows, and the policy actions affecting them."
                 .into(),
             topic_tags: vec!["lithium".into(), "battery_supply_chain".into()],
-            geographic_scope: vec!["AU".into(), "CL".into(), "CN".into()],
+            geographic_scope: vec![
+                AuthoredGeoScope {
+                    code: "AU".into(),
+                    display: "Australia".into(),
+                },
+                AuthoredGeoScope {
+                    code: "CL".into(),
+                    display: "Chile".into(),
+                },
+                AuthoredGeoScope {
+                    code: "CN".into(),
+                    display: "".into(),
+                },
+            ],
             historical_window_days: 730,
             expectations: AuthoredRecordExpectations {
                 observation_metrics: vec![AuthoredMetricExpectation {
@@ -625,6 +705,11 @@ mod tests {
         assert_eq!(plan.expectations.observation_metrics.len(), 1);
         assert_eq!(plan.expectations.event_types.len(), 1);
         assert_eq!(plan.geographic_scope.len(), 3);
+        // Display labels survive the conversion; empty stays empty.
+        assert_eq!(plan.geographic_scope[0].code, "AU");
+        assert_eq!(plan.geographic_scope[0].display, "Australia");
+        assert_eq!(plan.geographic_scope[2].code, "CN");
+        assert_eq!(plan.geographic_scope[2].display, "");
     }
 
     #[test]
@@ -723,6 +808,94 @@ mod tests {
         let err = build_validated_plan(out, "x").unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("exceeds limit"), "got {msg}");
+    }
+
+    #[test]
+    fn build_validated_plan_rejects_geographic_scope_with_empty_code() {
+        let mut out = good_output();
+        out.geographic_scope = vec![AuthoredGeoScope {
+            code: "  ".into(),
+            display: "Atlantis".into(),
+        }];
+        let err = build_validated_plan(out, "x").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("empty code"), "got {msg}");
+    }
+
+    #[test]
+    fn build_validated_plan_rejects_geographic_scope_display_too_long() {
+        let mut out = good_output();
+        out.geographic_scope = vec![AuthoredGeoScope {
+            code: "HU".into(),
+            display: "X".repeat(MAX_GEO_DISPLAY_CHARS + 1),
+        }];
+        let err = build_validated_plan(out, "x").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("display label"), "got {msg}");
+        assert!(msg.contains("limit"), "got {msg}");
+    }
+
+    #[test]
+    fn build_validated_plan_rejects_geographic_scope_display_with_control_char() {
+        let mut out = good_output();
+        out.geographic_scope = vec![AuthoredGeoScope {
+            code: "HU".into(),
+            // Embedded newline — would disrupt a TUI render.
+            display: "Magyar\norszag".into(),
+        }];
+        let err = build_validated_plan(out, "x").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("control character"), "got {msg}");
+    }
+
+    #[test]
+    fn build_validated_plan_accepts_geographic_scope_with_non_latin_display() {
+        // The whole point of the display field is that the LLM can
+        // pick a label in the session's chosen register, including
+        // non-Latin scripts. The character-count cap (not byte-count)
+        // means non-Latin labels aren't unfairly truncated.
+        let mut out = good_output();
+        out.geographic_scope = vec![AuthoredGeoScope {
+            code: "HU".into(),
+            display: "Magyarország".into(),
+        }];
+        let plan = build_validated_plan(out, "Hungarian sovereign debt").unwrap();
+        assert_eq!(plan.geographic_scope.len(), 1);
+        assert_eq!(plan.geographic_scope[0].code, "HU");
+        assert_eq!(plan.geographic_scope[0].display, "Magyarország");
+    }
+
+    #[test]
+    fn build_validated_plan_accepts_geographic_scope_with_empty_display() {
+        let mut out = good_output();
+        out.geographic_scope = vec![AuthoredGeoScope {
+            code: "US".into(),
+            display: "".into(),
+        }];
+        let plan = build_validated_plan(out, "x").unwrap();
+        assert_eq!(plan.geographic_scope[0].code, "US");
+        assert_eq!(plan.geographic_scope[0].display, "");
+    }
+
+    #[test]
+    fn build_validated_plan_accepts_empty_geographic_scope() {
+        // Global topics legitimately have no scope at all.
+        let mut out = good_output();
+        out.geographic_scope = vec![];
+        let plan = build_validated_plan(out, "global pandemic preparedness").unwrap();
+        assert!(plan.geographic_scope.is_empty());
+    }
+
+    #[test]
+    fn build_validated_plan_trims_geographic_scope_whitespace() {
+        let mut out = good_output();
+        out.geographic_scope = vec![AuthoredGeoScope {
+            code: "  HU  ".into(),
+            display: "  Magyarország  ".into(),
+        }];
+        let plan = build_validated_plan(out, "x").unwrap();
+        assert_eq!(plan.geographic_scope[0].code, "HU");
+        assert_eq!(plan.geographic_scope[0].display, "Magyarország");
     }
 
     #[test]
@@ -844,8 +1017,9 @@ mod tests {
             REGISTERED SOURCES:\n{{REGISTERED_SOURCES}}\n\
             Return JSON conforming to AuthoredResearchPlan. Use lowercase \
             snake_case for topic_tags and event_type. Include at least one \
-            entry across the expectations buckets. ISO 3166-1 alpha-2 codes \
-            for geographic_scope when applicable.\
+            entry across the expectations buckets. For geographic_scope \
+            entries, use ISO 3166-1 alpha-2 codes when applicable, and \
+            provide a human-readable display label.\
         ";
 
         let ctx = sample_ctx();

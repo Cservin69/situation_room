@@ -618,7 +618,7 @@ mod tests {
         ProductionBinding, RowFilter,
     };
     use crate::research::{
-        DocumentSourceHint, EntityKindExpectation, EventTypeExpectation,
+        DocumentSourceHint, EntityKindExpectation, EventTypeExpectation, GeoScope,
         MetricExpectation, RecordExpectations, RelationKindExpectation,
     };
     use chrono::TimeZone;
@@ -631,7 +631,7 @@ mod tests {
             topic: "lithium production".into(),
             interpretation: "Global lithium production figures.".into(),
             topic_tags: vec![Topic::new("Li").unwrap()],
-            geographic_scope: vec!["CL".into()],
+            geographic_scope: vec![GeoScope::code_only("CL")],
             historical_window_days: 365,
             expectations: RecordExpectations {
                 observation_metrics: vec![MetricExpectation {

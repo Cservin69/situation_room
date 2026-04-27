@@ -584,8 +584,8 @@ fn convert_field_map(fm: AuthoredFieldMap) -> Result<FieldMap, AuthoringError> {
 mod tests {
     use super::*;
     use crate::research::{
-        DocumentSourceHint, EntityKindExpectation, EventTypeExpectation, MetricExpectation,
-        RecordExpectations, RelationKindExpectation,
+        DocumentSourceHint, EntityKindExpectation, EventTypeExpectation, GeoScope,
+        MetricExpectation, RecordExpectations, RelationKindExpectation,
     };
     use chrono::{TimeZone, Utc};
     use stockpile_core::vocab::{EntityId, EventType, Topic, Unit};
@@ -596,7 +596,7 @@ mod tests {
             topic: "lithium production".into(),
             interpretation: "Research on global lithium production, reserves, and trade.".into(),
             topic_tags: vec![Topic::new("Li").unwrap()],
-            geographic_scope: vec!["AU".into(), "CL".into()],
+            geographic_scope: vec![GeoScope::code_only("AU"), GeoScope::code_only("CL")],
             historical_window_days: 730,
             expectations: RecordExpectations {
                 observation_metrics: vec![

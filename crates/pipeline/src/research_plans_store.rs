@@ -108,8 +108,8 @@ fn stored_to_plan(s: StoredResearchPlan) -> Result<ResearchPlan, ResearchPlanSto
 mod tests {
     use super::*;
     use crate::research::{
-        DocumentSourceHint, EntityKindExpectation, EventTypeExpectation, MetricExpectation,
-        RecordExpectations, RelationKindExpectation,
+        DocumentSourceHint, EntityKindExpectation, EventTypeExpectation, GeoScope,
+        MetricExpectation, RecordExpectations, RelationKindExpectation,
     };
     use chrono::Utc;
     use stockpile_core::vocab::{EntityId, EventType, Topic, Unit};
@@ -123,7 +123,17 @@ mod tests {
                 Topic::new("lithium").unwrap(),
                 Topic::new("battery_supply_chain").unwrap(),
             ],
-            geographic_scope: vec!["AU".into(), "CL".into(), "CN".into()],
+            geographic_scope: vec![
+                GeoScope {
+                    code: "AU".into(),
+                    display: "Australia".into(),
+                },
+                GeoScope {
+                    code: "CL".into(),
+                    display: "Chile".into(),
+                },
+                GeoScope::code_only("CN"),
+            ],
             historical_window_days: 730,
             expectations: RecordExpectations {
                 observation_metrics: vec![MetricExpectation {

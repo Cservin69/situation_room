@@ -65,11 +65,19 @@ pub struct ResearchPlan {
     /// existing tag strings when appropriate.
     pub topic_tags: Vec<Topic>,
 
-    /// Geographic scope of the research, if any. Free-form region
-    /// strings ("east_asia", "lithium_triangle") or ISO country codes
-    /// — the same shape that will land in record `Subjects::places`.
+    /// Geographic scope of the research, if any. Each entry carries a
+    /// canonical machine code (ISO 3166-1 alpha-2 like `HU`, or a
+    /// snake_case region descriptor like `east_asia`) and an optional
+    /// human display label produced by the LLM in the session's
+    /// chosen register (`Magyarország`, `Hungary`, `Ungarn`).
+    ///
+    /// Cross-session reasoning, persistence joins, and recipe matching
+    /// all key off `code` — the display label is render-only and
+    /// never participates in equality, lookup, or aggregation. The
+    /// display label persists with the plan so re-rendering it later
+    /// preserves the session's voice.
     #[serde(default)]
-    pub geographic_scope: Vec<String>,
+    pub geographic_scope: Vec<GeoScope>,
 
     /// How far back should historical ingestion reach?
     pub historical_window_days: u32,
@@ -80,6 +88,43 @@ pub struct ResearchPlan {
 
     /// When the plan was produced.
     pub created_at: DateTime<Utc>,
+}
+
+/// One geographic scope entry on a [`ResearchPlan`].
+///
+/// `code` is canonical and machine-comparable: an ISO 3166-1 alpha-2
+/// code (`HU`, `CD`, `BR`) or a `lowercase_snake_case` region label
+/// (`east_asia`, `lithium_triangle`, `eu_27`). Every cross-session
+/// query, every record subject join, every recipe-author match keys
+/// off `code`.
+///
+/// `display` is the LLM's free-text label for this code, in the
+/// session's chosen linguistic register. It may be Hungarian
+/// (`Magyarország`), German (`Ungarn`), English (`Hungary`), or any
+/// other label the LLM chose to match the topic's voice. An empty
+/// `display` means "no per-session preference; render `code`."
+///
+/// `display` participates in **no** equality, hashing, joining, or
+/// vocabulary control. It is render-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeoScope {
+    pub code: String,
+    /// Empty string is the "no display preference" wire form. See
+    /// [`GeoScope`] docs for why this is a `String` and not an
+    /// `Option<String>`.
+    #[serde(default)]
+    pub display: String,
+}
+
+impl GeoScope {
+    /// Build a scope entry with no display label. Convenience for
+    /// tests and code paths that don't care about presentation.
+    pub fn code_only(code: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            display: String::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +317,17 @@ mod tests {
                 Topic::new("semiconductors").unwrap(),
                 Topic::new("ai_export_controls").unwrap(),
             ],
-            geographic_scope: vec!["TW".into(), "KR".into(), "US".into()],
+            geographic_scope: vec![
+                GeoScope {
+                    code: "TW".into(),
+                    display: "Taiwan".into(),
+                },
+                GeoScope {
+                    code: "KR".into(),
+                    display: "South Korea".into(),
+                },
+                GeoScope::code_only("US"),
+            ],
             historical_window_days: 365,
             expectations: RecordExpectations {
                 observation_metrics: vec![MetricExpectation {
@@ -304,6 +359,31 @@ mod tests {
         assert_eq!(back.topic, plan.topic);
         assert_eq!(back.topic_tags.len(), 2);
         assert_eq!(back.expectations.observation_metrics.len(), 1);
+
+        // GeoScope: code is preserved; display survives the round trip
+        // when set; empty display also survives.
+        assert_eq!(back.geographic_scope.len(), 3);
+        assert_eq!(back.geographic_scope[0].code, "TW");
+        assert_eq!(back.geographic_scope[0].display, "Taiwan");
+        assert_eq!(back.geographic_scope[2].code, "US");
+        assert_eq!(back.geographic_scope[2].display, "");
+    }
+
+    #[test]
+    fn geo_scope_code_only_constructs_with_empty_display() {
+        let g = GeoScope::code_only("HU");
+        assert_eq!(g.code, "HU");
+        assert!(g.display.is_empty());
+    }
+
+    #[test]
+    fn geo_scope_serializes_with_default_display() {
+        // The renderer relies on `display` being present after
+        // deserialization (via `#[serde(default)]`) even when the
+        // wire form omitted it. This guards that.
+        let g: GeoScope = serde_json::from_str(r#"{"code":"HU"}"#).unwrap();
+        assert_eq!(g.code, "HU");
+        assert_eq!(g.display, "");
     }
 
     #[test]
