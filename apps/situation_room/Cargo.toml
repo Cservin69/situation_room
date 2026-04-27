@@ -1,0 +1,38 @@
+[package]
+name = "stockpile-situation-room"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Stockpile situation room — CLI that classifies a topic into a research plan and persists it."
+
+[[bin]]
+name = "situation-room"
+path = "src/main.rs"
+
+[dependencies]
+stockpile-core = { workspace = true }
+stockpile-storage = { workspace = true }
+stockpile-llm = { workspace = true }
+stockpile-pipeline = { workspace = true }
+stockpile-secure = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Errors and serialization
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# .env loading for development; the binary reads XAI_API_KEY from
+# either the process environment or a .env file at the workspace root.
+dotenvy = { workspace = true }

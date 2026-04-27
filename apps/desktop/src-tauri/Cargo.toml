@@ -13,7 +13,6 @@ path = "src/main.rs"
 [dependencies]
 stockpile-core = { workspace = true }
 stockpile-storage = { workspace = true }
-stockpile-sources = { workspace = true }
 stockpile-llm = { workspace = true }
 stockpile-pipeline = { workspace = true }
 stockpile-api = { workspace = true }

@@ -41,3 +41,4 @@ pub mod recipe_apply;
 pub mod recipes_store;
 pub mod research;
 pub mod research_classifier;
+pub mod research_plans_store;

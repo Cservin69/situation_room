@@ -3,12 +3,12 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/storage",
-    "crates/sources",
     "crates/llm",
     "crates/pipeline",
     "crates/api",
     "crates/secure",
     "apps/desktop/src-tauri",
+    "apps/situation_room",
 ]
 
 [workspace.package]
@@ -100,7 +100,6 @@ jsonpath-rust = "1.0"
 # Internal workspace crates
 stockpile-core = { path = "crates/core" }
 stockpile-storage = { path = "crates/storage" }
-stockpile-sources = { path = "crates/sources" }
 stockpile-llm = { path = "crates/llm" }
 stockpile-pipeline = { path = "crates/pipeline" }
 stockpile-api = { path = "crates/api" }

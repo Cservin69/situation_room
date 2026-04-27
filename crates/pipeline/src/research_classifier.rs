@@ -91,11 +91,13 @@ pub struct TopicUsage {
     pub uses: u64,
 }
 
-/// Compact view of a registered source for prompt injection.
+/// Compact view of a known data source for prompt injection.
 ///
-/// Built by the caller from `stockpile_sources::SourceMetadata`. The
-/// classifier crate doesn't depend on the sources crate; the caller
-/// translates.
+/// Stockpile no longer carries hand-coded source adapters; the LLM
+/// nominates sources from the descriptors the caller supplies here.
+/// Callers typically load these from `config/sources.toml` (or
+/// equivalent) at the binary layer — the pipeline crate stays
+/// agnostic of where the list comes from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceDescriptor {
     /// Stable id used by recipes (`source_id` in `FetchRecipe`).

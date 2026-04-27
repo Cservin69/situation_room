@@ -41,6 +41,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "recipes table",
         sql: include_str!("../../../migrations/0003_recipes.sql"),
     },
+    Migration {
+        version: 4,
+        description: "research_plans table",
+        sql: include_str!("../../../migrations/0004_research_plans.sql"),
+    },
 ];
 
 /// Apply every migration whose version is not yet in

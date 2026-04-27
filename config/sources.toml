@@ -1,0 +1,142 @@
+# Source descriptors for the Level-1 classifier.
+#
+# This file is the LLM's awareness of "what data sources exist that
+# Stockpile could read from." It is NOT a runtime registry, NOT a
+# fetch configuration, and there are NO Rust adapters tied to these
+# entries. Each entry is a description Stockpile shows the LLM at
+# classification time so the plan's `document_sources` hints can
+# reference real ids and have meaningful priority ordering.
+#
+# When Level-2 recipe authoring lands as a separate session, it will
+# consume the same file (or a successor) to know what id-to-fetch
+# mappings exist. Until then this file is purely classifier-side
+# context.
+#
+# Editing this file does not require any Rust changes. The situation
+# room binary loads it at startup; if the file is missing, the LLM
+# is told "no sources are currently known" and nominates by
+# description only.
+#
+# Schema:
+#   [[source]]
+#   id                    = "stable_snake_case_id"
+#   display_name          = "Human-readable name"
+#   description           = "One-paragraph description"
+#   authoritative_for     = ["topic_or_metric_label", ...]   # optional
+#
+# Keep entries ordered roughly by priority tier (authoritative
+# primary first). The LLM reads them in order.
+
+# ---- Authoritative primary -----------------------------------------------
+
+[[source]]
+id = "usgs_mcs"
+display_name = "USGS Mineral Commodity Summaries"
+description = """
+Annual U.S. Geological Survey reports on production, reserves, trade,
+and consumption of mineral commodities (lithium, copper, cobalt, rare
+earths, etc.). Public domain, no API key. Authoritative for U.S.
+mineral production figures and the global rankings published in each
+chapter.
+"""
+authoritative_for = ["mineral_production", "mineral_reserves"]
+
+[[source]]
+id = "sec_edgar"
+display_name = "SEC EDGAR"
+description = """
+The U.S. Securities and Exchange Commission's filing system. Contains
+10-K annual reports, 10-Q quarterly reports, 8-K material event
+filings, and proxy statements for every U.S.-listed public company.
+Authoritative for company-stated financials, risk factors, executive
+compensation, and material events.
+"""
+authoritative_for = ["corporate_filings", "company_financials"]
+
+[[source]]
+id = "eur_lex"
+display_name = "EUR-Lex"
+description = """
+The European Union's legal database — directives, regulations,
+decisions, and treaties. Authoritative for the text of EU law and
+the official journal entries that bring acts into force.
+"""
+authoritative_for = ["eu_legislation"]
+
+[[source]]
+id = "ofac_sdn"
+display_name = "OFAC Specially Designated Nationals List"
+description = """
+The U.S. Treasury's sanctions list, updated continuously. Names
+individuals, companies, vessels, and aircraft subject to U.S.
+sanctions. Authoritative for U.S. sanction designations.
+"""
+authoritative_for = ["us_sanctions"]
+
+[[source]]
+id = "world_bank_indicators"
+display_name = "World Bank Open Data Indicators"
+description = """
+Country-level macroeconomic and development indicators (GDP, trade,
+demographics, governance) sourced from national statistical offices
+and standardized by the World Bank. Long historical series.
+"""
+authoritative_for = ["country_macro_indicators"]
+
+[[source]]
+id = "imf_weo"
+display_name = "IMF World Economic Outlook"
+description = """
+Twice-yearly IMF projections of country and regional macroeconomic
+indicators (GDP, inflation, current account, fiscal balance). Carries
+both historical series and forward-looking forecasts.
+"""
+authoritative_for = ["country_macro_forecasts"]
+
+# ---- Authoritative secondary --------------------------------------------
+
+[[source]]
+id = "lme"
+display_name = "London Metal Exchange"
+description = """
+Spot, three-month, and warehouse stock data for industrial metals
+(aluminium, copper, zinc, lead, nickel, tin). The reference exchange
+for non-ferrous metals pricing.
+"""
+authoritative_for = ["industrial_metals_prices", "industrial_metals_stocks"]
+
+[[source]]
+id = "comtrade"
+display_name = "UN Comtrade"
+description = """
+The United Nations international trade statistics database. Bilateral
+trade flows by HS code, country, and year. Reported by importers and
+exporters; figures often disagree between the two reporting sides.
+"""
+authoritative_for = ["bilateral_trade_flows"]
+
+# ---- Industry / trade press --------------------------------------------
+
+[[source]]
+id = "gdelt"
+display_name = "GDELT Project"
+description = """
+The Global Database of Events, Language, and Tone. Machine-coded
+events extracted from broadcast, print, and web news worldwide,
+updated every fifteen minutes. Useful for event detection, less so
+for ground-truth claims.
+"""
+authoritative_for = []
+
+# ---- General news (lowest authority) ------------------------------------
+
+[[source]]
+id = "rss_feeds"
+display_name = "RSS Feeds (configured per session)"
+description = """
+Generic RSS/Atom feed reader for monitoring named publications. Use
+for outlets where the publication itself is the only reasonable
+source for the topic (specialist trade press, regulator press
+rooms, etc.). Specific feed URLs are configured separately.
+"""
+authoritative_for = []
