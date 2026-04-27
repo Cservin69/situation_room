@@ -6,11 +6,9 @@ members = [
     "crates/sources",
     "crates/llm",
     "crates/pipeline",
-    "crates/analytics",
     "crates/api",
     "crates/secure",
     "apps/desktop/src-tauri",
-    "apps/demo",
 ]
 
 [workspace.package]
@@ -75,7 +73,7 @@ url = { version = "2.5", features = ["serde"] }
 # Level-2 FetchRecipe apply runtime's job (ADR 0007).
 pdf-extract = "0.7"
 
-# CLI argument parsing (used by the demo binary)
+# CLI argument parsing (used by binaries that need it)
 clap = { version = "4.5", features = ["derive"] }
 
 # .env loading for binaries and test harnesses only — never pulled in
@@ -105,7 +103,6 @@ stockpile-storage = { path = "crates/storage" }
 stockpile-sources = { path = "crates/sources" }
 stockpile-llm = { path = "crates/llm" }
 stockpile-pipeline = { path = "crates/pipeline" }
-stockpile-analytics = { path = "crates/analytics" }
 stockpile-api = { path = "crates/api" }
 stockpile-secure = { path = "crates/secure" }
 

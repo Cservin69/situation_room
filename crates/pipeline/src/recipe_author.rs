@@ -377,12 +377,7 @@ fn build_validated_recipe(
         id: Uuid::now_v7(),
         dedup_key: None, // caller sets this — convention is
         // `{plan_id}:{source_id}:{binding_tag}`.
-        plan_id: Uuid::now_v7(), // placeholder — callers replace with
-        // the real ResearchPlan id.  Because
-        // ResearchPlan doesn't carry an id today,
-        // we generate one here and expect the
-        // caller to thread the plan id in. See
-        // the module-level docs.
+        plan_id: plan.id,
         source_id: String::new(), // set by caller from registry
         source_url,
         extraction,
@@ -597,6 +592,7 @@ mod tests {
 
     fn sample_plan() -> ResearchPlan {
         ResearchPlan {
+            id: Uuid::now_v7(),
             topic: "lithium production".into(),
             interpretation: "Research on global lithium production, reserves, and trade.".into(),
             topic_tags: vec![Topic::new("Li").unwrap()],
@@ -811,6 +807,18 @@ mod tests {
         ));
         // UUIDv7 is the only identity form we accept.
         assert_eq!(recipe.id.get_version_num(), 7);
+    }
+
+    /// Regression: `FetchRecipe::plan_id` must equal `ResearchPlan::id`.
+    /// Before Session 4 this was a placeholder (`Uuid::now_v7()`)
+    /// because `ResearchPlan` carried no id; the consequence was that
+    /// the same logical recipe authored twice produced different
+    /// `dedup_key`s (`{plan_id}:{source_id}:{tag}`) and never deduped.
+    #[test]
+    fn build_validated_recipe_threads_plan_id() {
+        let plan = sample_plan();
+        let recipe = build_validated_recipe(good_output(), &plan, "xai").unwrap();
+        assert_eq!(recipe.plan_id, plan.id);
     }
 
     // -----------------------------------------------------------------------

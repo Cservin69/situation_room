@@ -627,6 +627,7 @@ mod tests {
 
     fn plan() -> ResearchPlan {
         ResearchPlan {
+            id: Uuid::now_v7(),
             topic: "lithium production".into(),
             interpretation: "Global lithium production figures.".into(),
             topic_tags: vec![Topic::new("Li").unwrap()],

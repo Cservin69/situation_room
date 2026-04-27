@@ -40,3 +40,4 @@ pub mod recipe_author;
 pub mod recipe_apply;
 pub mod recipes_store;
 pub mod research;
+pub mod research_classifier;

@@ -32,6 +32,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use stockpile_core::vocab::{EntityId, EventType, Topic, Unit};
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // ResearchPlan — the classifier's output
@@ -41,6 +42,15 @@ use stockpile_core::vocab::{EntityId, EventType, Topic, Unit};
 /// LLM classifier; consumed by source matching and panel layout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResearchPlan {
+    /// Stable identifier for this plan. Threaded into every recipe
+    /// authored against it (as `FetchRecipe::plan_id`) and into the
+    /// `dedup_key` so re-authoring against the same plan converges
+    /// on the same recipe row rather than creating duplicates.
+    ///
+    /// UUIDv7 per ADR 0003 — sortable, contains the construction time,
+    /// fits the same identity convention as records.
+    pub id: Uuid,
+
     /// User's original topic string.
     pub topic: String,
 
@@ -252,6 +262,7 @@ mod tests {
     #[test]
     fn research_plan_roundtrips() {
         let plan = ResearchPlan {
+            id: Uuid::now_v7(),
             topic: "chip production".into(),
             interpretation:
                 "Research covering semiconductor wafer manufacturing: fab capacity, equipment \
@@ -289,6 +300,7 @@ mod tests {
         };
         let json = serde_json::to_string(&plan).unwrap();
         let back: ResearchPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, plan.id);
         assert_eq!(back.topic, plan.topic);
         assert_eq!(back.topic_tags.len(), 2);
         assert_eq!(back.expectations.observation_metrics.len(), 1);

@@ -1,6 +1,0 @@
-# Guangzhou Futures Exchange — Chinese lithium carbonate futures (proxy price)
-[source]
-id = "gfex_lithium"
-enabled = true
-cadence = { seconds = 300 }
-license = "public_domain"

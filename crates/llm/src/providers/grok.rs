@@ -243,7 +243,14 @@ impl LlmProvider for XaiProvider {
                 &self.endpoint,
                 &body,
                 &[("authorization", &bearer_secret)],
-                &[("content-type", "application/json")],
+                // No `content-type` here — `SecureHttpClient::post_json_bytes`
+                // calls `.json(body)` on the reqwest builder, which already
+                // sets `Content-Type: application/json`. Adding it again as
+                // an extra header makes reqwest *append* a second
+                // Content-Type to the wire, and xAI's API gateway returns
+                // `415 Unsupported Media Type` when it sees two of them.
+                // See `SecureHttpClient::post_json_bytes` for the rule.
+                &[],
             )
             .await
             .map_err(map_http_err)?;

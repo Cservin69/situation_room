@@ -1,9 +1,0 @@
-# UN Comtrade — international trade flows
-# https://comtradeplus.un.org/
-[source]
-id = "un_comtrade"
-enabled = true
-cadence = { monthly_on = { day = 15 } }
-license = "open_with_attribution"
-license_id = "UN-Comtrade-TOS"
-api_key_env = "COMTRADE_API_KEY"

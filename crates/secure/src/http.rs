@@ -215,6 +215,17 @@ impl SecureHttpClient {
     ///
     /// Header values from `auth_headers` are passed with
     /// `.sensitive(true)` so reqwest's own logging will redact them.
+    ///
+    /// ### Do not pass `content-type` in `extra_headers`
+    ///
+    /// This method calls `.json(body)` on the reqwest builder, which sets
+    /// `Content-Type: application/json` itself. Reqwest's `.header(...)`
+    /// appends — it does not replace — so passing `("content-type", ...)`
+    /// in `extra_headers` results in *two* Content-Type headers on the
+    /// wire. Strict API gateways (xAI's, notably) reject that with `415
+    /// Unsupported Media Type`. There is no exception: every body this
+    /// method sends is JSON. If a caller needs to send a non-JSON body,
+    /// add a sibling method, don't override the header here.
     pub async fn post_json_bytes(
         &self,
         url: &str,

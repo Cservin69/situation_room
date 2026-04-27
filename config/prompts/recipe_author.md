@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1
+# Recipe Author Prompt — v1.2
 
 <!--
     This file is the Level-2 recipe authoring prompt for Stockpile.
@@ -138,6 +138,78 @@ The top-level shape is:
       value from the research plan itself at the given pointer (e.g.
       `"expectations.observation_metrics.0.name"`).
 
+## Content type reference
+
+This section names the exact fields of each content type your
+`field_mappings` populate, and which fields are **closed enums**
+(strings that must match one of a small fixed set). For closed-enum
+fields, you must use a `literal` source with a valid enum value —
+never an `extracted` source, because extracted values from the
+source document will almost always be in the source's own spelling
+and will fail deserialization.
+
+### `observation` — fields of `ObservationContent`
+
+- `metric` (string, snake_case) — what is being measured. Required.
+  Examples: `"price"`, `"production"`, `"population"`,
+  `"warehouse_stock"`. Usually sourced via `from_plan` pointing at
+  the target metric expectation's name.
+- `value` (number) — the measured value. Required. Usually
+  `extracted`.
+- `unit` (string, UCUM-style) — e.g. `"t"`, `"kt/yr"`, `"USD/t"`,
+  `"%"`, `"1"` (dimensionless count). Required. Usually a `literal`
+  the recipe author knows from the source's documentation.
+- `value_uncertainty` (number, optional) — symmetric absolute
+  bound. Omit if unknown.
+- `currency` (string, optional) — ISO 4217 code like `"USD"`,
+  `"EUR"`. Include for prices and monetary amounts.
+- `period` (**closed enum**) — one of exactly:
+  `"instant"`, `"daily"`, `"weekly"`, `"monthly"`, `"quarterly"`,
+  `"annual"`. (There is also a `custom` variant with an ISO-8601
+  duration, but prefer the closed set.) Required. **Must be a
+  `literal` — never extracted.** Annual reports → `"annual"`.
+  Daily prices → `"daily"`. Spot values → `"instant"`.
+
+### `event` — fields of `EventContent`
+
+- `event_type` (string from the controlled vocabulary) — required.
+  Usually `from_plan` pointing at the target event-type
+  expectation's `event_type` field.
+- `headline` (string) — required. A complete English sentence
+  suitable for a feed. Usually `extracted` if the source provides
+  one; otherwise a `literal` or `from_plan`.
+- `actors` (array of entity ids) — defaults to empty. Leave
+  unmapped if the source doesn't identify actors structurally.
+- `direction` (**closed enum**, optional) — one of:
+  `"supply_positive"`, `"supply_negative"`, `"demand_positive"`,
+  `"demand_negative"`, `"context"`. **Must be a `literal` — never
+  extracted.** A recipe for export restrictions →
+  `"supply_negative"`; for new mine openings → `"supply_positive"`.
+- `magnitude` (nested observation content, optional) — for events
+  with a quantified size (e.g. tonnage lost to a strike). Advanced;
+  usually omitted.
+
+### `relation` — fields of `RelationContent`
+
+- `kind` (string, snake_case) — required. Examples: `"ownership"`,
+  `"trade_flow"`, `"supply_contract"`. Usually `from_plan` pointing
+  at the target relation-kind expectation.
+- `from` (entity id) — required, the source of the edge.
+- `to` (entity id) — required, the target of the edge.
+- `magnitude` (nested observation content, optional) — e.g. the
+  flow volume for a trade relation.
+- `valid_until` (ISO-8601 timestamp, optional) — end of the
+  relation's validity window if it has one.
+
+### The envelope and subjects are automatic
+
+You do **not** map anything onto the envelope (`provenance`,
+`observed_at`, `valid_at`, `confidence`) or the subjects
+(`entities`, `places`, `topics`). The runtime builds the envelope
+from the fetch context and attaches the plan's `topic_tags` as
+subjects. If you try to map onto these paths, the recipe will be
+rejected.
+
 ## What NOT to produce
 
 - Do not invent new extraction modes or new `kind` values.
@@ -153,6 +225,12 @@ The top-level shape is:
   summarizing them. If the document says "production fell sharply
   in Chile," your recipe should extract Chile's production number,
   not a narrative observation about a fall.
+- Do not use `{"kind": "extracted"}` for closed-enum fields
+  (`period`, `direction`). The extracted value will be whatever
+  string happens to be in the source (a year, a date, a currency
+  code, a heading), and it will fail to deserialize into the
+  enum. Always use `{"kind": "literal", "value": "<one of the
+  allowed values>"}` for enum fields.
 
 ## One-shot, no follow-up
 
@@ -169,3 +247,10 @@ you pick.
 - **v1.1** (2026-04-22) — Narrowed `record_type` to observation /
   event / relation after discovering `Assertion` can't be populated
   from scalar field mappings (carries claimant + stance).
+- **v1.2** (2026-04-22) — Added "Content type reference" section
+  enumerating exact fields for each record type and naming closed
+  enums (`period`, `direction`) explicitly. Caught after a live xAI
+  run mapped `"2022"` (extracted from a `date` field in the source)
+  to `ObservationContent.period`, which failed deserialization at
+  runtime. The prompt now tells the LLM that closed-enum fields
+  must use `literal` sources with one of the allowed values.

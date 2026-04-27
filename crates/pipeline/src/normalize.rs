@@ -95,6 +95,7 @@ mod tests {
 
     fn plan_with_topics(topics: Vec<&str>) -> ResearchPlan {
         ResearchPlan {
+            id: Uuid::now_v7(),
             topic: "test".into(),
             interpretation: "test".into(),
             topic_tags: topics

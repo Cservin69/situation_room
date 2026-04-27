@@ -16,7 +16,6 @@ stockpile-storage = { workspace = true }
 stockpile-sources = { workspace = true }
 stockpile-llm = { workspace = true }
 stockpile-pipeline = { workspace = true }
-stockpile-analytics = { workspace = true }
 stockpile-api = { workspace = true }
 stockpile-secure = { workspace = true }
 serde = { workspace = true }
