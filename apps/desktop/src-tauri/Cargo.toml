@@ -10,6 +10,9 @@ description = "Stockpile desktop app — Tauri shim and composition root."
 name = "stockpile"
 path = "src/main.rs"
 
+[build-dependencies]
+tauri-build = { workspace = true }
+
 [dependencies]
 stockpile-core = { workspace = true }
 stockpile-storage = { workspace = true }
@@ -19,12 +22,8 @@ stockpile-api = { workspace = true }
 stockpile-secure = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-# tracing-subscriber used via stockpile-secure::logging; not direct
-# figment added in Phase 2 when we load config files
-
-# Tauri itself is added at Phase 4 when we wire up the actual app shell.
-# For Phase 1 the binary is a no-op CLI that prints "Stockpile boots." so
-# that the whole workspace compiles to a real executable.
+tauri = { workspace = true }

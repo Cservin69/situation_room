@@ -1,48 +1,192 @@
-//! Stockpile desktop binary — composition root.
+//! Stockpile desktop binary — Tauri 2 composition root.
 //!
-//! Phase 1: boots the scrubbed tracing logger, prints the boot banner,
-//! verifies API key loading (without logging keys), exits.
+//! Boots the scrubbed tracing logger, opens the DuckDB store, builds
+//! the LLM provider on top of `SecureHttpClient`, loads the source
+//! descriptors from `config/sources.toml`, registers the three
+//! commands defined in `stockpile-api`, and starts the webview.
 //!
-//! Phase 4 wires up Tauri proper, registers commands from `stockpile-api`,
-//! starts the source scheduler, and opens the webview.
+//! Per ADR 0001 this is the only binary `main.rs` for the desktop app:
+//! all wiring happens here, in one file. The library crates own the
+//! types, the pipeline, the security primitives; this file owns the
+//! act of plugging them together.
 
-use anyhow::Result;
-use stockpile_secure::{logging, secrets::ApiKey};
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use stockpile_api::commands::AppState;
+use stockpile_llm::XaiProvider;
+use stockpile_pipeline::research_classifier::SourceDescriptor;
+use stockpile_secure::{
+    http::{SecureHttpClient, SecureHttpConfig},
+    logging,
+};
+use stockpile_storage::Store;
 use tracing::{info, warn};
 
-fn main() -> Result<()> {
-    // Load .env if present — never required, but convenient for dev.
-    // Uses a minimal inline loader so we don't depend on `dotenv` (one less
-    // transitive dep, one less thing to review for supply chain).
-    load_dotenv();
+/// The production classifier prompt, embedded at compile time. The CLI
+/// embeds the same file via `include_str!` from the same path; keeping
+/// both binaries on a single source-of-truth means a prompt revision
+/// affects both surfaces in lockstep.
+const CLASSIFIER_PROMPT: &str =
+    include_str!("../../../../config/prompts/research_classifier.md");
 
-    // Initialize the scrubbed tracing subscriber. All subsequent logs pass
-    // through the secret-scrubbing writer.
+fn main() -> Result<()> {
+    // .env is a dev convenience; the real environment always wins.
+    // Walks up from CWD to find .env at the workspace root and
+    // returns that directory so we can anchor other relative paths
+    // (db, sources) to the same place. Falls back to CWD if no .env
+    // is found.
+    let workspace_root = load_dotenv().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    });
+
+    // Scrubbed tracing — every log line passes through the secret-
+    // scrubbing writer before it reaches stdout or disk.
     logging::init();
 
-    info!("Stockpile boots (Phase 1).");
-    info!("security posture: scrubbed logging active, api keys loaded via env only");
+    info!(
+        workspace_root = %workspace_root.display(),
+        "Stockpile desktop boots (Session 6 — GUI)."
+    );
 
-    // Verify API key ingress — but never log the key, only the fingerprint.
-    verify_llm_keys();
+    // --- Storage -----------------------------------------------------
+    //
+    // `stockpile.duckdb` lives at the workspace root — the same
+    // location the CLI uses by default. Anchoring on workspace_root
+    // (not CWD) means `tauri dev` finds the same database whether
+    // the binary is launched from the repo root or from inside
+    // `apps/desktop/src-tauri/` (Tauri sets CWD there).
+    let db_path = workspace_root.join("stockpile.duckdb");
+    let store = Store::open(&db_path)
+        .with_context(|| format!("opening store at {}", db_path.display()))?;
+    store.migrate().context("running migrations")?;
+    let store = Arc::new(store);
 
-    info!("");
-    info!("Phase 1 complete: workspace structure verified.");
-    info!("Next steps:");
-    info!("  - Phase 2: schema + storage layer");
-    info!("  - Phase 3: source adapters + llm extraction");
-    info!("  - Phase 4: Tauri webview + Svelte frontend");
+    // --- LLM provider ------------------------------------------------
+    //
+    // Single SecureHttpClient instance shared by the provider — no
+    // fresh `reqwest::Client::new()` anywhere. ADR 0009 §"The rule".
+    let http = SecureHttpClient::new(SecureHttpConfig::default())
+        .context("building secure http client")?;
+    let provider = XaiProvider::from_env(http).context(
+        "XAI_API_KEY not found — set it in the environment or in a .env file at the workspace root",
+    )?;
+    let provider = Arc::new(provider);
+
+    // --- Source descriptors -----------------------------------------
+    //
+    // Loaded from `<workspace_root>/config/sources.toml`. A missing
+    // file is non-fatal: classification still runs, just without
+    // registered-source nominations.
+    let sources_path = workspace_root.join("config").join("sources.toml");
+    let sources = load_source_descriptors(&sources_path, 30)
+        .with_context(|| format!("loading sources from {}", sources_path.display()))?;
+    info!(count = sources.len(), "registered source descriptors loaded");
+
+    // --- AppState ----------------------------------------------------
+    let state = AppState::new(store, provider, CLASSIFIER_PROMPT, sources);
+
+    // --- Tauri -------------------------------------------------------
+    //
+    // The capabilities file (`capabilities/default.json`) explicitly
+    // enumerates which IPC commands the webview is allowed to call.
+    // Adding a fourth command means editing both this `invoke_handler`
+    // call and the capabilities file. ADR 0009 §"Tauri posture".
+    //
+    // The full paths are required, not just the imported function
+    // names: `#[tauri::command]` generates a sibling `__cmd__<name>`
+    // macro in the same module as the function, and
+    // `tauri::generate_handler!` re-prefixes the path you give it. So
+    // `generate_handler![classify]` looks for `__cmd__classify` in
+    // *this* file's scope, where it does not exist; the macro lives
+    // in `stockpile_api::commands`. Bare imports work for the
+    // function, not for the macro.
+    tauri::Builder::default()
+        .manage(state)
+        .invoke_handler(tauri::generate_handler![
+            stockpile_api::commands::classify,
+            stockpile_api::commands::list_recent_plans,
+            stockpile_api::commands::get_plan
+        ])
+        .run(tauri::generate_context!())
+        .context("running tauri")?;
 
     Ok(())
 }
 
-/// Minimal `.env` loader. Reads KEY=VALUE lines from `./.env` if present.
-/// Does not overwrite existing env vars (the real environment wins).
-fn load_dotenv() {
-    let path = std::path::Path::new(".env");
-    if !path.exists() {
-        return;
+// ---------------------------------------------------------------------------
+// .env loader (minimal, no transitive dep)
+// ---------------------------------------------------------------------------
+
+/// Minimal `.env` loader. Walks up from the current working
+/// directory looking for a `.env` file and reads `KEY=VALUE` lines
+/// from the first one found. Does not overwrite existing env vars
+/// (the real environment wins).
+///
+/// Why the walk: `tauri dev` sets CWD to `apps/desktop/src-tauri/`
+/// when it runs the Rust binary, but the user's `.env` lives at the
+/// workspace root. A naive `Path::new(".env")` looks in the wrong
+/// place and the boot fails with "XAI_API_KEY not found" even when
+/// the file is right there.
+///
+/// We stop walking at the filesystem root or after 8 hops, whichever
+/// comes first. Eight is comfortably more than any sane monorepo
+/// depth and bounds the work.
+/// Minimal `.env` loader. Walks up from the current working
+/// directory looking for a `.env` file, reads `KEY=VALUE` lines from
+/// the first one found, and returns the directory it was found in.
+/// That directory is treated as the workspace root by the caller, so
+/// other relative paths (the DuckDB file, `config/sources.toml`) can
+/// be anchored consistently regardless of CWD.
+///
+/// Returns `None` if no `.env` is found within the search budget — in
+/// which case `main` falls back to CWD as the workspace root and
+/// expects `XAI_API_KEY` to come from the real environment (or the
+/// Tauri build to ship a `.app` bundle whose user supplies the key
+/// via launchd plist or shell rc).
+///
+/// Why the walk: `tauri dev` sets CWD to `apps/desktop/src-tauri/`
+/// when it runs the Rust binary, but the user's `.env` lives at the
+/// workspace root. A naive `Path::new(".env")` looks in the wrong
+/// place and the boot fails with "XAI_API_KEY not found" even when
+/// the file is right there.
+///
+/// We stop walking at the filesystem root or after 8 hops, whichever
+/// comes first. Eight is comfortably more than any sane monorepo
+/// depth and bounds the work.
+///
+/// Existing env vars take precedence over `.env` contents.
+fn load_dotenv() -> Option<PathBuf> {
+    let start = std::env::current_dir().ok()?;
+
+    let mut current: Option<&Path> = Some(start.as_path());
+    let mut hops = 0u8;
+    while let Some(dir) = current {
+        if hops > 8 {
+            break;
+        }
+        let candidate = dir.join(".env");
+        if candidate.is_file() {
+            apply_dotenv(&candidate);
+            return Some(dir.to_path_buf());
+        }
+        current = dir.parent();
+        hops += 1;
     }
+    None
+}
+
+/// Read `KEY=VALUE` pairs from `path` and set them in the
+/// environment, but only for keys not already present. Silently
+/// ignores read errors — `.env` is a convenience, not a contract.
+fn apply_dotenv(path: &Path) {
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return,
@@ -56,45 +200,59 @@ fn load_dotenv() {
             let k = k.trim();
             let v = v.trim().trim_matches('"').trim_matches('\'');
             if std::env::var_os(k).is_none() {
-                // NOTE: env::set_var will become unsafe in edition 2024.
-                // We're on edition 2021 where it's safe. When we migrate to
-                // edition 2024, wrap this in an `unsafe` block with a SAFETY
-                // comment explaining that this runs in main before threads spawn.
+                // SAFETY note: env::set_var becomes unsafe in edition
+                // 2024. We're on 2021 where it's safe. When migrating
+                // to 2024, wrap this in `unsafe { … }` with a SAFETY
+                // comment noting it runs in main before threads spawn.
                 std::env::set_var(k, v);
             }
         }
     }
 }
 
-fn verify_llm_keys() {
-    let providers = [
-        ("ANTHROPIC_API_KEY", "Anthropic (Claude)"),
-        ("XAI_API_KEY", "xAI (Grok)"),
-        ("OPENAI_API_KEY", "OpenAI"),
-        ("GOOGLE_API_KEY", "Google (Gemini)"),
-    ];
+// ---------------------------------------------------------------------------
+// Source-descriptor loader (mirrors the CLI's logic verbatim)
+// ---------------------------------------------------------------------------
 
-    let mut found_any = false;
-    for (env_var, label) in providers {
-        match ApiKey::from_env(env_var) {
-            Ok(key) => {
-                info!(provider = label, fingerprint = %key.fingerprint(), "llm provider key loaded");
-                found_any = true;
-            }
-            Err(e) => {
-                // Downgrade the known-bad-placeholder case to info; real missing keys
-                // stay as warn so users see them during setup.
-                match e {
-                    stockpile_secure::secrets::ApiKeyError::NotSet(_) => {
-                        tracing::debug!(provider = label, "no key configured (optional)");
-                    }
-                    _ => warn!(provider = label, error = %e, "llm provider key rejected"),
-                }
-            }
-        }
-    }
+#[derive(Debug, Deserialize)]
+struct SourcesFile {
+    #[serde(default)]
+    source: Vec<SourceEntry>,
+}
 
-    if !found_any {
-        warn!("no LLM provider keys configured. copy .env.example to .env and add at least one key.");
+#[derive(Debug, Deserialize)]
+struct SourceEntry {
+    id: String,
+    display_name: String,
+    description: String,
+    #[serde(default)]
+    authoritative_for: Vec<String>,
+}
+
+fn load_source_descriptors(path: &Path, limit: usize) -> Result<Vec<SourceDescriptor>> {
+    if !path.exists() {
+        warn!(
+            path = %path.display(),
+            "sources file not found; classifier will see no registered sources"
+        );
+        return Ok(Vec::new());
     }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let file: SourcesFile = toml::from_str(&raw)
+        .with_context(|| format!("parsing TOML in {}", path.display()))?;
+
+    let descriptors = file
+        .source
+        .into_iter()
+        .take(limit)
+        .map(|e| SourceDescriptor {
+            id: e.id,
+            display_name: e.display_name,
+            description: e.description.trim().to_string(),
+            authoritative_for: e.authoritative_for,
+        })
+        .collect();
+
+    Ok(descriptors)
 }

@@ -61,6 +61,13 @@ figment = { version = "0.10", features = ["toml", "env"] }
 # TS type generation
 ts-rs = { version = "9.0", features = ["chrono-impl", "uuid-impl"] }
 
+# Tauri 2 — desktop shell. rustls-only via the runtime; no native-tls
+# transitively (verified via cargo deny). The frontend invokes the
+# commands declared in `crates/api`; capabilities are allow-listed in
+# `apps/desktop/src-tauri/capabilities/`. See ADR 0002, ADR 0009.
+tauri = { version = "2", features = [] }
+tauri-build = { version = "2", features = [] }
+
 # Secret handling — scrubs from logs, zeroizes on drop
 secrecy = { version = "0.10" }
 zeroize = { version = "1.8", features = ["derive"] }
