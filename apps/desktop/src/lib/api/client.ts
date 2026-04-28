@@ -2,7 +2,7 @@
  * Stockpile API client.
  *
  * Typed wrappers around `@tauri-apps/api/core`'s `invoke()` for the
- * three commands the backend exposes. The frontend should always go
+ * five commands the backend exposes. The frontend should always go
  * through these wrappers — never call `invoke()` directly — so the
  * argument names and return types stay in lockstep with the Rust
  * `#[tauri::command]` signatures.
@@ -14,11 +14,13 @@ import { invoke } from '@tauri-apps/api/core';
 
 import type { ResearchPlanDto } from './types/ResearchPlanDto';
 import type { PlanSummary } from './types/PlanSummary';
+import type { PlanStatusDto } from './types/PlanStatusDto';
 import type { CommandErrorDto } from './types/CommandErrorDto';
 
 /**
  * Run Level-1 classification on a topic. Persists the resulting plan
- * and returns it. The same call flow that the situation-room CLI uses.
+ * (status = `pending`) and returns it. The same call flow that the
+ * situation-room CLI uses.
  *
  * Throws a `CommandErrorDto` (Tauri serializes thrown command errors
  * directly) — call sites should catch and switch on `.kind`.
@@ -31,9 +33,16 @@ export async function classify(topic: string): Promise<ResearchPlanDto> {
  * List the most recent persisted plans. No LLM call; safe to invoke
  * on app startup. The backend clamps `limit` into [1, 200] regardless
  * of what the frontend sends.
+ *
+ * `status` filters by lifecycle state. Pass `null` (the default) to
+ * see every status; pass `'pending'` / `'accepted'` / `'rejected'`
+ * for the filtered listing the filter strip drives.
  */
-export async function listRecentPlans(limit = 50): Promise<PlanSummary[]> {
-  return invoke<PlanSummary[]>('list_recent_plans', { limit });
+export async function listRecentPlans(
+  limit = 50,
+  status: PlanStatusDto | null = null,
+): Promise<PlanSummary[]> {
+  return invoke<PlanSummary[]>('list_recent_plans', { limit, status });
 }
 
 /**
@@ -42,6 +51,26 @@ export async function listRecentPlans(limit = 50): Promise<PlanSummary[]> {
  */
 export async function getPlan(id: string): Promise<ResearchPlanDto> {
   return invoke<ResearchPlanDto>('get_plan', { id });
+}
+
+/**
+ * Mark a plan as accepted. Idempotent. Returns the updated plan so
+ * the caller can refresh local state without a separate `getPlan`
+ * roundtrip.
+ *
+ * Throws `{ kind: 'not_found' }` if the id has been removed between
+ * the listing fetch and this call.
+ */
+export async function acceptPlan(id: string): Promise<ResearchPlanDto> {
+  return invoke<ResearchPlanDto>('accept_plan', { id });
+}
+
+/**
+ * Mark a plan as rejected. Soft-delete: the row stays for audit but
+ * is hidden from default listings. Idempotent.
+ */
+export async function rejectPlan(id: string): Promise<ResearchPlanDto> {
+  return invoke<ResearchPlanDto>('reject_plan', { id });
 }
 
 /**

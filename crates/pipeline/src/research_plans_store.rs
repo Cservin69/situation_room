@@ -9,7 +9,7 @@
 //! identical (storage mustn't reverse-depend on pipeline).
 
 use stockpile_storage::{
-    research_plans::{ResearchPlanRow, StoredResearchPlan},
+    research_plans::{PlanStatus, ResearchPlanRow, StoredResearchPlan},
     Store,
 };
 use thiserror::Error;
@@ -77,6 +77,10 @@ fn plan_to_row(
         expectations_json,
         created_at: plan.created_at,
         classified_by: classified_by.to_string(),
+        // Newly-classified plans start in Pending. The user must
+        // explicitly Accept (or Reject) before downstream Phase-6
+        // fetching considers them. See ADR 0007 + STOCKPILE_HANDOFF_SESSION7.
+        status: PlanStatus::Pending,
     })
 }
 

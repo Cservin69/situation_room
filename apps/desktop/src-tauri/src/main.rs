@@ -97,8 +97,10 @@ fn main() -> Result<()> {
     //
     // The capabilities file (`capabilities/default.json`) explicitly
     // enumerates which IPC commands the webview is allowed to call.
-    // Adding a fourth command means editing both this `invoke_handler`
-    // call and the capabilities file. ADR 0009 §"Tauri posture".
+    // Adding a fourth or fifth command means editing this
+    // `invoke_handler` call; capabilities here gate built-in plugin
+    // permissions only, not custom #[tauri::command] handlers.
+    // ADR 0009 §"Tauri posture".
     //
     // The full paths are required, not just the imported function
     // names: `#[tauri::command]` generates a sibling `__cmd__<name>`
@@ -113,7 +115,9 @@ fn main() -> Result<()> {
         .invoke_handler(tauri::generate_handler![
             stockpile_api::commands::classify,
             stockpile_api::commands::list_recent_plans,
-            stockpile_api::commands::get_plan
+            stockpile_api::commands::get_plan,
+            stockpile_api::commands::accept_plan,
+            stockpile_api::commands::reject_plan
         ])
         .run(tauri::generate_context!())
         .context("running tauri")?;

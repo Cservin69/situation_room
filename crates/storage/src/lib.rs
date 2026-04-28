@@ -29,7 +29,7 @@ pub mod research_plans;
 pub use connection::Store;
 pub use queries::TopicUsage;
 pub use recipes::{RecipeRow, StoredRecipe};
-pub use research_plans::{ResearchPlanRow, StoredResearchPlan};
+pub use research_plans::{PlanStatus, ResearchPlanRow, StoredResearchPlan};
 
 use thiserror::Error;
 

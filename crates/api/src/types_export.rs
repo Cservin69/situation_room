@@ -28,15 +28,60 @@ use stockpile_pipeline::research::{
     DocumentSourceHint, EntityKindExpectation, EventTypeExpectation, GeoScope,
     MetricExpectation, RecordExpectations, RelationKindExpectation, ResearchPlan,
 };
-use stockpile_storage::research_plans::StoredResearchPlan;
+use stockpile_storage::research_plans::{PlanStatus, StoredResearchPlan};
 use ts_rs::TS;
+
+// ---------------------------------------------------------------------------
+// PlanStatusDto — wire mirror of storage::PlanStatus
+// ---------------------------------------------------------------------------
+
+/// Lifecycle state for a plan, as seen by the frontend. Mirrors
+/// [`stockpile_storage::research_plans::PlanStatus`] one-for-one.
+///
+/// The serde representation is lowercase and unit-tagged
+/// (`"pending"` / `"accepted"` / `"rejected"`), matching both the
+/// storage column form and the `serde(rename_all = "lowercase")` on
+/// the underlying enum. Bend either side and the other follows; the
+/// `command_error_dto` shadow-type pattern doesn't apply here because
+/// `PlanStatus` is a plain unit enum and ts-rs handles those cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+#[serde(rename_all = "lowercase")]
+pub enum PlanStatusDto {
+    Pending,
+    Accepted,
+    Rejected,
+}
+
+impl From<PlanStatus> for PlanStatusDto {
+    fn from(s: PlanStatus) -> Self {
+        match s {
+            PlanStatus::Pending => PlanStatusDto::Pending,
+            PlanStatus::Accepted => PlanStatusDto::Accepted,
+            PlanStatus::Rejected => PlanStatusDto::Rejected,
+        }
+    }
+}
+
+impl From<PlanStatusDto> for PlanStatus {
+    fn from(s: PlanStatusDto) -> Self {
+        match s {
+            PlanStatusDto::Pending => PlanStatus::Pending,
+            PlanStatusDto::Accepted => PlanStatus::Accepted,
+            PlanStatusDto::Rejected => PlanStatus::Rejected,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ResearchPlanDto — the full plan shape, on the wire
 // ---------------------------------------------------------------------------
 
 /// Wire shape for a research plan. Mirrors
-/// [`stockpile_pipeline::research::ResearchPlan`] one-for-one.
+/// [`stockpile_pipeline::research::ResearchPlan`] one-for-one, with
+/// the storage-layer audit field [`status`](Self::status) tacked on so
+/// the frontend can render the lifecycle pill / accept-reject buttons
+/// without a second IPC roundtrip.
 ///
 /// ## Why every nested type is also a DTO
 ///
@@ -57,6 +102,7 @@ pub struct ResearchPlanDto {
     pub historical_window_days: u32,
     pub expectations: RecordExpectationsDto,
     pub created_at: DateTime<Utc>,
+    pub status: PlanStatusDto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -138,6 +184,7 @@ pub struct PlanSummary {
     pub id: String,
     pub topic: String,
     pub created_at: DateTime<Utc>,
+    pub status: PlanStatusDto,
     pub topic_tag_count: u32,
     pub observation_count: u32,
     pub event_count: u32,
@@ -160,6 +207,7 @@ impl PlanSummary {
             id: s.id.to_string(),
             topic: s.topic,
             created_at: s.created_at,
+            status: s.status.into(),
             topic_tag_count: tags.len() as u32,
             observation_count: exp.observation_metrics.len() as u32,
             event_count: exp.event_types.len() as u32,
@@ -217,8 +265,33 @@ pub enum CommandErrorDto {
 // From<ResearchPlan> for ResearchPlanDto and friends
 // ---------------------------------------------------------------------------
 
-impl From<ResearchPlan> for ResearchPlanDto {
-    fn from(p: ResearchPlan) -> Self {
+// ---------------------------------------------------------------------------
+// ResearchPlanDto constructors
+//
+// Two paths to a DTO. We deliberately do NOT impl `From<ResearchPlan>`
+// because the typed plan carries no `status` and a blanket `From`
+// would have to invent one — which is fine for a freshly-classified
+// plan (always Pending) and wrong for any plan re-loaded from
+// storage. Forcing the call site to choose its constructor makes the
+// implicit choice explicit and audit-greppable.
+// ---------------------------------------------------------------------------
+
+impl ResearchPlanDto {
+    /// Build a DTO from a freshly-classified typed plan. The caller
+    /// asserts (by choosing this constructor) that the plan has just
+    /// been written by `save_research_plan`, which always inserts
+    /// with `PlanStatus::Pending`.
+    ///
+    /// Use [`Self::from_stored`] for any plan re-read from storage.
+    pub fn from_typed_pending(p: ResearchPlan) -> Self {
+        Self::from_typed_with_status(p, PlanStatusDto::Pending)
+    }
+
+    /// Build a DTO from a typed plan plus an explicit status. Used
+    /// by [`Self::from_stored`]; exposed for tests and any future
+    /// caller that has both pieces in hand without going through a
+    /// `StoredResearchPlan`.
+    pub fn from_typed_with_status(p: ResearchPlan, status: PlanStatusDto) -> Self {
         Self {
             id: p.id.to_string(),
             topic: p.topic,
@@ -228,7 +301,33 @@ impl From<ResearchPlan> for ResearchPlanDto {
             historical_window_days: p.historical_window_days,
             expectations: RecordExpectationsDto::from(p.expectations),
             created_at: p.created_at,
+            status,
         }
+    }
+
+    /// Build a DTO from a [`StoredResearchPlan`] — parsing the JSON
+    /// columns and carrying the storage-layer `status` through. This
+    /// is the path used by `get_plan`, `accept_plan`, `reject_plan`,
+    /// and any other command that re-reads a plan from disk.
+    pub fn from_stored(s: StoredResearchPlan) -> Result<Self, serde_json::Error> {
+        let topic_tags: Vec<stockpile_core::vocab::Topic> =
+            serde_json::from_str(&s.topic_tags_json)?;
+        let geographic_scope: Vec<GeoScope> =
+            serde_json::from_str(&s.geographic_scope_json)?;
+        let expectations: RecordExpectations = serde_json::from_str(&s.expectations_json)?;
+        let status: PlanStatusDto = s.status.into();
+
+        let plan = ResearchPlan {
+            id: s.id,
+            topic: s.topic,
+            interpretation: s.interpretation,
+            topic_tags,
+            geographic_scope,
+            historical_window_days: s.historical_window_days,
+            expectations,
+            created_at: s.created_at,
+        };
+        Ok(Self::from_typed_with_status(plan, status))
     }
 }
 
@@ -386,18 +485,20 @@ mod tests {
     }
 
     #[test]
-    fn plan_dto_round_trips_via_from() {
+    fn plan_dto_round_trips_via_from_typed_pending() {
         let p = sample_plan();
         let id_str = p.id.to_string();
         let topic_count = p.topic_tags.len();
         let obs_count = p.expectations.observation_metrics.len();
         let geo_count = p.geographic_scope.len();
 
-        let dto: ResearchPlanDto = p.into();
+        let dto = ResearchPlanDto::from_typed_pending(p);
         assert_eq!(dto.id, id_str);
         assert_eq!(dto.topic_tags.len(), topic_count);
         assert_eq!(dto.expectations.observation_metrics.len(), obs_count);
         assert_eq!(dto.geographic_scope.len(), geo_count);
+        // The "pending" constructor name is load-bearing — guard it.
+        assert_eq!(dto.status, PlanStatusDto::Pending);
 
         // Geo display field is preserved verbatim (including empty for code-only).
         assert_eq!(dto.geographic_scope[0].display, "Australia");
@@ -411,9 +512,18 @@ mod tests {
     fn plan_dto_serializes_topic_tags_as_strings() {
         // The frontend treats topic_tags as a plain string array.
         // Guard the wire shape.
-        let dto: ResearchPlanDto = sample_plan().into();
+        let dto = ResearchPlanDto::from_typed_pending(sample_plan());
         let json = serde_json::to_string(&dto).unwrap();
         assert!(json.contains(r#""topic_tags":["lithium","battery_supply_chain"]"#));
+    }
+
+    #[test]
+    fn plan_dto_serializes_status_as_lowercase_string() {
+        // The frontend pattern-matches on status as a string union;
+        // guard the wire shape so a future serde rename can't break it.
+        let dto = ResearchPlanDto::from_typed_with_status(sample_plan(), PlanStatusDto::Accepted);
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains(r#""status":"accepted""#), "got: {json}");
     }
 
     #[test]
@@ -442,10 +552,12 @@ mod tests {
             expectations_json: serde_json::to_string(&p.expectations).unwrap(),
             created_at: p.created_at,
             classified_by: "xai".into(),
+            status: stockpile_storage::research_plans::PlanStatus::Pending,
         };
 
         let s = PlanSummary::from_stored(stored).unwrap();
         assert_eq!(s.id, p.id.to_string());
+        assert_eq!(s.status, PlanStatusDto::Pending);
         assert_eq!(s.topic_tag_count, 2);
         assert_eq!(s.observation_count, 1);
         assert_eq!(s.event_count, 1);
@@ -467,8 +579,46 @@ mod tests {
             expectations_json: serde_json::to_string(&p.expectations).unwrap(),
             created_at: p.created_at,
             classified_by: "xai".into(),
+            status: stockpile_storage::research_plans::PlanStatus::Pending,
         };
         assert!(PlanSummary::from_stored(stored).is_err());
+    }
+
+    #[test]
+    fn plan_dto_from_stored_carries_status_through() {
+        // The from_stored path is what get_plan / accept_plan /
+        // reject_plan use; status must flow through unmodified or the
+        // listing pill and the review-pane badge will lie.
+        let p = sample_plan();
+        let stored = StoredResearchPlan {
+            id: p.id,
+            topic: p.topic.clone(),
+            interpretation: p.interpretation.clone(),
+            topic_tags_json: serde_json::to_string(&p.topic_tags).unwrap(),
+            geographic_scope_json: serde_json::to_string(&p.geographic_scope).unwrap(),
+            historical_window_days: p.historical_window_days,
+            expectations_json: serde_json::to_string(&p.expectations).unwrap(),
+            created_at: p.created_at,
+            classified_by: "xai".into(),
+            status: stockpile_storage::research_plans::PlanStatus::Rejected,
+        };
+        let dto = ResearchPlanDto::from_stored(stored).unwrap();
+        assert_eq!(dto.status, PlanStatusDto::Rejected);
+    }
+
+    #[test]
+    fn plan_status_dto_round_trips_via_storage_status() {
+        use stockpile_storage::research_plans::PlanStatus as S;
+        for (storage, dto) in [
+            (S::Pending, PlanStatusDto::Pending),
+            (S::Accepted, PlanStatusDto::Accepted),
+            (S::Rejected, PlanStatusDto::Rejected),
+        ] {
+            let lifted: PlanStatusDto = storage.into();
+            assert_eq!(lifted, dto);
+            let back: S = dto.into();
+            assert_eq!(back, storage);
+        }
     }
 
     #[test]

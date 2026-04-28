@@ -1,38 +1,34 @@
 <!--
-  PlanReview — the heart of Session 6. P1 in the handoff.
+  PlanReview — the heart of the review pane.
 
   Renders a `ResearchPlanDto` as an interactive, scannable panel.
-  Composition matches the handoff spec:
+  Composition:
 
-    - Header: topic, plan id, created_at.
+    - Header: topic, created_at, status badge, accept/reject buttons
+              (when pending).
     - Trust paragraph: `interpretation` rendered prominently. This is
       "the moment of trust before fetching" per ADR 0007.
     - Topic-tags strip: chips, one per tag.
     - Geographic-scope strip: chips. Each chip's primary label is
       `display`; the `code` is in the title attribute for hover. When
-      `display` is empty, the chip falls back to `code`. This is where
-      the GeoScope work pays off visually.
+      `display` is empty, the chip falls back to `code`.
     - Six bucket panels (Observation, Event, Entity, Relation, Document,
       Assertion) on a CSS grid.
-    - Source-nominations panel listing the document sources in the order
-      the LLM produced them.
 
-  ## What's deliberately NOT here
+  ## Accept / Reject (Session 7 §P1)
 
-  - Accept / Reject / Re-classify buttons: the handoff lists them under
-    the P1 spec but the storage layer has no soft-delete or supersede
-    operation yet (handoff §5: "no way to delete or amend a plan").
-    Adding non-functional buttons would be UI theater. They land when
-    storage grows the underlying operation.
-  - "Hover showing usage count" on topic chips: the topic-tags row
-    shows tags as plain chips. Usage count requires a `topics_in_use`
-    call, which isn't a current Tauri command. Cheap to add later.
+  The accept and reject buttons appear only while the plan is pending.
+  Once the user has decided either way the buttons are replaced with
+  a status pill, because the decision isn't reversible from this UI:
+  rejecting a wrong reject means classifying a fresh plan, not
+  un-rejecting (handoff §"explicitly NOT": no edit-the-plan flow).
 -->
 <script lang="ts">
   import type { ResearchPlanDto } from '$lib/api/types/ResearchPlanDto';
   import type { GeoScopeDto } from '$lib/api/types/GeoScopeDto';
-  import { formatCreatedAt } from '$stores/plans.svelte';
+  import { plans, formatCreatedAt, acceptSelected, rejectSelected } from '$stores/plans.svelte';
   import Chip from '$components/common/Chip.svelte';
+  import StatusPill from '$components/common/StatusPill.svelte';
   import Bucket from '$components/panels/Bucket.svelte';
   import ExpectationRow from '$components/panels/ExpectationRow.svelte';
 
@@ -49,6 +45,13 @@
   function scopeLabel(g: GeoScopeDto): string {
     return g.display.trim().length > 0 ? g.display : g.code;
   }
+
+  // The handlers go through the runes store helpers, which do the
+  // optimistic update + rollback dance. We just await the boolean
+  // return and ignore failures — the store has already populated
+  // `plans.error` for the toast / banner layer to surface.
+  async function onAccept() { await acceptSelected(); }
+  async function onReject() { await rejectSelected(); }
 </script>
 
 <article class="plan">
@@ -56,6 +59,28 @@
     <div class="topic-line">
       <h2 class="topic">{plan.topic}</h2>
       <span class="created">{formatCreatedAt(plan.created_at)}</span>
+    </div>
+    <div class="actions">
+      {#if plan.status === 'pending'}
+        <button
+          type="button"
+          class="btn btn-primary"
+          disabled={plans.mutating}
+          onclick={onAccept}
+        >
+          accept
+        </button>
+        <button
+          type="button"
+          class="btn btn-secondary"
+          disabled={plans.mutating}
+          onclick={onReject}
+        >
+          reject
+        </button>
+      {:else}
+        <StatusPill status={plan.status} />
+      {/if}
     </div>
     <div class="meta">
       <span class="kv"><span class="k">id</span><span class="v">{plan.id}</span></span>
@@ -160,16 +185,37 @@
 
   /* Header */
   .head {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    grid-template-rows: auto auto;
+    column-gap: 12px;
+    row-gap: 6px;
+    align-items: start;
     border-bottom: 1px solid var(--border-subtle);
     padding-bottom: 10px;
   }
   .topic-line {
+    grid-column: 1;
+    grid-row: 1;
     display: flex;
     align-items: baseline;
     gap: 12px;
+    min-width: 0;
+  }
+  .actions {
+    grid-column: 2;
+    grid-row: 1;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .meta {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    display: flex;
+    gap: 16px;
+    font-family: var(--font-mono);
+    font-size: 10px;
   }
   .topic {
     font-size: 18px;
@@ -177,21 +223,60 @@
     margin: 0;
     color: var(--fg-primary);
     letter-spacing: -0.01em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .created {
     font-family: var(--font-mono);
     font-size: 11px;
     color: var(--fg-tertiary);
-  }
-  .meta {
-    display: flex;
-    gap: 16px;
-    font-family: var(--font-mono);
-    font-size: 10px;
+    flex: 0 0 auto;
   }
   .kv { display: inline-flex; gap: 4px; align-items: baseline; }
   .k  { color: var(--fg-quaternary); text-transform: uppercase; letter-spacing: 0.06em; }
   .v  { color: var(--fg-secondary); }
+
+  /* Buttons. Following ADR 0006 — primary uses warm-amber for the
+     "approve and proceed" semantic, secondary stays chrome. */
+  .btn {
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    border-radius: 2px;
+    padding: 4px 10px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    color: var(--fg-secondary);
+    transition: background var(--duration-ui) var(--ease),
+                border-color var(--duration-ui) var(--ease),
+                color var(--duration-ui) var(--ease);
+  }
+  .btn:focus-visible {
+    outline: 1px solid var(--border-accent);
+    outline-offset: 0;
+  }
+  .btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+  .btn-primary {
+    color: var(--signal-warning);
+    border-color: var(--signal-warning);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: rgba(224, 165, 46, 0.1);
+  }
+  .btn-secondary {
+    color: var(--fg-secondary);
+  }
+  .btn-secondary:hover:not(:disabled) {
+    background: var(--bg-panel-alt);
+    border-color: var(--border-strong);
+    color: var(--fg-primary);
+  }
 
   /* Trust paragraph */
   .trust {

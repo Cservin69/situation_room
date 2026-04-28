@@ -1,13 +1,19 @@
 <!--
-  RecentPlansList — left pane. P2 in the handoff.
+  RecentPlansList — left pane.
 
-  Renders one row per recent plan with topic, created_at, and the
-  bucket-count summary. Click a row to open it in the review pane.
-  Active row gets a strong-border treatment (chrome change, not color).
+  Renders one row per recent plan with topic, created_at, the
+  bucket-count summary, and a status pill. Click a row to open it in
+  the review pane. Active row gets a strong-border treatment (chrome
+  change, not color).
+
+  The PlanFilterStrip sits at the top of the listing and drives which
+  status bucket is visible.
 -->
 <script lang="ts">
   import { plans, selectPlan, formatCreatedAt } from '$stores/plans.svelte';
   import type { PlanSummary } from '$lib/api/types/PlanSummary';
+  import PlanFilterStrip from '$components/PlanFilterStrip.svelte';
+  import StatusPill from '$components/common/StatusPill.svelte';
 
   function summaryLine(p: PlanSummary): string {
     return `${p.observation_count} obs · ${p.event_count} ev · ${p.entity_count} ent · ${p.relation_count} rel · ${p.document_source_count} src`;
@@ -19,9 +25,16 @@
     <span class="title">recent</span>
     <span class="count">{plans.recent.length}</span>
   </header>
+  <PlanFilterStrip />
   {#if plans.recent.length === 0}
     <p class="empty">
-      {plans.loading ? 'loading…' : 'no plans yet — classify a topic above'}
+      {#if plans.loading}
+        loading…
+      {:else if plans.statusFilter === 'all'}
+        no plans yet — classify a topic above
+      {:else}
+        no {plans.statusFilter} plans
+      {/if}
     </p>
   {:else}
     <ul>
@@ -33,7 +46,10 @@
             class:active={plans.selected?.id === p.id}
             onclick={() => selectPlan(p.id)}
           >
-            <span class="topic">{p.topic}</span>
+            <span class="topic-line">
+              <span class="topic">{p.topic}</span>
+              <StatusPill status={p.status} />
+            </span>
             <span class="meta">{formatCreatedAt(p.created_at)}</span>
             <span class="summary">{summaryLine(p)}</span>
           </button>
@@ -104,9 +120,19 @@
     background: var(--bg-panel-alt);
     border-left-color: var(--border-strong);
   }
+  .topic-line {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+  }
   .topic {
     font-size: 12px;
     color: var(--fg-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1 1 auto;
   }
   .meta {
     font-family: var(--font-mono);

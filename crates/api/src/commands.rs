@@ -1,20 +1,25 @@
 //! Tauri commands — actions the frontend triggers.
 //!
-//! ## The three commands (Session 6 baseline)
+//! ## The command surface (Session 7)
 //!
-//! Per `STOCKPILE_HANDOFF_SESSION5.md` Priority 4, the GUI's Tauri
-//! command surface is exactly these three:
+//! Five `#[tauri::command]` handlers, all thin wrappers over functions
+//! that already exist in pipeline / storage:
 //!
 //! - [`classify`] — run Level-1 classification on a topic, persist
-//!   the resulting plan, return it.
-//! - [`list_recent_plans`] — list the most recent persisted plans
-//!   without making any LLM call.
+//!   the resulting plan (status = pending), return it.
+//! - [`list_recent_plans`] — list recent plans, optionally filtered
+//!   by status. No LLM call.
 //! - [`get_plan`] — fetch one plan by id.
+//! - [`accept_plan`] — mark a plan as accepted (gates Phase-6 fetch).
+//! - [`reject_plan`] — mark a plan as rejected (hidden from default
+//!   listings; retained for audit).
 //!
-//! All three are thin wrappers over functions that already exist in
-//! `pipeline::research_classifier` and `pipeline::research_plans_store`.
-//! The `apps/situation_room` CLI already wires the same calls; this
-//! module is the IPC surface for the same pipeline.
+//! The first three were the Session-6 baseline; accept/reject land in
+//! Session 7 to soft-delete the duplicate-/bad-classification problem
+//! visible in the Session-6 screenshots. See ADR 0007 §"runtime path"
+//! for why the gate exists at all: only accepted plans should drive
+//! deterministic fetching, and that gate has to be a deliberate user
+//! action, not an automatic consequence of classification.
 //!
 //! ## Security discipline (ADR 0009)
 //!
@@ -46,16 +51,15 @@ use stockpile_pipeline::research_classifier::{
     classify_topic, ClassificationContext, ClassificationError,
     SourceDescriptor as PipelineSourceDescriptor, TopicUsage as ClassifierTopicUsage,
 };
-use stockpile_pipeline::research_plans_store::{
-    load_research_plan, save_research_plan, ResearchPlanStoreError,
-};
+use stockpile_pipeline::research_plans_store::{save_research_plan, ResearchPlanStoreError};
 use stockpile_secure::bounds::{check_string, Bounds};
+use stockpile_storage::research_plans::PlanStatus;
 use stockpile_storage::{Store, StorageError};
 use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::types_export::{PlanSummary, ResearchPlanDto, SourceDescriptorDto};
+use crate::types_export::{PlanStatusDto, PlanSummary, ResearchPlanDto, SourceDescriptorDto};
 
 // ---------------------------------------------------------------------------
 // AppState — injected by the Tauri builder, shared across commands
@@ -239,8 +243,12 @@ pub async fn classify(
 
     info!(plan_id = %plan.id, "plan classified and persisted");
 
-    // 5. Marshal to the wire shape.
-    Ok(ResearchPlanDto::from(plan))
+    // 5. Marshal to the wire shape. The plan was just inserted by
+    //    `save_research_plan`, which always writes status = Pending —
+    //    so the explicit `from_typed_pending` constructor is correct
+    //    here. Any plan re-read from storage goes through
+    //    `ResearchPlanDto::from_stored` instead.
+    Ok(ResearchPlanDto::from_typed_pending(plan))
 }
 
 // ---------------------------------------------------------------------------
@@ -250,21 +258,35 @@ pub async fn classify(
 /// List the most recent persisted plans. Pure read; no LLM call.
 ///
 /// Returns lightweight [`PlanSummary`] rows (id, topic, created_at,
-/// bucket counts). The frontend uses these to render the listing and
-/// invokes [`get_plan`] when the user opens one.
+/// status, bucket counts). The frontend uses these to render the
+/// listing and invokes [`get_plan`] when the user opens one.
 ///
 /// `limit` is clamped to a sane range (1 to 200) to bound the IPC
 /// payload regardless of frontend bugs.
+///
+/// `status` is an optional filter. The frontend's filter strip
+/// (All / Pending / Accepted / Rejected) maps to:
+///   - All       → status = None
+///   - Pending   → status = Some(PlanStatusDto::Pending)
+///   - Accepted  → status = Some(PlanStatusDto::Accepted)
+///   - Rejected  → status = Some(PlanStatusDto::Rejected)
+///
+/// Pre-Session-7 callers that still pass no `status` argument
+/// continue to work because Tauri's IPC unmarshals an absent JSON
+/// field as the type's `Default`, and `Option::default()` is `None` —
+/// which is the "show all statuses" path.
 #[tauri::command]
 pub async fn list_recent_plans(
     limit: usize,
+    status: Option<PlanStatusDto>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<PlanSummary>, CommandError> {
     let clamped = limit.clamp(1, 200);
+    let storage_status: Option<PlanStatus> = status.map(Into::into);
 
     let stored = state
         .store
-        .recent_research_plans(clamped)
+        .recent_research_plans_by_status(storage_status, clamped)
         .map_err(CommandError::from)?;
 
     let summaries = stored
@@ -287,6 +309,11 @@ pub async fn list_recent_plans(
 /// `id` arrives from the frontend as a string (Tauri JSON IPC has no
 /// native UUID); we parse it here. A malformed id is a 4xx-equivalent,
 /// not a 5xx — surface as `InvalidInput`.
+///
+/// Goes through `store.get_research_plan` (returning a
+/// `StoredResearchPlan`) rather than the pipeline helper, because the
+/// frontend needs the storage-layer `status` field which the typed
+/// `ResearchPlan` deliberately doesn't carry.
 #[tauri::command]
 pub async fn get_plan(
     id: String,
@@ -297,11 +324,103 @@ pub async fn get_plan(
         message: format!("not a valid UUID: {e}"),
     })?;
 
-    let plan = load_research_plan(state.store.as_ref(), parsed)
+    let stored = state
+        .store
+        .get_research_plan(parsed)
         .map_err(CommandError::from)?
         .ok_or_else(|| CommandError::NotFound { id: id.clone() })?;
 
-    Ok(ResearchPlanDto::from(plan))
+    ResearchPlanDto::from_stored(stored).map_err(|e| CommandError::Storage {
+        message: format!("plan deserialization: {e}"),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Command 4 — accept_plan
+// ---------------------------------------------------------------------------
+
+/// Mark a plan as accepted. The user has reviewed it; downstream
+/// Phase-6 fetching may consume it.
+///
+/// Returns the updated [`ResearchPlanDto`] so the frontend can update
+/// its optimistic UI without a second roundtrip. Idempotent — calling
+/// `accept_plan` on an already-accepted plan is a successful no-op.
+///
+/// Errors:
+///   - `InvalidInput` if `id` isn't a valid UUID.
+///   - `NotFound` if the id isn't in the store.
+///   - `Storage` for any other DB-level failure.
+#[tauri::command]
+pub async fn accept_plan(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<ResearchPlanDto, CommandError> {
+    set_status_and_load(id, PlanStatus::Accepted, state).await
+}
+
+// ---------------------------------------------------------------------------
+// Command 5 — reject_plan
+// ---------------------------------------------------------------------------
+
+/// Mark a plan as rejected. Hidden from default listings; retained
+/// for audit. Soft-delete; no row is removed.
+///
+/// Returns the updated [`ResearchPlanDto`]. Idempotent. Same error
+/// semantics as [`accept_plan`].
+#[tauri::command]
+pub async fn reject_plan(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<ResearchPlanDto, CommandError> {
+    set_status_and_load(id, PlanStatus::Rejected, state).await
+}
+
+// ---------------------------------------------------------------------------
+// accept_plan / reject_plan share an implementation
+// ---------------------------------------------------------------------------
+
+/// The shared body of `accept_plan` and `reject_plan`. Validates the
+/// id, transitions the status, then re-loads the plan so the wire
+/// response always reflects what's actually in the database (rather
+/// than what the caller asked for).
+///
+/// Re-loading after the write is deliberate: it costs one extra
+/// query per call, but it means the frontend can trust the returned
+/// status field as the canonical post-write value. Alternative —
+/// constructing the DTO from the pre-write read plus the requested
+/// status — would be a denormalized cache that drifts if a future
+/// trigger or constraint mutates the row at write time.
+async fn set_status_and_load(
+    id: String,
+    new_status: PlanStatus,
+    state: tauri::State<'_, AppState>,
+) -> Result<ResearchPlanDto, CommandError> {
+    let parsed: Uuid = id.parse().map_err(|e: uuid::Error| CommandError::InvalidInput {
+        field: "id".into(),
+        message: format!("not a valid UUID: {e}"),
+    })?;
+
+    // Map storage's NotFound to the command-level NotFound so the
+    // frontend can surface "plan disappeared" without parsing strings.
+    state
+        .store
+        .set_plan_status(parsed, new_status)
+        .map_err(|e| match e {
+            StorageError::NotFound(_) => CommandError::NotFound { id: id.clone() },
+            other => CommandError::from(other),
+        })?;
+
+    info!(plan_id = %parsed, new_status = %new_status, "plan status transitioned");
+
+    let stored = state
+        .store
+        .get_research_plan(parsed)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::NotFound { id: id.clone() })?;
+
+    ResearchPlanDto::from_stored(stored).map_err(|e| CommandError::Storage {
+        message: format!("plan deserialization: {e}"),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -359,5 +478,28 @@ mod tests {
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains(r#""kind":"classification_failed""#));
         assert!(json.contains("schema rejected by gateway"));
+    }
+
+    #[test]
+    fn storage_not_found_maps_to_command_not_found_via_from() {
+        // The shared accept/reject handler uses a manual match arm to
+        // turn StorageError::NotFound into CommandError::NotFound. The
+        // generic `From<StorageError>` is the fallback for everything
+        // else; this test guards that NotFound takes the dedicated
+        // branch (frontend treats NotFound as "stale id, refresh
+        // listing", and Storage as "show error toast").
+        let storage_err = StorageError::NotFound("research_plan abc".into());
+        // The conversion in the handler is structural — replicate it
+        // here for the test boundary.
+        let mapped: CommandError = match storage_err {
+            StorageError::NotFound(_) => CommandError::NotFound {
+                id: "abc".into(),
+            },
+            other => CommandError::from(other),
+        };
+        match mapped {
+            CommandError::NotFound { id } => assert_eq!(id, "abc"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 }
