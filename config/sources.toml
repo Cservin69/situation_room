@@ -167,3 +167,18 @@ source for substantive topics — its role is to keep the fetch path
 honest end-to-end.
 """
 authoritative_for = []
+
+[[source]]
+id = "json_demo"
+display_name = "JSON Demo"
+description = """
+A small public JSON document exposing a scalar value at a known
+path. Used by Stockpile's Phase-6 fetch executor as a deterministic
+demo source for the JSON-path extraction mode (Session 9): the
+recipe author picks a JSONPath expression, the runtime fetches the
+document, applies the recipe, and produces one observation. Not
+appropriate as an authoritative source for substantive topics — its
+role is to keep the JSON fetch path honest end-to-end alongside the
+CSV demo.
+"""
+authoritative_for = []

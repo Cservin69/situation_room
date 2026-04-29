@@ -24,7 +24,8 @@
 //!
 //! ## Extraction-mode policy in this session
 //!
-//! Only [`ExtractionSpec::CsvCell`] is wired through to apply +
+//! [`ExtractionSpec::CsvCell`] and [`ExtractionSpec::JsonPath`] are
+//! wired through to apply +
 //! insert. The other modes get authored normally (Level-2 picks
 //! whatever fits the source) and are surfaced in the report as
 //! `Skipped { reason }` rather than failures — they're not bugs,
@@ -448,7 +449,9 @@ async fn author_one(
 }
 
 /// Run one recipe end-to-end. Pure dispatch on the extraction mode
-/// — Session 8 only enables CSV, the rest report as Skipped.
+/// — Session 8 wired CSV; Session 9 added JSON. The remaining modes
+/// (CssSelect, PdfTable, RegexCapture) are still reported as
+/// `Skipped` until they're promoted in their own session.
 async fn run_one_recipe(
     ctx: &ExecutorContext<'_>,
     plan: &ResearchPlan,
@@ -456,11 +459,7 @@ async fn run_one_recipe(
 ) -> RecipeOutcome {
     match &recipe.extraction {
         ExtractionSpec::CsvCell { .. } => run_csv_recipe(ctx, plan, recipe).await,
-        ExtractionSpec::JsonPath { .. } => RecipeOutcome::Skipped {
-            recipe_id: recipe.id,
-            source_id: recipe.source_id.clone(),
-            reason: "json_path: extraction mode not yet enabled in executor".into(),
-        },
+        ExtractionSpec::JsonPath { .. } => run_json_recipe(ctx, plan, recipe).await,
         ExtractionSpec::CssSelect { .. } => RecipeOutcome::Skipped {
             recipe_id: recipe.id,
             source_id: recipe.source_id.clone(),
@@ -550,6 +549,86 @@ fn describe_apply_error(e: &ApplyError) -> String {
     // The apply error's Display already names the stage; including
     // the Debug form would just duplicate. Display is enough.
     e.to_string()
+}
+
+/// JSON runtime path: fetch → apply → insert.
+///
+/// Structurally identical to [`run_csv_recipe`] — both go through the
+/// same `apply()` boundary, which dispatches internally on the recipe's
+/// `ExtractionSpec`. The two functions exist as separate dispatch
+/// targets because (a) it keeps `run_one_recipe` honest about which
+/// modes are wired, and (b) when the modes start to diverge in
+/// behaviour (e.g. JSON gaining streamed parsing, CSV gaining row-set
+/// extraction), the split lets each path evolve without a
+/// flag-soup-inside-one-function. If you find yourself collapsing
+/// these into one helper, first ask whether the dispatch contract
+/// from `run_one_recipe` would still be readable — Session 9 chose
+/// duplication-with-comments over premature unification.
+async fn run_json_recipe(
+    ctx: &ExecutorContext<'_>,
+    plan: &ResearchPlan,
+    recipe: &FetchRecipe,
+) -> RecipeOutcome {
+    // Fetch.
+    let bytes = match ctx.http.fetch_bytes(recipe.source_url.as_str()).await {
+        Ok(b) => b,
+        Err(HttpFetchError::Http(msg)) => {
+            return RecipeOutcome::Failed {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                stage: FailureStage::Fetch,
+                message: msg,
+            }
+        }
+        Err(HttpFetchError::NoFixture(url)) => {
+            return RecipeOutcome::Failed {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                stage: FailureStage::Fetch,
+                message: format!("no fixture configured for url: {url}"),
+            }
+        }
+    };
+
+    // Apply.
+    let fetched_at = Utc::now();
+    let apply_ctx = ApplyContext {
+        recipe,
+        plan,
+        bytes: &bytes,
+        fetched_at,
+    };
+    let records = match apply(apply_ctx) {
+        Ok(rs) => rs,
+        Err(e) => {
+            return RecipeOutcome::Failed {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                stage: FailureStage::Apply,
+                message: describe_apply_error(&e),
+            }
+        }
+    };
+
+    // Insert. A failure to insert any one record fails the recipe —
+    // we don't half-write a recipe's batch. Same discipline as the
+    // CSV path.
+    for record in &records {
+        if let Err(e) = ctx.store.insert_record(record) {
+            return RecipeOutcome::Failed {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                stage: FailureStage::Insert,
+                message: e.to_string(),
+            };
+        }
+    }
+
+    RecipeOutcome::Succeeded {
+        recipe_id: recipe.id,
+        source_id: recipe.source_id.clone(),
+        records_produced: records.len() as u32,
+    }
 }
 
 /// Close a fetch_run row with an error_summary populated. Used when
@@ -643,6 +722,54 @@ mod tests {
                     column: "country".into(),
                     value: "Chile".into(),
                 }),
+            },
+            produces: vec![ProductionBinding {
+                record_type: RecordType::Observation,
+                expectation: ExpectationRef::ObservationMetric { index: 0 },
+                field_mappings: vec![
+                    FieldMap {
+                        path: "value".into(),
+                        source: FieldValueSource::Extracted,
+                    },
+                    FieldMap {
+                        path: "unit".into(),
+                        source: FieldValueSource::Literal { value: json!("t") },
+                    },
+                    FieldMap {
+                        path: "metric".into(),
+                        source: FieldValueSource::FromPlan {
+                            pointer: "expectations.observation_metrics.0.name".into(),
+                        },
+                    },
+                    FieldMap {
+                        path: "period".into(),
+                        source: FieldValueSource::Literal {
+                            value: json!("annual"),
+                        },
+                    },
+                ],
+            }],
+            authored_at: Utc.with_ymd_and_hms(2026, 4, 28, 0, 0, 0).unwrap(),
+            authored_by: "test".into(),
+            version: 1,
+        }
+    }
+
+    /// Working JSON recipe — pre-authored, persisted, exercises the
+    /// JSON happy-path runtime. Mirrors `working_csv_recipe` in
+    /// shape; only `extraction` differs. The `produces` binding is
+    /// identical because both extractors produce a single scalar
+    /// string that flows through the same field-mapping discipline
+    /// in `apply()`.
+    fn working_json_recipe(plan: &ResearchPlan, url: &str) -> FetchRecipe {
+        FetchRecipe {
+            id: Uuid::now_v7(),
+            dedup_key: Some(format!("{}:demo_json", plan.id)),
+            plan_id: plan.id,
+            source_id: "demo_json".into(),
+            source_url: Url::parse(url).unwrap(),
+            extraction: ExtractionSpec::JsonPath {
+                path: "$.data.production.chile".into(),
             },
             produces: vec![ProductionBinding {
                 record_type: RecordType::Observation,
@@ -854,24 +981,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_fetch_for_plan_skips_non_csv_extraction_modes() {
+    async fn run_fetch_for_plan_succeeds_against_json_recipe_without_calling_llm() {
         let plan = sample_plan();
         let store = make_store_with_accepted_plan(&plan);
 
-        let url = "https://example.test/api.json";
-        let mut json_recipe = working_csv_recipe(&plan, url);
-        json_recipe.id = Uuid::now_v7();
-        json_recipe.dedup_key = Some(format!("{}:demo_csv:json", plan.id));
-        json_recipe.extraction = ExtractionSpec::JsonPath {
-            path: "$.data".into(),
+        let url = "https://example.test/lithium.json";
+        let recipe = working_json_recipe(&plan, url);
+        save_recipe(&store, &recipe).unwrap();
+
+        // Mirrors the shape from the recipe_apply JSON path tests:
+        // the path `$.data.production.chile` extracts the scalar
+        // 49000, which flows into the Observation's `value` field.
+        let body = br#"{"data": {"production": {"chile": 49000, "australia": 88000}}}"#;
+        let fetcher = StaticFetcher::new().with(url, body);
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: "unused — recipes already authored",
         };
-        save_recipe(&store, &json_recipe).unwrap();
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        assert_eq!(report.plan_id, plan.id);
+        assert_eq!(report.recipes_attempted, 1);
+        assert_eq!(report.recipes_succeeded, 1);
+        assert_eq!(report.records_produced, 1);
+        assert_eq!(report.outcomes.len(), 1);
+        match &report.outcomes[0] {
+            RecipeOutcome::Succeeded {
+                records_produced, ..
+            } => assert_eq!(*records_produced, 1),
+            other => panic!("expected Succeeded, got {other:?}"),
+        }
+
+        // The fetch_runs row was opened and closed cleanly — same
+        // discipline as the CSV path.
+        let runs = store.recent_fetch_runs_for_plan(plan.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, report.run_id);
+        assert_eq!(runs[0].recipes_attempted, 1);
+        assert_eq!(runs[0].recipes_succeeded, 1);
+        assert_eq!(runs[0].records_produced, 1);
+        assert!(runs[0].finished_at.is_some());
+        assert!(runs[0].error_summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_fetch_for_plan_reports_apply_failure_on_malformed_json() {
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let url = "https://example.test/bad.json";
+        let recipe = working_json_recipe(&plan, url);
+        save_recipe(&store, &recipe).unwrap();
+
+        // Path matches nothing in this body — the JSON extractor
+        // surfaces an `ApplyError::Extraction { mode: "json_path" }`,
+        // which the executor maps to `FailureStage::Apply`.
+        let bad_body = br#"{"unrelated": 1}"#;
+        let fetcher = StaticFetcher::new().with(url, bad_body);
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: "",
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+        assert_eq!(report.recipes_succeeded, 0);
+        match &report.outcomes[0] {
+            RecipeOutcome::Failed { stage, .. } => assert_eq!(*stage, FailureStage::Apply),
+            other => panic!("expected Failed(Apply), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_fetch_for_plan_skips_unwired_extraction_modes() {
+        // Coverage regression: confirms the dispatch arm for a still-
+        // unwired mode (CssSelect, in this case) still emits Skipped
+        // rather than silently going through a wired path. When
+        // CssSelect is promoted in a later session, replace this with
+        // a happy-path test for that mode and pick another unwired
+        // mode here.
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let url = "https://example.test/page.html";
+        let mut css_recipe = working_csv_recipe(&plan, url);
+        css_recipe.id = Uuid::now_v7();
+        css_recipe.dedup_key = Some(format!("{}:demo_css", plan.id));
+        css_recipe.extraction = ExtractionSpec::CssSelect {
+            selector: "td.value".into(),
+            attribute: None,
+        };
+        save_recipe(&store, &css_recipe).unwrap();
 
         // Fixture not strictly necessary — Skipped is decided before
         // fetch — but include it so a regression that *did* attempt
         // fetch wouldn't trip on a missing fixture and look like a
         // test setup bug.
-        let fetcher = StaticFetcher::new().with(url, b"{}");
+        let fetcher = StaticFetcher::new().with(url, b"<html></html>");
 
         let provider = UnreachableProvider;
         let ctx = ExecutorContext {
@@ -1050,6 +1264,117 @@ mod tests {
         );
 
         // The audit row exists and was closed.
+        let runs = store.recent_fetch_runs_for_plan(plan.id, 5).unwrap();
+        assert!(!runs.is_empty());
+        assert!(runs[0].finished_at.is_some(), "fetch_run must be closed");
+    }
+
+    // Live JSON variant. Same structural-only discipline as the CSV
+    // live test: prove the wiring works end-to-end against a real
+    // network endpoint, without asserting on extracted values. The
+    // default URL points at a small, stable public JSON document;
+    // override with FETCH_LIVE_JSON_URL / FETCH_LIVE_JSON_PATH to
+    // target something else.
+    //
+    // The recipe is pre-authored — UnreachableProvider enforces that
+    // the executor must not call the LLM here (ADR 0011 §"LLM-free
+    // runtime invariant").
+    #[tokio::test]
+    #[ignore]
+    async fn live_fetch_against_real_json_produces_observation_and_closes_run() {
+        use stockpile_secure::http::{SecureHttpClient, SecureHttpConfig};
+
+        let _ = dotenvy::dotenv();
+
+        // Default: a stable JSON file in the same datasets/country-list
+        // repo the CSV live test uses. The path `$[0].Code` extracts
+        // the first country code as a single scalar — matches the
+        // shape of working_json_recipe (one extracted scalar per
+        // recipe). Override the env vars if you want to target a
+        // numeric dataset.
+        let url = std::env::var("FETCH_LIVE_JSON_URL").unwrap_or_else(|_| {
+            "https://raw.githubusercontent.com/datasets/country-list/main/data.json".to_string()
+        });
+        let path =
+            std::env::var("FETCH_LIVE_JSON_PATH").unwrap_or_else(|_| "$[0].Code".to_string());
+
+        let http = SecureHttpClient::new(SecureHttpConfig::default()).unwrap();
+
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let recipe = FetchRecipe {
+            id: Uuid::now_v7(),
+            dedup_key: Some(format!("{}:json_demo:live", plan.id)),
+            plan_id: plan.id,
+            source_id: "json_demo".into(),
+            source_url: Url::parse(&url).expect("FETCH_LIVE_JSON_URL must be a valid URL"),
+            extraction: ExtractionSpec::JsonPath { path },
+            produces: vec![ProductionBinding {
+                record_type: RecordType::Observation,
+                expectation: ExpectationRef::ObservationMetric { index: 0 },
+                field_mappings: vec![
+                    FieldMap {
+                        path: "value".into(),
+                        // Same reasoning as the CSV live test: the
+                        // default extracts a non-numeric scalar
+                        // (country code), so we side-step the f64
+                        // coercion by literal-binding `value`. The
+                        // test is about wiring, not extraction
+                        // values; override the env vars to exercise
+                        // the numeric path.
+                        source: FieldValueSource::Literal {
+                            value: serde_json::json!(0.0),
+                        },
+                    },
+                    FieldMap {
+                        path: "unit".into(),
+                        source: FieldValueSource::Literal {
+                            value: serde_json::json!("t"),
+                        },
+                    },
+                    FieldMap {
+                        path: "metric".into(),
+                        source: FieldValueSource::FromPlan {
+                            pointer: "expectations.observation_metrics.0.name".into(),
+                        },
+                    },
+                    FieldMap {
+                        path: "period".into(),
+                        source: FieldValueSource::Literal {
+                            value: serde_json::json!("annual"),
+                        },
+                    },
+                ],
+            }],
+            authored_at: Utc::now(),
+            authored_by: "live_test".into(),
+            version: 1,
+        };
+        save_recipe(&store, &recipe).unwrap();
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &http,
+            provider: &provider,
+            recipe_author_prompt: "unused — recipe pre-authored",
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        // Structural: recipe was attempted; either it succeeded or
+        // surfaced a typed failure stage (Fetch / Apply / Insert).
+        // A Skipped here would mean we accidentally went through a
+        // non-JSON branch — that's a regression.
+        assert_eq!(report.recipes_attempted, 1);
+        assert!(
+            !matches!(report.outcomes[0], RecipeOutcome::Skipped { .. }),
+            "live test should not skip — got: {:?}",
+            report.outcomes[0]
+        );
+
+        // Audit row exists and was closed.
         let runs = store.recent_fetch_runs_for_plan(plan.id, 5).unwrap();
         assert!(!runs.is_empty());
         assert!(runs[0].finished_at.is_some(), "fetch_run must be closed");
