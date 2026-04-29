@@ -16,6 +16,8 @@ import type { ResearchPlanDto } from './types/ResearchPlanDto';
 import type { PlanSummary } from './types/PlanSummary';
 import type { PlanStatusDto } from './types/PlanStatusDto';
 import type { CommandErrorDto } from './types/CommandErrorDto';
+import type { FetchReportDto } from './types/FetchReportDto';
+import type { FetchRunSummaryDto } from './types/FetchRunSummaryDto';
 
 /**
  * Run Level-1 classification on a topic. Persists the resulting plan
@@ -71,6 +73,36 @@ export async function acceptPlan(id: string): Promise<ResearchPlanDto> {
  */
 export async function rejectPlan(id: string): Promise<ResearchPlanDto> {
   return invoke<ResearchPlanDto>('reject_plan', { id });
+}
+
+/**
+ * Run the Phase-6 fetch executor against an accepted plan. One
+ * synchronous call from the user's perspective: the executor loads
+ * (and Level-2-authors, if needed) recipes, fetches each source,
+ * applies the recipe deterministically, and writes records.
+ *
+ * Returns a {@link FetchReportDto} summarising what happened. Per-
+ * recipe failures live inside the report's `outcomes` array; only
+ * wholesale failures (plan not accepted, plan vanished, authoring
+ * blew up entirely) come back as thrown {@link CommandErrorDto}.
+ *
+ * Throws `{ kind: 'invalid_input' }` if the plan isn't in the
+ * `accepted` state.
+ */
+export async function runFetchForPlan(id: string): Promise<FetchReportDto> {
+  return invoke<FetchReportDto>('run_fetch_for_plan', { id });
+}
+
+/**
+ * List the most recent fetch runs for a plan, newest first. Pure
+ * read; safe to invoke whenever the review pane needs to refresh
+ * its history strip. The backend clamps `limit` to a sane range.
+ */
+export async function listFetchRuns(
+  planId: string,
+  limit = 10,
+): Promise<FetchRunSummaryDto[]> {
+  return invoke<FetchRunSummaryDto[]>('list_fetch_runs', { planId, limit });
 }
 
 /**

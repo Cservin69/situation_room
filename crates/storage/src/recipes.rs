@@ -150,6 +150,45 @@ impl Store {
             .map_err(StorageError::DuckDb)?;
         Ok(count as u64)
     }
+
+    /// List every recipe authored against a given plan, newest first.
+    ///
+    /// The fetch executor's primary read path: "given an accepted
+    /// plan, what recipes do I run?" — answered in one indexed query.
+    /// Uses the `(plan_id, source_id)` index from migration v3 for
+    /// the WHERE clause; the ORDER BY is on `authored_at` because
+    /// when the same `(plan_id, source_id)` has multiple versions
+    /// (re-authoring), the newest is the one we want.
+    ///
+    /// Iteration is manual rather than `query_map` for the same
+    /// reason `recent_research_plans_by_status` does it manually:
+    /// the row-mapper returns `crate::Result`, and `query_map`'s
+    /// closure must return `duckdb::Result`. Here the row mapper
+    /// is infallible at the column level, but the cast pattern is
+    /// kept to match the rest of the storage crate.
+    pub fn recipes_for_plan(&self, plan_id: Uuid) -> Result<Vec<StoredRecipe>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Other(format!("connection poisoned: {e}")))?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, dedup_key, plan_id, source_id, source_url,
+                        extraction, produces, authored_at, authored_by, version
+                 FROM recipes
+                 WHERE plan_id = ?
+                 ORDER BY authored_at DESC, version DESC",
+            )
+            .map_err(StorageError::DuckDb)?;
+
+        let mut rows = stmt.query(params![plan_id]).map_err(StorageError::DuckDb)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
+            out.push(row_to_stored(row)?);
+        }
+        Ok(out)
+    }
 }
 
 fn row_to_stored(row: &duckdb::Row<'_>) -> Result<StoredRecipe> {
@@ -253,5 +292,49 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.migrate().unwrap();
         assert_eq!(store.count_recipes().unwrap(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Session 8 — recipes_for_plan
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn recipes_for_plan_returns_only_matching_plan() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_a = Uuid::now_v7();
+        let plan_b = Uuid::now_v7();
+
+        let mut a1 = sample_row(Uuid::now_v7());
+        a1.plan_id = plan_a;
+        a1.dedup_key = Some("a1".into());
+        store.insert_recipe(&a1).unwrap();
+
+        let mut a2 = sample_row(Uuid::now_v7());
+        a2.plan_id = plan_a;
+        a2.dedup_key = Some("a2".into());
+        store.insert_recipe(&a2).unwrap();
+
+        let mut b1 = sample_row(Uuid::now_v7());
+        b1.plan_id = plan_b;
+        b1.dedup_key = Some("b1".into());
+        store.insert_recipe(&b1).unwrap();
+
+        let for_a = store.recipes_for_plan(plan_a).unwrap();
+        assert_eq!(for_a.len(), 2);
+        assert!(for_a.iter().all(|r| r.plan_id == plan_a));
+
+        let for_b = store.recipes_for_plan(plan_b).unwrap();
+        assert_eq!(for_b.len(), 1);
+        assert_eq!(for_b[0].plan_id, plan_b);
+    }
+
+    #[test]
+    fn recipes_for_plan_returns_empty_when_no_recipes_yet() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let recipes = store.recipes_for_plan(Uuid::now_v7()).unwrap();
+        assert!(recipes.is_empty());
     }
 }

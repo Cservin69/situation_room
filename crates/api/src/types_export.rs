@@ -259,6 +259,11 @@ pub enum CommandErrorDto {
     ClassificationFailed { message: String },
     Storage { message: String },
     NotFound { id: String },
+    FetchFailed {
+        recipes_attempted: u32,
+        recipes_succeeded: u32,
+        message: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +424,168 @@ impl From<DocumentSourceHint> for DocumentSourceHintDto {
         Self {
             description: h.description,
             preferred_source_ids: h.preferred_source_ids,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fetch executor DTOs (Session 8)
+// ---------------------------------------------------------------------------
+
+/// Wire shape for one fetch run's outcome. Mirrors
+/// [`stockpile_pipeline::fetch_executor::FetchReport`] one-for-one.
+///
+/// Returned synchronously by the `run_fetch_for_plan` command. The
+/// frontend renders it in the review pane so the user sees, in one
+/// place, what each recipe produced.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct FetchReportDto {
+    pub plan_id: String,
+    pub run_id: String,
+    pub outcomes: Vec<RecipeOutcomeDto>,
+    pub recipes_attempted: u32,
+    pub recipes_succeeded: u32,
+    pub records_produced: u32,
+    pub error_summary: Option<String>,
+}
+
+/// One per-recipe outcome on the wire. Discriminated union with the
+/// same shape as the Rust enum — the frontend pattern-matches on
+/// `kind`.
+///
+/// The discriminator naming follows the codebase's existing `kind`
+/// convention (see `CommandErrorDto`). Adding a new outcome variant
+/// is an additive change; the frontend's `kind` switch must add the
+/// new arm or the type-checker will flag the missing case.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecipeOutcomeDto {
+    Succeeded {
+        recipe_id: String,
+        source_id: String,
+        records_produced: u32,
+    },
+    Skipped {
+        recipe_id: String,
+        source_id: String,
+        reason: String,
+    },
+    Failed {
+        recipe_id: String,
+        source_id: String,
+        stage: FailureStageDto,
+        message: String,
+    },
+}
+
+/// Per-failure stage on the wire. Mirrors
+/// [`stockpile_pipeline::fetch_executor::FailureStage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+#[serde(rename_all = "snake_case")]
+pub enum FailureStageDto {
+    Fetch,
+    Apply,
+    Insert,
+}
+
+/// Summary row for the fetch-runs list.
+///
+/// `started_at` and `finished_at` are full timestamps; the frontend
+/// formats them locally. `finished_at` of `None` means the run is
+/// still in flight (or — in the corner case where closing the row
+/// failed — the final write was lost; the next session's UI may want
+/// to surface that state distinctly, but for now an open-looking row
+/// is treated as in-flight).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct FetchRunSummaryDto {
+    pub id: String,
+    pub plan_id: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub recipes_attempted: u32,
+    pub recipes_succeeded: u32,
+    pub records_produced: u32,
+    pub error_summary: Option<String>,
+}
+
+impl FetchReportDto {
+    /// Lift a typed `FetchReport` into the wire shape.
+    pub fn from_typed(r: stockpile_pipeline::fetch_executor::FetchReport) -> Self {
+        Self {
+            plan_id: r.plan_id.to_string(),
+            run_id: r.run_id.to_string(),
+            outcomes: r.outcomes.into_iter().map(RecipeOutcomeDto::from).collect(),
+            recipes_attempted: r.recipes_attempted,
+            recipes_succeeded: r.recipes_succeeded,
+            records_produced: r.records_produced,
+            error_summary: r.error_summary,
+        }
+    }
+}
+
+impl From<stockpile_pipeline::fetch_executor::RecipeOutcome> for RecipeOutcomeDto {
+    fn from(o: stockpile_pipeline::fetch_executor::RecipeOutcome) -> Self {
+        use stockpile_pipeline::fetch_executor::RecipeOutcome as O;
+        match o {
+            O::Succeeded {
+                recipe_id,
+                source_id,
+                records_produced,
+            } => RecipeOutcomeDto::Succeeded {
+                recipe_id: recipe_id.to_string(),
+                source_id,
+                records_produced,
+            },
+            O::Skipped {
+                recipe_id,
+                source_id,
+                reason,
+            } => RecipeOutcomeDto::Skipped {
+                recipe_id: recipe_id.to_string(),
+                source_id,
+                reason,
+            },
+            O::Failed {
+                recipe_id,
+                source_id,
+                stage,
+                message,
+            } => RecipeOutcomeDto::Failed {
+                recipe_id: recipe_id.to_string(),
+                source_id,
+                stage: stage.into(),
+                message,
+            },
+        }
+    }
+}
+
+impl From<stockpile_pipeline::fetch_executor::FailureStage> for FailureStageDto {
+    fn from(s: stockpile_pipeline::fetch_executor::FailureStage) -> Self {
+        use stockpile_pipeline::fetch_executor::FailureStage as S;
+        match s {
+            S::Fetch => FailureStageDto::Fetch,
+            S::Apply => FailureStageDto::Apply,
+            S::Insert => FailureStageDto::Insert,
+        }
+    }
+}
+
+impl FetchRunSummaryDto {
+    pub fn from_stored(r: stockpile_storage::StoredFetchRun) -> Self {
+        Self {
+            id: r.id.to_string(),
+            plan_id: r.plan_id.to_string(),
+            started_at: r.started_at,
+            finished_at: r.finished_at,
+            recipes_attempted: r.recipes_attempted,
+            recipes_succeeded: r.recipes_succeeded,
+            records_produced: r.records_produced,
+            error_summary: r.error_summary,
         }
     }
 }
@@ -631,5 +798,89 @@ mod tests {
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains(r#""kind":"invalid_input""#));
+    }
+
+    // -----------------------------------------------------------------
+    // Session 8 — fetch executor DTOs
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn recipe_outcome_dto_serializes_with_kind_tag_per_variant() {
+        let succeeded = RecipeOutcomeDto::Succeeded {
+            recipe_id: "id".into(),
+            source_id: "demo_csv".into(),
+            records_produced: 1,
+        };
+        let json = serde_json::to_string(&succeeded).unwrap();
+        assert!(json.contains(r#""kind":"succeeded""#), "got {json}");
+
+        let skipped = RecipeOutcomeDto::Skipped {
+            recipe_id: "id".into(),
+            source_id: "demo_csv".into(),
+            reason: "json_path: not yet enabled".into(),
+        };
+        let json = serde_json::to_string(&skipped).unwrap();
+        assert!(json.contains(r#""kind":"skipped""#), "got {json}");
+
+        let failed = RecipeOutcomeDto::Failed {
+            recipe_id: "id".into(),
+            source_id: "demo_csv".into(),
+            stage: FailureStageDto::Fetch,
+            message: "404".into(),
+        };
+        let json = serde_json::to_string(&failed).unwrap();
+        assert!(json.contains(r#""kind":"failed""#), "got {json}");
+        assert!(json.contains(r#""stage":"fetch""#), "got {json}");
+    }
+
+    #[test]
+    fn fetch_report_dto_round_trips_from_typed() {
+        use stockpile_pipeline::fetch_executor::{FetchReport, RecipeOutcome};
+        let plan_id = uuid::Uuid::now_v7();
+        let run_id = uuid::Uuid::now_v7();
+        let recipe_id = uuid::Uuid::now_v7();
+        let report = FetchReport {
+            plan_id,
+            run_id,
+            outcomes: vec![RecipeOutcome::Succeeded {
+                recipe_id,
+                source_id: "demo_csv".into(),
+                records_produced: 1,
+            }],
+            recipes_attempted: 1,
+            recipes_succeeded: 1,
+            records_produced: 1,
+            error_summary: None,
+        };
+        let dto = FetchReportDto::from_typed(report);
+        assert_eq!(dto.plan_id, plan_id.to_string());
+        assert_eq!(dto.run_id, run_id.to_string());
+        assert_eq!(dto.recipes_succeeded, 1);
+        assert_eq!(dto.outcomes.len(), 1);
+        match &dto.outcomes[0] {
+            RecipeOutcomeDto::Succeeded {
+                records_produced, ..
+            } => assert_eq!(*records_produced, 1),
+            other => panic!("expected Succeeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_run_summary_dto_round_trips_from_stored() {
+        use chrono::TimeZone;
+        let stored = stockpile_storage::StoredFetchRun {
+            id: uuid::Uuid::now_v7(),
+            plan_id: uuid::Uuid::now_v7(),
+            started_at: chrono::Utc.with_ymd_and_hms(2026, 4, 28, 10, 0, 0).unwrap(),
+            finished_at: Some(chrono::Utc.with_ymd_and_hms(2026, 4, 28, 10, 0, 5).unwrap()),
+            recipes_attempted: 2,
+            recipes_succeeded: 1,
+            records_produced: 1,
+            error_summary: None,
+        };
+        let dto = FetchRunSummaryDto::from_stored(stored.clone());
+        assert_eq!(dto.id, stored.id.to_string());
+        assert_eq!(dto.recipes_attempted, 2);
+        assert!(dto.finished_at.is_some());
     }
 }

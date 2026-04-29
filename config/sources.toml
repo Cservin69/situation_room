@@ -140,3 +140,30 @@ source for the topic (specialist trade press, regulator press
 rooms, etc.). Specific feed URLs are configured separately.
 """
 authoritative_for = []
+
+# ---- Demo / smoke-test source (Session 8) ------------------------------
+#
+# A trivial CSV-shaped source the fetch executor can author against
+# in development without needing access to a real API. The id is
+# stable so the live `#[ignore]` test in the pipeline crate can
+# refer to it deterministically; the description nudges the
+# Level-2 author toward a single observation/value extraction.
+#
+# Not authoritative for any topic — the classifier should rarely
+# nominate this source on its own merits, but a topic that happens
+# to be a good fit (a small numeric quantity by country, year, or
+# similar) will produce a legible recipe against it.
+
+[[source]]
+id = "csv_demo"
+display_name = "CSV Demo"
+description = """
+A small public CSV file exposing a single numeric measurement by
+named row. Used by Stockpile's Phase-6 fetch executor as a
+deterministic demo source: the recipe author picks a column and a
+row filter, the runtime fetches the CSV, applies the recipe, and
+produces one observation. Not appropriate as an authoritative
+source for substantive topics — its role is to keep the fetch path
+honest end-to-end.
+"""
+authoritative_for = []

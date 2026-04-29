@@ -37,6 +37,17 @@ use tracing::{info, warn};
 const CLASSIFIER_PROMPT: &str =
     include_str!("../../../../config/prompts/research_classifier.md");
 
+/// The production recipe-author prompt. Embedded the same way as the
+/// classifier prompt — single source of truth at the workspace
+/// `config/prompts/` location, included at compile time so the
+/// binary doesn't need filesystem discovery.
+///
+/// Used by the fetch executor's Level-2 authoring step (Session 8).
+/// ADR 0007: this is the *only* LLM call in the runtime path, and
+/// it runs once per (plan, source) pair — never on refresh.
+const RECIPE_AUTHOR_PROMPT: &str =
+    include_str!("../../../../config/prompts/recipe_author.md");
+
 fn main() -> Result<()> {
     // .env is a dev convenience; the real environment always wins.
     // Walks up from CWD to find .env at the workspace root and
@@ -71,10 +82,16 @@ fn main() -> Result<()> {
 
     // --- LLM provider ------------------------------------------------
     //
-    // Single SecureHttpClient instance shared by the provider — no
-    // fresh `reqwest::Client::new()` anywhere. ADR 0009 §"The rule".
+    // Single SecureHttpClient instance shared by the provider AND by
+    // the fetch executor's source-fetch path — no fresh
+    // `reqwest::Client::new()` anywhere. ADR 0009 §"The rule".
+    //
+    // We hold the client in an Arc and hand the provider a Clone
+    // (SecureHttpClient is internally Arc-wrapped, so Clone shares
+    // the underlying connection pool — what we want).
     let http = SecureHttpClient::new(SecureHttpConfig::default())
         .context("building secure http client")?;
+    let http_arc = Arc::new(http.clone());
     let provider = XaiProvider::from_env(http).context(
         "XAI_API_KEY not found — set it in the environment or in a .env file at the workspace root",
     )?;
@@ -91,7 +108,14 @@ fn main() -> Result<()> {
     info!(count = sources.len(), "registered source descriptors loaded");
 
     // --- AppState ----------------------------------------------------
-    let state = AppState::new(store, provider, CLASSIFIER_PROMPT, sources);
+    let state = AppState::new(
+        store,
+        provider,
+        http_arc,
+        CLASSIFIER_PROMPT,
+        RECIPE_AUTHOR_PROMPT,
+        sources,
+    );
 
     // --- Tauri -------------------------------------------------------
     //
@@ -117,7 +141,9 @@ fn main() -> Result<()> {
             stockpile_api::commands::list_recent_plans,
             stockpile_api::commands::get_plan,
             stockpile_api::commands::accept_plan,
-            stockpile_api::commands::reject_plan
+            stockpile_api::commands::reject_plan,
+            stockpile_api::commands::run_fetch_for_plan,
+            stockpile_api::commands::list_fetch_runs
         ])
         .run(tauri::generate_context!())
         .context("running tauri")?;

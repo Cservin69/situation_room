@@ -47,19 +47,26 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use stockpile_llm::{ModelTier, XaiProvider};
+use stockpile_pipeline::fetch_executor::{
+    run_fetch_for_plan as run_fetch_for_plan_impl, ExecutorContext, FetchExecutorError,
+};
 use stockpile_pipeline::research_classifier::{
     classify_topic, ClassificationContext, ClassificationError,
     SourceDescriptor as PipelineSourceDescriptor, TopicUsage as ClassifierTopicUsage,
 };
 use stockpile_pipeline::research_plans_store::{save_research_plan, ResearchPlanStoreError};
 use stockpile_secure::bounds::{check_string, Bounds};
+use stockpile_secure::http::SecureHttpClient;
 use stockpile_storage::research_plans::PlanStatus;
 use stockpile_storage::{Store, StorageError};
 use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::types_export::{PlanStatusDto, PlanSummary, ResearchPlanDto, SourceDescriptorDto};
+use crate::types_export::{
+    FetchReportDto, FetchRunSummaryDto, PlanStatusDto, PlanSummary, ResearchPlanDto,
+    SourceDescriptorDto,
+};
 
 // ---------------------------------------------------------------------------
 // AppState — injected by the Tauri builder, shared across commands
@@ -73,9 +80,15 @@ use crate::types_export::{PlanStatusDto, PlanSummary, ResearchPlanDto, SourceDes
 /// - the DuckDB [`Store`] (already thread-safe internally),
 /// - the LLM provider (a concrete [`XaiProvider`] today; if/when we
 ///   support more providers, lift to a trait object),
+/// - a shared [`SecureHttpClient`] used both for LLM calls (inside
+///   the provider) and for the fetch executor's source fetches —
+///   one client, ADR 0009 §"The rule",
 /// - the classifier prompt template (loaded from the workspace at
 ///   compile time via `include_str!` in the binary, then handed in
 ///   here so this crate stays filesystem-agnostic),
+/// - the recipe-author prompt template (same loading pattern; used
+///   by the fetch executor's Level-2 authoring step when a plan has
+///   no recipes yet),
 /// - the registered source descriptors (loaded from
 ///   `config/sources.toml` in the binary).
 ///
@@ -85,23 +98,33 @@ use crate::types_export::{PlanStatusDto, PlanSummary, ResearchPlanDto, SourceDes
 pub struct AppState {
     pub store: Arc<Store>,
     pub provider: Arc<XaiProvider>,
+    pub http: Arc<SecureHttpClient>,
     pub classifier_prompt: &'static str,
+    pub recipe_author_prompt: &'static str,
     pub sources: Vec<PipelineSourceDescriptor>,
 }
 
 impl AppState {
     pub const TOPICS_INJECTION_LIMIT: usize = 30;
+    /// How many recent fetch runs the listing endpoint will surface
+    /// for one plan. Bounds the IPC payload regardless of what the
+    /// frontend asks for.
+    pub const MAX_FETCH_RUNS_LISTING: usize = 50;
 
     pub fn new(
         store: Arc<Store>,
         provider: Arc<XaiProvider>,
+        http: Arc<SecureHttpClient>,
         classifier_prompt: &'static str,
+        recipe_author_prompt: &'static str,
         sources: Vec<PipelineSourceDescriptor>,
     ) -> Self {
         Self {
             store,
             provider,
+            http,
             classifier_prompt,
+            recipe_author_prompt,
             sources,
         }
     }
@@ -137,6 +160,17 @@ pub enum CommandError {
     /// not "show error toast".
     #[error("plan {id} not found")]
     NotFound { id: String },
+
+    /// The fetch executor failed before completing a run, or the
+    /// run's preconditions weren't met (e.g. the plan isn't accepted).
+    /// Per-recipe failures don't surface here — they live inside the
+    /// `FetchReportDto` returned on the success path.
+    #[error("fetch failed: {message}")]
+    FetchFailed {
+        recipes_attempted: u32,
+        recipes_succeeded: u32,
+        message: String,
+    },
 }
 
 impl From<ClassificationError> for CommandError {
@@ -164,6 +198,39 @@ impl From<ResearchPlanStoreError> for CommandError {
     fn from(e: ResearchPlanStoreError) -> Self {
         CommandError::Storage {
             message: e.to_string(),
+        }
+    }
+}
+
+impl From<FetchExecutorError> for CommandError {
+    fn from(e: FetchExecutorError) -> Self {
+        match e {
+            FetchExecutorError::PlanNotFound(id) => CommandError::NotFound {
+                id: id.to_string(),
+            },
+            FetchExecutorError::PlanNotAccepted { current } => CommandError::InvalidInput {
+                field: "id".into(),
+                // The message names the *source of the problem* —
+                // the plan isn't accepted — rather than dressing up
+                // the input as malformed. The handoff calls this
+                // out: `InvalidInput` reads odd here but is honest
+                // about the source of the problem.
+                message: format!(
+                    "plan must be accepted before fetch (current: {current})"
+                ),
+            },
+            FetchExecutorError::Storage(s) => CommandError::Storage {
+                message: s.to_string(),
+            },
+            FetchExecutorError::PlanLoad(_)
+            | FetchExecutorError::RecipeLoad(_)
+            | FetchExecutorError::Authoring(_) => CommandError::FetchFailed {
+                // Wholesale failures haven't started attempting any
+                // recipes yet; surface zeros to make that explicit.
+                recipes_attempted: 0,
+                recipes_succeeded: 0,
+                message: e.to_string(),
+            },
         }
     }
 }
@@ -421,6 +488,93 @@ async fn set_status_and_load(
     ResearchPlanDto::from_stored(stored).map_err(|e| CommandError::Storage {
         message: format!("plan deserialization: {e}"),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Command 6 — run_fetch_for_plan (Session 8)
+// ---------------------------------------------------------------------------
+
+/// Execute the Phase-6 fetch executor against an accepted plan.
+///
+/// One synchronous call from the user's perspective: the executor
+/// loads-or-authors recipes, fetches, applies, inserts records, and
+/// returns a [`FetchReportDto`] summarising what happened.
+///
+/// Validation:
+/// - `id` must parse as a UUID (`InvalidInput` otherwise).
+/// - The named plan must exist and be in the `accepted` state. A
+///   pending or rejected plan returns `InvalidInput` — see the
+///   `From<FetchExecutorError>` impl for the exact mapping.
+///
+/// The LLM is involved only inside the executor's authoring step,
+/// which itself only runs if no recipes exist yet for the plan. ADR
+/// 0007 §"runtime path": once recipes exist, the runtime is
+/// LLM-free.
+#[tauri::command]
+pub async fn run_fetch_for_plan(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<FetchReportDto, CommandError> {
+    let parsed: Uuid = id.parse().map_err(|e: uuid::Error| CommandError::InvalidInput {
+        field: "id".into(),
+        message: format!("not a valid UUID: {e}"),
+    })?;
+
+    info!(plan_id = %parsed, "run_fetch_for_plan command invoked");
+
+    let ctx = ExecutorContext {
+        store: state.store.as_ref(),
+        http: state.http.as_ref(),
+        provider: state.provider.as_ref(),
+        recipe_author_prompt: state.recipe_author_prompt,
+    };
+
+    let report = run_fetch_for_plan_impl(&ctx, parsed)
+        .await
+        .map_err(CommandError::from)?;
+
+    info!(
+        plan_id = %parsed,
+        run_id = %report.run_id,
+        attempted = report.recipes_attempted,
+        succeeded = report.recipes_succeeded,
+        records = report.records_produced,
+        "fetch run returned"
+    );
+
+    Ok(FetchReportDto::from_typed(report))
+}
+
+// ---------------------------------------------------------------------------
+// Command 7 — list_fetch_runs (Session 8)
+// ---------------------------------------------------------------------------
+
+/// List the most recent fetch runs for a plan, newest first. Pure
+/// read; no LLM call, no fetch.
+///
+/// `limit` is clamped to a sane range — the executor only writes a
+/// few runs per session and the listing is for at-a-glance
+/// "did I already fetch this and what happened?" context.
+#[tauri::command]
+pub async fn list_fetch_runs(
+    plan_id: String,
+    limit: usize,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<FetchRunSummaryDto>, CommandError> {
+    let parsed: Uuid = plan_id
+        .parse()
+        .map_err(|e: uuid::Error| CommandError::InvalidInput {
+            field: "plan_id".into(),
+            message: format!("not a valid UUID: {e}"),
+        })?;
+    let clamped = limit.clamp(1, AppState::MAX_FETCH_RUNS_LISTING);
+
+    let stored = state
+        .store
+        .recent_fetch_runs_for_plan(parsed, clamped)
+        .map_err(CommandError::from)?;
+
+    Ok(stored.into_iter().map(FetchRunSummaryDto::from_stored).collect())
 }
 
 // ---------------------------------------------------------------------------

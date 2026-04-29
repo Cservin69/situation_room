@@ -31,6 +31,8 @@
   import StatusPill from '$components/common/StatusPill.svelte';
   import Bucket from '$components/panels/Bucket.svelte';
   import ExpectationRow from '$components/panels/ExpectationRow.svelte';
+  import RunFetchButton from '$components/RunFetchButton.svelte';
+  import FetchReport from '$components/FetchReport.svelte';
 
   interface Props {
     plan: ResearchPlanDto;
@@ -80,6 +82,7 @@
         </button>
       {:else}
         <StatusPill status={plan.status} />
+        <RunFetchButton />
       {/if}
     </div>
     <div class="meta">
@@ -170,6 +173,13 @@
       {/if}
     </Bucket>
   </section>
+
+  <!-- Fetch report (Session 8). Renders only when the user has run a
+       fetch, or when the history strip has prior runs to show. The
+       component renders nothing when both are empty. -->
+  {#if plans.fetchReport || plans.fetchRuns.length > 0}
+    <FetchReport />
+  {/if}
 </article>
 
 <style>

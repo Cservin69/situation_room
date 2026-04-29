@@ -56,6 +56,23 @@ pub fn load_recipe_by_dedup_key(
     stored.map(stored_to_recipe).transpose()
 }
 
+/// Load every recipe authored against a plan, deserialized into
+/// typed [`FetchRecipe`]s. Newest first (matching
+/// [`stockpile_storage::Store::recipes_for_plan`]'s ordering).
+///
+/// Used by the fetch executor to decide whether Level-2 authoring
+/// needs to run for a plan: a non-empty result means recipes already
+/// exist and authoring is skipped (ADR 0007 §"runtime path").
+pub fn load_recipes_for_plan(
+    store: &Store,
+    plan_id: uuid::Uuid,
+) -> Result<Vec<FetchRecipe>, RecipeStoreError> {
+    let stored = store
+        .recipes_for_plan(plan_id)
+        .map_err(RecipeStoreError::Storage)?;
+    stored.into_iter().map(stored_to_recipe).collect()
+}
+
 fn recipe_to_row(r: &FetchRecipe) -> Result<RecipeRow, RecipeStoreError> {
     let extraction_json = serde_json::to_string(&r.extraction)
         .map_err(|e| RecipeStoreError::Serialize(format!("extraction: {e}")))?;

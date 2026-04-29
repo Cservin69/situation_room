@@ -18,6 +18,7 @@ pub mod documents;
 pub mod entities;
 pub mod envelope_io;
 pub mod events;
+pub mod fetch_runs;
 pub mod migrate;
 pub mod observations;
 pub mod queries;
@@ -27,6 +28,7 @@ pub mod relations;
 pub mod research_plans;
 
 pub use connection::Store;
+pub use fetch_runs::{FetchRunRow, StoredFetchRun};
 pub use queries::TopicUsage;
 pub use recipes::{RecipeRow, StoredRecipe};
 pub use research_plans::{PlanStatus, ResearchPlanRow, StoredResearchPlan};
