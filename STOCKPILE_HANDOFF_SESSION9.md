@@ -1,4 +1,4 @@
-# Stockpile Session 9 Handoff
+# situation_room Session 9 Handoff
 
 You are picking up after Session 8. Read this and ADR 0011 first;
 both are authoritative.
@@ -71,16 +71,16 @@ I could not run `cargo` in my sandbox. The patch is mechanically
 checked but not compiler-checked. Before extending it:
 
 1. `cargo check --workspace` — catch any signature drift I missed.
-2. `cargo test --package stockpile-storage` — migration v6 + the
+2. `cargo test --package situation_room-storage` — migration v6 + the
    new `fetch_runs` tests.
-3. `cargo test --package stockpile-pipeline` — five offline
+3. `cargo test --package situation_room-pipeline` — five offline
    `fetch_executor` tests + the unchanged recipe_apply / author
    suites.
-4. `cargo test --package stockpile-api` — DTO round-trips +
+4. `cargo test --package situation_room-api` — DTO round-trips +
    regenerates the TS type files. **Compare against the hand-
    written TS files I shipped**; if ts-rs disagrees with my
    shape, ts-rs is right and I made a mistake — adjust the DTO.
-5. `cargo test --package stockpile-pipeline -- --ignored` (with
+5. `cargo test --package situation_room-pipeline -- --ignored` (with
    network + a stable CSV URL) — the live test.
 
 If any step fails, the offending file is one of:
@@ -145,7 +145,7 @@ regressions in the CSV path without a big surface area increase.
   indexes. Fresh tables in `CREATE TABLE` are fine — read v5's
   comment block.
 - Patch packaging: tar.gz extracted at `~/Downloads/`, copied to
-  `/Users/aben/RustroverProjects/stockpile/`. **No `#`-prefixed
+  `/Users/aben/RustroverProjects/situation_room/`. **No `#`-prefixed
   hashtag comments in copyable shell commands** — they break zsh.
 - One `SecureHttpClient`. Never `reqwest::Client::new()`.
 - Quotes from web search ≤ 15 words and ≤ 1 per source — N/A here

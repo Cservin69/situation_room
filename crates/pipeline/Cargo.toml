@@ -1,20 +1,20 @@
 [package]
-name = "stockpile-pipeline"
+name = "situation_room-pipeline"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Pipeline orchestration for Stockpile: ingest → normalize → extract → promote, plus the research planner."
+description = "Pipeline orchestration for Aituation_room: ingest → normalize → extract → promote, plus the research planner."
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-stockpile-core = { workspace = true }
-stockpile-storage = { workspace = true }
-stockpile-llm = { workspace = true }
-stockpile-secure = { workspace = true }
+situation_room-core = { workspace = true }
+situation_room-storage = { workspace = true }
+situation_room-llm = { workspace = true }
+situation_room-secure = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

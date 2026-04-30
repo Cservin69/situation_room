@@ -28,7 +28,7 @@
 <div class="app">
   <header class="topbar">
     <div class="brand">
-      <span class="name">Stockpile</span>
+      <span class="name">situation_room</span>
       <span class="phase">situation room</span>
     </div>
     <div class="input-wrap">

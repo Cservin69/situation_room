@@ -3,7 +3,7 @@
 //! The runtime executor (`fetch_executor`) needs to fetch URLs but
 //! must remain testable without a real network. This module defines
 //! a single-method trait the executor depends on, and provides a
-//! blanket impl for [`stockpile_secure::http::SecureHttpClient`] so
+//! blanket impl for [`situation_room_secure::http::SecureHttpClient`] so
 //! production callers pass the secure client unchanged.
 //!
 //! ## Why the trait lives here, not in `secure`
@@ -34,7 +34,7 @@
 use async_trait::async_trait;
 use thiserror::Error;
 
-use stockpile_secure::http::{HttpError, SecureHttpClient};
+use situation_room_secure::http::{HttpError, SecureHttpClient};
 
 /// Error raised by an [`HttpFetcher`] implementation.
 #[derive(Debug, Error)]

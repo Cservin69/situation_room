@@ -7,8 +7,8 @@
 //! with a UNIQUE constraint.
 
 use duckdb::params;
-use stockpile_core::vocab::EntityId;
-use stockpile_core::Entity;
+use situation_room_core::vocab::EntityId;
+use situation_room_core::Entity;
 use uuid::Uuid;
 
 use crate::connection::Store;
@@ -161,8 +161,8 @@ impl Store {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use stockpile_core::schema::envelope::{Envelope, Provenance, Subjects};
-    use stockpile_core::vocab::Confidence;
+    use situation_room_core::schema::envelope::{Envelope, Provenance, Subjects};
+    use situation_room_core::vocab::Confidence;
 
     fn sample_entity() -> Entity {
         let envelope = Envelope {

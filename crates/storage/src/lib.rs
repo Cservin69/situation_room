@@ -1,6 +1,6 @@
-//! # stockpile-storage
+//! # situation_room-storage
 //!
-//! DuckDB persistence for Stockpile records. See ADR 0005 (DuckDB) and
+//! DuckDB persistence for situation_room records. See ADR 0005 (DuckDB) and
 //! ADR 0008 (offline / cache architecture).
 //!
 //! ## Phase 2e status

@@ -1,4 +1,4 @@
-//! # stockpile-secure
+//! # situation_room-secure
 //!
 //! Cross-cutting security primitives. Every other crate depends on this rather
 //! than hand-rolling its own security-adjacent code.
@@ -7,7 +7,7 @@
 //!
 //! - [`secrets`] — wrapping API keys in a type that scrubs from Debug,
 //!   zeroizes on drop, and never `Serialize`s by accident.
-//! - [`http`] — the one HTTP client Stockpile uses, with SSRF guardrails,
+//! - [`http`] — the one HTTP client situation_room uses, with SSRF guardrails,
 //!   strict TLS, bounded response sizes, timeouts, and redirect whitelisting.
 //! - [`url_guard`] — URL validation that rejects private IP ranges, localhost,
 //!   cloud metadata endpoints, and non-HTTP(S) schemes.

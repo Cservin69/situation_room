@@ -7,7 +7,7 @@
 
 ## Context
 
-Stockpile fetches from dozens of external sources, sends user-derived
+Situation_room fetches from dozens of external sources, sends user-derived
 strings to LLM providers, stores API keys, and writes files based on
 configuration that may ultimately come from an ingested document.
 Each of those is a failure surface. The question is whether security
@@ -31,7 +31,7 @@ depends on them rather than rolling its own.
 ## Decision
 
 **Cybersecurity is a Phase-1 concern, not a polish step.** The
-`stockpile_secure` crate centralizes the primitives that every other
+`situation_room_secure` crate centralizes the primitives that every other
 crate must use. The detailed threat model lives in
 `docs/security/threat_model.md`. Every new crate, every new source
 adapter, every new outbound fetch must route through these
@@ -49,7 +49,7 @@ crate root for convenient use.
    only from environment variables — never from config files,
    never from command-line arguments, never from disk.
 2. **`SecureHttpClient` / `SecureHttpConfig`** (`http.rs`). The one
-   HTTP client Stockpile uses. Rustls-only TLS (no OpenSSL anywhere
+   HTTP client Situation_room uses. Rustls-only TLS (no OpenSSL anywhere
    in the dependency tree; enforced by `cargo deny`), TLS 1.2+
    required at the client level, URL validation on every request
    *and* every redirect, bounded response sizes, timeouts, no
@@ -59,7 +59,7 @@ crate root for convenient use.
    ranges, point at localhost, point at cloud metadata endpoints
    (169.254.169.254 and friends), use non-allowlisted ports, or
    carry embedded credentials (`user:pass@host`). Every URL that
-   Stockpile fetches passes through this guard.
+   Situation_room fetches passes through this guard.
 4. **`FsGuard` / `FsViolation`** (`fs_guard.rs`). Path-traversal-safe
    filesystem access. Resolves paths against a designated workspace
    root; rejects any path that escapes the root via `..` or
@@ -73,12 +73,12 @@ crate root for convenient use.
 6. **Scrubbed logging** (`logging.rs`). A tracing subscriber wrapper
    that scrubs every log line for known secret patterns (Bearer
    tokens, known API key prefixes) before it reaches stdout or
-   disk. `stockpile_secure::logging::init()` is the only way the
+   disk. `situation_room_secure::logging::init()` is the only way the
    binary configures logging.
 
 ### The rule
 
-Every other crate depends on `stockpile_secure` and routes through
+Every other crate depends on `situation_room_secure` and routes through
 these primitives. If a crate needs HTTP, it uses `SecureHttpClient`.
 If a crate needs to read a URL from user input, it passes through
 `UrlGuard`. If a crate writes a file derived from user input, it
@@ -116,7 +116,7 @@ checks that contributors internalize.
 ### Tauri posture
 
 The desktop app uses Tauri for its webview host. Tauri's default
-posture is permissive; Stockpile's is not:
+posture is permissive; Situation_room's is not:
 
 - Strict CSP: `default-src 'self'`, `connect-src` restricted to
   `ipc:`, `object-src 'none'`, `frame-src 'none'`,
@@ -172,7 +172,7 @@ footprint, release cadence, and historical CVE track record are all
 strictly worse than rustls. Pure-Rust TLS means no C compilation,
 no linker games, no per-platform TLS library hunts. The tradeoff —
 rustls doesn't support some enterprise cert stores — doesn't bite
-us; Stockpile talks to public internet endpoints, not enterprise
+us; Situation_room talks to public internet endpoints, not enterprise
 HTTPS-inspecting proxies.
 
 **Why load API keys only from env.** Config-file loading makes it
@@ -231,7 +231,7 @@ affect every app consistently.
 **Positive**
 
 - Security posture is consistent across the codebase. A new
-  contributor learns the `stockpile_secure` crate once.
+  contributor learns the `situation_room_secure` crate once.
 - CVE response is fast: upgrade one crate, release.
 - SSRF, secret leakage, path traversal, and TLS downgrade all have
   defined defenses with tests. Regressions fail CI.

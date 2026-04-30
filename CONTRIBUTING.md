@@ -1,6 +1,6 @@
-# Contributing to Stockpile
+# Contributing to situation_room
 
-Stockpile is an open-source project. Contributions of all kinds are welcome:
+situation_room is an open-source project. Contributions of all kinds are welcome:
 new data sources, new anomaly detectors, frontend panels, documentation, bug
 reports, and design feedback.
 

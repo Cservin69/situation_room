@@ -2,13 +2,13 @@
 //!
 //! Plans are the Level-1 output of the research function (ADR 0007)
 //! and are stored alongside records but not *as* records. The typed
-//! `ResearchPlan` lives in `stockpile-pipeline`; storage accepts the
+//! `ResearchPlan` lives in `situation_room-pipeline`; storage accepts the
 //! plan as pre-serialized `serde_json::Value` columns plus the scalar
 //! fields we index on. Keeping the typed plan out of storage means
 //! storage stays the record-persistence layer and doesn't acquire a
 //! reverse dependency on pipeline.
 //!
-//! A typed helper sits in `stockpile_pipeline::research_plans_store`
+//! A typed helper sits in `situation_room_pipeline::research_plans_store`
 //! that does the serialization and calls these functions. Callers
 //! should prefer that helper over invoking these methods directly.
 //!

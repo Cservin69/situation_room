@@ -9,7 +9,7 @@ subjects), ADR 0009 (security posture)
 
 ## Context
 
-Stockpile's product surface starts with a text box. The user types a
+Situation_room's product surface starts with a text box. The user types a
 topic — anything from "lithium production" to "EU AI Act compliance"
 to "container shipping rates" — and the system populates a
 workstation with traceable data within seconds. That experience
@@ -131,7 +131,7 @@ something an LLM can invent on a whim.
 **Why recipes are not a seventh record type.** Recipes are
 *instructions*, not facts. They aren't claims about the world; they
 are rules for how to produce claims about the world. The six record
-types describe what Stockpile knows; recipes describe how Stockpile
+types describe what Situation_room knows; recipes describe how Situation_room
 learned it. Conflating them would muddy the schema. Recipes live in
 their own storage table, referenced by records via
 `Envelope::provenance` (the `source_id` will include the recipe id
@@ -254,7 +254,7 @@ Final field set will be refined during implementation, but this is
 the skeleton. Notable commitments:
 
 - `Url` here is the standard `url::Url`, validated through
-  `stockpile_secure::url_guard::UrlGuard` before storage. A recipe
+  `situation_room_secure::url_guard::UrlGuard` before storage. A recipe
   whose URL fails the URL guard is rejected at authoring time, not
   at runtime. (ADR 0009.)
 - The recipe's `source_id` must resolve against the source registry;
@@ -263,7 +263,7 @@ the skeleton. Notable commitments:
   `SecureHttpClient` policy get applied.
 - `authored_by` is the fingerprint (not the raw value) of the API
   key of the LLM that authored the recipe. Lets us audit provenance
-  of the recipe itself. Follows `stockpile_secure::secrets::ApiKey`
+  of the recipe itself. Follows `situation_room_secure::secrets::ApiKey`
   conventions.
 
 ### Level 2 runtime
@@ -514,3 +514,94 @@ stored, but fail predictably at apply time rather than silently or
 wrongly. The demo binary (Phase 3c.4) will use a non-PDF source to
 demonstrate end-to-end correctness; USGS / PDF sources unblock when
 `PdfTable` extraction lands as its own focused session.
+
+---
+
+Reviewed 2026-04-30 (Session 12). Two amendments to the runtime
+path, both prompted by real-plan runs since Session 9.
+
+**Amendment 1: CssSelect promoted from skipped to wired.** The
+runtime now dispatches `ExtractionSpec::CssSelect` through the same
+fetch → apply → insert pipeline as `CsvCell` and `JsonPath`. The
+`recipe_apply` extractor for CssSelect has existed since Session 3
+(via the `scraper` crate); what was missing was the executor-level
+arm. With this change, three of five modes are wired (`CsvCell`,
+`JsonPath`, `CssSelect`); `RegexCapture` is still surfaced as
+`Skipped { reason }` pending its own promotion session;
+`PdfTable` continues to return `NotImplemented` per the
+2026-04-22 review note above. The closed-enum invariant is
+unchanged — promotion is an executor-side wiring step, not a
+schema change.
+
+**Amendment 2: Known limitation — date-keyed object responses do
+not fit the closed extraction vocabulary cleanly.** Surfaced by the
+Session 11 first-real-plan run on "Swiss national debt." The
+recipe author chose IMF's
+`https://www.imf.org/external/datamapper/api/v3/GGXWDG_NGDP@WEO/CHE`
+endpoint, whose response shape is
+
+    { "values": { "GGXWDG_NGDP": { "CHE": { "1980": 24.06, "1981": ..., "2024": 38.1 } } } }
+
+— `values` is an object keyed by year, not an array. Standard
+JSONPath has no `[-1]` semantics over object members and cannot
+express "the most recent year" without hardcoding the year value
+in the path. The runtime correctly rejected `$.values[-1]` with
+`path matched no nodes`; no code change is warranted — the
+vocabulary genuinely can't address this shape.
+
+The right responses, in order of cost:
+
+1. **Steer the LLM at authoring time toward array-shaped
+   endpoints** (cheapest; prompt work). Many APIs offer multiple
+   shapes for the same data — e.g. World Bank's
+   `country/CHE/indicator/...` returns `[<metadata>, [<datapoints>]]`,
+   which JSONPath addresses cleanly. The recipe-author prompt
+   could be amended to prefer such shapes when they exist.
+2. **Pre-process at authoring time so the LLM sees an
+   array-shaped excerpt.** The Session-10 Option-F pre-fetch is
+   already in place; a transform step that flattens a year-keyed
+   object into `[{year, value}, ...]` before passing it to the
+   author would make the date-keyed shape addressable. This is a
+   modest extension to the existing pre-fetch pipeline, not a new
+   extraction mode, and preserves the closed-enum invariant.
+3. **Extend `RowFilter` (or add a sibling) to express
+   "last lexical key of an object."** This is more invasive
+   because `RowFilter` is currently a CSV concern; reusing it for
+   JSON would conflate two extractors. A cleaner shape would be a
+   small post-extraction selection step in `normalize` keyed by a
+   recipe-level hint. Expensive to design correctly; defer until
+   recurrence justifies it.
+4. **Add a sixth extraction mode.** ADR-level decision. Not
+   warranted on one example.
+
+The 2026-04-22 review note stated: "where a source doesn't fit an
+existing mode, the right responses are (a) improving Level 1's
+hints so Level 2 picks a better mode, (b) pre-processing the
+source at authoring time, or (c) adding a mode via ADR. Not (d)
+running an LLM at refresh." This amendment is consistent with that
+disposition: response (1) is a Level-1/prompt fix, response (2) is
+authoring-time pre-processing, response (3) is a normalize-stage
+refinement (still LLM-free at runtime), and only response (4)
+would expand the closed enum. None of (1)–(4) is taken in
+Session 12; this amendment exists so the next person who hits a
+date-keyed object response finds the failure-shape already named
+and the response options already enumerated.
+
+The Session 11 production run also revealed two adjacent failure
+shapes the prompt may need to address eventually:
+
+- **Country-code format inconsistency.** Same plan, same model
+  run: the LLM produced ISO 3166 alpha-3 (`CHE`) for the IMF
+  recipe and alpha-2 (`CH`) for the World Bank recipe — World
+  Bank requires alpha-3. One data point isn't a pattern; the
+  prompt stays at v1.3 until recurrence.
+- **JSONPath syntax synthesis errors.** The same Swiss-debt run
+  produced JSONPath `1[0].value` (missing `$.` prefix and
+  separator); the Session 12 "italy gdp" run produced
+  `$.['NGDP@WEO'][43]` (quoted-bracket form `jsonpath_rust`
+  rejects). Two data points; still below the threshold for a
+  prompt-level intervention.
+
+Both go in the failure-mode taxonomy that the deferred ADR 0012
+(re-author-on-failure) will need; neither prompts code or prompt
+changes in Session 12.

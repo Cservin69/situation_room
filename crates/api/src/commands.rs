@@ -24,9 +24,9 @@
 //! ## Security discipline (ADR 0009)
 //!
 //! Every `#[tauri::command]` handler in this crate MUST:
-//!   1. Validate any URL input via `stockpile_secure::url_guard::UrlGuard`.
-//!   2. Validate any path input via `stockpile_secure::fs_guard::FsGuard`.
-//!   3. Check any string input against `stockpile_secure::bounds::Bounds`.
+//!   1. Validate any URL input via `situation_room_secure::url_guard::UrlGuard`.
+//!   2. Validate any path input via `situation_room_secure::fs_guard::FsGuard`.
+//!   3. Check any string input against `situation_room_secure::bounds::Bounds`.
 //!   4. Never `expose_secret()` on an `ApiKey` except when passing to an
 //!      HTTP Authorization header.
 //!   5. Return typed errors. Never panic on user input.
@@ -46,19 +46,19 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use stockpile_llm::{ModelTier, XaiProvider};
-use stockpile_pipeline::fetch_executor::{
+use situation_room_llm::{ModelTier, XaiProvider};
+use situation_room_pipeline::fetch_executor::{
     run_fetch_for_plan as run_fetch_for_plan_impl, ExecutorContext, FetchExecutorError,
 };
-use stockpile_pipeline::research_classifier::{
+use situation_room_pipeline::research_classifier::{
     classify_topic, ClassificationContext, ClassificationError,
     SourceDescriptor as PipelineSourceDescriptor, TopicUsage as ClassifierTopicUsage,
 };
-use stockpile_pipeline::research_plans_store::{save_research_plan, ResearchPlanStoreError};
-use stockpile_secure::bounds::{check_string, Bounds};
-use stockpile_secure::http::SecureHttpClient;
-use stockpile_storage::research_plans::PlanStatus;
-use stockpile_storage::{Store, StorageError};
+use situation_room_pipeline::research_plans_store::{save_research_plan, ResearchPlanStoreError};
+use situation_room_secure::bounds::{check_string, Bounds};
+use situation_room_secure::http::SecureHttpClient;
+use situation_room_storage::research_plans::PlanStatus;
+use situation_room_storage::{Store, StorageError};
 use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;

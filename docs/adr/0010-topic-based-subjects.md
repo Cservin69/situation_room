@@ -9,7 +9,7 @@
 
 Phase 2a shipped a schema in which `Subjects` had a first-class
 `commodities: Vec<CommodityId>` field alongside `entities`, `countries`,
-and `event_types`. The working assumption was that Stockpile was — at
+and `event_types`. The working assumption was that situation_room was — at
 minimum — a commodity workstation, and that commodities deserved a
 typed, validated, registry-backed dimension the way entities and
 countries did.
@@ -25,13 +25,13 @@ either (a) keep adding first-class dimensions forever, (b) cram
 unrelated concepts into the `commodities` field, or (c) admit that the
 field was a historical accident and migrate.
 
-The question this ADR decides is: **how does Stockpile represent the
+The question this ADR decides is: **how does situation_room represent the
 "what is this record about" axis so that any subject a user might
 research fits naturally, without periodic schema surgery?**
 
 ## Decision
 
-Stockpile's `Subjects` has exactly four dimensions, in this order:
+situation_room's `Subjects` has exactly four dimensions, in this order:
 
 1. **`entities: Vec<EntityId>`** — actors (companies, mines, vessels,
    agencies, people). Typed because entity-joins are the most heavily
@@ -73,7 +73,7 @@ catches obvious garbage at deserialization time without pretending to
 be a registry.
 
 **Why the three other dimensions stayed typed.** Entities, places,
-and time are the axes on which Stockpile will run structural queries:
+and time are the axes on which situation_room will run structural queries:
 "all records mentioning TSMC", "all records in East Asia", "all
 records about Q3 2025". Those queries want indexed columns and
 foreign keys. Topics, by contrast, are filter tags on a subject-search
@@ -174,7 +174,7 @@ classifier, not a type in the code.
 - Classification is per-session and reversible. A bad classifier
   output for one session doesn't pollute the schema.
 - The six record types remain the single point where "what can
-  Stockpile record" is defined.
+  situation_room record" is defined.
 
 **Negative**
 

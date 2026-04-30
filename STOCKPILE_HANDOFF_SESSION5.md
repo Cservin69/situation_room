@@ -1,4 +1,4 @@
-# Stockpile — Session 6 Handoff
+# situation_room — Session 6 Handoff
 
 Continuation document for the next session. Covers the state of the
 codebase as of end of Session 5, what works, what's still imperfect,
@@ -34,8 +34,8 @@ that knows about specific commodities.
 ## What works
 
 - **End-to-end Level-1 classification.** `cargo run -p
-  stockpile-situation-room -- "any topic"` returns a structurally
-  validated plan, persists it to `./stockpile.duckdb`, prints
+  situation_room-situation-room -- "any topic"` returns a structurally
+  validated plan, persists it to `./situation_room.duckdb`, prints
   pretty JSON to stdout and a one-line summary to stderr.
 - **Existing-topics injection.** Topics from past sessions are
   surfaced to the LLM as context. Demonstrated working on the
@@ -356,7 +356,7 @@ In order of importance:
 - Classification produces RecordExpectations, not new schemas.
 - Closed enum of 5 extraction modes. Adding a sixth needs an ADR.
 - UUIDv7 + dedup_key for identity.
-- Security primitives in stockpile_secure. No
+- Security primitives in situation_room_secure. No
   `reqwest::Client::new()` anywhere.
 - Structure follows code, not anticipates it. No empty folders.
 - Code validates format, prompt teaches content. The LLM is

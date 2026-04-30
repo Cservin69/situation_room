@@ -5,8 +5,8 @@ end-to-end demo work — that patch will follow once these fixes are
 verified green on your side.
 
 ```bash
-cd /Users/aben/RustroverProjects/stockpile
-tar -xzvf ~/Downloads/stockpile_session3_fixes_patch.tar.gz
+cd /Users/aben/RustroverProjects/situation_room
+tar -xzvf ~/Downloads/situation_room_session3_fixes_patch.tar.gz
 ```
 
 ## What failed
@@ -99,10 +99,10 @@ Files changed: `crates/llm/src/providers/grok.rs`,
 
 ```bash
 cargo check --workspace
-cargo test -p stockpile-secure     # must now be 20/20 (was 18/20)
-cargo test -p stockpile-sources    # should stay 5/5 + 1 ignored
-cargo test -p stockpile-llm        # must now be 10/10 + 2 ignored (was 9/10)
-cargo test -p stockpile-pipeline   # must compile + all recipe_apply tests pass
+cargo test -p situation_room-secure     # must now be 20/20 (was 18/20)
+cargo test -p situation_room-sources    # should stay 5/5 + 1 ignored
+cargo test -p situation_room-llm        # must now be 10/10 + 2 ignored (was 9/10)
+cargo test -p situation_room-pipeline   # must compile + all recipe_apply tests pass
 ```
 
 If anything here surprises you, share the output and we'll iterate

@@ -1,6 +1,6 @@
 //! The envelope.
 //!
-//! Every record in Stockpile carries this metadata. It answers five
+//! Every record in situation_room carries this metadata. It answers five
 //! questions a user will want to ask of any claim the system surfaces:
 //!
 //! 1. **Where did this come from?** → [`Provenance`]
@@ -52,7 +52,7 @@ pub struct Envelope {
     /// no meaningful world-time.
     pub valid_at: Option<DateTime<Utc>>,
 
-    /// When did Stockpile learn about this?
+    /// When did situation_room learn about this?
     ///
     /// Always set. Usually the fetch time. For records imported from
     /// historical dumps, it's the import time.
@@ -84,7 +84,7 @@ impl Envelope {
 /// The subjects a record concerns.
 ///
 /// The design is **four universal dimensions** (entities, places, time,
-/// topics), applied uniformly across every domain Stockpile is used for.
+/// topics), applied uniformly across every domain situation_room is used for.
 /// The first three are typed — they answer structural queries well
 /// (entity-joins, geographic intersection, time windowing). The fourth,
 /// [`topics`](Self::topics), is an open bag of free-form [`Topic`] tags
@@ -250,7 +250,7 @@ pub struct Provenance {
 
     /// License of the data. Determines caching and redistribution behavior.
     /// Stored as a free-form string to stay in sync with `DataLicense` in
-    /// `stockpile-sources` without creating a core↔sources circular dep.
+    /// `situation_room-sources` without creating a core↔sources circular dep.
     /// Convention: values match one of `DataLicense` variant names in
     /// snake_case ("public_domain", "open_with_attribution", etc.).
     pub license: String,

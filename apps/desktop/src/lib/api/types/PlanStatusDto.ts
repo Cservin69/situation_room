@@ -2,7 +2,7 @@
 
 /**
  * Lifecycle state for a plan, as seen by the frontend. Mirrors
- * [`stockpile_storage::research_plans::PlanStatus`] one-for-one.
+ * [`situation_room_storage::research_plans::PlanStatus`] one-for-one.
  *
  * The serde representation is lowercase and unit-tagged
  * (`"pending"` / `"accepted"` / `"rejected"`), matching both the

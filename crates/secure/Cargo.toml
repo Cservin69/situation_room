@@ -1,11 +1,11 @@
 [package]
-name = "stockpile-secure"
+name = "situation_room-secure"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Cross-cutting security primitives for Stockpile: secret handling, URL validation, scrubbed logging, input bounds."
+description = "Cross-cutting security primitives for Situation_room: secret handling, URL validation, scrubbed logging, input bounds."
 
 [lib]
 path = "src/lib.rs"

@@ -3,8 +3,8 @@
 Extract this archive at your workspace root:
 
 ```bash
-cd /Users/aben/RustroverProjects/stockpile
-tar -xvf ~/Downloads/stockpile_session3_patch.tar.gz
+cd /Users/aben/RustroverProjects/situation_room
+tar -xvf ~/Downloads/situation_room_session3_patch.tar.gz
 ```
 
 All paths inside the archive are relative to the workspace root, so
@@ -56,7 +56,7 @@ previous version where applicable.
 ### 3c.2 — Recipe authoring
 
 - `crates/pipeline/Cargo.toml`
-  Added `schemars` and `stockpile-secure` to deps, `dotenvy` to
+  Added `schemars` and `situation_room-secure` to deps, `dotenvy` to
   dev-deps.
 - `crates/pipeline/src/lib.rs`
   Registered new `recipe_author` module.
@@ -86,18 +86,18 @@ All existing 66 tests should stay green. New tests:
 
 ```bash
 cargo check --workspace
-cargo test -p stockpile-sources   # ADR-0010 ripple check
-cargo test -p stockpile-secure    # post_json additions
-cargo test -p stockpile-llm       # ~11 new unit tests
-cargo test -p stockpile-pipeline  # ~20 new recipe_author tests
+cargo test -p situation_room-sources   # ADR-0010 ripple check
+cargo test -p situation_room-secure    # post_json additions
+cargo test -p situation_room-llm       # ~11 new unit tests
+cargo test -p situation_room-pipeline  # ~20 new recipe_author tests
 ```
 
 Live xAI tests (read `XAI_API_KEY` automatically from `.env` — you
 don't have to paste it anywhere):
 
 ```bash
-cargo test -p stockpile-llm --ignored live_xai
-cargo test -p stockpile-pipeline --ignored live_author
+cargo test -p situation_room-llm --ignored live_xai
+cargo test -p situation_room-pipeline --ignored live_author
 ```
 
 ## Notes for the next session

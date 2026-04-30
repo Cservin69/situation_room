@@ -1,25 +1,25 @@
 [package]
-name = "stockpile-desktop"
+name = "situation_room-desktop"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Stockpile desktop app — Tauri shim and composition root."
+description = "situation_room desktop app — Tauri shim and composition root."
 
 [[bin]]
-name = "stockpile"
+name = "situation_room"
 path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { workspace = true }
 
 [dependencies]
-stockpile-core = { workspace = true }
-stockpile-storage = { workspace = true }
-stockpile-llm = { workspace = true }
-stockpile-pipeline = { workspace = true }
-stockpile-api = { workspace = true }
-stockpile-secure = { workspace = true }
+situation_room-core = { workspace = true }
+situation_room-storage = { workspace = true }
+situation_room-llm = { workspace = true }
+situation_room-pipeline = { workspace = true }
+situation_room-api = { workspace = true }
+situation_room-secure = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

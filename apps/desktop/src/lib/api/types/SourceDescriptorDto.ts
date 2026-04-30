@@ -2,7 +2,7 @@
 
 /**
  * Wire shape for a registered source descriptor. Mirrors
- * [`stockpile_pipeline::research_classifier::SourceDescriptor`].
+ * [`situation_room_pipeline::research_classifier::SourceDescriptor`].
  *
  * Currently the frontend doesn't fetch this directly (the binary
  * loads `config/sources.toml` and stuffs descriptors into `AppState`),

@@ -5,9 +5,9 @@
 //! standard envelope columns.
 
 use duckdb::params;
-use stockpile_core::schema::content::AssertedContent;
-use stockpile_core::vocab::{EntityId, Stance};
-use stockpile_core::Assertion;
+use situation_room_core::schema::content::AssertedContent;
+use situation_room_core::vocab::{EntityId, Stance};
+use situation_room_core::Assertion;
 use uuid::Uuid;
 
 use crate::connection::Store;
@@ -152,9 +152,9 @@ impl Store {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use stockpile_core::schema::content::{ObservationContent, ObservationPeriod};
-    use stockpile_core::schema::envelope::{Envelope, Provenance, Subjects};
-    use stockpile_core::vocab::{Confidence, Topic, Unit};
+    use situation_room_core::schema::content::{ObservationContent, ObservationPeriod};
+    use situation_room_core::schema::envelope::{Envelope, Provenance, Subjects};
+    use situation_room_core::vocab::{Confidence, Topic, Unit};
 
     fn sample_assertion() -> Assertion {
         let envelope = Envelope {

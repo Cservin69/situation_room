@@ -67,7 +67,7 @@ and pre-fixed three spots clippy would likely have caught next:
 
 ## What this patch does NOT change
 
-- `STOCKPILE_HANDOFF_SESSION11.md` is unchanged. Session 11's
+- `situation_room_HANDOFF_SESSION11.md` is unchanged. Session 11's
   priority list (P1 build → P2 CssSelect → P3 manual run → P4
   coverage) still applies; this fixes patch is what closes P1.
 - The Session 10 architectural changes (endpoint_hint field,

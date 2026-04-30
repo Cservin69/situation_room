@@ -11,7 +11,7 @@ Then verify:
     cargo clippy --workspace --all-targets -- -D warnings
 
 The patch is **not compiler-verified** — it was authored in a
-sandbox without `cargo`. See `STOCKPILE_HANDOFF_SESSION11.md` §"Build
+sandbox without `cargo`. See `situation_room_HANDOFF_SESSION11.md` §"Build
 / test state" for the type-checked-by-eyeball constraint and the
 short list of failure modes I'd expect.
 
@@ -24,7 +24,7 @@ short list of failure modes I'd expect.
     crates/api/src/commands.rs
     crates/pipeline/src/fetch_executor.rs
     crates/pipeline/src/research_classifier.rs
-    STOCKPILE_HANDOFF_SESSION11.md         (new)
+    situation_room_HANDOFF_SESSION11.md         (new)
 
 ## What this patch does
 
@@ -50,6 +50,6 @@ pre-Session-10 behaviour (placeholder URL + stub excerpt) with a
 logged warning. Output contract on the recipe-author side is
 unchanged, so existing authored recipes don't need re-authoring.
 
-See `STOCKPILE_HANDOFF_SESSION11.md` for the full account of what
+See `situation_room_HANDOFF_SESSION11.md` for the full account of what
 shipped and what Session 11 should do next (P1 = build, P2 = E
 promotion).

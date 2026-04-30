@@ -11,4 +11,4 @@ fi
 echo "Building workspace…"
 cargo build --workspace
 echo ""
-echo "✓ Workspace built. Run \`cargo run --bin stockpile\` to verify."
+echo "✓ Workspace built. Run \`cargo run --bin situation_room\` to verify."

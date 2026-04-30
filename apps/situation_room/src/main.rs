@@ -1,4 +1,4 @@
-//! Stockpile situation room — CLI entry point for Level-1 classification.
+//! situation_room situation room — CLI entry point for Level-1 classification.
 //!
 //! Usage:
 //!     situation-room "lithium supply chain"
@@ -13,7 +13,7 @@
 //! ## What this binary does
 //!
 //! 1. Loads `XAI_API_KEY` from the process env or a `.env` file.
-//! 2. Opens the DuckDB store at `--db` (default `stockpile.duckdb` in CWD).
+//! 2. Opens the DuckDB store at `--db` (default `situation_room.duckdb` in CWD).
 //!    Runs migrations (idempotent).
 //! 3. Queries `Store::topics_in_use(limit)` to populate the classifier's
 //!    existing-topics injection.
@@ -36,23 +36,23 @@ use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-use stockpile_llm::{ModelTier, XaiProvider};
-use stockpile_pipeline::research_classifier::{
+use situation_room_llm::{ModelTier, XaiProvider};
+use situation_room_pipeline::research_classifier::{
     classify_topic, ClassificationContext, SourceDescriptor, TopicUsage as ClassifierTopicUsage,
 };
-use stockpile_pipeline::research_plans_store::save_research_plan;
-use stockpile_secure::http::{SecureHttpClient, SecureHttpConfig};
-use stockpile_storage::Store;
+use situation_room_pipeline::research_plans_store::save_research_plan;
+use situation_room_secure::http::{SecureHttpClient, SecureHttpConfig};
+use situation_room_storage::Store;
 
 /// The production classifier prompt, embedded at compile time so the
 /// binary doesn't have to discover the markdown at runtime.
 const CLASSIFIER_PROMPT: &str = include_str!("../../../config/prompts/research_classifier.md");
 
 #[derive(Parser, Debug)]
-#[command(name = "situation-room", version, about = "Classify a topic into a Stockpile research plan.")]
+#[command(name = "situation-room", version, about = "Classify a topic into a situation_room research plan.")]
 struct Cli {
     /// Path to the DuckDB store. Created if absent.
-    #[arg(long, default_value = "stockpile.duckdb")]
+    #[arg(long, default_value = "situation_room.duckdb")]
     db: PathBuf,
 
     /// Path to the source descriptors TOML.
@@ -148,7 +148,7 @@ async fn run_classify(store: &Store, cli: &Cli, topic: &str) -> Result<()> {
     }
 
     // 1. Build the LLM provider. SecureHttpClient applies the same
-    //    network defenses as every other Stockpile HTTP call.
+    //    network defenses as every other situation_room HTTP call.
     let http = SecureHttpClient::new(SecureHttpConfig::default())
         .context("building secure http client")?;
     let provider = XaiProvider::from_env(http).context(
@@ -447,7 +447,7 @@ description = "nothing else set"
                 .unwrap()
                 .as_nanos() as u64
         };
-        p.push(format!("stockpile_situation_room_test_{nonce}"));
+        p.push(format!("situation_room_situation_room_test_{nonce}"));
         std::fs::create_dir_all(&p).unwrap();
         // The dir leaks on test crash; acceptable for now.
         p

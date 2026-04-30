@@ -1,18 +1,18 @@
 [package]
-name = "stockpile-llm"
+name = "situation_room-llm"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "LLM provider router, prompt loader, and structured-output extraction for Stockpile."
+description = "LLM provider router, prompt loader, and structured-output extraction for Situation_room."
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-stockpile-core = { workspace = true }
-stockpile-secure = { workspace = true }
+situation_room-core = { workspace = true }
+situation_room-secure = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

@@ -2,13 +2,13 @@
 //!
 //! Recipes are the Level-2 output of the research function (ADR 0007)
 //! and are stored alongside records but not *as* records. The typed
-//! `FetchRecipe` lives in `stockpile-pipeline`; storage accepts the
+//! `FetchRecipe` lives in `situation_room-pipeline`; storage accepts the
 //! recipe as a pre-serialized `serde_json::Value` plus the scalar
 //! columns we index on. Keeping the typed recipe out of storage means
 //! storage stays the record-persistence layer and doesn't acquire a
 //! reverse dependency on pipeline.
 //!
-//! A typed helper sits in `stockpile_pipeline::recipes_store` that
+//! A typed helper sits in `situation_room_pipeline::recipes_store` that
 //! does the serialization and calls these functions. Callers should
 //! prefer that helper over invoking these methods directly.
 

@@ -43,7 +43,7 @@ Apply on top of the green Session 10 build:
 ### Frontend (5 files)
 
 - `apps/desktop/src/lib/api/types/RecipeDto.ts` — generated TS type,
-  hand-written to match what `cargo test --package stockpile-api`
+  hand-written to match what `cargo test --package situation_room-api`
   would emit. Gets overwritten on next test run; the hand-written
   copy means the SvelteKit build doesn't break in the meantime.
 - `apps/desktop/src/lib/api/client.ts` — new `listRecipesForPlan`

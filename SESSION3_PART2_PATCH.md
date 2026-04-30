@@ -4,8 +4,8 @@ This patch is a **delta** on top of the earlier Session 3 patch. It
 applies the same way:
 
 ```bash
-cd /Users/aben/RustroverProjects/stockpile
-tar -xvf ~/Downloads/stockpile_session3_part2_patch.tar.gz
+cd /Users/aben/RustroverProjects/situation_room
+tar -xvf ~/Downloads/situation_room_session3_part2_patch.tar.gz
 ```
 
 ## What this patch contains
@@ -82,7 +82,7 @@ when positional PDF table extraction is built as its own session.
 
 ```bash
 cargo check --workspace
-cargo test -p stockpile-pipeline     # ~35 tests including recipe_apply
+cargo test -p situation_room-pipeline     # ~35 tests including recipe_apply
 ```
 
 No new live (`#[ignore]`) tests in this patch — the apply runtime is

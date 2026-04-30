@@ -6,7 +6,7 @@
 //! binary originals (PDFs etc.) live in the file archive keyed by id.
 
 use duckdb::params;
-use stockpile_core::Document;
+use situation_room_core::Document;
 use uuid::Uuid;
 
 use crate::connection::Store;
@@ -148,8 +148,8 @@ impl Store {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use stockpile_core::schema::envelope::{Envelope, Provenance, Subjects};
-    use stockpile_core::vocab::{Confidence, Topic};
+    use situation_room_core::schema::envelope::{Envelope, Provenance, Subjects};
+    use situation_room_core::vocab::{Confidence, Topic};
 
     fn sample_document() -> Document {
         let envelope = Envelope {

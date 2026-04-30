@@ -15,7 +15,7 @@
 //! ## What a recipe captures
 //!
 //! - The URL the runtime will fetch (validated through
-//!   `stockpile_secure::url_guard::UrlGuard` before storage).
+//!   `situation_room_secure::url_guard::UrlGuard` before storage).
 //! - The extraction mode (one of five closed-enum variants — see
 //!   [`ExtractionSpec`]).
 //! - The mapping from extracted values to record fields (see
@@ -40,7 +40,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use stockpile_core::RecordType;
+use situation_room_core::RecordType;
 use url::Url;
 use uuid::Uuid;
 
@@ -77,7 +77,7 @@ pub struct FetchRecipe {
     pub source_id: String,
 
     /// The exact URL the runtime fetches. Must pass
-    /// `stockpile_secure::url_guard::UrlGuard` at authoring time —
+    /// `situation_room_secure::url_guard::UrlGuard` at authoring time —
     /// recipes with rejected URLs never reach storage.
     pub source_url: Url,
 
@@ -95,7 +95,7 @@ pub struct FetchRecipe {
     /// Fingerprint of the LLM API key that authored this recipe.
     /// Non-secret; used for auditing which provider wrote what.
     /// Never stores the raw key — see
-    /// `stockpile_secure::secrets::ApiKey::fingerprint`.
+    /// `situation_room_secure::secrets::ApiKey::fingerprint`.
     pub authored_by: String,
 
     /// Monotonically increasing version, starting at 1. Incremented on

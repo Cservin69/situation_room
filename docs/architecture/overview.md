@@ -1,8 +1,8 @@
-# Stockpile architecture — overview
+# Situation_room architecture — overview
 
 This document is the guided tour of the codebase. Read it before contributing.
 
-## What Stockpile is
+## What Situation_room is
 
 An open-source analyst workstation for critical-minerals intelligence —
 generalizable, via the research function, to any topic with public-source

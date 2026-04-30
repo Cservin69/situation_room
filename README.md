@@ -1,4 +1,4 @@
-# Stockpile
+# situation_room
 
 > An open-source analyst workstation for critical-minerals intelligence.
 
@@ -19,8 +19,8 @@ not yet do anything. See `docs/architecture/overview.md` for what's coming.
 
 ```bash
 # 1. Clone (or unzip)
-git clone https://github.com/yourusername/stockpile.git
-cd stockpile
+git clone https://github.com/Cservin69/situation_room.git
+cd situation_room
 
 # 2. Configure your API keys
 cp .env.example .env
@@ -96,13 +96,13 @@ the posture decisions.
 
 Quick checklist for contributors:
 
-- All outbound HTTP goes through `stockpile_secure::http::SecureHttpClient`.
+- All outbound HTTP goes through `situation_room_secure::http::SecureHttpClient`.
 - All URLs that could be influenced by user input or fetched content go
-  through `stockpile_secure::url_guard::UrlGuard`.
+  through `situation_room_secure::url_guard::UrlGuard`.
 - All filesystem writes influenced by user input go through
-  `stockpile_secure::fs_guard::FsGuard`.
-- API keys are `stockpile_secure::secrets::ApiKey`, loaded only from env.
-- Logging uses `stockpile_secure::logging::init()`; never `println!` with
+  `situation_room_secure::fs_guard::FsGuard`.
+- API keys are `situation_room_secure::secrets::ApiKey`, loaded only from env.
+- Logging uses `situation_room_secure::logging::init()`; never `println!` with
   sensitive values.
 - Install the local git hooks: `./scripts/install-hooks.sh`.
 

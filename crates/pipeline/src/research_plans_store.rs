@@ -8,7 +8,7 @@
 //! Mirrors the shape of [`crate::recipes_store`]; the rationale is
 //! identical (storage mustn't reverse-depend on pipeline).
 
-use stockpile_storage::{
+use situation_room_storage::{
     research_plans::{PlanStatus, ResearchPlanRow, StoredResearchPlan},
     Store,
 };
@@ -20,7 +20,7 @@ use crate::research::{RecordExpectations, ResearchPlan};
 #[derive(Debug, Error)]
 pub enum ResearchPlanStoreError {
     #[error("storage error: {0}")]
-    Storage(#[from] stockpile_storage::StorageError),
+    Storage(#[from] situation_room_storage::StorageError),
 
     #[error("plan serialization failed: {0}")]
     Serialize(String),
@@ -79,7 +79,7 @@ fn plan_to_row(
         classified_by: classified_by.to_string(),
         // Newly-classified plans start in Pending. The user must
         // explicitly Accept (or Reject) before downstream Phase-6
-        // fetching considers them. See ADR 0007 + STOCKPILE_HANDOFF_SESSION7.
+        // fetching considers them. See ADR 0007 + situation_room_HANDOFF_SESSION7.
         status: PlanStatus::Pending,
     })
 }
@@ -116,7 +116,7 @@ mod tests {
         MetricExpectation, RecordExpectations, RelationKindExpectation,
     };
     use chrono::Utc;
-    use stockpile_core::vocab::{EntityId, EventType, Topic, Unit};
+    use situation_room_core::vocab::{EntityId, EventType, Topic, Unit};
 
     fn sample_plan() -> ResearchPlan {
         ResearchPlan {

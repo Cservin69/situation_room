@@ -1,11 +1,11 @@
 [package]
-name = "stockpile-core"
+name = "situation_room-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Stockpile schema: record types, envelope, controlled vocabularies. Zero workspace dependencies."
+description = "situation_room schema: record types, envelope, controlled vocabularies. Zero workspace dependencies."
 
 [lib]
 path = "src/lib.rs"

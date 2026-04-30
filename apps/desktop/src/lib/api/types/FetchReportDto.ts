@@ -3,7 +3,7 @@ import type { RecipeOutcomeDto } from "./RecipeOutcomeDto";
 
 /**
  * Wire shape for one fetch run's outcome. Mirrors
- * [`stockpile_pipeline::fetch_executor::FetchReport`] one-for-one.
+ * [`situation_room_pipeline::fetch_executor::FetchReport`] one-for-one.
  *
  * Returned synchronously by the `run_fetch_for_plan` command. The
  * frontend renders it in the review pane so the user sees, in one

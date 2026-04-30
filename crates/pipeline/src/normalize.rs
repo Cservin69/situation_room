@@ -32,8 +32,8 @@
 
 use crate::recipes::FetchRecipe;
 use crate::research::ResearchPlan;
-use stockpile_core::schema::records::Record;
-use stockpile_core::vocab::Topic;
+use situation_room_core::schema::records::Record;
+use situation_room_core::vocab::Topic;
 
 /// Finalize a record after apply.
 ///
@@ -56,7 +56,7 @@ pub fn finalize(
 /// Access the envelope of any record variant.
 fn envelope_mut(
     record: &mut Record,
-) -> &mut stockpile_core::schema::envelope::Envelope {
+) -> &mut situation_room_core::schema::envelope::Envelope {
     match record {
         Record::Observation(r) => &mut r.envelope,
         Record::Event(r) => &mut r.envelope,
@@ -86,10 +86,10 @@ mod tests {
     };
     use crate::research::RecordExpectations;
     use chrono::{TimeZone, Utc};
-    use stockpile_core::schema::content::{ObservationContent, ObservationPeriod};
-    use stockpile_core::schema::envelope::{Envelope, Provenance, Subjects};
-    use stockpile_core::schema::records::Observation;
-    use stockpile_core::vocab::{Confidence, Topic, Unit};
+    use situation_room_core::schema::content::{ObservationContent, ObservationPeriod};
+    use situation_room_core::schema::envelope::{Envelope, Provenance, Subjects};
+    use situation_room_core::schema::records::Observation;
+    use situation_room_core::vocab::{Confidence, Topic, Unit};
     use url::Url;
     use uuid::Uuid;
 

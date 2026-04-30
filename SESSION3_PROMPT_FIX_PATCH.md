@@ -2,8 +2,8 @@
 
 Applies on top of Part 3. One file changed. No code changes.
 
-    cd /Users/aben/RustroverProjects/stockpile
-    tar -xzvf ~/Downloads/stockpile_session3_prompt_fix_patch.tar.gz
+    cd /Users/aben/RustroverProjects/situation_room
+    tar -xzvf ~/Downloads/situation_room_session3_prompt_fix_patch.tar.gz
 
 ## What happened
 
@@ -50,7 +50,7 @@ One file: config/prompts/recipe_author.md.
   we want a recipe that produces invalid content to fail loudly
   at apply time, not silently produce garbage.
 - No schema-embedding automation. The content types in
-  stockpile-core do not (and will not) derive schemars::JsonSchema
+  situation_room-core do not (and will not) derive schemars::JsonSchema
   just for the prompt — that would reverse-depend core on
   schemars for something core doesn't need. The content-type
   reference in the prompt is hand-maintained; if you add a new
@@ -62,7 +62,7 @@ One file: config/prompts/recipe_author.md.
 No build step needed (prompt is included via `include_str!`, so
 cargo will pick it up on next build). Re-run the live demo:
 
-    cargo run -p stockpile-demo --bin stockpile-e2e -- --db /tmp/stockpile-e2e-live2.duckdb
+    cargo run -p situation_room-demo --bin situation_room-e2e -- --db /tmp/situation_room-e2e-live2.duckdb
 
 Expected: step 4 still hits xAI, but the resulting recipe should
 now map `period` to a `literal` with value `"annual"`. Step 7

@@ -16,7 +16,7 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use stockpile_secure::secrets::ApiKey;
+//! use situation_room_secure::secrets::ApiKey;
 //!
 //! let key = ApiKey::from_env("ANTHROPIC_API_KEY")?;
 //! // key.expose_secret() returns &str when you genuinely need the value
@@ -30,7 +30,7 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 /// A generic secret string — wraps the `secrecy` crate's SecretString with
-/// Stockpile-specific constraints (no serialization, constant-time eq).
+/// situation_room-specific constraints (no serialization, constant-time eq).
 #[derive(Clone)]
 pub struct SecretString(SecrecySecretString);
 

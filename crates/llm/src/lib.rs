@@ -2,7 +2,7 @@
 // removed as Phase 2/3 fill in real implementations.
 #![allow(dead_code, unused_imports, unused_variables)]
 
-//! # stockpile-llm
+//! # situation_room-llm
 //!
 //! LLM provider abstraction, prompt management, and structured-output
 //! extraction. The LLM is treated as a *normalizer*, not a data source —

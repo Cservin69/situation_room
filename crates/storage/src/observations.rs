@@ -3,7 +3,7 @@
 //! See [`super::envelope_io`] for the shared envelope / subject writes.
 
 use duckdb::params;
-use stockpile_core::Observation;
+use situation_room_core::Observation;
 use uuid::Uuid;
 
 use crate::connection::Store;
@@ -106,7 +106,7 @@ impl Store {
             })?;
 
         let envelope = reconstruct_envelope(&conn, row_id, raw)?;
-        let content: stockpile_core::ObservationContent = serde_json::from_str(&content_json)?;
+        let content: situation_room_core::ObservationContent = serde_json::from_str(&content_json)?;
 
         Ok(Observation {
             id: row_id,
@@ -125,11 +125,11 @@ impl Store {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use stockpile_core::schema::content::{ObservationContent, ObservationPeriod};
-    use stockpile_core::schema::envelope::{
+    use situation_room_core::schema::content::{ObservationContent, ObservationPeriod};
+    use situation_room_core::schema::envelope::{
         DerivationRole, DerivedFrom, Envelope, PlaceRef, Provenance, Subjects,
     };
-    use stockpile_core::vocab::{Confidence, CountryCode, EntityId, Topic, Unit};
+    use situation_room_core::vocab::{Confidence, CountryCode, EntityId, Topic, Unit};
 
     fn sample_observation() -> Observation {
         let envelope = Envelope {

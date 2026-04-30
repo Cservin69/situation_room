@@ -3,8 +3,8 @@
 Applies on top of the two fixes patches. Completes Phase 3c.4:
 the full pipeline exercised end-to-end against a live source.
 
-    cd /Users/aben/RustroverProjects/stockpile
-    tar -xzvf ~/Downloads/stockpile_session3_part3_patch.tar.gz
+    cd /Users/aben/RustroverProjects/situation_room
+    tar -xzvf ~/Downloads/situation_room_session3_part3_patch.tar.gz
 
 ## What this patch does
 
@@ -41,7 +41,7 @@ FetchRecipe to RecipeRow marshalling lives in pipeline instead.
 ### The end-to-end demo
 
 - apps/demo/Cargo.toml — adds a second bin target
-  stockpile-e2e and the deps the new binary needs (pipeline, llm,
+  situation_room-e2e and the deps the new binary needs (pipeline, llm,
   serde_json, url, uuid, dotenvy).
 - apps/demo/src/bin/e2e_demo.rs — the demo binary.
 
@@ -75,9 +75,9 @@ The demo walks nine stages:
 
 ## Running
 
-    cargo run -p stockpile-demo --bin stockpile-e2e
-    cargo run -p stockpile-demo --bin stockpile-e2e -- --offline
-    cargo run -p stockpile-demo --bin stockpile-e2e -- --db /tmp/stockpile-e2e.duckdb
+    cargo run -p situation_room-demo --bin situation_room-e2e
+    cargo run -p situation_room-demo --bin situation_room-e2e -- --offline
+    cargo run -p situation_room-demo --bin situation_room-e2e -- --db /tmp/situation_room-e2e.duckdb
 
 Live path reads XAI_API_KEY from workspace .env. Offline path
 uses a hand-written recipe and needs no LLM.
@@ -87,8 +87,8 @@ uses a hand-written recipe and needs no LLM.
     cargo test --workspace
 
 Net new tests in this patch:
-- 5 recipe storage tests (stockpile-storage::recipes)
-- 2 typed recipe-store tests (stockpile-pipeline::recipes_store)
+- 5 recipe storage tests (situation_room-storage::recipes)
+- 2 typed recipe-store tests (situation_room-pipeline::recipes_store)
 
 No new ignored live tests. The 3c.2 live xAI test already covers
 the authoring path, and --offline gives deterministic coverage of
@@ -103,7 +103,7 @@ the full pipeline.
 - The demo fetches twice (authoring excerpt and apply). For
   production this is wasteful but kept visibly separate in the
   demo so the architecture is legible.
-- PdfTable stays NotImplemented. The sibling stockpile-e2e-usgs
+- PdfTable stays NotImplemented. The sibling situation_room-e2e-usgs
   demo will land when PDF positional extraction does.
 
 ## Files in this archive

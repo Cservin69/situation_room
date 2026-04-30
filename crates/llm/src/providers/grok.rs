@@ -2,7 +2,7 @@
 //!
 //! xAI's public API exposes a `chat/completions` endpoint that mirrors the
 //! OpenAI wire format. This adapter speaks that wire format directly
-//! through [`stockpile_secure::SecureHttpClient`] rather than pulling in
+//! through [`situation_room_secure::SecureHttpClient`] rather than pulling in
 //! an SDK, per ADR 0009 (one HTTP client, one set of guards).
 //!
 //! ## What this provider does
@@ -36,9 +36,9 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use stockpile_secure::bounds::{check_string, Bounds};
-use stockpile_secure::http::{HttpError, SecureHttpClient};
-use stockpile_secure::secrets::ApiKey;
+use situation_room_secure::bounds::{check_string, Bounds};
+use situation_room_secure::http::{HttpError, SecureHttpClient};
+use situation_room_secure::secrets::ApiKey;
 
 use crate::providers::trait_def::{
     CompletionRequest, CompletionResponse, LlmError, LlmProvider, ModelTier,
@@ -228,7 +228,7 @@ impl LlmProvider for XaiProvider {
         let bearer = format!("Bearer {}", self.key.expose_secret());
         // Wrap the bearer in a SecretString so expose_secret is only
         // called once, inside SecureHttpClient::post_json_bytes.
-        let bearer_secret = stockpile_secure::secrets::SecretString::new(bearer);
+        let bearer_secret = situation_room_secure::secrets::SecretString::new(bearer);
 
         tracing::debug!(
             tier = ?tier,
@@ -321,7 +321,7 @@ struct XaiUsage {
 mod tests {
     use super::*;
     use crate::providers::trait_def::StructuredOutputSchema;
-    use stockpile_secure::http::SecureHttpConfig;
+    use situation_room_secure::http::SecureHttpConfig;
 
     fn test_http() -> SecureHttpClient {
         SecureHttpClient::new(SecureHttpConfig::default()).unwrap()
@@ -512,7 +512,7 @@ mod tests {
     }
 
     // Live test — hits real xAI. Ignored by default. Run with:
-    //   cargo test -p stockpile-llm --ignored live_xai
+    //   cargo test -p situation_room-llm --ignored live_xai
     //
     // `.env` is loaded automatically: put `XAI_API_KEY=...` in a
     // `.env` file at the workspace root and it'll be picked up.

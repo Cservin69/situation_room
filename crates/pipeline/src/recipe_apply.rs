@@ -10,7 +10,7 @@
 //! ## Scope
 //!
 //! This module does **not** fetch. The caller fetches through
-//! [`stockpile_secure::SecureHttpClient`] and hands us the bytes.
+//! [`situation_room_secure::SecureHttpClient`] and hands us the bytes.
 //! Keeping I/O out of here makes the module trivially testable with
 //! inline fixtures and keeps all network-facing defences (SSRF,
 //! bounded size, TLS) in one place.
@@ -54,13 +54,13 @@ use serde_json::{json, Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
 
-use stockpile_core::schema::content::{
+use situation_room_core::schema::content::{
     EventContent, ObservationContent, RelationContent,
 };
-use stockpile_core::schema::envelope::{Envelope, Provenance, Subjects};
-use stockpile_core::schema::records::{Event, Observation, Record, Relation};
-use stockpile_core::vocab::Confidence;
-use stockpile_core::RecordType;
+use situation_room_core::schema::envelope::{Envelope, Provenance, Subjects};
+use situation_room_core::schema::records::{Event, Observation, Record, Relation};
+use situation_room_core::vocab::Confidence;
+use situation_room_core::RecordType;
 
 use crate::recipes::{
     ExpectationRef, ExtractionSpec, FetchRecipe, FieldMap, FieldValueSource,
@@ -622,7 +622,7 @@ mod tests {
         MetricExpectation, RecordExpectations, RelationKindExpectation,
     };
     use chrono::TimeZone;
-    use stockpile_core::vocab::{EntityId, EventType, Topic, Unit};
+    use situation_room_core::vocab::{EntityId, EventType, Topic, Unit};
     use url::Url;
 
     fn plan() -> ResearchPlan {

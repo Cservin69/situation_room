@@ -20,7 +20,7 @@ use crate::schema::envelope::Envelope;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// The unified record type. Every piece of structured data in Stockpile
+/// The unified record type. Every piece of structured data in situation_room
 /// is one of these six.
 ///
 /// Serialization uses the `type` field as a discriminator so the JSON
@@ -41,7 +41,7 @@ pub enum Record {
 ///
 /// Use this when you need to *refer to* a record type without having a
 /// value of that type — e.g. in pipeline configuration, in recipe
-/// production bindings (see `stockpile_pipeline::recipes`), or when
+/// production bindings (see `situation_room_pipeline::recipes`), or when
 /// logging type-level decisions. For an actual record, use [`Record`].
 ///
 /// The variant set is identical to [`Record`] and the serde

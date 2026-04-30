@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stockpile delta zip generator — respects .gitignore + only relevant changes
+# situation_room delta zip generator — respects .gitignore + only relevant changes
 
 set -euo pipefail
 
@@ -10,7 +10,7 @@ SHORT_HASH=$(git rev-parse --short HEAD)
 COMMIT_MSG=$(git log -1 --pretty=format:%s 2>/dev/null || echo "changes")
 MSG_SLUG=$(echo "$COMMIT_MSG" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]_-' | cut -c1-30)
 
-ZIP_NAME="stockpile_delta_${DATE}_${SHORT_HASH}_${MSG_SLUG}.zip"
+ZIP_NAME="situation_room_delta_${DATE}_${SHORT_HASH}_${MSG_SLUG}.zip"
 
 # Get only tracked files that changed in the last commit (respects .gitignore naturally)
 CHANGED_FILES=$(git diff --name-only --diff-filter=ACMRT HEAD~1 HEAD)

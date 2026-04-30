@@ -1,4 +1,4 @@
-# Stockpile — Session 5 Handoff
+# situation_room — Session 5 Handoff
 
 Continuation document for the next session. Covers the state of the
 codebase as of end of Session 4, what works, what's known to be
@@ -34,7 +34,7 @@ extraction recipes for registered sources.
   Mirrors the Level-2 author's shape: `Authored*` types with
   `JsonSchema` derived, schema-constrained LLM call, server-side
   stamping of identity fields, structural validation through the
-  existing `stockpile_core::vocab` newtypes.
+  existing `situation_room_core::vocab` newtypes.
 - **Format-only validation, content-agnostic.**
   The classifier rejects malformed plans (bad topic strings,
   invalid units, out-of-range historical windows, entirely-empty
@@ -63,7 +63,7 @@ to fit in a focused session.
 
 `ClassificationContext::registered_sources` is a `Vec<SourceDescriptor>`
 that the **caller** populates. The pipeline crate doesn't depend on
-`stockpile-sources`, so anyone wiring up Level-1 has to translate
+`situation_room-sources`, so anyone wiring up Level-1 has to translate
 `SourceMetadata` → `SourceDescriptor` themselves.
 
 This is deliberate (keeps the crate dep graph clean) but means
@@ -103,8 +103,8 @@ shape is what the rest of the codebase already accepts.
 
 ### 5. `apps/demo/` is gone
 
-The Phase-1 single-commodity demo (`stockpile-demo`) and the
-Phase-3c end-to-end demo (`stockpile-e2e`) have both been
+The Phase-1 single-commodity demo (`situation_room-demo`) and the
+Phase-3c end-to-end demo (`situation_room-e2e`) have both been
 deleted, on the principle that the situation-room is the real
 product and demo binaries shouldn't shape the design.
 Consequence: there is currently no executable that exercises
@@ -132,7 +132,7 @@ In rough order of leverage:
    against xAI, prints the plan, optionally calls
    `author_recipe` against each registered source for each
    document_source hint, persists everything, and prints the
-   final state. This is the moment Stockpile becomes a usable
+   final state. This is the moment situation_room becomes a usable
    thing rather than a library, and it forces the wiring
    questions in #1, #2, #5 above.
 
@@ -178,8 +178,8 @@ For history.
    priority hierarchy, the trust-paragraph contract for
    `interpretation`.
 
-4. `apps/demo/` deleted — removed both `stockpile-demo` and
-   `stockpile-e2e`, removed the workspace member entry. Stockpile
+4. `apps/demo/` deleted — removed both `situation_room-demo` and
+   `situation_room-e2e`, removed the workspace member entry. situation_room
    is being built as the situation room; demo binaries should not
    shape the design.
 
@@ -204,7 +204,7 @@ For history.
   LLM rewrite the user's words into the canonical record.
 - **Demo binaries are not products.** The whole `apps/demo/` was
   deleted because it was implicitly anchoring design choices.
-  Stockpile's product is the situation room; binaries should
+  situation_room's product is the situation room; binaries should
   serve that product, not test scaffolding.
 
 ## Files to read first when starting Session 5
@@ -228,7 +228,7 @@ In order of importance:
   (ADR 0007 Level 1)
 - Closed enum of 5 extraction modes. Adding a sixth needs an ADR.
 - UUIDv7 + dedup_key for identity.
-- Security primitives in stockpile_secure. No `reqwest::Client::new()`
+- Security primitives in situation_room_secure. No `reqwest::Client::new()`
   anywhere. (ADR 0009)
 - Structure follows code, not anticipates it. No empty folders.
 - When the user pushes back, listen. (Position A vs B was Session

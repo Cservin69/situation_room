@@ -1,9 +1,9 @@
-# Stockpile Session 11 Handoff
+# situation_room Session 11 Handoff
 
 You are picking up after Session 10. Read this and ADR 0007's
 "runtime path" + "Level 2" sections first. ADR 0011 still governs
 the lifecycle gate. The Session 10 production-run findings in
-`STOCKPILE_HANDOFF_SESSION10.md` are the diagnosis Session 10's
+`situation_room_HANDOFF_SESSION10.md` are the diagnosis Session 10's
 patch responds to; treat them as load-bearing context, not history.
 
 ## What Session 10 shipped — Option F (pre-fetch + endpoint_hint)
@@ -70,8 +70,8 @@ The fix is structural, not heuristic:
    string.
 
 7. **Cosmetic** — boot-banner string drift fixed
-   (`apps/desktop/src-tauri/src/main.rs`: "Stockpile desktop boots."
-   instead of "Stockpile desktop boots (Session 6 — GUI).").
+   (`apps/desktop/src-tauri/src/main.rs`: "situation_room desktop boots."
+   instead of "situation_room desktop boots (Session 6 — GUI).").
 
 ### Tests added
 
@@ -291,7 +291,7 @@ the F+E executor; revisit in 2–3 sessions.
 In order of importance:
 
 1. This file.
-2. `STOCKPILE_HANDOFF_SESSION10.md` — the production-run findings
+2. `situation_room_HANDOFF_SESSION10.md` — the production-run findings
    and the original Option F specification.
 3. `crates/pipeline/src/fetch_executor.rs` — `author_one`,
    `prefetch_excerpt`, `placeholder_url`, `stub_excerpt`,

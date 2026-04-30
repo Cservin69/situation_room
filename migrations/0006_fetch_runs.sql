@@ -1,4 +1,4 @@
--- Stockpile schema, version 0006.
+-- situation_room schema, version 0006.
 --
 -- Fetch runs — one row per invocation of the Phase-6 fetch executor
 -- against an accepted plan. See SESSION 8.

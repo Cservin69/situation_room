@@ -1,4 +1,4 @@
-# STOCKPILE — Session 7 handoff
+# situation_room — Session 7 handoff
 
 You are starting Session 7. Session 6 shipped the Tauri desktop GUI:
 the classify pipeline is wired end-to-end, the user can type a topic
@@ -34,7 +34,7 @@ them, not a replacement.
   traps INT/TERM/EXIT, frees :5173 on shutdown. Use it instead of
   `cargo tauri dev` directly.
 - .env loader in main.rs walks upward from CWD to find the
-  workspace root. Anchors stockpile.duckdb and config/sources.toml
+  workspace root. Anchors situation_room.duckdb and config/sources.toml
   to that root regardless of where the binary was launched from.
 
 
@@ -79,7 +79,7 @@ become input to deterministic fetching, including the bad ones.
 - ResearchPlanDto and PlanSummary gain a status: PlanStatusDto
   field. Add the enum to types_export.rs with #[derive(TS)].
 - Both new commands wired into the invoke_handler! in main.rs
-  using the full path form (stockpile_api::commands::accept_plan
+  using the full path form (situation_room_api::commands::accept_plan
   etc.) — see Session 6 patch 3 for why bare names break.
 
 #### Frontend changes

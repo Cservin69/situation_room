@@ -4,7 +4,7 @@
 //! - the user's free-text topic,
 //! - the set of [`Topic`] strings already in use across past sessions
 //!   (the existing-topics injection mechanic — see ADR 0007),
-//! - a description of the registered sources Stockpile can fetch from
+//! - a description of the registered sources situation_room can fetch from
 //!   (so the plan's `document_sources` hints reference real source ids
 //!   rather than freely-invented ones).
 //!
@@ -48,9 +48,9 @@
 use chrono::Utc;
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
-use stockpile_core::vocab::{EntityId, EventType, Topic, Unit, VocabError};
-use stockpile_llm::{CompletionRequest, LlmError, LlmProvider, ModelTier};
-use stockpile_secure::bounds::{check_string, Bounds};
+use situation_room_core::vocab::{EntityId, EventType, Topic, Unit, VocabError};
+use situation_room_llm::{CompletionRequest, LlmError, LlmProvider, ModelTier};
+use situation_room_secure::bounds::{check_string, Bounds};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -77,7 +77,7 @@ pub struct ClassificationContext {
     /// vocabulary cohesive.
     pub existing_topics: Vec<TopicUsage>,
 
-    /// Registered sources Stockpile can fetch from. Surfaced to the
+    /// Registered sources situation_room can fetch from. Surfaced to the
     /// LLM so the plan's `document_sources` hints reference real ids.
     /// An empty list is legal — the plan will then nominate sources
     /// only by description, and the user / Level-2 will resolve.
@@ -93,7 +93,7 @@ pub struct TopicUsage {
 
 /// Compact view of a known data source for prompt injection.
 ///
-/// Stockpile no longer carries hand-coded source adapters; the LLM
+/// situation_room no longer carries hand-coded source adapters; the LLM
 /// nominates sources from the descriptors the caller supplies here.
 /// Callers typically load these from `config/sources.toml` (or
 /// equivalent) at the binary layer — the pipeline crate stays
@@ -222,12 +222,12 @@ pub async fn classify_topic(
 
     let req = CompletionRequest {
         system: Some(
-            "You are the research classifier for Stockpile. Output only JSON \
+            "You are the research classifier for situation_room. Output only JSON \
              conforming to the provided schema. No prose outside the JSON."
                 .to_string(),
         ),
         user,
-        schema: Some(stockpile_llm::providers::StructuredOutputSchema {
+        schema: Some(situation_room_llm::providers::StructuredOutputSchema {
             name: "AuthoredResearchPlan".to_string(),
             schema: schema_value,
         }),
@@ -1033,8 +1033,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_classify_topic_against_xai_produces_valid_plan() {
-        use stockpile_llm::XaiProvider;
-        use stockpile_secure::http::{SecureHttpClient, SecureHttpConfig};
+        use situation_room_llm::XaiProvider;
+        use situation_room_secure::http::{SecureHttpClient, SecureHttpConfig};
 
         let _ = dotenvy::dotenv();
         let http = SecureHttpClient::new(SecureHttpConfig::default()).unwrap();
@@ -1045,7 +1045,7 @@ mod tests {
         // Test-scoped minimal template. Production loads the real
         // markdown via include_str! at the binary layer.
         let template = "\
-            You are the research classifier for Stockpile.\n\
+            You are the research classifier for situation_room.\n\
             TOPIC: {{TOPIC}}\n\
             EXISTING TOPICS:\n{{EXISTING_TOPICS}}\n\
             REGISTERED SOURCES:\n{{REGISTERED_SOURCES}}\n\

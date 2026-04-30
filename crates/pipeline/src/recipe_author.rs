@@ -9,7 +9,7 @@
 //! deterministically by the runtime (Phase 3c.3, forthcoming) for
 //! every subsequent fetch. This is the architectural commitment that
 //! Session 2's deleted `parse.rs` tried to shortcut around. See the
-//! "READ THIS FIRST" section of `STOCKPILE_HANDOFF_SESSION2.md`.
+//! "READ THIS FIRST" section of `situation_room_HANDOFF_SESSION2.md`.
 //!
 //! ## What this module guarantees
 //!
@@ -19,7 +19,7 @@
 //!   `schemars` from [`RecipeAuthoringOutput`]. The LLM cannot return
 //!   shapes the runtime wouldn't understand.
 //! - The returned URL is validated through
-//!   [`stockpile_secure::UrlGuard`] before the recipe is returned. An
+//!   [`situation_room_secure::UrlGuard`] before the recipe is returned. An
 //!   LLM hallucinating `file:///etc/passwd` doesn't leave this
 //!   module.
 //! - Structural sanity checks (≥1 binding, variant-specific bounds)
@@ -41,11 +41,11 @@ use chrono::Utc;
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use stockpile_llm::{
+use situation_room_llm::{
     CompletionRequest, LlmError, LlmProvider, ModelTier,
 };
-use stockpile_secure::bounds::{check_string, Bounds};
-use stockpile_secure::url_guard::{UrlGuard, UrlViolation};
+use situation_room_secure::bounds::{check_string, Bounds};
+use situation_room_secure::url_guard::{UrlGuard, UrlViolation};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
@@ -55,7 +55,7 @@ use crate::recipes::{
     ProductionBinding, RowFilter,
 };
 use crate::research::ResearchPlan;
-use stockpile_core::RecordType;
+use situation_room_core::RecordType;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -169,12 +169,12 @@ pub async fn author_recipe(
 
     let req = CompletionRequest {
         system: Some(
-            "You are a recipe author for Stockpile. Output only JSON conforming \
+            "You are a recipe author for situation_room. Output only JSON conforming \
              to the provided schema. No prose outside the JSON."
                 .to_string(),
         ),
         user,
-        schema: Some(stockpile_llm::providers::StructuredOutputSchema {
+        schema: Some(situation_room_llm::providers::StructuredOutputSchema {
             name: "RecipeAuthoringOutput".to_string(),
             schema: schema_value,
         }),
@@ -588,7 +588,7 @@ mod tests {
         MetricExpectation, RecordExpectations, RelationKindExpectation,
     };
     use chrono::{TimeZone, Utc};
-    use stockpile_core::vocab::{EntityId, EventType, Topic, Unit};
+    use situation_room_core::vocab::{EntityId, EventType, Topic, Unit};
 
     fn sample_plan() -> ResearchPlan {
         ResearchPlan {
@@ -988,8 +988,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_author_recipe_against_xai_produces_valid_recipe() {
-        use stockpile_llm::XaiProvider;
-        use stockpile_secure::http::{SecureHttpClient, SecureHttpConfig};
+        use situation_room_llm::XaiProvider;
+        use situation_room_secure::http::{SecureHttpClient, SecureHttpConfig};
 
         let _ = dotenvy::dotenv();
         let http = SecureHttpClient::new(SecureHttpConfig::default()).unwrap();

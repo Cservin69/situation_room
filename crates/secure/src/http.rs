@@ -1,4 +1,4 @@
-//! The one HTTP client Stockpile uses.
+//! The one HTTP client situation_room uses.
 //!
 //! All outbound HTTP goes through [`SecureHttpClient`]. No crate talks to
 //! `reqwest::Client::new()` directly — if you see that in a PR, it's a bug.
@@ -65,7 +65,7 @@ impl Default for SecureHttpConfig {
             total_timeout: Duration::from_secs(120),
             max_response_bytes: 32 * 1024 * 1024, // 32 MB
             max_redirects: 5,
-            user_agent: format!("Stockpile/{} (+https://github.com/stockpile)", env!("CARGO_PKG_VERSION")),
+            user_agent: format!("situation_room/{} (+https://github.com/situation_room)", env!("CARGO_PKG_VERSION")),
             allow_http2: true,
         }
     }

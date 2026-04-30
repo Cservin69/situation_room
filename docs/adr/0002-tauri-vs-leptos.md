@@ -6,7 +6,7 @@
 
 ## Context
 
-Stockpile is a desktop application with a heavy visualization
+Situation_room is a desktop application with a heavy visualization
 surface — small multiples, sparklines, time-series charts, maps,
 flow diagrams. The frontend choice has two dimensions: the shell
 (how the app runs on the user's machine) and the UI framework
@@ -48,13 +48,13 @@ The IPC boundary is typed in both directions:
 
 ## Rationale
 
-**The chart ecosystem is the decisive factor.** Stockpile renders
+**The chart ecosystem is the decisive factor.** Situation_room renders
 densely — uPlot for sparklines and time series at scale, Observable
 Plot for analytical charts, deck.gl for maps and flows. None of
 these have production-quality Rust-WASM equivalents as of this
 writing. The Rust-WASM charting ecosystem (Plotters, egui_plot,
 etc.) is functional but not in the same league for the
-information-density surface Stockpile wants to render (see ADR
+information-density surface Situation_room wants to render (see ADR
 0006). Picking Leptos would mean either rebuilding those libraries
 in Rust or paying WASM→JS interop costs on every render.
 
@@ -75,7 +75,7 @@ developer," which is small.
 **The IPC boundary isn't as costly as feared.** With `ts-rs`
 generating types from Rust, the Rust-to-TypeScript boundary is
 still mostly type-safe. Serialization cost is real but small —
-for the data volumes Stockpile moves across IPC (per-panel
+for the data volumes Situation_room moves across IPC (per-panel
 refresh, not streaming), it doesn't matter.
 
 **Why Svelte over React.** Smaller runtime, compiled output
@@ -106,7 +106,7 @@ worse than Tauri.
 
 **Native desktop (egui / iced / gtk).** Rejected: losing the web
 chart ecosystem entirely. The visualization surface is where
-Stockpile competes; giving up the tools to render it well would
+Situation_room competes; giving up the tools to render it well would
 undercut the product.
 
 ## Revisit conditions
@@ -123,7 +123,7 @@ production parity with the web stack. Rough expected window:
   chart types).
 - A geospatial rendering library at deck.gl's level (WebGL-
   accelerated, handles the scales of trade-flow and shipping data
-  Stockpile will use).
+  Situation_room will use).
 
 When all three exist in Rust-WASM, the tradeoff inverts —
 language uniformity becomes a clear win, the IPC boundary

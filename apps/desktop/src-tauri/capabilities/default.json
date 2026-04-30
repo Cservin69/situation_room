@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Stockpile capability allow-list. Per ADR 0009: core:shell, core:fs, core:http, core:process are NOT enabled — the frontend cannot shell out, touch the filesystem, make HTTP calls, or spawn processes. All such operations go through Rust-side commands that route through stockpile_secure primitives. The custom #[tauri::command] handlers (classify, list_recent_plans, get_plan) are gated by the invoke_handler!() registration in src/main.rs; capabilities here gate built-in plugin permissions only.",
+  "description": "situation_room capability allow-list. Per ADR 0009: core:shell, core:fs, core:http, core:process are NOT enabled — the frontend cannot shell out, touch the filesystem, make HTTP calls, or spawn processes. All such operations go through Rust-side commands that route through situation_room_secure primitives. The custom #[tauri::command] handlers (classify, list_recent_plans, get_plan) are gated by the invoke_handler!() registration in src/main.rs; capabilities here gate built-in plugin permissions only.",
   "windows": ["main"],
   "permissions": [
     "core:default",

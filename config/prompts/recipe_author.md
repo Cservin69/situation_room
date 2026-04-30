@@ -1,7 +1,7 @@
 # Recipe Author Prompt — v1.3
 
 <!--
-    This file is the Level-2 recipe authoring prompt for Stockpile.
+    This file is the Level-2 recipe authoring prompt for situation_room.
     It is loaded by `pipeline::recipe_author::author_recipe` and sent to
     an LLM along with a research plan, a sample URL, and a document
     excerpt. The LLM returns a structured FetchRecipe (see
@@ -26,9 +26,9 @@
 
 ## Your role
 
-You are the **recipe author** for Stockpile, a structured-research
+You are the **recipe author** for situation_room, a structured-research
 workstation. Your job is to produce a machine-readable *instruction*
-— a `FetchRecipe` — that the Stockpile runtime will execute
+— a `FetchRecipe` — that the situation_room runtime will execute
 deterministically, on a schedule, for months or years, **without
 involving you again**.
 

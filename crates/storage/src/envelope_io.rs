@@ -11,10 +11,10 @@
 //! handles what's common.
 
 use duckdb::{params, Connection, Transaction};
-use stockpile_core::schema::envelope::{
+use situation_room_core::schema::envelope::{
     DerivationRole, DerivedFrom, Envelope, PlaceRef, Provenance, Subjects, TimeScope,
 };
-use stockpile_core::vocab::{Confidence, EntityId, Topic};
+use situation_room_core::vocab::{Confidence, EntityId, Topic};
 use uuid::Uuid;
 
 use crate::{Result, StorageError};
@@ -57,7 +57,7 @@ impl EnvelopeColumns {
 
 /// Write the multi-valued subject dimensions and derivation chain.
 /// Call after the main record row has been inserted in the same
-/// transaction. `record_type` is the [`stockpile_core::RecordType`]
+/// transaction. `record_type` is the [`situation_room_core::RecordType`]
 /// string form — `"observation"`, `"event"`, etc.
 pub(crate) fn insert_subjects_and_derivation(
     tx: &Transaction,

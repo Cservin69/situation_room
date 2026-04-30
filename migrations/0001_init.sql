@@ -1,4 +1,4 @@
--- Stockpile schema, version 0001.
+-- Situation_room schema, version 0001.
 --
 -- One table per record type. Envelope columns are flat (id, dedup_key,
 -- provenance, timestamps, confidence) so the hot query paths are columnar.
@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 --   license         License string ("public_domain", "fair_use", etc.).
 --   tags            JSON array of "key:value" strings.
 --   subject_time    JSON-encoded Option<TimeScope>, null when absent.
---   observed_at     When Stockpile learned about this record.
+--   observed_at     When situation_room learned about this record.
 --   valid_at        When the claim was true in the world (optional).
 --   confidence      Float in [0.0, 1.0].
 ------------------------------------------------------------------------

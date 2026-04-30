@@ -1,7 +1,7 @@
 //! Relation storage: insert + get.
 
 use duckdb::params;
-use stockpile_core::Relation;
+use situation_room_core::Relation;
 use uuid::Uuid;
 
 use crate::connection::Store;
@@ -100,7 +100,7 @@ impl Store {
             })?;
 
         let envelope = reconstruct_envelope(&conn, row_id, raw)?;
-        let content: stockpile_core::RelationContent = serde_json::from_str(&content_json)?;
+        let content: situation_room_core::RelationContent = serde_json::from_str(&content_json)?;
 
         Ok(Relation {
             id: row_id,
@@ -115,9 +115,9 @@ impl Store {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use stockpile_core::schema::content::RelationContent;
-    use stockpile_core::schema::envelope::{Envelope, Provenance, Subjects};
-    use stockpile_core::vocab::{Confidence, EntityId, Topic};
+    use situation_room_core::schema::content::RelationContent;
+    use situation_room_core::schema::envelope::{Envelope, Provenance, Subjects};
+    use situation_room_core::vocab::{Confidence, EntityId, Topic};
 
     fn sample_relation() -> Relation {
         let envelope = Envelope {

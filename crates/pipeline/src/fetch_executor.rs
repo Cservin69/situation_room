@@ -30,7 +30,7 @@
 //! production run on "bulgaria elections 2026" revealed that the
 //! LLM would echo the placeholder back into the recipe, producing
 //! recipes that fetched `example.invalid` at runtime and failed at
-//! the Fetch stage. (See `STOCKPILE_HANDOFF_SESSION10.md` §"gdelt
+//! the Fetch stage. (See `situation_room_HANDOFF_SESSION10.md` §"gdelt
 //! → Failed @ Fetch" for the diagnosis.)
 //!
 //! Session 10 fixes this by:
@@ -52,14 +52,23 @@
 //!
 //! ## Extraction-mode policy in this session
 //!
-//! [`ExtractionSpec::CsvCell`] and [`ExtractionSpec::JsonPath`] are
-//! wired through to apply +
-//! insert. The other modes get authored normally (Level-2 picks
+//! [`ExtractionSpec::CsvCell`], [`ExtractionSpec::JsonPath`], and
+//! [`ExtractionSpec::CssSelect`] are wired through to apply + insert.
+//! The remaining modes ([`ExtractionSpec::RegexCapture`] and
+//! [`ExtractionSpec::PdfTable`]) get authored normally (Level-2 picks
 //! whatever fits the source) and are surfaced in the report as
 //! `Skipped { reason }` rather than failures — they're not bugs,
 //! they're a deliberate phasing of work. This is the cheapest
 //! discipline that keeps the executor honest about what it can and
 //! can't do without conflating "didn't try" with "tried and broke".
+//!
+//! CssSelect was promoted in Session 12. The recipe_apply runtime
+//! has supported it since Session 3 (via the `scraper` crate); what
+//! was missing until Session 12 was the executor-level dispatch +
+//! the apply-and-insert plumbing. The wiring is structurally
+//! identical to the CSV and JSON paths because all three go through
+//! the same `apply()` boundary, which dispatches internally on the
+//! recipe's `ExtractionSpec`.
 //!
 //! ## What this module does NOT do
 //!
@@ -75,9 +84,9 @@ use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use stockpile_llm::{LlmProvider, ModelTier};
-use stockpile_secure::bounds::Bounds;
-use stockpile_storage::{
+use situation_room_llm::{LlmProvider, ModelTier};
+use situation_room_secure::bounds::Bounds;
+use situation_room_storage::{
     fetch_runs::FetchRunRow, research_plans::PlanStatus, Store,
 };
 
@@ -181,7 +190,7 @@ pub enum FetchExecutorError {
     Authoring(#[from] AuthoringError),
 
     #[error("storage error: {0}")]
-    Storage(#[from] stockpile_storage::StorageError),
+    Storage(#[from] situation_room_storage::StorageError),
 }
 
 /// Inputs the executor needs from the composition root. Bundled into
@@ -667,11 +676,7 @@ async fn run_one_recipe(
     match &recipe.extraction {
         ExtractionSpec::CsvCell { .. } => run_csv_recipe(ctx, plan, recipe).await,
         ExtractionSpec::JsonPath { .. } => run_json_recipe(ctx, plan, recipe).await,
-        ExtractionSpec::CssSelect { .. } => RecipeOutcome::Skipped {
-            recipe_id: recipe.id,
-            source_id: recipe.source_id.clone(),
-            reason: "css_select: extraction mode not yet enabled in executor".into(),
-        },
+        ExtractionSpec::CssSelect { .. } => run_css_recipe(ctx, plan, recipe).await,
         ExtractionSpec::PdfTable { .. } => RecipeOutcome::Skipped {
             recipe_id: recipe.id,
             source_id: recipe.source_id.clone(),
@@ -838,6 +843,85 @@ async fn run_json_recipe(
     }
 }
 
+/// CSS runtime path: fetch → apply → insert.
+///
+/// Structurally identical to [`run_csv_recipe`] and [`run_json_recipe`]
+/// — all three go through the same `apply()` boundary, which
+/// dispatches internally on the recipe's `ExtractionSpec`. Promoted
+/// from `Skipped` in Session 12. The duplication-with-comments
+/// discipline that Session 9 chose for the CSV/JSON split applies
+/// here too: keeping the dispatch in `run_one_recipe` honest about
+/// which modes are wired is worth more than the line-saving of a
+/// generic helper, especially while modes may still diverge in
+/// behaviour (CssSelect could grow attribute-vs-text rendering
+/// concerns at the executor level later).
+async fn run_css_recipe(
+    ctx: &ExecutorContext<'_>,
+    plan: &ResearchPlan,
+    recipe: &FetchRecipe,
+) -> RecipeOutcome {
+    // Fetch.
+    let bytes = match ctx.http.fetch_bytes(recipe.source_url.as_str()).await {
+        Ok(b) => b,
+        Err(HttpFetchError::Http(msg)) => {
+            return RecipeOutcome::Failed {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                stage: FailureStage::Fetch,
+                message: msg,
+            }
+        }
+        Err(HttpFetchError::NoFixture(url)) => {
+            return RecipeOutcome::Failed {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                stage: FailureStage::Fetch,
+                message: format!("no fixture configured for url: {url}"),
+            }
+        }
+    };
+
+    // Apply.
+    let fetched_at = Utc::now();
+    let apply_ctx = ApplyContext {
+        recipe,
+        plan,
+        bytes: &bytes,
+        fetched_at,
+    };
+    let records = match apply(apply_ctx) {
+        Ok(rs) => rs,
+        Err(e) => {
+            return RecipeOutcome::Failed {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                stage: FailureStage::Apply,
+                message: describe_apply_error(&e),
+            }
+        }
+    };
+
+    // Insert. A failure to insert any one record fails the recipe —
+    // we don't half-write a recipe's batch. Same discipline as the
+    // CSV and JSON paths.
+    for record in &records {
+        if let Err(e) = ctx.store.insert_record(record) {
+            return RecipeOutcome::Failed {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                stage: FailureStage::Insert,
+                message: e.to_string(),
+            };
+        }
+    }
+
+    RecipeOutcome::Succeeded {
+        recipe_id: recipe.id,
+        source_id: recipe.source_id.clone(),
+        records_produced: records.len() as u32,
+    }
+}
+
 /// Close a fetch_run row with an error_summary populated. Used when
 /// the run failed before processing any recipe — per-recipe failures
 /// don't go through here.
@@ -868,9 +952,9 @@ mod tests {
     use async_trait::async_trait;
     use chrono::TimeZone;
     use serde_json::json;
-    use stockpile_core::vocab::{EntityId, EventType, Topic, Unit};
-    use stockpile_core::RecordType;
-    use stockpile_llm::{
+    use situation_room_core::vocab::{EntityId, EventType, Topic, Unit};
+    use situation_room_core::RecordType;
+    use situation_room_llm::{
         CompletionRequest, CompletionResponse, LlmError, LlmProvider, ModelTier,
     };
     use url::Url;
@@ -977,6 +1061,56 @@ mod tests {
             source_url: Url::parse(url).unwrap(),
             extraction: ExtractionSpec::JsonPath {
                 path: "$.data.production.chile".into(),
+            },
+            produces: vec![ProductionBinding {
+                record_type: RecordType::Observation,
+                expectation: ExpectationRef::ObservationMetric { index: 0 },
+                field_mappings: vec![
+                    FieldMap {
+                        path: "value".into(),
+                        source: FieldValueSource::Extracted,
+                    },
+                    FieldMap {
+                        path: "unit".into(),
+                        source: FieldValueSource::Literal { value: json!("t") },
+                    },
+                    FieldMap {
+                        path: "metric".into(),
+                        source: FieldValueSource::FromPlan {
+                            pointer: "expectations.observation_metrics.0.name".into(),
+                        },
+                    },
+                    FieldMap {
+                        path: "period".into(),
+                        source: FieldValueSource::Literal {
+                            value: json!("annual"),
+                        },
+                    },
+                ],
+            }],
+            authored_at: Utc.with_ymd_and_hms(2026, 4, 28, 0, 0, 0).unwrap(),
+            authored_by: "test".into(),
+            version: 1,
+        }
+    }
+
+    /// Working CSS recipe — pre-authored, persisted, exercises the
+    /// CssSelect happy-path runtime promoted in Session 12. Mirrors
+    /// `working_csv_recipe` and `working_json_recipe` in shape; only
+    /// `extraction` differs. The `produces` binding is identical
+    /// because the CssSelect extractor produces a single scalar
+    /// string (the matched element's text or attribute) that flows
+    /// through the same field-mapping discipline in `apply()`.
+    fn working_css_recipe(plan: &ResearchPlan, url: &str) -> FetchRecipe {
+        FetchRecipe {
+            id: Uuid::now_v7(),
+            dedup_key: Some(format!("{}:demo_css", plan.id)),
+            plan_id: plan.id,
+            source_id: "demo_css".into(),
+            source_url: Url::parse(url).unwrap(),
+            extraction: ExtractionSpec::CssSelect {
+                selector: "td.prod".into(),
+                attribute: None,
             },
             produces: vec![ProductionBinding {
                 record_type: RecordType::Observation,
@@ -1274,31 +1408,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_fetch_for_plan_skips_unwired_extraction_modes() {
-        // Coverage regression: confirms the dispatch arm for a still-
-        // unwired mode (CssSelect, in this case) still emits Skipped
-        // rather than silently going through a wired path. When
-        // CssSelect is promoted in a later session, replace this with
-        // a happy-path test for that mode and pick another unwired
-        // mode here.
+    async fn run_fetch_for_plan_succeeds_against_css_recipe_without_calling_llm() {
+        // Session 12 happy-path: CssSelect promoted from Skipped to a
+        // first-class wired mode. Mirrors the CSV and JSON success
+        // tests structurally; the only meaningful differences are the
+        // recipe's `extraction` variant and the body bytes (HTML
+        // instead of CSV/JSON).
         let plan = sample_plan();
         let store = make_store_with_accepted_plan(&plan);
 
-        let url = "https://example.test/page.html";
-        let mut css_recipe = working_csv_recipe(&plan, url);
-        css_recipe.id = Uuid::now_v7();
-        css_recipe.dedup_key = Some(format!("{}:demo_css", plan.id));
-        css_recipe.extraction = ExtractionSpec::CssSelect {
-            selector: "td.value".into(),
-            attribute: None,
+        let url = "https://example.test/lithium.html";
+        let recipe = working_css_recipe(&plan, url);
+        save_recipe(&store, &recipe).unwrap();
+
+        // The selector `td.prod` matches the cell whose text is
+        // `49,000`. `parse_extracted_scalar` strips the comma and
+        // produces `49000.0`, which flows into the Observation's
+        // `value` field — same end-state as the CSV / JSON paths.
+        let html =
+            b"<html><body><table><tr><td class='prod'>49,000</td></tr></table></body></html>";
+        let fetcher = StaticFetcher::new().with(url, html);
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: "unused — recipes already authored",
+            sources: &[],
         };
-        save_recipe(&store, &css_recipe).unwrap();
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        assert_eq!(report.plan_id, plan.id);
+        assert_eq!(report.recipes_attempted, 1);
+        assert_eq!(report.recipes_succeeded, 1);
+        assert_eq!(report.records_produced, 1);
+        assert_eq!(report.outcomes.len(), 1);
+        match &report.outcomes[0] {
+            RecipeOutcome::Succeeded {
+                records_produced, ..
+            } => assert_eq!(*records_produced, 1),
+            other => panic!("expected Succeeded, got {other:?}"),
+        }
+
+        // The fetch_runs row was opened and closed cleanly — same
+        // discipline as the CSV and JSON paths.
+        let runs = store.recent_fetch_runs_for_plan(plan.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, report.run_id);
+        assert_eq!(runs[0].recipes_attempted, 1);
+        assert_eq!(runs[0].recipes_succeeded, 1);
+        assert_eq!(runs[0].records_produced, 1);
+        assert!(runs[0].finished_at.is_some());
+        assert!(runs[0].error_summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_fetch_for_plan_reports_apply_failure_on_unmatched_css_selector() {
+        // Failure-shape coverage for the new CssSelect arm: when the
+        // selector matches nothing in the fetched HTML, `apply()`
+        // surfaces `ApplyError::Extraction { mode: "css_select" }`,
+        // which the executor maps to `FailureStage::Apply`. Mirrors
+        // the malformed-CSV and malformed-JSON apply-failure tests.
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let url = "https://example.test/empty.html";
+        let recipe = working_css_recipe(&plan, url);
+        save_recipe(&store, &recipe).unwrap();
+
+        // Body parses as HTML but the recipe's `td.prod` selector
+        // matches no elements — extraction errors at the apply stage.
+        let bad_html = b"<html><body><p>nothing here</p></body></html>";
+        let fetcher = StaticFetcher::new().with(url, bad_html);
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: "",
+            sources: &[],
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+        assert_eq!(report.recipes_succeeded, 0);
+        match &report.outcomes[0] {
+            RecipeOutcome::Failed { stage, .. } => assert_eq!(*stage, FailureStage::Apply),
+            other => panic!("expected Failed(Apply), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_fetch_for_plan_skips_unwired_extraction_modes() {
+        // Coverage regression: confirms the dispatch arm for a still-
+        // unwired mode (RegexCapture, in this case) still emits Skipped
+        // rather than silently going through a wired path. When
+        // RegexCapture is promoted in a later session, replace this
+        // with a happy-path test for that mode and pick another
+        // unwired mode here. (CssSelect was the canary in Sessions
+        // 8–11 and was promoted in Session 12; if PdfTable ever lands
+        // it will inherit the role.)
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let url = "https://example.test/page.txt";
+        let mut regex_recipe = working_csv_recipe(&plan, url);
+        regex_recipe.id = Uuid::now_v7();
+        regex_recipe.dedup_key = Some(format!("{}:demo_regex", plan.id));
+        regex_recipe.extraction = ExtractionSpec::RegexCapture {
+            pattern: r"production:\s*(\d+)".into(),
+            group: 1,
+        };
+        save_recipe(&store, &regex_recipe).unwrap();
 
         // Fixture not strictly necessary — Skipped is decided before
         // fetch — but include it so a regression that *did* attempt
         // fetch wouldn't trip on a missing fixture and look like a
         // test setup bug.
-        let fetcher = StaticFetcher::new().with(url, b"<html></html>");
+        let fetcher = StaticFetcher::new().with(url, b"production: 49000");
 
         let provider = UnreachableProvider;
         let ctx = ExecutorContext {
@@ -1794,7 +2023,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_fetch_against_real_csv_produces_observation_and_closes_run() {
-        use stockpile_secure::http::{SecureHttpClient, SecureHttpConfig};
+        use situation_room_secure::http::{SecureHttpClient, SecureHttpConfig};
 
         let _ = dotenvy::dotenv();
 
@@ -1917,7 +2146,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_fetch_against_real_json_produces_observation_and_closes_run() {
-        use stockpile_secure::http::{SecureHttpClient, SecureHttpConfig};
+        use situation_room_secure::http::{SecureHttpClient, SecureHttpConfig};
 
         let _ = dotenvy::dotenv();
 

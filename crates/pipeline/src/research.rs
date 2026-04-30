@@ -31,7 +31,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use stockpile_core::vocab::{EntityId, EventType, Topic, Unit};
+use situation_room_core::vocab::{EntityId, EventType, Topic, Unit};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -157,7 +157,7 @@ pub struct RecordExpectations {
     pub event_types: Vec<EventTypeExpectation>,
 
     /// Kinds of entities the session expects to track. "Kind" here
-    /// matches [`Entity::kind`](stockpile_core::Entity::kind) — the
+    /// matches [`Entity::kind`](situation_room_core::Entity::kind) — the
     /// free-form classifier of what an entity is (`company`, `fab`,
     /// `equipment_vendor`, `government_agency`, etc.). Known exemplars
     /// are listed so source matching can seed ingestion with known
@@ -166,7 +166,7 @@ pub struct RecordExpectations {
     pub entity_kinds: Vec<EntityKindExpectation>,
 
     /// Kinds of relations the session expects. Each kind is a free-form
-    /// string matching [`RelationContent::kind`](stockpile_core::RelationContent::kind):
+    /// string matching [`RelationContent::kind`](situation_room_core::RelationContent::kind):
     /// `supply_contract`, `fab_operator`, `equipment_source`, `subsidiary`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relation_kinds: Vec<RelationKindExpectation>,

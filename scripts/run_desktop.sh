@@ -22,12 +22,12 @@
 #     ./scripts/run_desktop.sh
 #
 # Optional env:
-#   STOCKPILE_DEV_PORT — default 5173. Override if you change
+#   situation_room_DEV_PORT — default 5173. Override if you change
 #                        vite.config.ts's `server.port`.
 
 set -euo pipefail
 
-PORT="${STOCKPILE_DEV_PORT:-5173}"
+PORT="${situation_room_DEV_PORT:-5173}"
 
 # Resolve workspace root from this script's location so it's CWD-agnostic.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"

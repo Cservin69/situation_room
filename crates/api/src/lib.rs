@@ -1,4 +1,4 @@
-//! # stockpile-api
+//! # situation_room-api
 //!
 //! The frontend-facing surface. Tauri commands and the TypeScript type
 //! exports the Svelte frontend imports as compile-time-checked DTOs.

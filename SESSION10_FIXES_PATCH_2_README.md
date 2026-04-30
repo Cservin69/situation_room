@@ -35,7 +35,7 @@ the production code path is correct as written.
 ### More pre-existing clippy lints in `crates/storage/` (5 files)
 
 Same situation as round 1: `cargo test` getting further this time
-allowed clippy to reach `stockpile-storage`, which had its own
+allowed clippy to reach `situation_room-storage`, which had its own
 backlog of clippy-1.88 lints in untouched code:
 
 - `crates/storage/src/assertions.rs:38` — `needless_borrows_for_generic_args`

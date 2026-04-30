@@ -7,7 +7,7 @@ ADR 0006 (design language)
 
 ## Context
 
-Stockpile is a desktop app that pulls from internet sources. Two
+Situation_room is a desktop app that pulls from internet sources. Two
 realities follow from that:
 
 1. The user is sometimes offline, or on a bad connection, or
@@ -29,7 +29,7 @@ There are two common answers:
   the UI reads only from the cache. Panels are fast; offline
   works; freshness is a separate concern surfaced explicitly.
 
-Stockpile picks the second.
+Situation_room picks the second.
 
 ## Decision
 
@@ -111,7 +111,7 @@ there is no real version.
 
 **Why the scheduler runs in the background, not on-demand.**
 Users shouldn't have to hit refresh. A commodities analyst who
-checks Stockpile every morning wants yesterday's overnight
+checks Situation_room every morning wants yesterday's overnight
 updates already present, not "loading..." The scheduler ticks
 at configured intervals (per-source, per-severity); the UI
 always has what the scheduler last brought in.

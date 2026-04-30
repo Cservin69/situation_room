@@ -1,21 +1,21 @@
 [package]
-name = "stockpile-situation-room"
+name = "situation_room-situation-room"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Stockpile situation room — CLI that classifies a topic into a research plan and persists it."
+description = "situation_room situation room — CLI that classifies a topic into a research plan and persists it."
 
 [[bin]]
 name = "situation-room"
 path = "src/main.rs"
 
 [dependencies]
-stockpile-core = { workspace = true }
-stockpile-storage = { workspace = true }
-stockpile-llm = { workspace = true }
-stockpile-pipeline = { workspace = true }
-stockpile-secure = { workspace = true }
+situation_room-core = { workspace = true }
+situation_room-storage = { workspace = true }
+situation_room-llm = { workspace = true }
+situation_room-pipeline = { workspace = true }
+situation_room-secure = { workspace = true }
 
 # CLI
 clap = { workspace = true }

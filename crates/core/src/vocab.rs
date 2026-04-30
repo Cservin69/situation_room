@@ -1,6 +1,6 @@
 //! Controlled vocabularies.
 //!
-//! These are the typed identifiers Stockpile uses for countries, entities,
+//! These are the typed identifiers situation_room uses for countries, entities,
 //! event types, units, currencies, topics, stance, and confidence. They
 //! reuse existing standards wherever possible:
 //!
@@ -11,7 +11,7 @@
 //!
 //! ## On topics (and why there is no `CommodityId`)
 //!
-//! Stockpile does not hardcode a schema for "commodities", "sectors",
+//! situation_room does not hardcode a schema for "commodities", "sectors",
 //! "technologies", "elections", etc. The six record types
 //! ([Observation](crate::schema::records::Observation),
 //! [Event](crate::schema::records::Event), [Entity](crate::schema::records::Entity),
@@ -216,7 +216,7 @@ impl std::fmt::Display for EventType {
 /// grammar (that would require a dependency) — we accept any non-empty
 /// string with printable ASCII. Consumers can validate more strictly.
 ///
-/// Common units in Stockpile: "t" (metric ton), "kt" (kiloton),
+/// Common units in situation_room: "t" (metric ton), "kt" (kiloton),
 /// "USD/t" (price), "%" (percent), "1" (dimensionless),
 /// "USD" (raw currency amount), "units/month", "MWh".
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

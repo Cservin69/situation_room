@@ -6,7 +6,7 @@
  *
  * ## Why scalar fields are typed but `extraction` / `produces` aren't
  *
- * The internal [`stockpile_pipeline::recipes::FetchRecipe`] has
+ * The internal [`situation_room_pipeline::recipes::FetchRecipe`] has
  * strongly-typed `extraction: ExtractionSpec` (closed enum of five
  * modes) and `produces: Vec<ProductionBinding>` (with nested closed
  * enums for `record_type`, `field_value_source`, etc.). Mirroring all

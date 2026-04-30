@@ -1,7 +1,7 @@
 //! Structured-output extraction.
 //!
-//! Takes a [`Document`](stockpile_core::schema::records::document::Document) plus a
-//! prompt, asks the LLM to extract structured [`Assertion`](stockpile_core::schema::records::assertion::Assertion)s,
+//! Takes a [`Document`](situation_room_core::schema::records::document::Document) plus a
+//! prompt, asks the LLM to extract structured [`Assertion`](situation_room_core::schema::records::assertion::Assertion)s,
 //! validates the response against a JSON schema, retries on failure, returns
 //! typed assertions.
 //!

@@ -1,4 +1,4 @@
--- Stockpile schema, version 0005.
+-- situation_room schema, version 0005.
 --
 -- Soft-delete-via-status for research plans. See SESSION 7 P1.
 --

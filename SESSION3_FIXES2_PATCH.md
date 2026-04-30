@@ -3,8 +3,8 @@
 Applies cleanly on top of the first fixes patch. Two remaining
 failures from the last run addressed; both were mine to fix.
 
-    cd /Users/aben/RustroverProjects/stockpile
-    tar -xzvf ~/Downloads/stockpile_session3_fixes2_patch.tar.gz
+    cd /Users/aben/RustroverProjects/situation_room
+    tar -xzvf ~/Downloads/situation_room_session3_fixes2_patch.tar.gz
 
 ## What failed
 
@@ -62,8 +62,8 @@ Files changed: crates/secure/src/fs_guard.rs.
 ## What to run
 
     cargo check --workspace
-    cargo test -p stockpile-secure
-    cargo test -p stockpile-pipeline
+    cargo test -p situation_room-secure
+    cargo test -p situation_room-pipeline
 
 Both should now be fully green. Everything else was already green
 in the previous run.

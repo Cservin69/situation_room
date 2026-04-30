@@ -46,8 +46,8 @@ logs/
 
 # Version control
 clean_code.zip
-stockpile_codebase.txt
-stockpile_delta_*.zip
+situation_room_codebase.txt
+situation_room_delta_*.zip
 
 # Misc
 *.swp

@@ -5,7 +5,7 @@ import type { RecordExpectationsDto } from "./RecordExpectationsDto";
 
 /**
  * Wire shape for a research plan. Mirrors
- * [`stockpile_pipeline::research::ResearchPlan`] one-for-one, with
+ * [`situation_room_pipeline::research::ResearchPlan`] one-for-one, with
  * the storage-layer audit field [`status`](Self::status) tacked on so
  * the frontend can render the lifecycle pill / accept-reject buttons
  * without a second IPC roundtrip.

@@ -6,9 +6,9 @@
 
 ## Context
 
-Stockpile distinguishes between *facts* (measurements Stockpile made
+Situation_room distinguishes between *facts* (measurements Situation_room made
 itself or pulled directly from authoritative structured sources) and
-*claims* (things someone said in a document Stockpile ingested).
+*claims* (things someone said in a document Situation_room ingested).
 ADR 0003 codified this by making `Assertion` the sixth record type:
 it wraps a content shape (`ObservationContent`, `EventContent`,
 `RelationContent`, or `EntityAttributeContent`) with a claimant, a
@@ -188,7 +188,7 @@ product-critical:
    you'd only see the consensus-survivor.
 2. *Auditability.* "Here's the Observation, here are the seven
    claims it was derived from, here's who said what and when" is
-   the traceability story Stockpile promises. Collapsing to only
+   the traceability story Situation_room promises. Collapsing to only
    the promoted record turns that story into "trust me, the
    consensus said so."
 
@@ -234,7 +234,7 @@ Assertions" above.
 
 **Single pathway — consensus only.** Rejected: can't promote
 authoritative single-source facts, which are the cleanest,
-fastest-to-panel data Stockpile can surface.
+fastest-to-panel data Situation_room can surface.
 
 **Single pathway — authoritative only.** Rejected: inverts the
 problem. Topics without dispositive sources never leave the

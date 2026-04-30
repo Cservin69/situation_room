@@ -16,8 +16,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/yourusername/stockpile"
-authors = ["Stockpile contributors"]
+repository = "https://github.com/Cservin69/situation_room.git"
+authors = ["Situation room contributors"]
 
 [workspace.dependencies]
 # Async runtime
@@ -36,7 +36,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1.0"
 anyhow = "1.0"
 
-# Logging — stockpile::secure::logging wraps this to scrub secrets
+# Logging — situation_room::secure::logging wraps this to scrub secrets
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
@@ -105,12 +105,12 @@ scraper = "0.20"
 jsonpath-rust = "1.0"
 
 # Internal workspace crates
-stockpile-core = { path = "crates/core" }
-stockpile-storage = { path = "crates/storage" }
-stockpile-llm = { path = "crates/llm" }
-stockpile-pipeline = { path = "crates/pipeline" }
-stockpile-api = { path = "crates/api" }
-stockpile-secure = { path = "crates/secure" }
+situation_room-core = { path = "crates/core" }
+situation_room-storage = { path = "crates/storage" }
+situation_room-llm = { path = "crates/llm" }
+situation_room-pipeline = { path = "crates/pipeline" }
+situation_room-api = { path = "crates/api" }
+situation_room-secure = { path = "crates/secure" }
 
 [profile.release]
 opt-level = 3

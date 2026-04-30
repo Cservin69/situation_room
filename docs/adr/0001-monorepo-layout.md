@@ -7,7 +7,7 @@
 
 ## Context
 
-Stockpile is a Rust-heavy project with several distinct concerns:
+Situation_room is a Rust-heavy project with several distinct concerns:
 schema definitions, data storage, source adapters, LLM integration,
 a pipeline that moves data through stages, analytical detectors,
 and a Tauri desktop shell. Early in Phase 1 we had to decide how to

@@ -1,5 +1,5 @@
 /**
- * Stockpile design tokens.
+ * situation_room design tokens.
  *
  * The visual language is documented in ADR 0006. The principles in short:
  *

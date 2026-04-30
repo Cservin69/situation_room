@@ -6,7 +6,7 @@
 
 ## Context
 
-Stockpile's product is a research workstation. The user spends
+Situation_room's product is a research workstation. The user spends
 hours in front of it reading numbers, cross-referencing claims,
 and looking for anomalies. The visual language has to support
 that mode of use — high information density, low friction, no
@@ -27,7 +27,7 @@ The space of existing analytical UIs falls into two broad camps:
    fitness apps; low information density per screen; signals
    polish but not substance.
 
-Neither serves Stockpile's user. A commodities analyst tracking
+Neither serves situation_room's user. A commodities analyst tracking
 lithium prices does not need illustrated empty states and does
 not need orange-on-black nostalgia. They need a lot of numbers
 that are legible, small multiples they can scan, sparklines
@@ -35,7 +35,7 @@ everywhere, and a signal when something is unusual.
 
 ## Decision
 
-Stockpile's visual language is:
+situation_room's visual language is:
 
 **Tufte information-density discipline on a warm-charcoal
 foundation, with surgical color use and ambient kinetic moments.**
@@ -108,7 +108,7 @@ misses the update, or has to actively verify nothing changed.
 Ambient motion (a fade-in on new data, a subtle pulse on
 anomalies) communicates liveness without demanding attention.
 The counter-model is Slack-style notifications: theatrical,
-demanding, exhausting. Stockpile is the opposite.
+demanding, exhausting. situation_room is the opposite.
 
 **Why the "80/20" rule is stated as a percentage.** Precision
 forces discipline. "Mostly charcoal, some color" is a vibe;
@@ -125,7 +125,7 @@ discipline without each author having to re-derive it.
 ## Alternatives considered
 
 **Bloomberg-clone aesthetic.** Rejected: signals seriousness
-through volume, not through information. Stockpile wants to
+through volume, not through information. situation_room wants to
 be quiet and clear, not loud.
 
 **Modern SaaS dashboard.** Rejected: looks like every other
@@ -155,7 +155,7 @@ information saturation that drowns the actual signal.
   research session at once.
 - Color carries meaning; anomalies and disagreements are
   visible at a glance.
-- The look is distinctive — Stockpile doesn't look like every
+- The look is distinctive — situation_room doesn't look like every
   other dashboard.
 - Tokens enforce consistency without per-component discipline.
 

@@ -2,6 +2,6 @@
 
 /**
  * Per-failure stage on the wire. Mirrors
- * [`stockpile_pipeline::fetch_executor::FailureStage`].
+ * [`situation_room_pipeline::fetch_executor::FailureStage`].
  */
 export type FailureStageDto = "fetch" | "apply" | "insert";

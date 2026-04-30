@@ -1,4 +1,4 @@
--- Stockpile schema, version 0003.
+-- situation_room schema, version 0003.
 --
 -- Recipes — the Level-2 output of the research function (ADR 0007).
 -- A recipe is an instruction, not a fact: it tells the runtime what
@@ -13,7 +13,7 @@
 -- the records claim about the world. See ADR 0003 on why the six are
 -- closed and ADR 0007 on why recipes sit outside them.
 --
--- Identity: UUIDv7 per Stockpile convention. A (plan_id, source_id,
+-- Identity: UUIDv7 per situation_room convention. A (plan_id, source_id,
 -- binding_tag) dedup_key supports idempotent re-authoring — running
 -- Level-2 twice for the same plan × source × binding collides on the
 -- key and bumps version rather than creating a parallel recipe.

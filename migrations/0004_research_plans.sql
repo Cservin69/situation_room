@@ -1,8 +1,8 @@
--- Stockpile schema, version 0004.
+-- situation_room schema, version 0004.
 --
 -- Research plans — the Level-1 output of the research function (ADR 0007).
 -- A plan is the structured classification of a free-text topic into the
--- Stockpile vocabulary: which record types to populate, which sources to
+-- situation_room vocabulary: which record types to populate, which sources to
 -- nominate, what the geographic and temporal scope is, and the
 -- interpretation paragraph the user reviews before fetching begins.
 --
@@ -17,7 +17,7 @@
 -- they describe how a session is shaped, not what records claim about
 -- the world.
 --
--- Identity: UUIDv7 per Stockpile convention. No dedup_key — re-running
+-- Identity: UUIDv7 per situation_room convention. No dedup_key — re-running
 -- classification for the same topic legitimately produces a new plan
 -- (the LLM may classify the same topic differently across sessions, the
 -- existing-topics injection might steer it differently, the prompt may

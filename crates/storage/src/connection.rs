@@ -10,7 +10,7 @@
 //! ## Lifecycle
 //!
 //! ```ignore
-//! let store = Store::open("stockpile.duckdb")?;
+//! let store = Store::open("situation_room.duckdb")?;
 //! store.migrate()?;  // idempotent; safe to call on every startup
 //! // ... use the store ...
 //! ```
@@ -24,7 +24,7 @@ use std::sync::Mutex;
 
 use crate::{Result, StorageError};
 
-/// A handle to the Stockpile DuckDB store.
+/// A handle to the situation_room DuckDB store.
 ///
 /// Clonable via `Arc<Store>` at the application layer; we don't derive
 /// `Clone` on `Store` itself because the underlying connection is not

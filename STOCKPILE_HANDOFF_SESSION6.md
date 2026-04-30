@@ -1,4 +1,4 @@
-# Stockpile — Session 7 Handoff
+# situation_room — Session 7 Handoff
 
 Continuation document for the next session. Covers the state of the
 codebase as of end of Session 6, what works, what's still imperfect,
@@ -37,7 +37,7 @@ build" below as the start of the punchlist.
 | 5f — Svelte 5 frontend (P1/P2/P3) | done, never opened in a browser |
 
 Workspace is unchanged at seven library crates plus two binaries
-(`stockpile-desktop`, `stockpile-situation-room`).
+(`situation_room-desktop`, `situation_room-situation-room`).
 
 ## What works (in theory; verify on first build)
 
@@ -88,7 +88,7 @@ Workspace is unchanged at seven library crates plus two binaries
   hardcoded hex values anywhere.
 
 - **Capabilities (ADR 0009).** `apps/desktop/src-tauri/capabilities/default.json`
-  enumerates only the core window permissions Stockpile needs. Custom
+  enumerates only the core window permissions situation_room needs. Custom
   Tauri commands (the three above) are exposed via `invoke_handler`
   on the builder, which is the standard Tauri 2 path. `core:fs`,
   `core:http`, `core:shell`, `core:process` remain disabled.
@@ -152,7 +152,7 @@ In rough order of likelihood-something-breaks:
    wrote `apps/desktop/src/lib/api/types/*.ts` to match ts-rs's
    default formatter (one line per type, semicolons after each field,
    `Array<T>` rather than `T[]`). On first run of
-   `cargo test --package stockpile-api`, ts-rs will overwrite these
+   `cargo test --package situation_room-api`, ts-rs will overwrite these
    files. If the files diverge, treat ts-rs's output as canonical
    and update the frontend's imports if any field name changes
    slipped through (none should — I cross-referenced).
@@ -310,7 +310,7 @@ to users, which is one of the project's distinctive properties.
 
 ### Priority 4 — Basic packaging story
 
-Right now the dev loop is `cargo run -p stockpile-desktop` with the
+Right now the dev loop is `cargo run -p situation_room-desktop` with the
 frontend served by Vite. A first `tauri build` pass to produce a
 real `.app` / `.dmg` / `.AppImage` is a half-day's work and surfaces
 icon assets, signing posture, and the macOS hardened-runtime
@@ -343,7 +343,7 @@ entitlements. Worth doing once before the cosmetic polish session.
 In order of importance:
 
 1. This file.
-2. `STOCKPILE_HANDOFF_SESSION5.md` — still the architectural-context
+2. `situation_room_HANDOFF_SESSION5.md` — still the architectural-context
    primer for the GUI work.
 3. `crates/api/src/commands.rs` — the Tauri command surface.
 4. `crates/api/src/types_export.rs` — the wire schema and From
@@ -363,7 +363,7 @@ In order of importance:
 - Classification produces RecordExpectations, not new schemas.
 - Closed enum of 5 extraction modes. Adding a sixth needs an ADR.
 - UUIDv7 + dedup_key for identity.
-- Security primitives in stockpile_secure. No
+- Security primitives in situation_room_secure. No
   `reqwest::Client::new()` anywhere.
 - Structure follows code, not anticipates it. No empty folders.
 - Code validates format, prompt teaches content. The LLM is trusted

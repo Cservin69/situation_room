@@ -1,4 +1,4 @@
-# STOCKPILE — Session 8 handoff
+# situation_room — Session 8 handoff
 
 You are starting Session 8. Session 7 shipped the plan-lifecycle
 gate: plans now carry a three-state `status` (`pending` /
@@ -17,7 +17,7 @@ LLM architecture) — both are authoritative for this session.
   optional status filter), `get_plan`, `accept_plan`, `reject_plan`.
 - `Store::set_plan_status` and
   `Store::recent_research_plans_by_status` in the storage crate.
-  `PlanStatus` enum re-exported from `stockpile_storage`.
+  `PlanStatus` enum re-exported from `situation_room_storage`.
 - `PlanStatusDto` in the api crate, mirrored to TS via ts-rs.
 - `ResearchPlanDto::from_typed_pending` / `::from_typed_with_status`
   / `::from_stored` — three explicit constructors. There is no
@@ -144,7 +144,7 @@ modes get their own sessions once the plumbing is proven.
   runs of a plan so a re-fetch is visible context.
 - Wire both new commands in `apps/desktop/src-tauri/src/main.rs`'s
   `invoke_handler!`. Use the full path form
-  (`stockpile_api::commands::run_fetch_for_plan`); see Session 6
+  (`situation_room_api::commands::run_fetch_for_plan`); see Session 6
   for why bare names break.
 - Two new ts-rs DTOs: `FetchReportDto` (with nested
   `RecipeOutcomeDto`) and `FetchRunSummaryDto`.
@@ -210,7 +210,7 @@ modes get their own sessions once the plumbing is proven.
   kind from existing ones — likely yes. Suggested:
   `FetchFailed { recipes_attempted, recipes_succeeded, message }`.
 - Generated TS files in `apps/desktop/src/lib/api/types/` are
-  written by ts-rs via `cargo test --package stockpile-api`. Never
+  written by ts-rs via `cargo test --package situation_room-api`. Never
   hand-edit. Ship the regenerated files in the patch tarball so
   the SvelteKit build passes immediately after extract.
 - ts-rs DTOs and the typed pipeline structs are intentionally
@@ -238,7 +238,7 @@ Build incrementally:
 1. Migration v6 + `fetch_runs` Store methods + `recipes_for_plan`
    method + tests. `cargo test --workspace` passes.
 2. `pipeline::fetch_executor::run_fetch_for_plan` against an
-   in-memory CSV fixture. `cargo test -p stockpile-pipeline`
+   in-memory CSV fixture. `cargo test -p situation_room-pipeline`
    passes.
 3. `FetchReportDto` + the two new commands + their unit tests.
    `cargo check --workspace` passes.

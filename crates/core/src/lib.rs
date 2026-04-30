@@ -1,4 +1,4 @@
-//! # stockpile-core
+//! # situation_room-core
 //!
 //! The schema. This crate defines:
 //!
@@ -15,13 +15,13 @@
 //! - Controlled vocabularies in [`vocab`]: countries, entities, event
 //!   types, units, currencies, topics, stance, confidence.
 //!
-//! `stockpile-core` has zero dependencies on other workspace crates by
-//! design: if you want to know what Stockpile *is*, you read this crate
+//! `situation_room-core` has zero dependencies on other workspace crates by
+//! design: if you want to know what situation_room *is*, you read this crate
 //! and you have the full picture.
 //!
 //! ## Design note: "general by default"
 //!
-//! Stockpile does not hardcode any domain — there is no first-class
+//! situation_room does not hardcode any domain — there is no first-class
 //! "commodity", "sector", or "technology" concept in the schema. The
 //! six record types are the universal schema. Domain categorization
 //! happens through free-form [`Topic`] tags in
@@ -32,7 +32,7 @@
 //! ## Quick tour
 //!
 //! ```ignore
-//! use stockpile_core::{
+//! use situation_room_core::{
 //!     schema::{
 //!         content::{ObservationContent, ObservationPeriod},
 //!         envelope::{Envelope, Provenance, Subjects},

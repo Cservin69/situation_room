@@ -5,7 +5,7 @@
 //! source adapters in particular — can use [`Store::insert_record`]
 //! to avoid matching on the variant themselves.
 
-use stockpile_core::Record;
+use situation_room_core::Record;
 
 use crate::connection::Store;
 use crate::Result;
@@ -30,9 +30,9 @@ impl Store {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use stockpile_core::schema::envelope::{Envelope, Provenance, Subjects};
-    use stockpile_core::vocab::{Confidence, Topic};
-    use stockpile_core::Document;
+    use situation_room_core::schema::envelope::{Envelope, Provenance, Subjects};
+    use situation_room_core::vocab::{Confidence, Topic};
+    use situation_room_core::Document;
 
     #[test]
     fn insert_record_dispatches_to_document() {

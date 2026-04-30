@@ -14,13 +14,13 @@
 //! callers typed values.
 
 use crate::recipes::{ExtractionSpec, FetchRecipe, ProductionBinding};
-use stockpile_storage::{RecipeRow, Result as StorageResult, StoredRecipe, Store};
+use situation_room_storage::{RecipeRow, Result as StorageResult, StoredRecipe, Store};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum RecipeStoreError {
     #[error("storage error: {0}")]
-    Storage(#[from] stockpile_storage::StorageError),
+    Storage(#[from] situation_room_storage::StorageError),
 
     #[error("recipe serialization failed: {0}")]
     Serialize(String),
@@ -58,7 +58,7 @@ pub fn load_recipe_by_dedup_key(
 
 /// Load every recipe authored against a plan, deserialized into
 /// typed [`FetchRecipe`]s. Newest first (matching
-/// [`stockpile_storage::Store::recipes_for_plan`]'s ordering).
+/// [`situation_room_storage::Store::recipes_for_plan`]'s ordering).
 ///
 /// Used by the fetch executor to decide whether Level-2 authoring
 /// needs to run for a plan: a non-empty result means recipes already
@@ -122,7 +122,7 @@ mod tests {
         ExpectationRef, FieldMap, FieldValueSource, ProductionBinding,
     };
     use chrono::{TimeZone, Utc};
-    use stockpile_core::RecordType;
+    use situation_room_core::RecordType;
     use url::Url;
     use uuid::Uuid;
 

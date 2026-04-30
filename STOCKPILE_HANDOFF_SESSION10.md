@@ -1,4 +1,4 @@
-# Stockpile Session 10 Handoff
+# situation_room Session 10 Handoff
 
 You are picking up after Session 9. Read this and ADR 0011 first;
 both are authoritative. ADR 0007's "runtime path" section is also
@@ -52,7 +52,7 @@ Verified by the user post-extract:
 
 - `cargo check --workspace`: green.
 - `cargo test --workspace` (default, non-ignored): green.
-- `cargo test --package stockpile-pipeline -- --ignored`:
+- `cargo test --package situation_room-pipeline -- --ignored`:
   - `live_fetch_against_real_csv_produces_observation_and_closes_run`: ok
   - `live_fetch_against_real_json_produces_observation_and_closes_run`: **ok**
   - `live_author_recipe_against_xai_produces_valid_recipe`: ok
@@ -109,7 +109,7 @@ API returns the string `"null"` (not a JSON null literal) for
 country-year combinations where no data exists. The recipe asked
 for a missing combination.
 
-This is **real-world drift in source content**, not a Stockpile
+This is **real-world drift in source content**, not a situation_room
 bug. The runtime caught it cleanly. ADR 0007's deterministic-runtime
 promise held: bad content → typed error → audit trail.
 
@@ -243,7 +243,7 @@ becomes the right next thing. If you take it on, it warrants ADR
    speculative") applies.
 
 4. **Boot-banner string drift.** The desktop binary boots with
-   `"Stockpile desktop boots (Session 6 — GUI)"`. Cosmetic but
+   `"situation_room desktop boots (Session 6 — GUI)"`. Cosmetic but
    real. One-character sweep when the next session touches
    `apps/desktop/src-tauri/src/main.rs`.
 

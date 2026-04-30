@@ -23,7 +23,7 @@ use tracing_subscriber::EnvFilter;
 /// Initialize the global tracing subscriber. Call once at startup.
 pub fn init() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("stockpile=info,warn"));
+        .unwrap_or_else(|_| EnvFilter::new("situation_room=info,warn"));
 
     let writer = ScrubbingStdout::new();
 

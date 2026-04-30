@@ -6,7 +6,7 @@
 //! queries converge on shared topic strings.
 
 use duckdb::params;
-use stockpile_core::vocab::Topic;
+use situation_room_core::vocab::Topic;
 
 use crate::connection::Store;
 use crate::{Result, StorageError};
@@ -67,10 +67,10 @@ impl Store {
 mod tests {
     use crate::connection::Store;
     use chrono::Utc;
-    use stockpile_core::schema::content::{ObservationContent, ObservationPeriod};
-    use stockpile_core::schema::envelope::{Envelope, Provenance, Subjects};
-    use stockpile_core::vocab::{Confidence, Topic, Unit};
-    use stockpile_core::Observation;
+    use situation_room_core::schema::content::{ObservationContent, ObservationPeriod};
+    use situation_room_core::schema::envelope::{Envelope, Provenance, Subjects};
+    use situation_room_core::vocab::{Confidence, Topic, Unit};
+    use situation_room_core::Observation;
 
     fn obs_with_topics(topics: Vec<Topic>) -> Observation {
         let envelope = Envelope {

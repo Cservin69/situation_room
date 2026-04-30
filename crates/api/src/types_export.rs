@@ -18,17 +18,17 @@
 //!
 //! Each `#[derive(TS)]` type carries `#[ts(export, export_to = "…")]`
 //! pointing at `apps/desktop/src/lib/api/types/`. Running
-//! `cargo test --package stockpile-api` triggers ts-rs to write the
+//! `cargo test --package situation_room-api` triggers ts-rs to write the
 //! files (the export hook runs inside a generated test). The Svelte
 //! frontend imports from that directory.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use stockpile_pipeline::research::{
+use situation_room_pipeline::research::{
     DocumentSourceHint, EntityKindExpectation, EventTypeExpectation, GeoScope,
     MetricExpectation, RecordExpectations, RelationKindExpectation, ResearchPlan,
 };
-use stockpile_storage::research_plans::{PlanStatus, StoredResearchPlan};
+use situation_room_storage::research_plans::{PlanStatus, StoredResearchPlan};
 use ts_rs::TS;
 
 // ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@ use ts_rs::TS;
 // ---------------------------------------------------------------------------
 
 /// Lifecycle state for a plan, as seen by the frontend. Mirrors
-/// [`stockpile_storage::research_plans::PlanStatus`] one-for-one.
+/// [`situation_room_storage::research_plans::PlanStatus`] one-for-one.
 ///
 /// The serde representation is lowercase and unit-tagged
 /// (`"pending"` / `"accepted"` / `"rejected"`), matching both the
@@ -78,7 +78,7 @@ impl From<PlanStatusDto> for PlanStatus {
 // ---------------------------------------------------------------------------
 
 /// Wire shape for a research plan. Mirrors
-/// [`stockpile_pipeline::research::ResearchPlan`] one-for-one, with
+/// [`situation_room_pipeline::research::ResearchPlan`] one-for-one, with
 /// the storage-layer audit field [`status`](Self::status) tacked on so
 /// the frontend can render the lifecycle pill / accept-reject buttons
 /// without a second IPC roundtrip.
@@ -223,7 +223,7 @@ impl PlanSummary {
 // ---------------------------------------------------------------------------
 
 /// Wire shape for a registered source descriptor. Mirrors
-/// [`stockpile_pipeline::research_classifier::SourceDescriptor`].
+/// [`situation_room_pipeline::research_classifier::SourceDescriptor`].
 ///
 /// Currently the frontend doesn't fetch this directly (the binary
 /// loads `config/sources.toml` and stuffs descriptors into `AppState`),
@@ -315,7 +315,7 @@ impl ResearchPlanDto {
     /// is the path used by `get_plan`, `accept_plan`, `reject_plan`,
     /// and any other command that re-reads a plan from disk.
     pub fn from_stored(s: StoredResearchPlan) -> Result<Self, serde_json::Error> {
-        let topic_tags: Vec<stockpile_core::vocab::Topic> =
+        let topic_tags: Vec<situation_room_core::vocab::Topic> =
             serde_json::from_str(&s.topic_tags_json)?;
         let geographic_scope: Vec<GeoScope> =
             serde_json::from_str(&s.geographic_scope_json)?;
@@ -433,7 +433,7 @@ impl From<DocumentSourceHint> for DocumentSourceHintDto {
 // ---------------------------------------------------------------------------
 
 /// Wire shape for one fetch run's outcome. Mirrors
-/// [`stockpile_pipeline::fetch_executor::FetchReport`] one-for-one.
+/// [`situation_room_pipeline::fetch_executor::FetchReport`] one-for-one.
 ///
 /// Returned synchronously by the `run_fetch_for_plan` command. The
 /// frontend renders it in the review pane so the user sees, in one
@@ -481,7 +481,7 @@ pub enum RecipeOutcomeDto {
 }
 
 /// Per-failure stage on the wire. Mirrors
-/// [`stockpile_pipeline::fetch_executor::FailureStage`].
+/// [`situation_room_pipeline::fetch_executor::FailureStage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
 #[serde(rename_all = "snake_case")]
@@ -514,7 +514,7 @@ pub struct FetchRunSummaryDto {
 
 impl FetchReportDto {
     /// Lift a typed `FetchReport` into the wire shape.
-    pub fn from_typed(r: stockpile_pipeline::fetch_executor::FetchReport) -> Self {
+    pub fn from_typed(r: situation_room_pipeline::fetch_executor::FetchReport) -> Self {
         Self {
             plan_id: r.plan_id.to_string(),
             run_id: r.run_id.to_string(),
@@ -527,9 +527,9 @@ impl FetchReportDto {
     }
 }
 
-impl From<stockpile_pipeline::fetch_executor::RecipeOutcome> for RecipeOutcomeDto {
-    fn from(o: stockpile_pipeline::fetch_executor::RecipeOutcome) -> Self {
-        use stockpile_pipeline::fetch_executor::RecipeOutcome as O;
+impl From<situation_room_pipeline::fetch_executor::RecipeOutcome> for RecipeOutcomeDto {
+    fn from(o: situation_room_pipeline::fetch_executor::RecipeOutcome) -> Self {
+        use situation_room_pipeline::fetch_executor::RecipeOutcome as O;
         match o {
             O::Succeeded {
                 recipe_id,
@@ -564,9 +564,9 @@ impl From<stockpile_pipeline::fetch_executor::RecipeOutcome> for RecipeOutcomeDt
     }
 }
 
-impl From<stockpile_pipeline::fetch_executor::FailureStage> for FailureStageDto {
-    fn from(s: stockpile_pipeline::fetch_executor::FailureStage) -> Self {
-        use stockpile_pipeline::fetch_executor::FailureStage as S;
+impl From<situation_room_pipeline::fetch_executor::FailureStage> for FailureStageDto {
+    fn from(s: situation_room_pipeline::fetch_executor::FailureStage) -> Self {
+        use situation_room_pipeline::fetch_executor::FailureStage as S;
         match s {
             S::Fetch => FailureStageDto::Fetch,
             S::Apply => FailureStageDto::Apply,
@@ -576,7 +576,7 @@ impl From<stockpile_pipeline::fetch_executor::FailureStage> for FailureStageDto 
 }
 
 impl FetchRunSummaryDto {
-    pub fn from_stored(r: stockpile_storage::StoredFetchRun) -> Self {
+    pub fn from_stored(r: situation_room_storage::StoredFetchRun) -> Self {
         Self {
             id: r.id.to_string(),
             plan_id: r.plan_id.to_string(),
@@ -599,7 +599,7 @@ impl FetchRunSummaryDto {
 ///
 /// ## Why scalar fields are typed but `extraction` / `produces` aren't
 ///
-/// The internal [`stockpile_pipeline::recipes::FetchRecipe`] has
+/// The internal [`situation_room_pipeline::recipes::FetchRecipe`] has
 /// strongly-typed `extraction: ExtractionSpec` (closed enum of five
 /// modes) and `produces: Vec<ProductionBinding>` (with nested closed
 /// enums for `record_type`, `field_value_source`, etc.). Mirroring all
@@ -650,11 +650,11 @@ pub struct RecipeDto {
 }
 
 impl RecipeDto {
-    /// Lift a [`stockpile_storage::StoredRecipe`] into wire shape.
+    /// Lift a [`situation_room_storage::StoredRecipe`] into wire shape.
     /// Parses the JSON-string columns back to `Value`s; if either
     /// fails to parse, the field carries a structured error object
     /// instead of crashing the whole listing.
-    pub fn from_stored(r: stockpile_storage::StoredRecipe) -> Self {
+    pub fn from_stored(r: situation_room_storage::StoredRecipe) -> Self {
         let extraction = serde_json::from_str::<serde_json::Value>(&r.extraction_json)
             .unwrap_or_else(|e| {
                 serde_json::json!({
@@ -691,8 +691,8 @@ impl RecipeDto {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stockpile_core::vocab::{EntityId, EventType, Topic, Unit};
-    use stockpile_pipeline::research::{
+    use situation_room_core::vocab::{EntityId, EventType, Topic, Unit};
+    use situation_room_pipeline::research::{
         DocumentSourceHint as P_DSH, EntityKindExpectation as P_EKE,
         EventTypeExpectation as P_ETE, GeoScope as P_GS, MetricExpectation as P_ME,
         RecordExpectations as P_RE, RelationKindExpectation as P_RKE,
@@ -813,7 +813,7 @@ mod tests {
             expectations_json: serde_json::to_string(&p.expectations).unwrap(),
             created_at: p.created_at,
             classified_by: "xai".into(),
-            status: stockpile_storage::research_plans::PlanStatus::Pending,
+            status: situation_room_storage::research_plans::PlanStatus::Pending,
         };
 
         let s = PlanSummary::from_stored(stored).unwrap();
@@ -840,7 +840,7 @@ mod tests {
             expectations_json: serde_json::to_string(&p.expectations).unwrap(),
             created_at: p.created_at,
             classified_by: "xai".into(),
-            status: stockpile_storage::research_plans::PlanStatus::Pending,
+            status: situation_room_storage::research_plans::PlanStatus::Pending,
         };
         assert!(PlanSummary::from_stored(stored).is_err());
     }
@@ -861,7 +861,7 @@ mod tests {
             expectations_json: serde_json::to_string(&p.expectations).unwrap(),
             created_at: p.created_at,
             classified_by: "xai".into(),
-            status: stockpile_storage::research_plans::PlanStatus::Rejected,
+            status: situation_room_storage::research_plans::PlanStatus::Rejected,
         };
         let dto = ResearchPlanDto::from_stored(stored).unwrap();
         assert_eq!(dto.status, PlanStatusDto::Rejected);
@@ -869,7 +869,7 @@ mod tests {
 
     #[test]
     fn plan_status_dto_round_trips_via_storage_status() {
-        use stockpile_storage::research_plans::PlanStatus as S;
+        use situation_room_storage::research_plans::PlanStatus as S;
         for (storage, dto) in [
             (S::Pending, PlanStatusDto::Pending),
             (S::Accepted, PlanStatusDto::Accepted),
@@ -929,7 +929,7 @@ mod tests {
 
     #[test]
     fn fetch_report_dto_round_trips_from_typed() {
-        use stockpile_pipeline::fetch_executor::{FetchReport, RecipeOutcome};
+        use situation_room_pipeline::fetch_executor::{FetchReport, RecipeOutcome};
         let plan_id = uuid::Uuid::now_v7();
         let run_id = uuid::Uuid::now_v7();
         let recipe_id = uuid::Uuid::now_v7();
@@ -962,7 +962,7 @@ mod tests {
     #[test]
     fn fetch_run_summary_dto_round_trips_from_stored() {
         use chrono::TimeZone;
-        let stored = stockpile_storage::StoredFetchRun {
+        let stored = situation_room_storage::StoredFetchRun {
             id: uuid::Uuid::now_v7(),
             plan_id: uuid::Uuid::now_v7(),
             started_at: chrono::Utc.with_ymd_and_hms(2026, 4, 28, 10, 0, 0).unwrap(),
@@ -984,7 +984,7 @@ mod tests {
         // land on the wire as parsed `Value`s and serde round-trips
         // them cleanly.
         use chrono::TimeZone;
-        let stored = stockpile_storage::StoredRecipe {
+        let stored = situation_room_storage::StoredRecipe {
             id: uuid::Uuid::now_v7(),
             dedup_key: Some("plan-x:demo_csv".into()),
             plan_id: uuid::Uuid::now_v7(),
@@ -1020,7 +1020,7 @@ mod tests {
         // This is the discipline the handoff calls "surfacing parse
         // failures rather than zeroing them out."
         use chrono::TimeZone;
-        let stored = stockpile_storage::StoredRecipe {
+        let stored = situation_room_storage::StoredRecipe {
             id: uuid::Uuid::now_v7(),
             dedup_key: None,
             plan_id: uuid::Uuid::now_v7(),

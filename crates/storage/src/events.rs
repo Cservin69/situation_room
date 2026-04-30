@@ -1,7 +1,7 @@
 //! Event storage: insert + get.
 
 use duckdb::params;
-use stockpile_core::Event;
+use situation_room_core::Event;
 use uuid::Uuid;
 
 use crate::connection::Store;
@@ -95,7 +95,7 @@ impl Store {
             })?;
 
         let envelope = reconstruct_envelope(&conn, row_id, raw)?;
-        let content: stockpile_core::EventContent = serde_json::from_str(&content_json)?;
+        let content: situation_room_core::EventContent = serde_json::from_str(&content_json)?;
 
         Ok(Event {
             id: row_id,
@@ -110,9 +110,9 @@ impl Store {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use stockpile_core::schema::content::{EventContent, EventDirection};
-    use stockpile_core::schema::envelope::{Envelope, Provenance, Subjects};
-    use stockpile_core::vocab::{Confidence, EntityId, EventType, Topic};
+    use situation_room_core::schema::content::{EventContent, EventDirection};
+    use situation_room_core::schema::envelope::{Envelope, Provenance, Subjects};
+    use situation_room_core::vocab::{Confidence, EntityId, EventType, Topic};
 
     fn sample_event() -> Event {
         let envelope = Envelope {

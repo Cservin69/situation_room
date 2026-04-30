@@ -1,9 +1,9 @@
 # Source descriptors for the Level-1 classifier.
 #
 # This file is the LLM's awareness of "what data sources exist that
-# Stockpile could read from." It is NOT a runtime registry, NOT a
+# situation_room could read from." It is NOT a runtime registry, NOT a
 # fetch configuration, and there are NO Rust adapters tied to these
-# entries. Each entry is a description Stockpile shows the LLM at
+# entries. Each entry is a description situation_room shows the LLM at
 # classification time so the plan's `document_sources` hints can
 # reference real ids and have meaningful priority ordering.
 #
@@ -186,7 +186,7 @@ id = "csv_demo"
 display_name = "CSV Demo"
 description = """
 A small public CSV file exposing a single numeric measurement by
-named row. Used by Stockpile's Phase-6 fetch executor as a
+named row. Used by situation_room's Phase-6 fetch executor as a
 deterministic demo source: the recipe author picks a column and a
 row filter, the runtime fetches the CSV, applies the recipe, and
 produces one observation. Not appropriate as an authoritative
@@ -205,7 +205,7 @@ id = "json_demo"
 display_name = "JSON Demo"
 description = """
 A small public JSON document exposing a scalar value at a known
-path. Used by Stockpile's Phase-6 fetch executor as a deterministic
+path. Used by situation_room's Phase-6 fetch executor as a deterministic
 demo source for the JSON-path extraction mode (Session 9): the
 recipe author picks a JSONPath expression, the runtime fetches the
 document, applies the recipe, and produces one observation. Not

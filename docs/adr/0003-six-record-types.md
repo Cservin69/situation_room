@@ -7,7 +7,7 @@ subjects), ADR 0007 (research function)
 
 ## Context
 
-Stockpile is a research workstation. It ingests facts from public
+Situation_room is a research workstation. It ingests facts from public
 sources — prices, production numbers, shipments, trade flows,
 regulatory actions, corporate filings, news reports — and surfaces
 them in a way that the user can query, cross-reference, and trace
@@ -35,11 +35,11 @@ decide which of the N types to emit. Every new idea threatens a new
 type.
 
 This ADR decides: **how many fundamental record shapes does
-Stockpile need, and why exactly that number?**
+Situation_room need, and why exactly that number?**
 
 ## Decision
 
-Stockpile recognizes **exactly six record types**, and no seventh
+Situation_room recognizes **exactly six record types**, and no seventh
 will be added:
 
 1. **`Observation`** — a measurement of a metric. Price, production
@@ -142,7 +142,7 @@ extraction would produce records directly — the LLM reads an article
 and emits an `Observation` if the article contained a number. But
 that conflates measurement with reporting-of-measurement. If Reuters
 reports that USGS says Chile produced 142kt, the number in the
-article is not a measurement Stockpile made; it's a claim Reuters
+article is not a measurement Situation_room made; it's a claim Reuters
 relayed about a claim USGS made. Treating it as an `Observation`
 throws away the claim structure.
 
@@ -150,7 +150,7 @@ throws away the claim structure.
 structure: claimant (who is making the claim — USGS), stance (how
 they're making it — asserted vs hedged vs predicted), content (what
 they're claiming — an `ObservationContent`), and envelope
-(provenance points to the article, where Stockpile learned the
+(provenance points to the article, where Situation_room learned the
 claim). ADR 0004 covers how Assertions get promoted into the other
 five types when the claim is trusted enough to treat as fact.
 

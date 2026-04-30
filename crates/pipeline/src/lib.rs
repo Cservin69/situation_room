@@ -2,7 +2,7 @@
 // removed as Phase 2/3 fill in real implementations.
 #![allow(dead_code, unused_imports, unused_variables)]
 
-//! # stockpile-pipeline
+//! # situation_room-pipeline
 //!
 //! Pipeline orchestration. This is the only crate that depends on most of
 //! the others; it's the place where wiring lives so that everywhere else
@@ -20,7 +20,7 @@
 //! [`research`] is the entry point for "research topic X" — it decomposes a
 //! free-text topic into a structured research plan, matches it against
 //! registered sources, and triggers targeted ingestion. This is what makes
-//! Stockpile general-purpose rather than commodity-only.
+//! situation_room general-purpose rather than commodity-only.
 //!
 //! [`recipes`] holds the Level-2 output types ([`recipes::FetchRecipe`] et
 //! al.) — deterministic instructions produced by the LLM at authoring time

@@ -7,7 +7,7 @@ ADR 0007 (research function)
 
 ## Context
 
-Stockpile needs an embedded database. The workload is analytical:
+Situation_room needs an embedded database. The workload is analytical:
 most queries are time-series aggregates, subject-filtered scans,
 joins between records and their derived-from chains, and
 windowed comparisons. The data footprint is modest for a single-
@@ -33,7 +33,7 @@ The decision was not close.
 
 **DuckDB from day one. Not SQLite. Not Postgres.**
 
-Stockpile ships a DuckDB database file per workspace. All
+Situation_room ships a DuckDB database file per workspace. All
 records, all recipes, all derived artifacts live in it. The
 database file is the system of record; the file is portable
 (copy it, you have the whole state). Migrations live in
@@ -56,7 +56,7 @@ research state with a colleague by sending that file. They can
 version-control it if they really want to (not recommended, but
 possible). None of this works with a server-based database.
 
-**Native Parquet interop matters for the future.** Stockpile
+**Native Parquet interop matters for the future.** Situation_room
 will likely want to ingest public data dumps (USGS's historical
 tables, census data, etc.). Many of these ship as Parquet today
 and will increasingly do so. DuckDB reads Parquet natively
@@ -84,10 +84,10 @@ Postgres does not.
 ## Alternatives considered
 
 **SQLite.** Rejected on query performance. The analytical
-workload Stockpile will run — cross-session aggregates, large
+workload Situation_room will run — cross-session aggregates, large
 filtered scans, panel-driven joins — is the workload SQLite is
 worst at. SQLite is the right answer for OLTP-shaped workloads
-with many small transactions. Stockpile's shape is the opposite.
+with many small transactions. Situation_room's shape is the opposite.
 
 **Postgres (local instance).** Rejected on setup friction. Even
 with `brew install postgres` being a single command, "make sure
@@ -95,7 +95,7 @@ the server is running, create a user, create a database, manage
 connection strings" is a lot of non-product work for someone who
 just wants to type a topic.
 
-**Postgres (hosted).** Rejected: Stockpile is a desktop app for
+**Postgres (hosted).** Rejected: Situation_room is a desktop app for
 a researcher's own machine. Hosting means an account, a network
 dependency, and a monthly bill for a product that's supposed to
 be OSS and self-contained.
@@ -106,7 +106,7 @@ bounded and understood failure mode. Newer options may be
 excellent but the risk profile is higher than necessary.
 
 **Flat files (Parquet + DataFusion).** Considered briefly.
-Rejected because mutation is painful — Stockpile isn't write-
+Rejected because mutation is painful — Situation_room isn't write-
 once; records get updated, dedup-keyed, promoted. A real
 database handles this better than files plus a query engine.
 

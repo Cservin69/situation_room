@@ -1,9 +1,9 @@
-//! Stockpile desktop binary — Tauri 2 composition root.
+//! situation_room desktop binary — Tauri 2 composition root.
 //!
 //! Boots the scrubbed tracing logger, opens the DuckDB store, builds
 //! the LLM provider on top of `SecureHttpClient`, loads the source
 //! descriptors from `config/sources.toml`, registers the three
-//! commands defined in `stockpile-api`, and starts the webview.
+//! commands defined in `situation_room-api`, and starts the webview.
 //!
 //! Per ADR 0001 this is the only binary `main.rs` for the desktop app:
 //! all wiring happens here, in one file. The library crates own the
@@ -20,14 +20,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use stockpile_api::commands::AppState;
-use stockpile_llm::XaiProvider;
-use stockpile_pipeline::research_classifier::SourceDescriptor;
-use stockpile_secure::{
+use situation_room_api::commands::AppState;
+use situation_room_llm::XaiProvider;
+use situation_room_pipeline::research_classifier::SourceDescriptor;
+use situation_room_secure::{
     http::{SecureHttpClient, SecureHttpConfig},
     logging,
 };
-use stockpile_storage::Store;
+use situation_room_storage::Store;
 use tracing::{info, warn};
 
 /// The production classifier prompt, embedded at compile time. The CLI
@@ -64,17 +64,17 @@ fn main() -> Result<()> {
 
     info!(
         workspace_root = %workspace_root.display(),
-        "Stockpile desktop boots."
+        "situation_room desktop boots."
     );
 
     // --- Storage -----------------------------------------------------
     //
-    // `stockpile.duckdb` lives at the workspace root — the same
+    // `situation_room.duckdb` lives at the workspace root — the same
     // location the CLI uses by default. Anchoring on workspace_root
     // (not CWD) means `tauri dev` finds the same database whether
     // the binary is launched from the repo root or from inside
     // `apps/desktop/src-tauri/` (Tauri sets CWD there).
-    let db_path = workspace_root.join("stockpile.duckdb");
+    let db_path = workspace_root.join("situation_room.duckdb");
     let store = Store::open(&db_path)
         .with_context(|| format!("opening store at {}", db_path.display()))?;
     store.migrate().context("running migrations")?;
@@ -132,19 +132,19 @@ fn main() -> Result<()> {
     // `tauri::generate_handler!` re-prefixes the path you give it. So
     // `generate_handler![classify]` looks for `__cmd__classify` in
     // *this* file's scope, where it does not exist; the macro lives
-    // in `stockpile_api::commands`. Bare imports work for the
+    // in `situation_room_api::commands`. Bare imports work for the
     // function, not for the macro.
     tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
-            stockpile_api::commands::classify,
-            stockpile_api::commands::list_recent_plans,
-            stockpile_api::commands::get_plan,
-            stockpile_api::commands::accept_plan,
-            stockpile_api::commands::reject_plan,
-            stockpile_api::commands::run_fetch_for_plan,
-            stockpile_api::commands::list_fetch_runs,
-            stockpile_api::commands::list_recipes_for_plan
+            situation_room_api::commands::classify,
+            situation_room_api::commands::list_recent_plans,
+            situation_room_api::commands::get_plan,
+            situation_room_api::commands::accept_plan,
+            situation_room_api::commands::reject_plan,
+            situation_room_api::commands::run_fetch_for_plan,
+            situation_room_api::commands::list_fetch_runs,
+            situation_room_api::commands::list_recipes_for_plan
         ])
         .run(tauri::generate_context!())
         .context("running tauri")?;

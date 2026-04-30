@@ -1,4 +1,4 @@
-# Stockpile — Handoff Document (Session 2)
+# situation_room — Handoff Document (Session 2)
 
 **Date:** 2026-04-20 (end of second long session)
 **Status:** Phase 3a backed out, demo in deliberate Document-only state,
@@ -139,7 +139,7 @@ make the mistake this document was written to prevent.*
   every record type. `topics_in_use`. `insert_record` dispatch.
 - Sources: `Source` trait, USGS adapter that fetches a PDF and
   emits a `Document` with extracted text as body.
-- Demo: `stockpile-demo` binary runs fetch → extract → store →
+- Demo: `situation_room-demo` binary runs fetch → extract → store →
   query for one commodity, prints Document summary and topic
   counts. Does not emit Observations yet.
 - Pipeline types: `FetchRecipe`, `ExtractionSpec`,
@@ -150,7 +150,7 @@ make the mistake this document was written to prevent.*
 
 ### What doesn't exist yet
 
-- **LLM provider wiring.** `stockpile_llm` is all stubs. No real
+- **LLM provider wiring.** `situation_room_llm` is all stubs. No real
   SDK integration.
 - **Recipe-apply runtime.** The `FetchRecipe` types exist but
   nothing consumes them. This is the next phase's main work.
@@ -172,12 +172,12 @@ Recommended sequence (one sub-task per session, sanity-first):
 ### 3c.1 — LLM provider wiring (ONE session)
 
 Pick a provider (user will decide: Claude via Anthropic SDK, or
-GROK via XAI Console SDK). Wire the `stockpile_llm` crate for real:
+GROK via XAI Console SDK). Wire the `situation_room_llm` crate for real:
 
 - `LlmProvider` trait (probably exists as a stub — check and
   extend, do not replace without a good reason).
 - One real provider impl (e.g. `AnthropicProvider`).
-- API key loaded via `stockpile_secure::secrets::ApiKey::from_env`.
+- API key loaded via `situation_room_secure::secrets::ApiKey::from_env`.
 - All HTTP through `SecureHttpClient`. **Do not introduce a second
   HTTP client.** If the SDK insists on its own client, prefer a
   direct REST call that uses `SecureHttpClient` over taking the
@@ -253,7 +253,7 @@ most important here because they are the ones most at risk:
    an ADR update, not an ad-hoc module. ADR 0007.
 6. **UUIDv7 + dedup_key for identity.** No content-addressing
    except the scoped pipeline-state case in ADR 0004.
-7. **Security primitives in `stockpile_secure`**. No
+7. **Security primitives in `situation_room_secure`**. No
    `reqwest::Client::new()` anywhere. ADR 0009.
 8. **Structure follows code, not anticipates it.** No empty
    folders.
@@ -296,7 +296,7 @@ pdf-extract             text extraction only; no parsing on top
 clap (demo only)
 ```
 
-Tests: `stockpile-storage` has `dev-dependencies` on itself from
+Tests: `situation_room-storage` has `dev-dependencies` on itself from
 `sources` (for a future cross-crate test — unused so far; fine
 to leave).
 
@@ -307,10 +307,10 @@ to leave).
 After the pivot:
 
 ```
-stockpile-core         31 tests
-stockpile-pipeline     12 tests
-stockpile-storage      17 tests
-stockpile-sources       6 tests (5 unit + 1 ignored live)
+situation_room-core         31 tests
+situation_room-pipeline     12 tests
+situation_room-storage      17 tests
+situation_room-sources       6 tests (5 unit + 1 ignored live)
                      ─────────
                        66 tests
 ```
@@ -343,7 +343,7 @@ session.
 phase 2e-2: storage across all six record types + topics_in_use
 phase 3a session A: USGS adapter + SecureHttp fetch + insert_record dispatch
 phase 3a session B: PDF extraction + Observation emission (MSRV 1.88)  [REVERTED IN SPIRIT]
-phase 3b: stockpile-demo console binary                                [REWRITTEN]
+phase 3b: situation_room-demo console binary                                [REWRITTEN]
 phase 3b.1: revert parse.rs, back out to Document-only                 [this session end]
 ```
 

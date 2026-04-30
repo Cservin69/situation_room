@@ -1,10 +1,10 @@
-# Stockpile threat model
+# Situation_room threat model
 
 **Status**: Living document. Update when the attack surface changes.
 
 ## Scope
 
-Stockpile is an open-source desktop analyst workstation. It:
+situation_room is an open-source desktop analyst workstation. It:
 - Runs locally on the user's machine (macOS, Linux, Windows).
 - Fetches data from public APIs, RSS feeds, and government websites.
 - Sends prompts containing fetched content to third-party LLM providers.
@@ -29,11 +29,11 @@ Stockpile is an open-source desktop analyst workstation. It:
 **Attack**: key ends up in a log file, crash dump, telemetry payload, or Git.
 
 **Mitigations**:
-- All keys wrapped in `stockpile_secure::secrets::ApiKey` / `SecretString`.
+- All keys wrapped in `situation_room_secure::secrets::ApiKey` / `SecretString`.
   These types do not implement `Display` or `Serialize`; `Debug` prints
   only a fingerprint.
 - Keys loaded *only* from environment variables, never from config files.
-- All logging goes through `stockpile_secure::logging::init()`, which
+- All logging goes through `situation_room_secure::logging::init()`, which
   scrubs Bearer tokens, Anthropic/OpenAI/xAI/Google prefixes, and long
   hex/base64 runs before writing any line.
 - Rejection of common placeholder values at key-load time ("your-key",
@@ -70,7 +70,7 @@ the research bar, or a source's API response contains a redirect to a
 private IP, exfiltrating cloud credentials.
 
 **Mitigations**:
-- All URL inputs pass through `stockpile_secure::url_guard::UrlGuard`.
+- All URL inputs pass through `situation_room_secure::url_guard::UrlGuard`.
   Rejects: non-HTTP(S) schemes, private IP ranges (RFC 1918, RFC 4193,
   link-local), cloud metadata endpoints, localhost, `0.0.0.0`, ports
   outside {80, 443}, URLs with embedded credentials.
@@ -96,7 +96,7 @@ nesting, to exhaust memory / stack.
 
 **Mitigations**:
 - Article archive and any other user-derived filesystem write uses
-  `stockpile_secure::fs_guard::FsGuard::resolve`. Inputs containing
+  `situation_room_secure::fs_guard::FsGuard::resolve`. Inputs containing
   `..`, absolute paths, null bytes, or symlinks that escape the root
   are rejected.
 
@@ -168,7 +168,7 @@ commands to exfiltrate files or run shell.
 
 ## Out of scope
 
-- **Host-level malware**: if the user's machine is compromised, Stockpile
+- **Host-level malware**: if the user's machine is compromised, situation_room
   cannot defend against a keylogger reading `.env`.
 - **LLM provider trust**: we send prompts to Anthropic/OpenAI/etc. and
   trust them per their own TOS. Users who need air-gap analysis should
