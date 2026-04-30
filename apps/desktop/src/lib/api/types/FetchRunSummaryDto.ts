@@ -4,7 +4,7 @@
  * Summary row for the fetch-runs list.
  *
  * `started_at` and `finished_at` are full timestamps; the frontend
- * formats them locally. `finished_at` of `null` means the run is
+ * formats them locally. `finished_at` of `None` means the run is
  * still in flight (or — in the corner case where closing the row
  * failed — the final write was lost; the next session's UI may want
  * to surface that state distinctly, but for now an open-looking row

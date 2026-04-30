@@ -92,9 +92,10 @@ pub fn apply_all(conn: &Connection) -> Result<()> {
         }
         tracing::info!(version = m.version, description = m.description, "applying migration");
         conn.execute_batch(m.sql).map_err(|e| {
+            let version = m.version;
+            let description = m.description;
             StorageError::Migration(format!(
-                "migration {} ({}) failed: {}",
-                m.version, m.description, e
+                "migration {version} ({description}) failed: {e}"
             ))
         })?;
     }

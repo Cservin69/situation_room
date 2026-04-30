@@ -549,7 +549,7 @@ fn parse_extracted_scalar(s: &str) -> Value {
 
 /// Walk a dot-separated pointer through a `Value`. Numeric segments
 /// address `Value::Array`; other segments address `Value::Object`.
-fn walk_pointer<'v>(root: &'v Value, pointer: &str) -> Option<Value> {
+fn walk_pointer(root: &Value, pointer: &str) -> Option<Value> {
     let mut current = root;
     for seg in pointer.split('.') {
         current = match current {
@@ -902,7 +902,11 @@ mod tests {
 
     #[test]
     fn parse_extracted_scalar_handles_decimal() {
-        assert_eq!(parse_extracted_scalar("3.14"), json!(3.14));
+        // A bland decimal — earlier this test used `3.14`, which
+        // clippy's `approx_constant` flagged as a stand-in for π.
+        // The test cares about decimal-parsing correctness, not the
+        // numeric value, so `1.5` works fine.
+        assert_eq!(parse_extracted_scalar("1.5"), json!(1.5));
     }
 
     #[test]

@@ -22,6 +22,34 @@
 //! a failed recipe surfaces in the report and the user decides what
 //! to do (handoff §"explicitly NOT").
 //!
+//! ## Session 10, Option F — pre-fetch for authoring
+//!
+//! Before Session 10 the executor passed
+//! `https://example.invalid/{source_id}` as both the sample URL and
+//! a stub document excerpt to the Level-2 author. The Session 9
+//! production run on "bulgaria elections 2026" revealed that the
+//! LLM would echo the placeholder back into the recipe, producing
+//! recipes that fetched `example.invalid` at runtime and failed at
+//! the Fetch stage. (See `STOCKPILE_HANDOFF_SESSION10.md` §"gdelt
+//! → Failed @ Fetch" for the diagnosis.)
+//!
+//! Session 10 fixes this by:
+//!
+//! - Looking up the source's `SourceDescriptor::endpoint_hint` in
+//!   the registered-sources slice (loaded from `config/sources.toml`).
+//! - Pre-fetching the hint via the same `HttpFetcher` the runtime
+//!   uses for recipe execution — one client, ADR 0009 §"The rule".
+//! - Passing the real URL as `AuthoringContext::sample_url` and the
+//!   pre-fetched bytes (UTF-8 lossy, truncated) as
+//!   `AuthoringContext::document_excerpt`.
+//!
+//! The fallback discipline is conservative: a missing descriptor, a
+//! missing `endpoint_hint`, or a failed pre-fetch all degrade
+//! gracefully to the pre-Session-10 behaviour (placeholder URL +
+//! stub excerpt) with a logged warning. The intent is "make
+//! authoring better when we can", not "block authoring when we
+//! can't".
+//!
 //! ## Extraction-mode policy in this session
 //!
 //! [`ExtractionSpec::CsvCell`] and [`ExtractionSpec::JsonPath`] are
@@ -59,6 +87,7 @@ use crate::recipe_author::{author_recipe, AuthoringContext, AuthoringError};
 use crate::recipes::{ExtractionSpec, FetchRecipe};
 use crate::recipes_store::{load_recipes_for_plan, save_recipe, RecipeStoreError};
 use crate::research::{DocumentSourceHint, ResearchPlan};
+use crate::research_classifier::SourceDescriptor;
 use crate::research_plans_store::{load_research_plan, ResearchPlanStoreError};
 
 // ---------------------------------------------------------------------------
@@ -166,6 +195,16 @@ pub struct ExecutorContext<'a> {
     /// The recipe-author prompt template (loaded by the binary via
     /// `include_str!`, same pattern as the classifier prompt).
     pub recipe_author_prompt: &'a str,
+    /// Registered source descriptors. The executor uses these at
+    /// Level-2 authoring time to look up `endpoint_hint`s for the
+    /// pre-fetch step (Session 10, Option F). An empty slice is
+    /// legal: every author call falls back to the placeholder URL
+    /// path, mirroring the pre-Session-10 behaviour.
+    ///
+    /// We take a slice (not a Vec) because the executor only needs
+    /// to read; the binary owns the canonical `Vec<SourceDescriptor>`
+    /// in `AppState`.
+    pub sources: &'a [SourceDescriptor],
 }
 
 /// Run the fetch executor against an accepted plan.
@@ -384,17 +423,61 @@ fn bound_source_ids(hint: &DocumentSourceHint) -> Vec<String> {
     seen
 }
 
+/// Maximum number of bytes from a pre-fetched source document that we
+/// shove into the recipe-author prompt. The recipe-author prompt is
+/// ultimately bounded by `Bounds::LLM_PROMPT_BODY` (256 KiB), which
+/// also has to fit the prompt template, the plan JSON, the source
+/// metadata, and any future additions. 32 KiB leaves comfortable
+/// headroom while being more than enough excerpt for the LLM to
+/// recognize the source's shape.
+///
+/// Bumping this is fine, but check `build_prompt`'s post-substitution
+/// bound check first; the prompt + plan + excerpt together must stay
+/// under `Bounds::LLM_PROMPT_BODY`.
+const PREFETCH_EXCERPT_BUDGET: usize = 32 * 1024;
+
 /// Author one recipe for one (plan, source_id) pair.
 ///
-/// The authoring step needs a sample URL and a document excerpt for
-/// the prompt. We synthesize a stable sample URL from the source id
-/// (`https://example.invalid/{source_id}` — the URL guard accepts
-/// it; the LLM's job is to *replace* it with the real fetch URL).
-/// The excerpt is a placeholder describing the source plus the
-/// plan's interpretation; in a future session this becomes a real
-/// pre-fetch of the source's current content. The narrowing is
-/// deliberate — Session 8's job is to prove the executor pipeline,
-/// not to re-implement the demo binary's authoring loop here.
+/// This is the only function in the executor that calls the LLM. It
+/// runs at most once per (plan, bound source) pair — see the
+/// `load_or_author_recipes` callers — and the result is persisted so
+/// subsequent runs of the same plan don't re-author.
+///
+/// ## What the LLM sees (Session 10, Option F)
+///
+/// The author needs three things to do its job well: (a) what the
+/// research is about, (b) where the data lives, and (c) what shape
+/// it has. (a) comes from `plan`. (b) and (c) are the ones Session
+/// 10 fixes:
+///
+/// - **(b) The URL.** If the source's `SourceDescriptor` has an
+///   `endpoint_hint`, we use that as `AuthoringContext::sample_url`.
+///   Otherwise we synthesize `https://example.invalid/{source_id}`
+///   as a placeholder — same as pre-Session-10. The placeholder
+///   path is *not* removed because some sources are well-known
+///   enough that the LLM can author against the description alone
+///   (the sources.toml prose, e.g. SEC EDGAR), and we don't want a
+///   missing hint to be a hard error.
+///
+/// - **(c) The excerpt.** When `endpoint_hint` exists *and* the
+///   pre-fetch succeeds, the excerpt is the source's actual current
+///   content (UTF-8 lossy, truncated to `PREFETCH_EXCERPT_BUDGET`).
+///   When the pre-fetch fails (network error, DNS failure, response
+///   too large, server returned an error status), we log the failure
+///   and fall back to a stub excerpt — but we still pass the real
+///   `endpoint_hint` URL as the sample, so the LLM at least has a
+///   real target to author against.
+///
+/// ## Why fall back rather than error
+///
+/// A pre-fetch failure is an external condition (network down,
+/// rate-limited, geo-blocked); aborting authoring would mean the
+/// user can never recover without restarting the run. Falling back
+/// preserves the pre-Session-10 behaviour exactly: the LLM authors
+/// from the description alone. If the LLM produces a usable recipe
+/// anyway, the user gets a working pipeline; if not, the
+/// `RecipeOutcome::Failed { stage: Fetch | Apply }` surfaces in the
+/// report and the user can re-run.
 ///
 /// After authoring, the executor stamps the recipe's `source_id`
 /// (which `build_validated_recipe` left blank for the caller per
@@ -406,24 +489,47 @@ async fn author_one(
     plan: &ResearchPlan,
     source_id: &str,
 ) -> Result<FetchRecipe, FetchExecutorError> {
-    let sample_url = format!("https://example.invalid/{source_id}")
-        .parse::<url::Url>()
-        .map_err(|e| {
-            FetchExecutorError::Authoring(AuthoringError::InvalidRecipe(format!(
-                "could not parse synthetic sample url for {source_id}: {e}"
-            )))
-        })?;
-
-    let mut excerpt = format!(
-        "Source id: {source_id}\nPlan topic: {}\nInterpretation: {}\n",
-        plan.topic, plan.interpretation
-    );
-    // Bound the excerpt so the prompt fits inside Bounds::LLM_PROMPT_BODY
-    // even before substitution. The recipe-author prompt itself does a
-    // second check after substitution.
-    if excerpt.len() > Bounds::LLM_PROMPT_BODY {
-        excerpt.truncate(Bounds::LLM_PROMPT_BODY);
+    // Look up the descriptor. A missing one isn't an error — we
+    // just lose the chance to pre-fetch.
+    let descriptor = ctx.sources.iter().find(|s| s.id == source_id);
+    if descriptor.is_none() {
+        warn!(
+            source_id = %source_id,
+            "no SourceDescriptor registered for source_id; falling back to placeholder url + stub excerpt"
+        );
     }
+
+    // Resolve the sample URL. Priority:
+    //   1. descriptor's endpoint_hint (if parseable),
+    //   2. synthetic placeholder.
+    //
+    // Parsing happens up-front so a malformed hint surfaces as a
+    // warning and falls back, rather than crashing authoring later.
+    let (sample_url, hint_for_prefetch) = match descriptor.and_then(|d| d.endpoint_hint.as_deref()) {
+        Some(hint) => match hint.parse::<url::Url>() {
+            Ok(u) => (u.clone(), Some(u)),
+            Err(e) => {
+                warn!(
+                    source_id = %source_id,
+                    hint = %hint,
+                    error = %e,
+                    "endpoint_hint failed to parse; falling back to placeholder url"
+                );
+                (placeholder_url(source_id)?, None)
+            }
+        },
+        None => (placeholder_url(source_id)?, None),
+    };
+
+    // Build the document excerpt. Prefer real bytes from the
+    // endpoint_hint; fall back to a stub describing the source.
+    let excerpt = match &hint_for_prefetch {
+        Some(url) => match prefetch_excerpt(ctx, url, source_id).await {
+            Some(real) => real,
+            None => stub_excerpt(plan, source_id, Some(url.as_str())),
+        },
+        None => stub_excerpt(plan, source_id, None),
+    };
 
     let auth_ctx = AuthoringContext {
         source_id: source_id.to_string(),
@@ -446,6 +552,107 @@ async fn author_one(
     recipe.dedup_key = Some(format!("{}:{}", plan.id, source_id));
 
     Ok(recipe)
+}
+
+/// Synthesize a placeholder URL for sources without an
+/// `endpoint_hint`. The URL guard accepts `example.invalid` (it's a
+/// reserved-for-testing TLD), but the recipe author is told via the
+/// prompt that it must replace the placeholder with the source's
+/// real URL — the LLM, given a strong enough description, can
+/// usually do that for well-known sources.
+///
+/// This was the only authoring URL strategy before Session 10. It
+/// remains as the fallback for un-hinted sources because removing it
+/// would force every entry in `config/sources.toml` to declare an
+/// `endpoint_hint` even when the LLM doesn't need it, and that's a
+/// step we want to take when forced to, not preemptively.
+fn placeholder_url(source_id: &str) -> Result<url::Url, FetchExecutorError> {
+    format!("https://example.invalid/{source_id}")
+        .parse::<url::Url>()
+        .map_err(|e| {
+            FetchExecutorError::Authoring(AuthoringError::InvalidRecipe(format!(
+                "could not parse synthetic sample url for {source_id}: {e}"
+            )))
+        })
+}
+
+/// Fetch the endpoint hint and return a bounded UTF-8 excerpt, or
+/// `None` if the fetch failed. Failure is logged at warn level; the
+/// caller decides what to do with the absence.
+///
+/// We read up to `PREFETCH_EXCERPT_BUDGET` bytes. The HTTP layer
+/// already enforces a much larger ceiling (`max_response_bytes`); the
+/// budget here is about prompt size, not about defending the network
+/// layer.
+async fn prefetch_excerpt(
+    ctx: &ExecutorContext<'_>,
+    url: &url::Url,
+    source_id: &str,
+) -> Option<String> {
+    let bytes = match ctx.http.fetch_bytes(url.as_str()).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                source_id = %source_id,
+                url = %url,
+                error = %e,
+                "endpoint_hint pre-fetch failed; authoring will fall back to stub excerpt"
+            );
+            return None;
+        }
+    };
+
+    // Truncate at `PREFETCH_EXCERPT_BUDGET` *bytes*, not chars. The
+    // LLM tokenizer doesn't care about UTF-8 boundaries; we use
+    // `from_utf8_lossy` to handle the cut cleanly.
+    let byte_count = bytes.len();
+    let trimmed = if byte_count > PREFETCH_EXCERPT_BUDGET {
+        &bytes[..PREFETCH_EXCERPT_BUDGET]
+    } else {
+        &bytes[..]
+    };
+    let body = String::from_utf8_lossy(trimmed).into_owned();
+
+    let truncated_marker = if byte_count > PREFETCH_EXCERPT_BUDGET {
+        format!(
+            "\n\n[... excerpt truncated at {PREFETCH_EXCERPT_BUDGET} bytes; original was {byte_count} bytes ...]"
+        )
+    } else {
+        String::new()
+    };
+
+    Some(format!(
+        "Source id: {source_id}\nFetched URL: {url}\nFetched bytes: {byte_count}\n\n--- begin excerpt ---\n{body}{truncated_marker}\n--- end excerpt ---\n"
+    ))
+}
+
+/// Build a stub excerpt for cases where pre-fetch is impossible
+/// (no descriptor, no endpoint_hint, fetch failed). When we have a
+/// real URL but no body, we surface the URL so the LLM still has a
+/// concrete target — that alone often produces a usable recipe for
+/// well-known sources.
+fn stub_excerpt(plan: &ResearchPlan, source_id: &str, real_url: Option<&str>) -> String {
+    let topic = &plan.topic;
+    let interp = &plan.interpretation;
+    let mut out = format!(
+        "Source id: {source_id}\nPlan topic: {topic}\nInterpretation: {interp}\n"
+    );
+    if let Some(u) = real_url {
+        out.push_str(&format!(
+            "Documented endpoint (pre-fetch failed; author against this URL pattern): {u}\n"
+        ));
+    } else {
+        out.push_str(
+            "(no documented endpoint registered for this source; author from the description alone)\n",
+        );
+    }
+    // Bound the stub the same way the original code did, even though
+    // it's already much smaller than LLM_PROMPT_BODY — defense in
+    // depth.
+    if out.len() > Bounds::LLM_PROMPT_BODY {
+        out.truncate(Bounds::LLM_PROMPT_BODY);
+    }
+    out
 }
 
 /// Run one recipe end-to-end. Pure dispatch on the extraction mode
@@ -854,6 +1061,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
+            sources: &[],
         };
 
         let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
@@ -896,6 +1104,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            sources: &[],
         };
 
         let err = run_fetch_for_plan(&ctx, plan.id).await.unwrap_err();
@@ -924,6 +1133,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            sources: &[],
         };
 
         let err = run_fetch_for_plan(&ctx, Uuid::now_v7()).await.unwrap_err();
@@ -957,6 +1167,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            sources: &[],
         };
 
         let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
@@ -1001,6 +1212,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
+            sources: &[],
         };
 
         let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
@@ -1050,6 +1262,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            sources: &[],
         };
 
         let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
@@ -1093,6 +1306,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            sources: &[],
         };
 
         let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
@@ -1125,6 +1339,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            sources: &[],
         };
 
         let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
@@ -1133,6 +1348,425 @@ mod tests {
             RecipeOutcome::Failed { stage, .. } => assert_eq!(*stage, FailureStage::Apply),
             other => panic!("expected Failed(Apply), got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Session 10, Option F — pre-fetch for Level-2 authoring.
+    //
+    // These tests exercise `author_one` indirectly through
+    // `run_fetch_for_plan` by constructing a plan that has a bound
+    // source but no pre-authored recipes — so `load_or_author_recipes`
+    // falls into the authoring branch and calls the provider once
+    // per bound source.
+    //
+    // The provider is a `RecordingProvider` that captures the
+    // user-message prompt it receives and returns a fixed valid
+    // `RecipeAuthoringOutput`. We assert on what the provider saw
+    // (excerpt content, sample URL) rather than on what the runtime
+    // produced — the runtime's behaviour with the resulting recipe is
+    // covered by the existing CSV/JSON happy-path tests.
+    // -----------------------------------------------------------------------
+
+    /// Test provider that records the prompts it receives and returns
+    /// a hardcoded recipe-authoring output. Unlike `UnreachableProvider`,
+    /// this one is *meant* to be called — the tests below assert that
+    /// `author_one` reaches it with the expected prompt content.
+    ///
+    /// We use a `Mutex<Vec<_>>` rather than `tokio::sync::Mutex` because
+    /// the recording happens inside the synchronous `complete` body
+    /// before any await; the std lock never spans an await point.
+    struct RecordingProvider {
+        recorded_prompts: std::sync::Mutex<Vec<String>>,
+        canned_output: serde_json::Value,
+    }
+
+    impl RecordingProvider {
+        fn new() -> Self {
+            // A minimal valid `RecipeAuthoringOutput` JSON. The URL
+            // points at a real-looking host so URL-guard validation
+            // passes; the extraction is `csv_cell` because that's the
+            // simplest mode whose runtime path is fully wired.
+            let canned = serde_json::json!({
+                "source_url": "https://api.example.com/data.csv",
+                "extraction": {
+                    "mode": "csv_cell",
+                    "column": "production",
+                    "row_filter": null
+                },
+                "produces": [{
+                    "record_type": "observation",
+                    "expectation": { "list": "observation_metric", "index": 0 },
+                    "field_mappings": [
+                        { "path": "value", "source": { "kind": "extracted" } },
+                        { "path": "unit", "source": { "kind": "literal", "value": "t" } },
+                        { "path": "metric", "source": { "kind": "from_plan",
+                            "pointer": "expectations.observation_metrics.0.name" } },
+                        { "path": "period", "source": { "kind": "literal", "value": "annual" } }
+                    ]
+                }]
+            });
+            Self {
+                recorded_prompts: std::sync::Mutex::new(Vec::new()),
+                canned_output: canned,
+            }
+        }
+
+        fn last_prompt(&self) -> String {
+            self.recorded_prompts
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn call_count(&self) -> usize {
+            self.recorded_prompts.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RecordingProvider {
+        fn id(&self) -> &'static str {
+            "recording"
+        }
+        fn supported_tiers(&self) -> &[ModelTier] {
+            &[ModelTier::Workhorse]
+        }
+        async fn complete(
+            &self,
+            _tier: ModelTier,
+            req: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            self.recorded_prompts.lock().unwrap().push(req.user.clone());
+            Ok(CompletionResponse {
+                text: serde_json::to_string(&self.canned_output).unwrap(),
+                structured: Some(self.canned_output.clone()),
+                provider: "recording".into(),
+                model: "recording-test".into(),
+                // Token usage is "best effort" per the trait docs;
+                // None is the honest value for a test double.
+                input_tokens: None,
+                output_tokens: None,
+            })
+        }
+    }
+
+    /// A minimal recipe-author prompt template for offline tests. The
+    /// real prompt at `config/prompts/recipe_author.md` is far longer;
+    /// we only need the placeholders to be substituted so we can
+    /// assert what the LLM saw.
+    const TEST_AUTHOR_PROMPT: &str = "PLAN={{PLAN_JSON}}\nID={{SOURCE_ID}}\nURL={{SOURCE_URL}}\nEXCERPT={{DOCUMENT_EXCERPT}}\n";
+
+    #[tokio::test]
+    async fn author_one_uses_endpoint_hint_url_and_prefetched_excerpt() {
+        // Session 10, Option F happy path: the source has an
+        // endpoint_hint, the pre-fetch returns real bytes, the prompt
+        // the LLM sees contains those bytes verbatim and references
+        // the real URL — not `example.invalid`.
+        let plan = sample_plan(); // has document_sources -> "demo_csv"
+        let store = make_store_with_accepted_plan(&plan);
+
+        let hint_url = "https://api.example.com/csv-demo.csv";
+        // The pre-fetch body and the recipe-execution body don't
+        // need to be the same; the assertions only require that the
+        // pre-fetch body lands in the prompt. We use distinct
+        // bodies so they're easy to reason about:
+        //   - `hint_body` contains "Chile,49000" so the test asserts
+        //     the prefetched bytes appear in the prompt.
+        //   - `recipe_body` is a *single-row* CSV (no header twice,
+        //     just one data row) so the canned `csv_cell` recipe —
+        //     which has no `row_filter` — extracts unambiguously.
+        //     `recipe_apply::csv_cell_errors_on_ambiguous_multi_row_without_filter`
+        //     covers the other branch; this test wants the success
+        //     path so we can assert `recipes_succeeded == 1`.
+        let hint_body = b"country,production\nChile,49000\nAustralia,88000\n";
+        let recipe_body = b"country,production\nChile,49000\n";
+
+        let canned_recipe_url = "https://api.example.com/data.csv";
+        let fetcher = StaticFetcher::new()
+            .with(hint_url, hint_body)
+            .with(canned_recipe_url, recipe_body);
+
+        let sources = vec![SourceDescriptor {
+            id: "demo_csv".into(),
+            display_name: "CSV Demo".into(),
+            description: "Used by tests.".into(),
+            authoritative_for: vec![],
+            endpoint_hint: Some(hint_url.into()),
+        }];
+
+        let provider = RecordingProvider::new();
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            sources: &sources,
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        // Authoring happened exactly once (one bound source).
+        assert_eq!(provider.call_count(), 1);
+
+        let prompt = provider.last_prompt();
+        // The prompt's URL line refers to the endpoint_hint, not the
+        // synthetic placeholder.
+        assert!(
+            prompt.contains(hint_url),
+            "prompt should reference endpoint_hint URL; got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("example.invalid"),
+            "prompt should not contain example.invalid placeholder; got:\n{prompt}"
+        );
+        // The pre-fetched body is in the excerpt.
+        assert!(
+            prompt.contains("Chile,49000"),
+            "prompt should contain pre-fetched body; got:\n{prompt}"
+        );
+
+        // The run completed; one recipe authored, one record produced.
+        assert_eq!(report.recipes_attempted, 1);
+        assert_eq!(report.recipes_succeeded, 1);
+        assert_eq!(report.records_produced, 1);
+    }
+
+    #[tokio::test]
+    async fn author_one_falls_back_to_placeholder_when_no_endpoint_hint() {
+        // Session 10, Option F fallback: descriptor exists but has no
+        // endpoint_hint. The pre-fetch is skipped entirely; the
+        // synthesized placeholder URL goes through (matches
+        // pre-Session-10 behaviour). The LLM is still called.
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let canned_recipe_url = "https://api.example.com/data.csv";
+        let csv = b"country,production\nChile,49000\n";
+        let fetcher = StaticFetcher::new().with(canned_recipe_url, csv);
+
+        let sources = vec![SourceDescriptor {
+            id: "demo_csv".into(),
+            display_name: "CSV Demo".into(),
+            description: "Used by tests.".into(),
+            authoritative_for: vec![],
+            endpoint_hint: None,
+        }];
+
+        let provider = RecordingProvider::new();
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            sources: &sources,
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        assert_eq!(provider.call_count(), 1);
+        let prompt = provider.last_prompt();
+        // No endpoint hint → placeholder URL appears in the prompt.
+        assert!(
+            prompt.contains("example.invalid"),
+            "prompt should fall back to placeholder URL when endpoint_hint is absent; got:\n{prompt}"
+        );
+        // The stub-excerpt path was taken: the prompt explicitly
+        // notes the lack of a documented endpoint.
+        assert!(
+            prompt.contains("no documented endpoint registered")
+                || prompt.contains("author from the description"),
+            "prompt should carry the stub-excerpt marker; got:\n{prompt}"
+        );
+
+        assert_eq!(report.recipes_attempted, 1);
+    }
+
+    #[tokio::test]
+    async fn author_one_falls_back_when_descriptor_absent() {
+        // No descriptor at all for the bound source_id. Same fallback
+        // as missing endpoint_hint. Guards against a
+        // misconfiguration: the plan references "demo_csv" but no
+        // such descriptor was loaded into AppState.
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let canned_recipe_url = "https://api.example.com/data.csv";
+        let csv = b"country,production\nChile,49000\n";
+        let fetcher = StaticFetcher::new().with(canned_recipe_url, csv);
+
+        // sources slice is empty — no descriptor for "demo_csv".
+        let provider = RecordingProvider::new();
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            sources: &[],
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        assert_eq!(provider.call_count(), 1);
+        let prompt = provider.last_prompt();
+        assert!(prompt.contains("example.invalid"));
+        assert_eq!(report.recipes_attempted, 1);
+    }
+
+    #[tokio::test]
+    async fn author_one_falls_back_when_prefetch_fails() {
+        // Pre-fetch failure (URL not in fixture map → NoFixture
+        // error) must not abort authoring. The executor should log a
+        // warning and use the stub excerpt — but should still pass
+        // the real endpoint_hint URL as the sample URL, so the LLM
+        // has a real target.
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        // Endpoint hint URL is *not* in the fixture map → pre-fetch
+        // returns NoFixture. The recipe-execution URL *is* fixtured
+        // so the rest of the run completes.
+        let hint_url = "https://api.example.com/missing-fixture.csv";
+        let canned_recipe_url = "https://api.example.com/data.csv";
+        let csv = b"country,production\nChile,49000\n";
+        let fetcher = StaticFetcher::new().with(canned_recipe_url, csv);
+
+        let sources = vec![SourceDescriptor {
+            id: "demo_csv".into(),
+            display_name: "CSV Demo".into(),
+            description: "Used by tests.".into(),
+            authoritative_for: vec![],
+            endpoint_hint: Some(hint_url.into()),
+        }];
+
+        let provider = RecordingProvider::new();
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            sources: &sources,
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        assert_eq!(provider.call_count(), 1);
+        let prompt = provider.last_prompt();
+        // The sample URL is the real endpoint_hint, even though the
+        // pre-fetch failed.
+        assert!(
+            prompt.contains(hint_url),
+            "prompt should still carry the real endpoint_hint URL on pre-fetch failure; got:\n{prompt}"
+        );
+        // The stub-excerpt path was taken: it surfaces the URL as
+        // the documented endpoint.
+        assert!(
+            prompt.contains("Documented endpoint")
+                || prompt.contains("pre-fetch failed"),
+            "prompt should mark pre-fetch failure with the documented-endpoint hint; got:\n{prompt}"
+        );
+
+        assert_eq!(report.recipes_attempted, 1);
+    }
+
+    #[tokio::test]
+    async fn author_one_falls_back_when_endpoint_hint_unparseable() {
+        // A malformed `endpoint_hint` (non-URL string) must not crash
+        // authoring. The executor logs a warning and falls back to
+        // the placeholder path. Guards a misconfiguration in
+        // sources.toml from breaking the run.
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let canned_recipe_url = "https://api.example.com/data.csv";
+        let csv = b"country,production\nChile,49000\n";
+        let fetcher = StaticFetcher::new().with(canned_recipe_url, csv);
+
+        let sources = vec![SourceDescriptor {
+            id: "demo_csv".into(),
+            display_name: "CSV Demo".into(),
+            description: "Used by tests.".into(),
+            authoritative_for: vec![],
+            endpoint_hint: Some("not a url at all".into()),
+        }];
+
+        let provider = RecordingProvider::new();
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            sources: &sources,
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        assert_eq!(provider.call_count(), 1);
+        let prompt = provider.last_prompt();
+        assert!(
+            prompt.contains("example.invalid"),
+            "prompt should fall back to placeholder URL when endpoint_hint is unparseable; got:\n{prompt}"
+        );
+        assert_eq!(report.recipes_attempted, 1);
+    }
+
+    #[tokio::test]
+    async fn author_one_truncates_oversized_prefetch_excerpt() {
+        // Pre-fetch a body bigger than `PREFETCH_EXCERPT_BUDGET`. The
+        // excerpt that lands in the prompt must be truncated and
+        // include the truncation marker, so the LLM doesn't think
+        // the document just stops mid-row.
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        // A body larger than the 32 KiB budget. We use a
+        // distinctive prefix so we can assert it appears in the
+        // prompt, and a distinctive suffix that should NOT appear.
+        let mut body = Vec::with_capacity(PREFETCH_EXCERPT_BUDGET * 2);
+        body.extend_from_slice(b"PREFIX-MARKER\n");
+        body.extend(std::iter::repeat_n(b'x', PREFETCH_EXCERPT_BUDGET * 2));
+        body.extend_from_slice(b"SUFFIX-MARKER\n");
+
+        let hint_url = "https://api.example.com/large.csv";
+        let canned_recipe_url = "https://api.example.com/data.csv";
+        let small_csv = b"country,production\nChile,49000\n";
+        let fetcher = StaticFetcher::new()
+            .with(hint_url, body.as_slice())
+            .with(canned_recipe_url, small_csv);
+
+        let sources = vec![SourceDescriptor {
+            id: "demo_csv".into(),
+            display_name: "CSV Demo".into(),
+            description: "Used by tests.".into(),
+            authoritative_for: vec![],
+            endpoint_hint: Some(hint_url.into()),
+        }];
+
+        let provider = RecordingProvider::new();
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            sources: &sources,
+        };
+
+        let _ = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        let prompt = provider.last_prompt();
+        assert!(
+            prompt.contains("PREFIX-MARKER"),
+            "prompt should include the start of the body"
+        );
+        assert!(
+            !prompt.contains("SUFFIX-MARKER"),
+            "prompt should not include content past the truncation budget"
+        );
+        assert!(
+            prompt.contains("excerpt truncated"),
+            "prompt should carry an explicit truncation marker"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1248,6 +1882,7 @@ mod tests {
             http: &http,
             provider: &provider,
             recipe_author_prompt: "unused — recipe pre-authored",
+            sources: &[],
         };
 
         let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
@@ -1359,6 +1994,7 @@ mod tests {
             http: &http,
             provider: &provider,
             recipe_author_prompt: "unused — recipe pre-authored",
+            sources: &[],
         };
 
         let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();

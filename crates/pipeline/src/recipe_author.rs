@@ -183,8 +183,8 @@ pub async fn author_recipe(
         temperature: 0.0,
     };
 
-    let fingerprint = format!("{}", provider.id()); // stable provider id; key fingerprint
-                                                    // surfaces via the provider's own logging
+    let fingerprint = provider.id().to_string(); // stable provider id; key fingerprint
+                                                  // surfaces via the provider's own logging
     let resp = provider.complete(tier, req).await?;
 
     let raw = resp.structured.ok_or(AuthoringError::NoStructuredOutput)?;
@@ -786,8 +786,8 @@ mod tests {
         let a = AuthoredExpectationRef::ObservationMetric { index: 2 };
         let r = ExpectationRef::ObservationMetric { index: 2 };
         assert_eq!(
-            serde_json::to_value(&a).unwrap(),
-            serde_json::to_value(&r).unwrap()
+            serde_json::to_value(a).unwrap(),
+            serde_json::to_value(r).unwrap()
         );
     }
 

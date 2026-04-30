@@ -61,8 +61,8 @@ pub struct SecureHttpConfig {
 impl Default for SecureHttpConfig {
     fn default() -> Self {
         Self {
-            connect_timeout: Duration::from_secs(10),
-            total_timeout: Duration::from_secs(60),
+            connect_timeout: Duration::from_secs(30),
+            total_timeout: Duration::from_secs(120),
             max_response_bytes: 32 * 1024 * 1024, // 32 MB
             max_redirects: 5,
             user_agent: format!("Stockpile/{} (+https://github.com/stockpile)", env!("CARGO_PKG_VERSION")),
@@ -199,7 +199,7 @@ impl SecureHttpClient {
     /// GET and parse as JSON, bounded.
     pub async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, HttpError> {
         let bytes = self.get_bytes(url).await?;
-        serde_json::from_slice(&bytes).map_err(|e| HttpError::Request(format!("json parse: {}", e)))
+        serde_json::from_slice(&bytes).map_err(|e| HttpError::Request(format!("json parse: {e}")))
     }
 
     /// POST a JSON body with optional secret auth headers and optional plain
@@ -246,7 +246,7 @@ impl SecureHttpClient {
             // logging redacts it, and the SecretString on the caller side
             // is unchanged.
             let mut hv = reqwest::header::HeaderValue::from_str(secret.expose_secret())
-                .map_err(|e| HttpError::Request(format!("invalid header value: {}", e)))?;
+                .map_err(|e| HttpError::Request(format!("invalid header value: {e}")))?;
             hv.set_sensitive(true);
             req = req.header(*name, hv);
         }
@@ -318,7 +318,7 @@ impl SecureHttpClient {
             .post_json_bytes(url, body, auth_headers, extra_headers)
             .await?;
         serde_json::from_slice(&bytes)
-            .map_err(|e| HttpError::Request(format!("json parse: {}", e)))
+            .map_err(|e| HttpError::Request(format!("json parse: {e}")))
     }
 
     /// If the URL's host happens to be a literal IP, recheck it. (A host
@@ -336,7 +336,7 @@ impl SecureHttpClient {
                 let ip = IpAddr::V4(v4);
                 if is_disallowed_ip(&ip) {
                     return Err(HttpError::RedirectRejected(format!(
-                        "host resolves to disallowed IP: {}", ip
+                        "host resolves to disallowed IP: {ip}"
                     )));
                 }
             }
@@ -344,7 +344,7 @@ impl SecureHttpClient {
                 let ip = IpAddr::V6(v6);
                 if is_disallowed_ip(&ip) {
                     return Err(HttpError::RedirectRejected(format!(
-                        "host resolves to disallowed IP: {}", ip
+                        "host resolves to disallowed IP: {ip}"
                     )));
                 }
             }

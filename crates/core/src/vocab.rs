@@ -385,14 +385,14 @@ mod tests {
     #[test]
     fn topic_accepts_common() {
         for s in ["Li", "semiconductors", "euv_lithography", "tw_2028", "co2-removal", "Cu"] {
-            assert!(Topic::new(s).is_ok(), "should accept {}", s);
+            assert!(Topic::new(s).is_ok(), "should accept {s}");
         }
     }
 
     #[test]
     fn topic_rejects_bad() {
         for s in ["", "has spaces", "ünicode", &"x".repeat(65), "with/slash"] {
-            assert!(Topic::new(s).is_err(), "should reject {:?}", s);
+            assert!(Topic::new(s).is_err(), "should reject {s:?}");
         }
     }
 
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn unit_permissive() {
         for s in ["t", "kt", "USD/t", "%", "1", "mol/L", "m^3", "MWh"] {
-            assert!(Unit::new(s).is_ok(), "should accept {}", s);
+            assert!(Unit::new(s).is_ok(), "should accept {s}");
         }
         assert!(Unit::new("").is_err());
         assert!(Unit::new("kt\n").is_err());
@@ -442,11 +442,11 @@ mod tests {
             "vessel:IMO-9876543",
             "fab:TSMC-Arizona-F21",
         ] {
-            assert!(EntityId::new(s).is_ok(), "should accept {:?}", s);
+            assert!(EntityId::new(s).is_ok(), "should accept {s:?}");
         }
         assert!(EntityId::new("").is_err());
         assert!(EntityId::new("has spaces").is_err());
-        assert!(EntityId::new(&"x".repeat(200)).is_err());
+        assert!(EntityId::new("x".repeat(200)).is_err());
     }
 
     #[test]

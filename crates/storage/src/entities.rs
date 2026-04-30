@@ -148,7 +148,7 @@ impl Store {
             )
             .map_err(|e| match e {
                 duckdb::Error::QueryReturnedNoRows => {
-                    StorageError::NotFound(format!("entity {}", entity_id))
+                    StorageError::NotFound(format!("entity {entity_id}"))
                 }
                 other => StorageError::DuckDb(other),
             })?;

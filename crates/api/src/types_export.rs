@@ -591,6 +591,100 @@ impl FetchRunSummaryDto {
 }
 
 // ---------------------------------------------------------------------------
+// RecipeDto — wire shape for inspecting authored recipes
+// ---------------------------------------------------------------------------
+
+/// Wire shape for a recipe as the frontend renders it in the
+/// inspection panel.
+///
+/// ## Why scalar fields are typed but `extraction` / `produces` aren't
+///
+/// The internal [`stockpile_pipeline::recipes::FetchRecipe`] has
+/// strongly-typed `extraction: ExtractionSpec` (closed enum of five
+/// modes) and `produces: Vec<ProductionBinding>` (with nested closed
+/// enums for `record_type`, `field_value_source`, etc.). Mirroring all
+/// of that into ts-rs DTOs is feasible but adds a lot of code that the
+/// frontend's recipe-inspection panel doesn't need: it renders these
+/// fields as pretty-printed JSON for the user to read.
+///
+/// So we type the scalar fields strongly (id, source_id, source_url,
+/// version, authored_*) and leave the structured fields as
+/// `serde_json::Value` on the wire (`unknown` in TypeScript). If a
+/// future session wants per-mode rendering on the frontend, the DTO
+/// can grow per-variant mirrors then. Pay for type safety when
+/// rendering needs it; until then, the round-trip honesty of the JSON
+/// is enough.
+///
+/// ## Where this comes from
+///
+/// Storage (`StoredRecipe`) carries `extraction_json: String` and
+/// `produces_json: String` — JSON strings, not parsed values. The
+/// `from_stored` constructor parses both back into `Value` so the
+/// frontend doesn't have to do a `JSON.parse` at render time. A parse
+/// failure surfaces as a structured error in the `extraction` /
+/// `produces` field, which is honest about which recipe is broken
+/// rather than 500-ing the whole listing.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct RecipeDto {
+    pub id: String,
+    /// `None` if the recipe was authored without a stable dedup key
+    /// (older entries; the executor stamps one as of Session 10).
+    pub dedup_key: Option<String>,
+    pub plan_id: String,
+    pub source_id: String,
+    pub source_url: String,
+    /// The extraction spec — mode + parameters. Opaque on the wire;
+    /// TypeScript sees `unknown` and the frontend pretty-prints.
+    #[ts(type = "unknown")]
+    pub extraction: serde_json::Value,
+    /// The production bindings — record_type + field_mappings per
+    /// binding. Same opacity rationale as `extraction`.
+    #[ts(type = "unknown")]
+    pub produces: serde_json::Value,
+    pub authored_at: DateTime<Utc>,
+    /// Identifier for what authored this recipe — typically a
+    /// provider id like `"xai"` or `"recording"` (in tests).
+    pub authored_by: String,
+    pub version: u32,
+}
+
+impl RecipeDto {
+    /// Lift a [`stockpile_storage::StoredRecipe`] into wire shape.
+    /// Parses the JSON-string columns back to `Value`s; if either
+    /// fails to parse, the field carries a structured error object
+    /// instead of crashing the whole listing.
+    pub fn from_stored(r: stockpile_storage::StoredRecipe) -> Self {
+        let extraction = serde_json::from_str::<serde_json::Value>(&r.extraction_json)
+            .unwrap_or_else(|e| {
+                serde_json::json!({
+                    "_parse_error": e.to_string(),
+                    "_raw": r.extraction_json,
+                })
+            });
+        let produces = serde_json::from_str::<serde_json::Value>(&r.produces_json)
+            .unwrap_or_else(|e| {
+                serde_json::json!({
+                    "_parse_error": e.to_string(),
+                    "_raw": r.produces_json,
+                })
+            });
+        Self {
+            id: r.id.to_string(),
+            dedup_key: r.dedup_key,
+            plan_id: r.plan_id.to_string(),
+            source_id: r.source_id,
+            source_url: r.source_url,
+            extraction,
+            produces,
+            authored_at: r.authored_at,
+            authored_by: r.authored_by,
+            version: r.version,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -882,5 +976,70 @@ mod tests {
         assert_eq!(dto.id, stored.id.to_string());
         assert_eq!(dto.recipes_attempted, 2);
         assert!(dto.finished_at.is_some());
+    }
+
+    #[test]
+    fn recipe_dto_round_trips_from_stored_happy_path() {
+        // Both extraction and produces are well-formed JSON, so they
+        // land on the wire as parsed `Value`s and serde round-trips
+        // them cleanly.
+        use chrono::TimeZone;
+        let stored = stockpile_storage::StoredRecipe {
+            id: uuid::Uuid::now_v7(),
+            dedup_key: Some("plan-x:demo_csv".into()),
+            plan_id: uuid::Uuid::now_v7(),
+            source_id: "demo_csv".into(),
+            source_url: "https://api.example.com/data.csv".into(),
+            extraction_json: r#"{"mode":"csv_cell","column":"production"}"#.into(),
+            produces_json: r#"[{"record_type":"observation","field_mappings":[]}]"#.into(),
+            authored_at: chrono::Utc.with_ymd_and_hms(2026, 4, 28, 10, 0, 0).unwrap(),
+            authored_by: "xai".into(),
+            version: 1,
+        };
+        let dto = RecipeDto::from_stored(stored.clone());
+        assert_eq!(dto.id, stored.id.to_string());
+        assert_eq!(dto.source_id, "demo_csv");
+        assert_eq!(dto.dedup_key.as_deref(), Some("plan-x:demo_csv"));
+        // extraction parsed into a JSON object with the expected mode
+        assert_eq!(
+            dto.extraction.get("mode").and_then(|v| v.as_str()),
+            Some("csv_cell")
+        );
+        // produces parsed into a JSON array with one binding
+        assert!(dto.produces.is_array());
+        assert_eq!(dto.produces.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recipe_dto_surfaces_corrupt_extraction_as_structured_error() {
+        // If a stored recipe's extraction column is malformed JSON
+        // (which shouldn't normally happen — the executor authors
+        // valid JSON — but a hand-edit or future schema change could
+        // produce one), the DTO's `extraction` field carries a
+        // `_parse_error` marker instead of crashing the listing.
+        // This is the discipline the handoff calls "surfacing parse
+        // failures rather than zeroing them out."
+        use chrono::TimeZone;
+        let stored = stockpile_storage::StoredRecipe {
+            id: uuid::Uuid::now_v7(),
+            dedup_key: None,
+            plan_id: uuid::Uuid::now_v7(),
+            source_id: "broken".into(),
+            source_url: "https://example.com/".into(),
+            extraction_json: "{not valid json".into(),
+            produces_json: "[]".into(),
+            authored_at: chrono::Utc.with_ymd_and_hms(2026, 4, 28, 10, 0, 0).unwrap(),
+            authored_by: "xai".into(),
+            version: 1,
+        };
+        let dto = RecipeDto::from_stored(stored);
+        let err = dto
+            .extraction
+            .get("_parse_error")
+            .and_then(|v| v.as_str())
+            .expect("malformed extraction should surface _parse_error");
+        assert!(!err.is_empty(), "_parse_error should carry the serde message");
+        // produces was valid; it round-tripped cleanly.
+        assert!(dto.produces.is_array());
     }
 }

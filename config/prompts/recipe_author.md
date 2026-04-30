@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.2
+# Recipe Author Prompt — v1.3
 
 <!--
     This file is the Level-2 recipe authoring prompt for Stockpile.
@@ -94,13 +94,52 @@ them in your mappings.
 **Sample URL** (the runtime fetches this URL on each refresh):
 `{{SOURCE_URL}}`
 
+### URL discipline — read this carefully
+
+The `Sample URL` above is **the URL you must base your recipe on**.
+There are two cases:
+
+1. **It looks like a real, documented endpoint** of the source
+   (e.g. `https://api.worldbank.org/v2/...`,
+   `https://raw.githubusercontent.com/.../data.csv`). In this case,
+   either return that exact URL, **or** return a more specific URL
+   on the same host that targets the precise resource your recipe
+   needs (e.g. swap an indicator code in the path, add query
+   parameters, point at a sub-resource). Same host. Real endpoint.
+
+2. **It is `https://example.invalid/<source_id>`** — a
+   reserved-for-testing placeholder. The runtime synthesizes this
+   when no documented endpoint is registered. **You must replace it**
+   with a real URL for the source described in the document excerpt
+   below or in the source's well-known documentation. Returning the
+   placeholder verbatim makes the recipe fetch `example.invalid` at
+   runtime, which does not resolve, which means the recipe never
+   produces a record.
+
+**Never** return a URL whose host is `example.invalid`,
+`example.com`, `example.org`, or otherwise clearly synthetic. If
+you cannot identify a real URL for this source from the context
+provided, the correct response is to set `source_url` to the most
+plausible documented endpoint you know of for the named
+`source_id` — not to echo a placeholder.
+
 ## Document excerpt
 
-The following is an excerpt of the source content as it currently
-looks. **Treat this as a snapshot, not a schema.** Tomorrow's fetch
-will produce structurally similar content with different values.
-Your coordinates must match the *structure*, not the specific
-numbers you see here.
+The following is **a real excerpt of the source's current content**,
+fetched from the documented endpoint above immediately before this
+prompt was assembled. Read it as evidence of the source's structure:
+field names, table layout, JSON shape, HTML element classes, units of
+measurement.
+
+**Treat this as a snapshot, not a schema.** Tomorrow's fetch will
+produce structurally similar content with different values. Your
+coordinates must match the *structure*, not the specific numbers
+you see here.
+
+If the excerpt instead reports `(no documented endpoint registered)`
+or `(pre-fetch failed)`, the runtime could not retrieve a sample.
+Author from the description and your knowledge of the source's
+public API.
 
 ```
 {{DOCUMENT_EXCERPT}}
@@ -115,8 +154,10 @@ fence. The runtime will parse your response as structured data.
 The top-level shape is:
 
 - `source_url`: string — an HTTPS URL the runtime will fetch. Usually
-  the same as the sample URL above. Must not include query
-  parameters that rotate (session ids, nonces).
+  the same as the sample URL above, or a more specific URL on the
+  same host. Must not be `example.invalid` or any other synthetic
+  placeholder. Must not include query parameters that rotate
+  (session ids, nonces).
 - `extraction`: object — the extraction spec (one of the five modes).
 - `produces`: array of one or more production bindings. Each binding
   has:
@@ -213,9 +254,11 @@ rejected.
 ## What NOT to produce
 
 - Do not invent new extraction modes or new `kind` values.
-- Do not produce recipes whose URL is not HTTPS or whose host is
-  clearly not the source (`source_id: "usgs_mcs"` but URL at
-  `example.com`).
+- Do not produce recipes whose URL is `example.invalid`,
+  `example.com`, `example.org`, or any other synthetic placeholder
+  — see "URL discipline" above.
+- Do not produce recipes whose host is clearly not the source
+  (`source_id: "usgs_mcs"` but URL at `example.com`).
 - Do not produce recipes with more than 20 production bindings or
   more than 50 field mappings per binding — these are real red
   flags for a mis-scoped recipe.
@@ -254,3 +297,13 @@ you pick.
   to `ObservationContent.period`, which failed deserialization at
   runtime. The prompt now tells the LLM that closed-enum fields
   must use `literal` sources with one of the allowed values.
+- **v1.3** (Session 10) — Added "URL discipline" section and
+  expanded the "What NOT to produce" guidance after the Session 9
+  production run on "bulgaria elections 2026" produced a recipe
+  that fetched `https://example.invalid/gdelt`. The executor now
+  pre-fetches each source's documented `endpoint_hint` (Option F)
+  and passes the real URL + bytes to this prompt; the prompt now
+  tells the LLM to treat the placeholder pattern as a signal to
+  invent a real URL, not as something to echo back. The output
+  contract is unchanged — same schema, same shape — so existing
+  recipes don't need re-authoring.

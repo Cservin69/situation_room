@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn secret_debug_is_redacted() {
         let s = SecretString::new("actual_secret_value_xyz".to_string());
-        let dbg = format!("{:?}", s);
+        let dbg = format!("{s:?}");
         assert!(dbg.contains("***"));
         assert!(!dbg.contains("actual_secret_value"));
     }
@@ -169,7 +169,7 @@ mod tests {
             provider: "TEST_API_KEY",
             inner: SecretString::new("abcdefghijklmnop_secret_xyz123".to_string()),
         };
-        let dbg = format!("{:?}", key);
+        let dbg = format!("{key:?}");
         assert!(dbg.contains("TEST_API_KEY"));
         assert!(dbg.contains("abcd"));
         assert!(dbg.contains("z123"));

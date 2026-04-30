@@ -104,7 +104,7 @@ pub(crate) fn insert_subjects_and_derivation(
 
     // Derivation chain
     for d in &env.provenance.derived_from {
-        let role = serde_json::to_value(&d.role)?
+        let role = serde_json::to_value(d.role)?
             .as_str()
             .unwrap_or("unknown")
             .to_string();

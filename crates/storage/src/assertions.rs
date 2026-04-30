@@ -35,7 +35,7 @@ impl Store {
 
         let cols = EnvelopeColumns::from_envelope(&a.envelope)?;
         let content_json = serde_json::to_string(&a.content)?;
-        let stance_str = serde_json::to_value(&a.stance)?
+        let stance_str = serde_json::to_value(a.stance)?
             .as_str()
             .unwrap_or("unknown")
             .to_string();

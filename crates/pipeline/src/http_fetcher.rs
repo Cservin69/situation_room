@@ -92,6 +92,12 @@ pub mod testing {
         fixtures: Mutex<HashMap<String, Vec<u8>>>,
     }
 
+    impl Default for StaticFetcher {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl StaticFetcher {
         pub fn new() -> Self {
             Self {

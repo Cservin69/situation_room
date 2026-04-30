@@ -98,6 +98,23 @@ pub struct TopicUsage {
 /// Callers typically load these from `config/sources.toml` (or
 /// equivalent) at the binary layer — the pipeline crate stays
 /// agnostic of where the list comes from.
+///
+/// ## `endpoint_hint` — Session 10, Option F
+///
+/// `endpoint_hint` is consumed by the **fetch executor's** Level-2
+/// authoring step, not by the classifier prompt. It is a stable URL
+/// the executor pre-fetches to obtain a real document excerpt before
+/// asking the LLM to author a recipe. Without it, the executor falls
+/// back to a synthetic placeholder URL — which the Session 9
+/// production run revealed the LLM tends to keep verbatim, producing
+/// recipes that fetch `example.invalid` at runtime and fail.
+///
+/// The classifier itself does not render `endpoint_hint` into its
+/// prompt: the classifier teaches the LLM via descriptions, and a
+/// plan whose `document_sources` reference an id is enough — the
+/// runtime side resolves URLs. Keeping `endpoint_hint` invisible to
+/// the classifier is deliberate and keeps the two prompts' contracts
+/// independent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceDescriptor {
     /// Stable id used by recipes (`source_id` in `FetchRecipe`).
@@ -110,6 +127,21 @@ pub struct SourceDescriptor {
     /// (e.g. `["production", "reserves"]`). Empty if not declared.
     #[serde(default)]
     pub authoritative_for: Vec<String>,
+    /// Stable URL the fetch executor pre-fetches at recipe-authoring
+    /// time so the LLM sees a real excerpt of the source's current
+    /// shape. Validated through `UrlGuard` at use-time, not at
+    /// load-time — a bad URL here produces a clean fallback to the
+    /// synthetic-placeholder behaviour, not a hard configuration
+    /// error.
+    ///
+    /// `None` is legal: the executor will synthesize a placeholder
+    /// (`https://example.invalid/{id}`) and emit a warning. Sources
+    /// for which the LLM already knows the URL pattern (e.g.
+    /// well-known APIs documented in the description) can author
+    /// usable recipes from a placeholder; sources whose URL the LLM
+    /// would need to invent will benefit from setting this.
+    #[serde(default)]
+    pub endpoint_hint: Option<String>,
 }
 
 /// Errors that can arise during classification.
@@ -636,6 +668,7 @@ mod tests {
                               production, reserves, and trade."
                     .into(),
                 authoritative_for: vec!["production".into(), "reserves".into()],
+                endpoint_hint: None,
             }],
         }
     }
@@ -674,6 +707,7 @@ mod tests {
             display_name: "USGS MCS".into(),
             description: "Annual reports.".into(),
             authoritative_for: vec!["production".into()],
+            endpoint_hint: None,
         }]);
         assert!(s.contains("usgs_mcs"));
         assert!(s.contains("USGS MCS"));

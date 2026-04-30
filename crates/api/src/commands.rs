@@ -64,8 +64,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::types_export::{
-    FetchReportDto, FetchRunSummaryDto, PlanStatusDto, PlanSummary, ResearchPlanDto,
-    SourceDescriptorDto,
+    FetchReportDto, FetchRunSummaryDto, PlanStatusDto, PlanSummary, RecipeDto,
+    ResearchPlanDto, SourceDescriptorDto,
 };
 
 // ---------------------------------------------------------------------------
@@ -110,6 +110,12 @@ impl AppState {
     /// for one plan. Bounds the IPC payload regardless of what the
     /// frontend asks for.
     pub const MAX_FETCH_RUNS_LISTING: usize = 50;
+    /// How many recipes the inspection-panel endpoint will surface
+    /// for one plan. A plan rarely has more than ~10 bound sources,
+    /// so this ceiling is generous; a value at the limit is a sign of
+    /// a misconfigured plan or a pathological prompt response, not
+    /// normal behaviour.
+    pub const MAX_RECIPES_LISTING: usize = 100;
 
     pub fn new(
         store: Arc<Store>,
@@ -527,6 +533,10 @@ pub async fn run_fetch_for_plan(
         http: state.http.as_ref(),
         provider: state.provider.as_ref(),
         recipe_author_prompt: state.recipe_author_prompt,
+        // The same slice the classifier sees, threaded through to
+        // the executor for endpoint_hint lookup at Level-2 authoring
+        // time (Session 10, Option F).
+        sources: state.sources.as_slice(),
     };
 
     let report = run_fetch_for_plan_impl(&ctx, parsed)
@@ -575,6 +585,66 @@ pub async fn list_fetch_runs(
         .map_err(CommandError::from)?;
 
     Ok(stored.into_iter().map(FetchRunSummaryDto::from_stored).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Command 8 — list_recipes_for_plan (Session 11 P2.5)
+// ---------------------------------------------------------------------------
+
+/// Return the recipes authored for one plan, newest first.
+///
+/// The frontend's recipe-inspection panel calls this on plan
+/// selection. The data was already loadable via the situation_room
+/// CLI / DuckDB, but the desktop app couldn't see it — which made
+/// every authoring failure a DuckDB-spelunking exercise. This
+/// command makes the recipes legible in the UI.
+///
+/// ## Empty list vs not-found
+///
+/// An accepted plan with no fetch runs yet has zero recipes (they
+/// get authored on the first `run_fetch_for_plan` call). That's
+/// indistinguishable, at this layer, from "the plan exists but its
+/// recipes were lost" — both come back as an empty `Vec`. The UI
+/// renders empty-list state with appropriate copy ("No recipes yet
+/// — run fetch to author them"). A bad UUID surfaces as
+/// `InvalidInput`; we do not separately verify the plan exists,
+/// because doing so would add a second storage call without
+/// changing the UX.
+///
+/// ## Why no status filter
+///
+/// Unlike `list_recent_plans`, recipes don't carry a lifecycle
+/// (they're either authored or absent). All recipes for the plan
+/// come back in `authored_at DESC, version DESC` order — the same
+/// order `recipes_for_plan` produces.
+#[tauri::command]
+pub async fn list_recipes_for_plan(
+    plan_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<RecipeDto>, CommandError> {
+    let parsed: Uuid = plan_id
+        .parse()
+        .map_err(|e: uuid::Error| CommandError::InvalidInput {
+            field: "plan_id".into(),
+            message: format!("not a valid UUID: {e}"),
+        })?;
+
+    let stored = state
+        .store
+        .recipes_for_plan(parsed)
+        .map_err(CommandError::from)?;
+
+    // Defensive: the storage layer doesn't currently bound this and
+    // a pathological plan with hundreds of recipes would bloat the
+    // IPC payload. Truncate at the listing ceiling. The constant is
+    // generous (100) so this is a guardrail, not a routine clip.
+    let truncated = stored
+        .into_iter()
+        .take(AppState::MAX_RECIPES_LISTING)
+        .map(RecipeDto::from_stored)
+        .collect();
+
+    Ok(truncated)
 }
 
 // ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ import type { PlanStatusDto } from './types/PlanStatusDto';
 import type { CommandErrorDto } from './types/CommandErrorDto';
 import type { FetchReportDto } from './types/FetchReportDto';
 import type { FetchRunSummaryDto } from './types/FetchRunSummaryDto';
+import type { RecipeDto } from './types/RecipeDto';
 
 /**
  * Run Level-1 classification on a topic. Persists the resulting plan
@@ -103,6 +104,26 @@ export async function listFetchRuns(
   limit = 10,
 ): Promise<FetchRunSummaryDto[]> {
   return invoke<FetchRunSummaryDto[]>('list_fetch_runs', { planId, limit });
+}
+
+/**
+ * List the recipes authored for one plan, newest first. Pure read;
+ * the recipe-inspection panel calls this on plan selection so the
+ * user can see what URL / extraction spec / production bindings the
+ * Level-2 author produced.
+ *
+ * An empty array is returned both for plans that have not yet been
+ * fetched (recipes are authored on the first `run_fetch_for_plan`
+ * call) and for plans whose recipes have somehow been lost. The UI
+ * renders empty-state copy to cover both.
+ *
+ * The backend caps the result at `MAX_RECIPES_LISTING` (currently
+ * 100) regardless of how many recipes exist.
+ *
+ * Throws `{ kind: 'invalid_input' }` if `planId` isn't a UUID.
+ */
+export async function listRecipesForPlan(planId: string): Promise<RecipeDto[]> {
+  return invoke<RecipeDto[]>('list_recipes_for_plan', { planId });
 }
 
 /**

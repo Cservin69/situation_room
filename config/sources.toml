@@ -23,6 +23,17 @@
 #   display_name          = "Human-readable name"
 #   description           = "One-paragraph description"
 #   authoritative_for     = ["topic_or_metric_label", ...]   # optional
+#   endpoint_hint         = "https://example.com/api/..."     # optional
+#
+# `endpoint_hint` is consumed by the **fetch executor's** Level-2
+# authoring step (Session 10, Option F). It is a stable URL the
+# executor pre-fetches so the LLM sees a real excerpt of the source's
+# current shape before authoring a recipe. Without it the executor
+# falls back to a synthetic placeholder URL — which the Session 9
+# production run revealed the LLM tends to echo back into the
+# recipe, producing `example.invalid` fetches that fail at runtime.
+# Set it for any source whose URL pattern the LLM would otherwise
+# have to guess.
 #
 # Keep entries ordered roughly by priority tier (authoritative
 # primary first). The LLM reads them in order.
@@ -62,6 +73,11 @@ decisions, and treaties. Authoritative for the text of EU law and
 the official journal entries that bring acts into force.
 """
 authoritative_for = ["eu_legislation"]
+# EUR-Lex search index page. HTML; the LLM should pick a
+# `css_select` recipe targeting the result-list rows. Stable URL
+# pattern but the underlying HTML structure is reshuffled
+# occasionally — re-authoring is expected when it shifts.
+endpoint_hint = "https://eur-lex.europa.eu/search.html?scope=EURLEX&type=quick&lang=en"
 
 [[source]]
 id = "ofac_sdn"
@@ -82,6 +98,12 @@ demographics, governance) sourced from national statistical offices
 and standardized by the World Bank. Long historical series.
 """
 authoritative_for = ["country_macro_indicators"]
+# JSON API root for the indicators catalog. Stable for years; returns
+# a paginated indicator list. The LLM uses this excerpt to pick a
+# specific indicator endpoint (e.g.
+# https://api.worldbank.org/v2/country/HUN/indicator/NY.GDP.MKTP.CD?format=json
+# ) for the recipe.
+endpoint_hint = "https://api.worldbank.org/v2/indicator?format=json&per_page=20"
 
 [[source]]
 id = "imf_weo"
@@ -127,6 +149,11 @@ updated every fifteen minutes. Useful for event detection, less so
 for ground-truth claims.
 """
 authoritative_for = []
+# GDELT 2.0 DOC API documentation page. Returns HTML describing the
+# query parameters; the LLM reads the doc shape and constructs a
+# JSON-mode query URL for the recipe (DOC API supports `format=json`
+# query parameter and `query=` for keyword filtering).
+endpoint_hint = "https://api.gdeltproject.org/api/v2/doc/doc?query=domain:reuters.com&mode=ArtList&format=json&maxrecords=10"
 
 # ---- General news (lowest authority) ------------------------------------
 
@@ -167,6 +194,11 @@ source for substantive topics — its role is to keep the fetch path
 honest end-to-end.
 """
 authoritative_for = []
+# Stable public-domain CSV used by the live `#[ignore]` test in the
+# pipeline crate. Two columns: `Name`, `Code`. The LLM authors a
+# recipe targeting one of those columns with a row filter on the
+# other.
+endpoint_hint = "https://raw.githubusercontent.com/datasets/country-list/main/data.csv"
 
 [[source]]
 id = "json_demo"
@@ -182,3 +214,7 @@ role is to keep the JSON fetch path honest end-to-end alongside the
 CSV demo.
 """
 authoritative_for = []
+# Stable public-domain JSON used by the live `#[ignore]` test. The
+# top-level shape is an array of `{Name, Code}` objects; the LLM
+# authors a JSONPath recipe targeting one of those scalar fields.
+endpoint_hint = "https://raw.githubusercontent.com/datasets/country-list/main/data.json"

@@ -20,7 +20,7 @@
 //!   - `Pending`  — newly classified, awaiting user review.
 //!   - `Accepted` — user reviewed and approved; fetch executor input.
 //!   - `Rejected` — user discarded; retained for audit, hidden by
-//!                  default in listings.
+//!     default in listings.
 //!
 //! Status is a TEXT column, not a DuckDB enum (see migration v5 for
 //! why). Validation lives at the storage boundary in

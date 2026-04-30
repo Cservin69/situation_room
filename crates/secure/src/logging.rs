@@ -74,7 +74,7 @@ pub struct ScrubbingWriter {
 impl Write for ScrubbingWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         let mut buf = self.buf.lock().map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "log buffer mutex poisoned")
+            io::Error::other("log buffer mutex poisoned")
         })?;
         buf.extend_from_slice(data);
         // Flush on newline to keep per-line scrubbing behavior.
@@ -91,7 +91,7 @@ impl Write for ScrubbingWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         let mut buf = self.buf.lock().map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "log buffer mutex poisoned")
+            io::Error::other("log buffer mutex poisoned")
         })?;
         if !buf.is_empty() {
             let text = String::from_utf8_lossy(&buf).into_owned();

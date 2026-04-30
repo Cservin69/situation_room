@@ -49,6 +49,7 @@ import {
   rejectPlan as apiRejectPlan,
   runFetchForPlan as apiRunFetchForPlan,
   listFetchRuns as apiListFetchRuns,
+  listRecipesForPlan as apiListRecipesForPlan,
   asCommandError,
 } from '$lib/api/client';
 import type { PlanSummary } from '$lib/api/types/PlanSummary';
@@ -57,6 +58,7 @@ import type { PlanStatusDto } from '$lib/api/types/PlanStatusDto';
 import type { CommandErrorDto } from '$lib/api/types/CommandErrorDto';
 import type { FetchReportDto } from '$lib/api/types/FetchReportDto';
 import type { FetchRunSummaryDto } from '$lib/api/types/FetchRunSummaryDto';
+import type { RecipeDto } from '$lib/api/types/RecipeDto';
 
 export type StatusFilter = PlanStatusDto | 'all';
 
@@ -87,6 +89,19 @@ interface PlansState {
    * `runFetch`. Empty until the first listing roundtrip lands.
    */
   fetchRuns: FetchRunSummaryDto[];
+  /**
+   * Recipes authored for the selected plan, newest first. Loaded
+   * alongside the plan body and refreshed after each successful
+   * `runFetch` (because the first run is what triggers Level-2
+   * authoring; subsequent runs may add new recipes if the plan was
+   * extended). Empty until the first listing roundtrip lands, or
+   * if no recipes have been authored for the plan yet.
+   *
+   * Drives `RecipesPanel.svelte`. The `RecipeDto`'s `extraction` and
+   * `produces` fields are typed as `unknown` on the wire — the
+   * panel pretty-prints them as JSON.
+   */
+  recipes: RecipeDto[];
   error: CommandErrorDto | null;
 }
 
@@ -102,6 +117,7 @@ export const plans: PlansState = $state({
   fetching: false,
   fetchReport: null,
   fetchRuns: [],
+  recipes: [],
   error: null,
 });
 
@@ -168,16 +184,19 @@ export async function classifyTopic(topic: string): Promise<void> {
 /**
  * Open a plan in the review pane. Called from the listing.
  *
- * Resets the per-plan fetch state (`fetchReport`, `fetchRuns`) so
- * the previously-viewed plan's history doesn't leak across the
- * selection boundary, then asynchronously refreshes the fetch-run
- * history for the newly-selected plan.
+ * Resets the per-plan fetch and recipe state so the previously-viewed
+ * plan's history doesn't leak across the selection boundary, then
+ * asynchronously refreshes the fetch-run history and the authored-
+ * recipes list for the newly-selected plan. Both refreshes are
+ * fire-and-forget; failures are non-fatal and surface as an error
+ * banner without blocking the plan body from rendering.
  */
 export async function selectPlan(id: string): Promise<void> {
   plans.loading = true;
   plans.error = null;
   plans.fetchReport = null;
   plans.fetchRuns = [];
+  plans.recipes = [];
   try {
     plans.selected = await getPlan(id);
     // Pull the recent fetch-run history alongside the plan body so
@@ -185,6 +204,11 @@ export async function selectPlan(id: string): Promise<void> {
     // without a second user action. Failure to load the history is
     // not fatal — the report panel will just show empty state.
     void refreshFetchRuns(id).catch(() => {});
+    // Same for the recipes — load them in the background so the
+    // recipe-inspection panel populates as soon as the plan body
+    // renders. Empty list is the legitimate state for a plan that
+    // hasn't been fetched yet.
+    void refreshRecipes(id).catch(() => {});
   } catch (e) {
     plans.error = asCommandError(e);
   } finally {
@@ -200,6 +224,7 @@ export function clearSelection(): void {
   plans.selected = null;
   plans.fetchReport = null;
   plans.fetchRuns = [];
+  plans.recipes = [];
 }
 
 /**
@@ -301,6 +326,13 @@ export async function runFetch(): Promise<boolean> {
     // Failure to refresh is non-fatal — the report itself is
     // already showing in the UI.
     void refreshFetchRuns(current.id).catch(() => {});
+    // Also refresh recipes — the first run is what triggers
+    // Level-2 authoring, so the recipes panel goes from empty to
+    // populated on that first call. Subsequent runs against an
+    // already-authored plan are idempotent for the recipe list,
+    // but refreshing is cheap and keeps the panel in sync if the
+    // plan's bound sources ever expand.
+    void refreshRecipes(current.id).catch(() => {});
     return true;
   } catch (e) {
     plans.error = asCommandError(e);
@@ -321,6 +353,28 @@ export async function refreshFetchRuns(planId: string): Promise<void> {
     plans.fetchRuns = await apiListFetchRuns(planId, 10);
   } catch (e) {
     // Non-fatal: history is a nicety, not a precondition.
+    plans.error = asCommandError(e);
+  }
+}
+
+/**
+ * Refresh the authored-recipes list for a plan. Pure read; called
+ * alongside `selectPlan` and after each successful `runFetch`.
+ *
+ * Like `refreshFetchRuns`, this doesn't toggle any spinner — the
+ * recipes panel renders its own empty state until the call returns,
+ * and a slow read shouldn't visibly block the rest of the review
+ * pane. Failure surfaces as an error banner but leaves the cached
+ * `plans.recipes` array intact, so a transient network blip during a
+ * background refresh doesn't blank a useful panel.
+ */
+export async function refreshRecipes(planId: string): Promise<void> {
+  try {
+    plans.recipes = await apiListRecipesForPlan(planId);
+  } catch (e) {
+    // Non-fatal: same rationale as refreshFetchRuns. Don't reset
+    // plans.recipes here — preserving the previous list is more
+    // useful than blanking it on a transient failure.
     plans.error = asCommandError(e);
   }
 }

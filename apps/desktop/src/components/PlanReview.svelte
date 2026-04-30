@@ -33,6 +33,7 @@
   import ExpectationRow from '$components/panels/ExpectationRow.svelte';
   import RunFetchButton from '$components/RunFetchButton.svelte';
   import FetchReport from '$components/FetchReport.svelte';
+  import RecipesPanel from '$components/RecipesPanel.svelte';
 
   interface Props {
     plan: ResearchPlanDto;
@@ -180,6 +181,15 @@
   {#if plans.fetchReport || plans.fetchRuns.length > 0}
     <FetchReport />
   {/if}
+
+  <!-- Recipes panel (Session 11 P2.5). Renders the Level-2 authored
+       recipes for the selected plan so the user can read what URL
+       and extraction spec the LLM produced — invaluable when
+       diagnosing why a fetch run came back with 0 records. The
+       component itself renders nothing when there are no recipes,
+       which is the legitimate state for a freshly-classified plan
+       that hasn't been fetched yet. -->
+  <RecipesPanel />
 </article>
 
 <style>

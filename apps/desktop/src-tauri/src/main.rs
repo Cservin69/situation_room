@@ -64,7 +64,7 @@ fn main() -> Result<()> {
 
     info!(
         workspace_root = %workspace_root.display(),
-        "Stockpile desktop boots (Session 6 — GUI)."
+        "Stockpile desktop boots."
     );
 
     // --- Storage -----------------------------------------------------
@@ -143,7 +143,8 @@ fn main() -> Result<()> {
             stockpile_api::commands::accept_plan,
             stockpile_api::commands::reject_plan,
             stockpile_api::commands::run_fetch_for_plan,
-            stockpile_api::commands::list_fetch_runs
+            stockpile_api::commands::list_fetch_runs,
+            stockpile_api::commands::list_recipes_for_plan
         ])
         .run(tauri::generate_context!())
         .context("running tauri")?;
@@ -257,6 +258,13 @@ struct SourceEntry {
     description: String,
     #[serde(default)]
     authoritative_for: Vec<String>,
+    /// Optional URL the fetch executor pre-fetches at recipe-authoring
+    /// time. See Session 10 handoff §"Top: F" — without this, the
+    /// LLM tends to keep `https://example.invalid/{id}` placeholders.
+    /// `None` is legal; the executor falls back to a placeholder URL
+    /// and a stub excerpt and continues.
+    #[serde(default)]
+    endpoint_hint: Option<String>,
 }
 
 fn load_source_descriptors(path: &Path, limit: usize) -> Result<Vec<SourceDescriptor>> {
@@ -281,6 +289,7 @@ fn load_source_descriptors(path: &Path, limit: usize) -> Result<Vec<SourceDescri
             display_name: e.display_name,
             description: e.description.trim().to_string(),
             authoritative_for: e.authoritative_for,
+            endpoint_hint: e.endpoint_hint.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         })
         .collect();
 
