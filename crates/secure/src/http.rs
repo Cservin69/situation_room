@@ -61,8 +61,8 @@ pub struct SecureHttpConfig {
 impl Default for SecureHttpConfig {
     fn default() -> Self {
         Self {
-            connect_timeout: Duration::from_secs(30),
-            total_timeout: Duration::from_secs(120),
+            connect_timeout: Duration::from_secs(60),
+            total_timeout: Duration::from_secs(300),
             max_response_bytes: 32 * 1024 * 1024, // 32 MB
             max_redirects: 5,
             user_agent: format!("situation_room/{} (+https://github.com/situation_room)", env!("CARGO_PKG_VERSION")),
