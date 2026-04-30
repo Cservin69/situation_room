@@ -3,7 +3,9 @@
 You are picking up after Session 12. Read this document, the
 Session 12 handoff, and ADR 0007 §"runtime path" + the new
 Session-12 review note before writing any code. ADRs 0007 and
-0011 remain authoritative.
+0011 remain authoritative.  in the meantime Ervin refactored most of the things 
+from Stockpile to Situation Room as he hated it because he fighted with us as 
+we deviated always towards mineral specific queries
 
 ## What Session 12 shipped
 
