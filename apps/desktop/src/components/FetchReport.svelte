@@ -12,36 +12,55 @@
 
   The component reads from the runes store directly; no props. Mounts
   as a child of PlanReview when there's a plan selected.
+
+  Empty-state taxonomy (Session 13 P5)
+  -------------------------------------
+
+  Three legitimate "nothing useful happened" states the panel must
+  distinguish, because they imply different user actions:
+
+    1. recipes_attempted == 0, outcomes empty
+       → No recipe was authored against any source. The plan's
+         document_sources didn't bind to any registered descriptor
+         in `config/sources.toml`. The fix is editorial — either add
+         a source, or re-classify with a topic the registry covers.
+         Surface this with a dedicated message that names the cause.
+         (This was the "footgun" from the Session 12 hungary's-frozen-
+         EU-funds run: 0 recipes attempted, no signal why.)
+
+    2. recipes_attempted > 0, outcomes empty
+       → Defensive. Shouldn't happen in practice (every attempted
+         recipe lands in `outcomes`), but if invariants ever drift
+         the panel should still say *something*. Falls into the
+         generic "no outcomes" message below; not flagged specially.
+
+    3. recipes_attempted > 0, outcomes populated
+       → The normal case. Render the outcomes list as before.
+
+  The two zero-attempt-empty cases above were collapsed into a single
+  "no recipes" message before this session; they're separated now
+  because case 1 is always actionable and case 2 is always a bug.
+
+  Design-token discipline
+  -----------------------
+
+  Up to Session 12 this component used `var(--signal-ok, #5b9c5e)`
+  and `var(--signal-error, #c83c3c)` — the named vars don't exist in
+  global.css, so the hex fallbacks were what actually painted. That
+  drifted from the design tokens (`--signal-positive`,
+  `--signal-negative`) and embedded hex literals in component CSS,
+  both of which the handoff hard rules forbid. This file now uses the
+  canonical vars throughout. ADR 0006.
 -->
 <script lang="ts">
   import { plans } from '$stores/plans.svelte';
-  import type { RecipeOutcomeDto } from '$lib/api/types/RecipeOutcomeDto';
   import type { FetchRunSummaryDto } from '$lib/api/types/FetchRunSummaryDto';
+  import { outcomeTone, outcomeLabel, outcomeDetail } from '$lib/outcomes';
 
   function shortId(id: string): string {
     // UUIDv7s are too long for inline display; first 8 chars are
     // unique enough for a single plan's recipe list.
     return id.slice(0, 8);
-  }
-
-  function outcomeTone(o: RecipeOutcomeDto): 'ok' | 'skip' | 'fail' {
-    if (o.kind === 'succeeded') return 'ok';
-    if (o.kind === 'skipped') return 'skip';
-    return 'fail';
-  }
-
-  function outcomeLabel(o: RecipeOutcomeDto): string {
-    if (o.kind === 'succeeded') {
-      return `${o.records_produced} record${o.records_produced === 1 ? '' : 's'}`;
-    }
-    if (o.kind === 'skipped') return 'skipped';
-    return `failed @ ${o.stage}`;
-  }
-
-  function outcomeDetail(o: RecipeOutcomeDto): string {
-    if (o.kind === 'skipped') return o.reason;
-    if (o.kind === 'failed') return o.message;
-    return '';
   }
 
   function formatRunStarted(iso: string): string {
@@ -78,8 +97,32 @@
       <p class="top-error">{report.error_summary}</p>
     {/if}
 
-    {#if report.outcomes.length === 0}
-      <p class="empty">no recipes were authored or applied — check the plan's bound sources.</p>
+    {#if report.recipes_attempted === 0 && report.outcomes.length === 0}
+      <!--
+        Case 1 from the empty-state taxonomy above. Distinct from the
+        generic "no outcomes" message: this happens when the plan's
+        document_sources hints didn't bind to any registered source
+        descriptor, so `load_or_author_recipes` had nothing to do.
+        Adjacent to ADR 0007's deferred CoverageReport; the Session
+        13 handoff §P5 chose to address it locally rather than wait
+        for the broader coverage design.
+      -->
+      <div class="empty empty-no-bindings">
+        <p class="empty-headline">No recipes were attempted.</p>
+        <p class="empty-explainer">
+          The plan's document sources didn't bind to any registered
+          source in <code>config/sources.toml</code>. Either add a
+          matching source descriptor, or re-classify the topic in
+          terms the registry covers.
+        </p>
+      </div>
+    {:else if report.outcomes.length === 0}
+      <!--
+        Case 2: defensive. Shouldn't happen in practice (the executor
+        records every attempt), but if the invariant ever slips, we
+        say something rather than render a blank panel.
+      -->
+      <p class="empty">no outcomes were recorded — this is unexpected; check the logs.</p>
     {:else}
       <ul class="outcomes">
         {#each report.outcomes as o (o.recipe_id)}
@@ -154,8 +197,8 @@
   .top-error {
     margin: 0;
     padding: 6px 8px;
-    background: rgba(200, 60, 60, 0.08);
-    border-left: 2px solid var(--signal-error, #c83c3c);
+    background: var(--bg-panel-alt);
+    border-left: 2px solid var(--signal-negative);
     color: var(--fg-primary);
     font-size: 12px;
     font-family: var(--font-mono);
@@ -165,6 +208,40 @@
     margin: 0;
     color: var(--fg-tertiary);
     font-size: 12px;
+  }
+
+  /* Case-1 empty state — has its own small block treatment because
+     the message is two paragraphs and the second one references a
+     filename. The border-left in warning amber distinguishes it
+     visually from the generic "empty" grey. */
+  .empty-no-bindings {
+    padding: 8px 10px;
+    background: var(--bg-panel-alt);
+    border-left: 2px solid var(--signal-warning);
+    border-radius: 2px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .empty-headline {
+    margin: 0;
+    color: var(--fg-primary);
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .empty-explainer {
+    margin: 0;
+    color: var(--fg-secondary);
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .empty-explainer code {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    background: var(--bg-inset);
+    padding: 1px 4px;
+    border-radius: 2px;
+    color: var(--fg-primary);
   }
 
   .outcomes {
@@ -187,9 +264,18 @@
     font-size: 12px;
     font-family: var(--font-mono);
   }
-  .outcome[data-tone="ok"]   { border-left-color: var(--signal-ok, #5b9c5e); }
+  .outcome[data-tone="ok"]   { border-left-color: var(--signal-positive); }
   .outcome[data-tone="skip"] { border-left-color: var(--fg-quaternary); }
-  .outcome[data-tone="fail"] { border-left-color: var(--signal-error, #c83c3c); background: rgba(200, 60, 60, 0.04); }
+  .outcome[data-tone="fail"] {
+    border-left-color: var(--signal-negative);
+    background: var(--bg-panel-alt);
+  }
+  /* Defensive: outcomeTone returns 'none' when the outcome is
+     undefined, which can't happen for items inside the outcomes
+     list (each list item is by construction a defined outcome).
+     Style anyway so the type-checker is satisfied if tone ever
+     widens. */
+  .outcome[data-tone="none"] { border-left-color: var(--border-subtle); }
 
   .recipe-id { color: var(--fg-quaternary); }
   .source-id { color: var(--fg-secondary); }
@@ -228,15 +314,15 @@
     font-size: 10px;
     color: var(--fg-secondary);
   }
-  .run[data-tone="ok"]      { border-color: var(--signal-ok, #5b9c5e); }
+  .run[data-tone="ok"]      { border-color: var(--signal-positive); }
   .run[data-tone="partial"] { border-color: var(--signal-warning); }
-  .run[data-tone="fail"]    { border-color: var(--signal-error, #c83c3c); }
+  .run[data-tone="fail"]    { border-color: var(--signal-negative); }
   .run[data-tone="pending"] { border-style: dashed; }
   .time   { color: var(--fg-tertiary); }
   .counts { color: var(--fg-primary); }
   .dot    { color: var(--fg-quaternary); margin: 0 2px; }
   .run-error {
-    color: var(--signal-error, #c83c3c);
+    color: var(--signal-negative);
     font-weight: 600;
     cursor: help;
   }

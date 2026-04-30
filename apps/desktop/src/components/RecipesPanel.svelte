@@ -17,6 +17,8 @@
   This panel makes the recipes legible inline. For each recipe:
 
     - source_id and dedup_key as a header strip
+    - per-recipe outcome badge from the most recent fetch run
+      (Session 13 P2 — see below)
     - source_url shown as monospace + click-to-copy
     - extraction spec pretty-printed as JSON
     - production bindings pretty-printed as JSON
@@ -25,6 +27,30 @@
   Per the handoff, the structured fields render as JSON rather than
   per-mode bespoke components — that's a future polish session if
   this view ever ships beyond the developer audience.
+
+  Per-recipe outcome badge (Session 13 P2)
+  -----------------------------------------
+
+  The badge below the recipe header shows the outcome of the *most
+  recent* fetch run for this recipe (matched by `recipe_id` against
+  `plans.fetchReport.outcomes`). This is the "show at a glance which
+  recipes are working and which aren't" affordance from the Session
+  13 handoff. Four states:
+
+    - ok    → "N records" badge in positive green
+    - skip  → "skipped" in chrome grey, with the reason expandable
+    - fail  → "failed @ stage" in negative red, with the message
+              expandable
+    - none  → "no fetch run yet" in tertiary grey, no expand
+
+  Tone semantics + label/detail strings are shared with FetchReport
+  via `$lib/outcomes.ts` so the two panels can't drift in their
+  rendering of the same wire shape.
+
+  The badge reflects only the most recent fetch run's outcomes —
+  earlier runs aren't surfaced here (the run history strip in
+  FetchReport covers that). When the user clicks "Run fetch" again,
+  the badge updates with the new run's outcome for this recipe.
 
   Empty state
   -----------
@@ -43,6 +69,12 @@
 <script lang="ts">
   import { plans } from '$stores/plans.svelte';
   import type { RecipeDto } from '$lib/api/types/RecipeDto';
+  import {
+    outcomeTone,
+    outcomeLabel,
+    outcomeDetail,
+    outcomeForRecipe,
+  } from '$lib/outcomes';
 
   function shortId(id: string): string {
     // UUIDv7s are too long for inline display; first 8 chars are
@@ -93,11 +125,32 @@
 {/if}
 
 {#snippet recipeCard(recipe: RecipeDto)}
+  {@const outcome = outcomeForRecipe(recipe.id, plans.fetchReport?.outcomes)}
+  {@const tone = outcomeTone(outcome)}
+  {@const label = outcomeLabel(outcome)}
+  {@const detail = outcomeDetail(outcome)}
   <article class="recipe">
     <header class="recipe-head">
       <span class="source-id">{recipe.source_id}</span>
       <span class="recipe-id">{shortId(recipe.id)}</span>
     </header>
+
+    <!--
+      Outcome strip. Always present (even in 'none' state) so the
+      vertical rhythm of the cards stays consistent across plans
+      with and without fetch runs. The expandable detail only
+      renders when there's something to show.
+    -->
+    <div class="outcome-strip" data-tone={tone}>
+      <span class="outcome-dot" aria-hidden="true"></span>
+      <span class="outcome-label">{label}</span>
+      {#if detail}
+        <details class="outcome-detail">
+          <summary>details</summary>
+          <pre>{detail}</pre>
+        </details>
+      {/if}
+    </div>
 
     <div class="kv-row">
       <span class="k">URL</span>
@@ -188,6 +241,97 @@
     font-size: 10px;
     color: var(--fg-quaternary);
     font-variant-numeric: tabular-nums;
+  }
+
+  /*
+   * Outcome strip — small status row sitting between the recipe
+   * head and the URL. Tone-driven: the dot color and the label
+   * color shift with the wire's outcome kind. Border-left accent
+   * mirrors the FetchReport outcome rows for visual consistency
+   * across the two panels — same data shape, same chrome.
+   *
+   * Only canonical signal vars from global.css are used. ADR 0006
+   * §"color is a meaning, not decoration" — and the no-hardcoded-hex
+   * rule from the Session 13 handoff hard rules.
+   */
+  .outcome-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    background: var(--bg-panel);
+    border-left: 2px solid var(--border-subtle);
+    border-radius: 2px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    flex-wrap: wrap;
+  }
+  .outcome-strip[data-tone="ok"]   { border-left-color: var(--signal-positive); }
+  .outcome-strip[data-tone="skip"] { border-left-color: var(--fg-quaternary); }
+  .outcome-strip[data-tone="fail"] {
+    border-left-color: var(--signal-negative);
+    background: var(--bg-panel-alt);
+  }
+  .outcome-strip[data-tone="none"] { border-left-color: var(--border-subtle); }
+
+  .outcome-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--fg-quaternary);
+    flex-shrink: 0;
+  }
+  .outcome-strip[data-tone="ok"]   .outcome-dot { background: var(--signal-positive); }
+  .outcome-strip[data-tone="skip"] .outcome-dot { background: var(--fg-tertiary); }
+  .outcome-strip[data-tone="fail"] .outcome-dot { background: var(--signal-negative); }
+  .outcome-strip[data-tone="none"] .outcome-dot { background: var(--fg-quaternary); }
+
+  .outcome-label {
+    color: var(--fg-primary);
+    flex: 1;
+    min-width: 0;
+  }
+  .outcome-strip[data-tone="none"] .outcome-label {
+    color: var(--fg-tertiary);
+  }
+  .outcome-strip[data-tone="fail"] .outcome-label {
+    color: var(--signal-negative);
+  }
+
+  .outcome-detail {
+    /* Inline expandable; the summary is the click target, the pre
+       is the message body. Same disclosure shape as the extraction
+       and produces blocks below — keeps the recipe card's
+       interaction grammar consistent. */
+    flex-basis: 100%;
+    margin-top: 4px;
+  }
+  .outcome-detail summary {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-tertiary);
+    cursor: pointer;
+    user-select: none;
+  }
+  .outcome-detail summary:hover {
+    color: var(--fg-secondary);
+  }
+  .outcome-detail pre {
+    margin: 4px 0 0 0;
+    padding: 6px 8px;
+    background: var(--bg-inset);
+    border-radius: 2px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--fg-secondary);
+    white-space: pre-wrap;
+    word-break: break-word;
+    /* Long failure messages (e.g. JSONPath syntax errors with the
+       full expression echoed back) shouldn't blow out the card. */
+    max-height: 160px;
+    overflow-y: auto;
   }
 
   .kv-row {

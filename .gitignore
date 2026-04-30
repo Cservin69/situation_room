@@ -48,8 +48,6 @@ logs/
 clean_code.zip
 situation_room_codebase.txt
 situation_room_delta_*.zip
-stockpile_codebase.txt
-stockpile_delta_*.zip
 
 # Misc
 *.swp

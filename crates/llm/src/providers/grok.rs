@@ -14,6 +14,12 @@
 //!   schema } }`.
 //! - Parses the response, pulls out the assistant text and — if a schema
 //!   was requested — the text parsed as JSON.
+//! - **Retries once on response truncation** (Session 13 Improvement B).
+//!   When a structured-output response parses as a top-level JSON string
+//!   that ends mid-value (the gateway truncated the model's output before
+//!   it could close a string literal), we retry the same request once
+//!   with a larger `max_tokens` budget. Other JSON parse errors do not
+//!   retry — bigger budget will not fix a malformed schema.
 //!
 //! ## What this provider does NOT do
 //!
@@ -31,6 +37,11 @@
 //! override per-tier via [`XaiProvider::with_config`]. A wrong default is
 //! a config edit, not a code fix.
 //!
+//! Three env vars (`XAI_FRONTIER_MODEL`, `XAI_WORKHORSE_MODEL`,
+//! `XAI_CHEAP_MODEL`) override the per-tier defaults at startup. This
+//! lets operators swap to a frontier model for a session — or pin to a
+//! cheaper model — without recompiling. See [`XaiConfig::from_env`].
+//!
 //! See <https://docs.x.ai/api> for the current model catalog.
 
 use async_trait::async_trait;
@@ -47,8 +58,27 @@ use crate::providers::trait_def::{
 /// Environment variable the provider reads its key from.
 pub const XAI_API_KEY_ENV: &str = "XAI_API_KEY";
 
+/// Environment variables for per-tier model overrides. Optional; if any
+/// is unset (or set to an empty / whitespace-only string) the tier's
+/// hardcoded default in [`XaiConfig::default`] is used. Added in
+/// Session 13 to let operators swap to a frontier model for a session
+/// (e.g. when a cheaper model truncates structured output too often)
+/// without a code change.
+pub const XAI_FRONTIER_MODEL_ENV: &str = "XAI_FRONTIER_MODEL";
+pub const XAI_WORKHORSE_MODEL_ENV: &str = "XAI_WORKHORSE_MODEL";
+pub const XAI_CHEAP_MODEL_ENV: &str = "XAI_CHEAP_MODEL";
+
 /// xAI chat completions endpoint. Overridable (only) for tests.
 const DEFAULT_ENDPOINT: &str = "https://api.x.ai/v1/chat/completions";
+
+/// Token ceiling used by the truncation-retry path. When a structured-
+/// output response truncates mid-string, the retry doubles the original
+/// `max_tokens` and clamps to this value. Picked to be well above what
+/// any of our prompts actually need (a fully-populated `ResearchPlan`
+/// or `FetchRecipe` JSON object lands well under 16 KB of tokens) but
+/// well below the gateway's hard ceiling, so the retry can never loop
+/// forever even if the model genuinely can't finish.
+const MAX_RETRY_TOKENS: u32 = 32_768;
 
 /// Which model name to use for each tier.
 ///
@@ -86,6 +116,33 @@ impl XaiConfig {
             ModelTier::Cheap => &self.cheap_model,
         }
     }
+
+    /// Build a config by reading the three optional env vars and
+    /// falling back to [`XaiConfig::default`] for any that are unset
+    /// or empty/whitespace-only.
+    ///
+    /// Empty-string normalisation matches the `endpoint_hint` discipline
+    /// from Session 10's TOML loaders: a blank string is "absent", not
+    /// "use literal empty model name." A literal empty model name would
+    /// be rejected by xAI with a 400, which is a worse failure mode than
+    /// silently using the default.
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+        Self {
+            frontier_model: env_or(XAI_FRONTIER_MODEL_ENV, &defaults.frontier_model),
+            workhorse_model: env_or(XAI_WORKHORSE_MODEL_ENV, &defaults.workhorse_model),
+            cheap_model: env_or(XAI_CHEAP_MODEL_ENV, &defaults.cheap_model),
+        }
+    }
+}
+
+/// Read an env var, treating unset / empty / whitespace-only as
+/// "use default."
+fn env_or(name: &str, default: &str) -> String {
+    match std::env::var(name) {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => default.to_string(),
+    }
 }
 
 /// xAI provider. Holds an API key and a reference-counted HTTP client.
@@ -112,8 +169,28 @@ impl XaiProvider {
 
     /// Load the key from `XAI_API_KEY`. Returns `None` if unset / empty /
     /// placeholder — lets the caller fall back to another provider.
+    ///
+    /// Also reads the three optional `XAI_*_MODEL` env vars and applies
+    /// them to the provider's config. Setting any of them lets an
+    /// operator swap the per-tier model without a code change — useful
+    /// for one-off frontier-model runs when the workhorse keeps
+    /// truncating, or for pinning to a cheaper model in CI. See
+    /// [`XaiConfig::from_env`] for the empty-string normalisation rules.
     pub fn from_env(http: SecureHttpClient) -> Option<Self> {
-        ApiKey::from_env_optional(XAI_API_KEY_ENV).map(|k| Self::new(http, k))
+        ApiKey::from_env_optional(XAI_API_KEY_ENV).map(|k| {
+            let mut p = Self::new(http, k);
+            p.config = XaiConfig::from_env();
+            // Log the resolved model identifiers at INFO so operators
+            // who set the env vars can confirm the override took
+            // effect. The model names are not secret.
+            tracing::info!(
+                frontier = %p.config.frontier_model,
+                workhorse = %p.config.workhorse_model,
+                cheap = %p.config.cheap_model,
+                "xai: provider configured"
+            );
+            p
+        })
     }
 
     /// Override the tier → model mapping.
@@ -198,6 +275,52 @@ impl XaiProvider {
     }
 }
 
+/// Heuristic for "this JSON parse error is a truncation, not a malformed
+/// schema." Truncation messages from `serde_json` look like:
+///
+/// ```text
+/// EOF while parsing a string at line 1 column 519
+/// EOF while parsing an object at line 1 column 4096
+/// unexpected end of input
+/// ```
+///
+/// All three contain either "EOF" or "end of input". A schema-violation
+/// error has the form `invalid type: ...` or `missing field ...` — those
+/// will not match and will not retry. A bigger token budget cannot fix
+/// a schema mismatch; only re-authoring the prompt can.
+///
+/// Returns false for any non-`JsonParse` variant. The retry path is
+/// deliberately narrow.
+fn looks_like_truncated_json(err: &LlmError) -> bool {
+    match err {
+        LlmError::JsonParse(msg) => {
+            msg.contains("EOF") || msg.contains("end of input")
+        }
+        _ => false,
+    }
+}
+
+fn map_http_err(e: HttpError) -> LlmError {
+    match e {
+        HttpError::Status(401) | HttpError::Status(403) => LlmError::Auth,
+        HttpError::Status(429) => LlmError::RateLimited {
+            // xAI returns retry-after in headers; SecureHttpClient doesn't
+            // surface response headers today. Report 0 as "unknown" — the
+            // router can apply its own backoff.
+            retry_after_seconds: 0,
+        },
+        HttpError::Status(code) => LlmError::Api(format!("http {code}")),
+        HttpError::Timeout(d) => LlmError::Network(format!("timeout after {d:?}")),
+        HttpError::ResponseTooLarge { max, got } => {
+            LlmError::Api(format!("response exceeded bound: {got} > {max}"))
+        }
+        HttpError::Request(m) | HttpError::Tls(m) | HttpError::RedirectRejected(m) => {
+            LlmError::Network(m)
+        }
+        HttpError::UrlRejected(v) => LlmError::Network(v.to_string()),
+    }
+}
+
 #[async_trait]
 impl LlmProvider for XaiProvider {
     fn id(&self) -> &'static str {
@@ -223,7 +346,99 @@ impl LlmProvider for XaiProvider {
             .map_err(|e| LlmError::Api(e.to_string()))?;
 
         let schema_requested = request.schema.is_some();
-        let body = self.build_body(tier, &request);
+
+        // First attempt — exactly the original behaviour.
+        let first = self.send_one(tier, &request, schema_requested).await;
+
+        // Truncation-retry path (Session 13 Improvement B).
+        //
+        // Only retry when:
+        //   - the request asked for structured output (schema_requested),
+        //   - the parse error matches the truncation signature,
+        //   - the original max_tokens was below the retry ceiling so
+        //     doubling actually changes anything.
+        //
+        // One retry only. If the bigger budget also truncates, the
+        // model genuinely cannot finish this request and the caller
+        // should know — re-authoring the prompt or switching tiers is
+        // the right next step, not burning more tokens.
+        if !should_retry_truncation(&first, schema_requested, request.max_tokens) {
+            return first;
+        }
+
+        // SAFETY: we just confirmed `first` is `Err(_)` matching the
+        // truncation signature; the unwrap_err is total. Captured for
+        // the retry-failed branch below where we surface the original.
+        let original_err = first.expect_err("guarded by should_retry_truncation");
+
+        let retry_max_tokens = request
+            .max_tokens
+            .saturating_mul(2)
+            .min(MAX_RETRY_TOKENS);
+        tracing::warn!(
+            tier = ?tier,
+            original_max_tokens = request.max_tokens,
+            retry_max_tokens,
+            error = %original_err,
+            "xai: structured output truncated; retrying once with doubled max_tokens"
+        );
+        let retry_req = CompletionRequest {
+            system: request.system.clone(),
+            user: request.user.clone(),
+            schema: request.schema.clone(),
+            max_tokens: retry_max_tokens,
+            temperature: request.temperature,
+        };
+        match self.send_one(tier, &retry_req, schema_requested).await {
+            Ok(r) => {
+                tracing::info!(tier = ?tier, "xai: truncation retry succeeded");
+                Ok(r)
+            }
+            Err(retry_err) => {
+                tracing::warn!(
+                    tier = ?tier,
+                    error = %retry_err,
+                    "xai: truncation retry also failed; surfacing original error"
+                );
+                // Surface the original error rather than the retry's,
+                // on the principle that the first failure is what the
+                // user reported and what the logs above this layer
+                // will reference.
+                Err(original_err)
+            }
+        }
+    }
+}
+
+/// Predicate for the truncation-retry path. Pulled out so the borrow
+/// checker doesn't have to reason about a guard that inspects `first`
+/// while later arms move from it.
+fn should_retry_truncation(
+    first: &Result<CompletionResponse, LlmError>,
+    schema_requested: bool,
+    max_tokens: u32,
+) -> bool {
+    match first {
+        Err(e) => {
+            schema_requested
+                && looks_like_truncated_json(e)
+                && max_tokens < MAX_RETRY_TOKENS
+        }
+        Ok(_) => false,
+    }
+}
+
+impl XaiProvider {
+    /// One round-trip: build body, post, parse. Used by `complete` and
+    /// by the truncation-retry path. Factored out so the retry path
+    /// doesn't duplicate the bearer-construction + post + parse steps.
+    async fn send_one(
+        &self,
+        tier: ModelTier,
+        request: &CompletionRequest,
+        schema_requested: bool,
+    ) -> Result<CompletionResponse, LlmError> {
+        let body = self.build_body(tier, request);
 
         let bearer = format!("Bearer {}", self.key.expose_secret());
         // Wrap the bearer in a SecretString so expose_secret is only
@@ -234,6 +449,7 @@ impl LlmProvider for XaiProvider {
             tier = ?tier,
             model = %self.config.model_for(tier),
             structured = schema_requested,
+            max_tokens = request.max_tokens,
             "xai: sending completion"
         );
 
@@ -256,27 +472,6 @@ impl LlmProvider for XaiProvider {
             .map_err(map_http_err)?;
 
         self.parse_response(raw, schema_requested)
-    }
-}
-
-fn map_http_err(e: HttpError) -> LlmError {
-    match e {
-        HttpError::Status(401) | HttpError::Status(403) => LlmError::Auth,
-        HttpError::Status(429) => LlmError::RateLimited {
-            // xAI returns retry-after in headers; SecureHttpClient doesn't
-            // surface response headers today. Report 0 as "unknown" — the
-            // router can apply its own backoff.
-            retry_after_seconds: 0,
-        },
-        HttpError::Status(code) => LlmError::Api(format!("http {code}")),
-        HttpError::Timeout(d) => LlmError::Network(format!("timeout after {d:?}")),
-        HttpError::ResponseTooLarge { max, got } => {
-            LlmError::Api(format!("response exceeded bound: {got} > {max}"))
-        }
-        HttpError::Request(m) | HttpError::Tls(m) | HttpError::RedirectRejected(m) => {
-            LlmError::Network(m)
-        }
-        HttpError::UrlRejected(v) => LlmError::Network(v.to_string()),
     }
 }
 
@@ -509,6 +704,197 @@ mod tests {
     #[test]
     fn provider_id_is_stable() {
         assert_eq!(test_provider().id(), "xai");
+    }
+
+    // -----------------------------------------------------------------
+    // Session 13 Improvement B — env-driven model overrides
+    // -----------------------------------------------------------------
+
+    /// Tests that mutate process-wide env vars must serialise. Tokio
+    /// tests run in parallel; without this lock, two tests racing on
+    /// `XAI_*_MODEL_ENV` would observe each other's writes. Using a
+    /// `std::sync::Mutex` rather than the `serial_test` crate keeps
+    /// the dependency footprint identical.
+    ///
+    /// `Mutex` poisoning isn't a real concern here — every guarded
+    /// section is just a few env-var calls — but we use
+    /// `lock().unwrap_or_else(|e| e.into_inner())` to keep going
+    /// even if a previous test panicked while holding the lock.
+    /// That gives clearer test output (one failed test, not a
+    /// cascade of "lock poisoned" messages).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Test-only helper: clear the three model-override env vars so a
+    /// test starts from a known clean state. Tests using these vars
+    /// must call this both before *and* after they mutate. The
+    /// `ENV_LOCK` guard above prevents parallel mutation; the explicit
+    /// before-and-after clear keeps the env clean for the *next* test
+    /// even if the assertion in this one fails.
+    fn clear_model_envs() {
+        std::env::remove_var(XAI_FRONTIER_MODEL_ENV);
+        std::env::remove_var(XAI_WORKHORSE_MODEL_ENV);
+        std::env::remove_var(XAI_CHEAP_MODEL_ENV);
+    }
+
+    #[test]
+    fn xai_config_from_env_falls_back_to_default_when_vars_unset() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_model_envs();
+        let cfg = XaiConfig::from_env();
+        let defaults = XaiConfig::default();
+        assert_eq!(cfg.frontier_model, defaults.frontier_model);
+        assert_eq!(cfg.workhorse_model, defaults.workhorse_model);
+        assert_eq!(cfg.cheap_model, defaults.cheap_model);
+    }
+
+    #[test]
+    fn xai_config_from_env_picks_up_override_when_set() {
+        // Use a synthetic model name no real xAI catalog would mistake
+        // for a default — keeps the assertion unambiguous.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_model_envs();
+        std::env::set_var(XAI_FRONTIER_MODEL_ENV, "test-frontier-override");
+        let cfg = XaiConfig::from_env();
+        assert_eq!(cfg.frontier_model, "test-frontier-override");
+        // The other two should still be defaults.
+        let defaults = XaiConfig::default();
+        assert_eq!(cfg.workhorse_model, defaults.workhorse_model);
+        assert_eq!(cfg.cheap_model, defaults.cheap_model);
+        clear_model_envs();
+    }
+
+    #[test]
+    fn xai_config_from_env_treats_empty_string_as_unset() {
+        // A literal empty model name would be rejected by xAI with a
+        // 400; treating empty as "absent" makes the override safe to
+        // wire through shell scripts that conditionally export.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_model_envs();
+        std::env::set_var(XAI_WORKHORSE_MODEL_ENV, "");
+        let cfg = XaiConfig::from_env();
+        assert_eq!(cfg.workhorse_model, XaiConfig::default().workhorse_model);
+        clear_model_envs();
+    }
+
+    #[test]
+    fn xai_config_from_env_treats_whitespace_only_as_unset() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_model_envs();
+        std::env::set_var(XAI_CHEAP_MODEL_ENV, "   \t  ");
+        let cfg = XaiConfig::from_env();
+        assert_eq!(cfg.cheap_model, XaiConfig::default().cheap_model);
+        clear_model_envs();
+    }
+
+    // -----------------------------------------------------------------
+    // Session 13 Improvement B — truncation-retry detection
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn looks_like_truncated_json_matches_eof_in_string() {
+        // The exact wording from the Session 13 production failure on
+        // eur_lex authoring. If serde_json's wording ever changes we
+        // want a test that catches the regression at build time.
+        let err = LlmError::JsonParse(
+            "EOF while parsing a string at line 1 column 519".into(),
+        );
+        assert!(looks_like_truncated_json(&err));
+    }
+
+    #[test]
+    fn looks_like_truncated_json_matches_eof_in_object() {
+        let err = LlmError::JsonParse(
+            "EOF while parsing an object at line 1 column 4096".into(),
+        );
+        assert!(looks_like_truncated_json(&err));
+    }
+
+    #[test]
+    fn looks_like_truncated_json_matches_unexpected_end_of_input() {
+        let err = LlmError::JsonParse("unexpected end of input".into());
+        assert!(looks_like_truncated_json(&err));
+    }
+
+    #[test]
+    fn looks_like_truncated_json_does_not_match_schema_violation() {
+        // A schema-violation message that doesn't contain EOF or end of
+        // input — these are not truncations and should not retry.
+        let err = LlmError::JsonParse(
+            "invalid type: string \"foo\", expected an integer at line 1 column 12".into(),
+        );
+        assert!(!looks_like_truncated_json(&err));
+    }
+
+    #[test]
+    fn looks_like_truncated_json_does_not_match_other_error_kinds() {
+        assert!(!looks_like_truncated_json(&LlmError::Auth));
+        assert!(!looks_like_truncated_json(&LlmError::Api("boom".into())));
+        assert!(!looks_like_truncated_json(&LlmError::RateLimited {
+            retry_after_seconds: 30
+        }));
+        assert!(!looks_like_truncated_json(&LlmError::Network("dns".into())));
+    }
+
+    // -----------------------------------------------------------------
+    // Session 13 Improvement B — should_retry_truncation predicate
+    //
+    // The predicate gates the retry path. Wrong gating either burns
+    // budget on hopeless requests or silently swallows the legitimate
+    // first-shot success. Test all four corner cases explicitly.
+    // -----------------------------------------------------------------
+
+    fn fake_completion() -> CompletionResponse {
+        CompletionResponse {
+            text: "ok".into(),
+            structured: None,
+            provider: "xai".into(),
+            model: "test".into(),
+            input_tokens: None,
+            output_tokens: None,
+        }
+    }
+
+    #[test]
+    fn should_retry_truncation_yes_when_all_conditions_match() {
+        let err = LlmError::JsonParse(
+            "EOF while parsing a string at line 1 column 519".into(),
+        );
+        let first: Result<CompletionResponse, LlmError> = Err(err);
+        assert!(should_retry_truncation(&first, true, 8_000));
+    }
+
+    #[test]
+    fn should_retry_truncation_no_when_request_was_unstructured() {
+        // Even if the body parse failed with a truncation signature,
+        // an unstructured request can't have the schema-output mid-
+        // string truncation we're guarding against; the failure must
+        // be something else and shouldn't loop.
+        let err = LlmError::JsonParse("EOF while parsing a string".into());
+        let first: Result<CompletionResponse, LlmError> = Err(err);
+        assert!(!should_retry_truncation(&first, false, 8_000));
+    }
+
+    #[test]
+    fn should_retry_truncation_no_when_already_at_ceiling() {
+        // If max_tokens already equals the retry ceiling, doubling
+        // can't change anything; retrying would just burn another
+        // round-trip for the same outcome.
+        let err = LlmError::JsonParse("EOF while parsing a string".into());
+        let first: Result<CompletionResponse, LlmError> = Err(err);
+        assert!(!should_retry_truncation(&first, true, MAX_RETRY_TOKENS));
+    }
+
+    #[test]
+    fn should_retry_truncation_no_when_first_succeeded() {
+        let first: Result<CompletionResponse, LlmError> = Ok(fake_completion());
+        assert!(!should_retry_truncation(&first, true, 8_000));
+    }
+
+    #[test]
+    fn should_retry_truncation_no_for_non_truncation_errors() {
+        let first: Result<CompletionResponse, LlmError> =
+            Err(LlmError::Api("http 500".into()));
+        assert!(!should_retry_truncation(&first, true, 8_000));
     }
 
     // Live test — hits real xAI. Ignored by default. Run with:

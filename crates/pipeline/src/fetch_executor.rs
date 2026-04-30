@@ -52,23 +52,33 @@
 //!
 //! ## Extraction-mode policy in this session
 //!
-//! [`ExtractionSpec::CsvCell`], [`ExtractionSpec::JsonPath`], and
-//! [`ExtractionSpec::CssSelect`] are wired through to apply + insert.
-//! The remaining modes ([`ExtractionSpec::RegexCapture`] and
-//! [`ExtractionSpec::PdfTable`]) get authored normally (Level-2 picks
-//! whatever fits the source) and are surfaced in the report as
-//! `Skipped { reason }` rather than failures — they're not bugs,
-//! they're a deliberate phasing of work. This is the cheapest
-//! discipline that keeps the executor honest about what it can and
-//! can't do without conflating "didn't try" with "tried and broke".
+//! [`ExtractionSpec::CsvCell`], [`ExtractionSpec::JsonPath`],
+//! [`ExtractionSpec::CssSelect`], and [`ExtractionSpec::RegexCapture`]
+//! are wired through to apply + insert. The remaining mode
+//! ([`ExtractionSpec::PdfTable`]) gets authored normally (Level-2
+//! picks whatever fits the source) and is surfaced in the report as
+//! `Skipped { reason }` rather than a failure — not a bug, a
+//! deliberate phasing of work. This is the cheapest discipline that
+//! keeps the executor honest about what it can and can't do without
+//! conflating "didn't try" with "tried and broke".
 //!
-//! CssSelect was promoted in Session 12. The recipe_apply runtime
-//! has supported it since Session 3 (via the `scraper` crate); what
-//! was missing until Session 12 was the executor-level dispatch +
-//! the apply-and-insert plumbing. The wiring is structurally
-//! identical to the CSV and JSON paths because all three go through
-//! the same `apply()` boundary, which dispatches internally on the
-//! recipe's `ExtractionSpec`.
+//! CssSelect was promoted in Session 12; RegexCapture in Session 13.
+//! The recipe_apply runtime has supported every mode since Session 3
+//! (via `csv`, `jsonpath_lib`, `scraper`, and `regex` respectively);
+//! what was missing each time was the executor-level dispatch + the
+//! apply-and-insert plumbing. The wiring is structurally identical
+//! to the CSV and JSON paths because all of them go through the same
+//! `apply()` boundary, which dispatches internally on the recipe's
+//! `ExtractionSpec`.
+//!
+//! RegexCapture's promotion was prompted by a real Session-13
+//! production run: a "EU AI Act enforcement" plan authored a
+//! sensible regex against EUR-Lex's RSS feed XML, and the prior
+//! `Skipped` outcome cost the only authored-and-runnable recipe of
+//! the run. The handoff predicted RegexCapture would see "less
+//! production use than CssSelect"; that was wrong — RSS+regex is a
+//! legitimate first-class pattern for news/announcement feeds and
+//! the LLM nominates it correctly.
 //!
 //! ## What this module does NOT do
 //!
@@ -379,38 +389,84 @@ async fn load_or_author_recipes(
         return Ok(existing);
     }
 
-    let mut authored = Vec::new();
+    // Flatten the (hint, source_id) pairs into a single Vec so we
+    // know the total up-front. This is cosmetic — the resulting
+    // authoring loop is identical to the prior nested form — but it
+    // lets us emit a "N total sources to author" log at the top and
+    // an "authoring N of M" log per iteration, which the Session 13
+    // run identified as a real ergonomic gap (a 1m25s silent stretch
+    // during multi-source authoring made the GUI look frozen).
+    //
+    // Order is preserved: hints in the order Level-1 emitted them,
+    // and within each hint, sources in `preferred_source_ids` order.
+    // This matters because Level-1's ordering reflects the source-
+    // priority hierarchy the classifier was prompted to apply.
+    let mut sources: Vec<String> = Vec::new();
     for hint in &plan.expectations.document_sources {
         for source_id in bound_source_ids(hint) {
-            match author_one(ctx, plan, &source_id).await {
-                Ok(recipe) => {
-                    save_recipe(ctx.store, &recipe)?;
-                    authored.push(recipe);
-                }
-                Err(e) => {
-                    // Per-source authoring failures shouldn't abort
-                    // the whole run — other sources may still author
-                    // cleanly. We log loudly and continue.
-                    //
-                    // If *every* source fails to author, the run will
-                    // produce a report with zero outcomes, and the
-                    // user sees an empty list. That's the right
-                    // failure mode for now: the wholesale-authoring-
-                    // failed error surface is reserved for cases the
-                    // user's request couldn't even start (e.g. the
-                    // provider isn't configured), not "every single
-                    // source rejected the prompt", which is a recipe
-                    // problem the next session improves.
-                    warn!(
-                        plan_id = %plan.id,
-                        source_id = %source_id,
-                        error = %e,
-                        "recipe authoring failed for this source; continuing"
-                    );
-                }
+            // bound_source_ids already deduplicates within a hint;
+            // dedup across hints too so a source nominated by two
+            // hints is authored once, not twice.
+            if !sources.iter().any(|s| s == &source_id) {
+                sources.push(source_id);
             }
         }
     }
+
+    let total = sources.len();
+    info!(
+        plan_id = %plan.id,
+        total_sources = total,
+        "authoring recipes for plan: starting"
+    );
+
+    let mut authored = Vec::new();
+    for (idx, source_id) in sources.iter().enumerate() {
+        let position = idx + 1;
+        info!(
+            plan_id = %plan.id,
+            source_id = %source_id,
+            position,
+            total,
+            "authoring source"
+        );
+        match author_one(ctx, plan, source_id).await {
+            Ok(recipe) => {
+                save_recipe(ctx.store, &recipe)?;
+                authored.push(recipe);
+            }
+            Err(e) => {
+                // Per-source authoring failures shouldn't abort
+                // the whole run — other sources may still author
+                // cleanly. We log loudly and continue.
+                //
+                // If *every* source fails to author, the run will
+                // produce a report with zero outcomes, and the
+                // user sees an empty list. That's the right
+                // failure mode for now: the wholesale-authoring-
+                // failed error surface is reserved for cases the
+                // user's request couldn't even start (e.g. the
+                // provider isn't configured), not "every single
+                // source rejected the prompt", which is a recipe
+                // problem the next session improves.
+                warn!(
+                    plan_id = %plan.id,
+                    source_id = %source_id,
+                    position,
+                    total,
+                    error = %e,
+                    "recipe authoring failed for this source; continuing"
+                );
+            }
+        }
+    }
+
+    info!(
+        plan_id = %plan.id,
+        total_sources = total,
+        succeeded = authored.len(),
+        "authoring recipes for plan: complete"
+    );
 
     Ok(authored)
 }
@@ -598,6 +654,15 @@ async fn prefetch_excerpt(
     url: &url::Url,
     source_id: &str,
 ) -> Option<String> {
+    // Operator-visible "we're now fetching X" log. The Session 13
+    // run had a 1m25s silent stretch that included the time spent
+    // pre-fetching; this turns it into a visible step rather than a
+    // mystery wait.
+    info!(
+        source_id = %source_id,
+        url = %url,
+        "pre-fetching endpoint hint"
+    );
     let bytes = match ctx.http.fetch_bytes(url.as_str()).await {
         Ok(b) => b,
         Err(e) => {
@@ -665,9 +730,12 @@ fn stub_excerpt(plan: &ResearchPlan, source_id: &str, real_url: Option<&str>) ->
 }
 
 /// Run one recipe end-to-end. Pure dispatch on the extraction mode
-/// — Session 8 wired CSV; Session 9 added JSON. The remaining modes
-/// (CssSelect, PdfTable, RegexCapture) are still reported as
-/// `Skipped` until they're promoted in their own session.
+/// — Session 8 wired CSV; Session 9 added JSON; Session 12 added
+/// CssSelect; Session 13 added RegexCapture. The only remaining
+/// unwired mode (PdfTable) is reported as `Skipped` until it lands
+/// in its own session — it carries enough complexity (PDF table
+/// detection libraries, page rasterization, positional addressing)
+/// to deserve careful design.
 async fn run_one_recipe(
     ctx: &ExecutorContext<'_>,
     plan: &ResearchPlan,
@@ -677,15 +745,11 @@ async fn run_one_recipe(
         ExtractionSpec::CsvCell { .. } => run_csv_recipe(ctx, plan, recipe).await,
         ExtractionSpec::JsonPath { .. } => run_json_recipe(ctx, plan, recipe).await,
         ExtractionSpec::CssSelect { .. } => run_css_recipe(ctx, plan, recipe).await,
+        ExtractionSpec::RegexCapture { .. } => run_regex_recipe(ctx, plan, recipe).await,
         ExtractionSpec::PdfTable { .. } => RecipeOutcome::Skipped {
             recipe_id: recipe.id,
             source_id: recipe.source_id.clone(),
             reason: "pdf_table: extraction mode not implemented (ADR 0007 Session-3 review note)".into(),
-        },
-        ExtractionSpec::RegexCapture { .. } => RecipeOutcome::Skipped {
-            recipe_id: recipe.id,
-            source_id: recipe.source_id.clone(),
-            reason: "regex_capture: extraction mode not yet enabled in executor".into(),
         },
     }
 }
@@ -922,6 +986,91 @@ async fn run_css_recipe(
     }
 }
 
+/// RegexCapture runtime path: fetch → apply → insert.
+///
+/// Structurally identical to [`run_csv_recipe`], [`run_json_recipe`],
+/// and [`run_css_recipe`] — the dispatch on `ExtractionSpec` happens
+/// inside `apply()`, not here. The reason this still lives as a
+/// standalone helper rather than being collapsed into a shared
+/// "fetch-apply-insert" function is preserved across modes for
+/// failure-mode legibility: each mode has its own call site so a
+/// future "Class X failure shows up in mode Y but not Z" diagnosis
+/// has an obvious place to add per-mode hooks (timing, mode-specific
+/// fixture paths, mode-specific retry policies). When that
+/// diagnosis never materialises across multiple sessions the right
+/// move is consolidation; today the duplication earns its keep.
+///
+/// The mode is well-suited to RSS / news feeds and other XML-ish
+/// content where extraction is a literal regex against the bytes
+/// rather than structural navigation. The Session 13 production run
+/// against EUR-Lex's `/news/rss.xml` was the prompt.
+async fn run_regex_recipe(
+    ctx: &ExecutorContext<'_>,
+    plan: &ResearchPlan,
+    recipe: &FetchRecipe,
+) -> RecipeOutcome {
+    // Fetch.
+    let bytes = match ctx.http.fetch_bytes(recipe.source_url.as_str()).await {
+        Ok(b) => b,
+        Err(HttpFetchError::Http(msg)) => {
+            return RecipeOutcome::Failed {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                stage: FailureStage::Fetch,
+                message: msg,
+            }
+        }
+        Err(HttpFetchError::NoFixture(url)) => {
+            return RecipeOutcome::Failed {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                stage: FailureStage::Fetch,
+                message: format!("no fixture configured for url: {url}"),
+            }
+        }
+    };
+
+    // Apply.
+    let fetched_at = Utc::now();
+    let apply_ctx = ApplyContext {
+        recipe,
+        plan,
+        bytes: &bytes,
+        fetched_at,
+    };
+    let records = match apply(apply_ctx) {
+        Ok(rs) => rs,
+        Err(e) => {
+            return RecipeOutcome::Failed {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                stage: FailureStage::Apply,
+                message: describe_apply_error(&e),
+            }
+        }
+    };
+
+    // Insert. A failure to insert any one record fails the recipe —
+    // we don't half-write a recipe's batch. Same discipline as the
+    // CSV, JSON, and CSS paths.
+    for record in &records {
+        if let Err(e) = ctx.store.insert_record(record) {
+            return RecipeOutcome::Failed {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                stage: FailureStage::Insert,
+                message: e.to_string(),
+            };
+        }
+    }
+
+    RecipeOutcome::Succeeded {
+        recipe_id: recipe.id,
+        source_id: recipe.source_id.clone(),
+        records_produced: records.len() as u32,
+    }
+}
+
 /// Close a fetch_run row with an error_summary populated. Used when
 /// the run failed before processing any recipe — per-recipe failures
 /// don't go through here.
@@ -1111,6 +1260,58 @@ mod tests {
             extraction: ExtractionSpec::CssSelect {
                 selector: "td.prod".into(),
                 attribute: None,
+            },
+            produces: vec![ProductionBinding {
+                record_type: RecordType::Observation,
+                expectation: ExpectationRef::ObservationMetric { index: 0 },
+                field_mappings: vec![
+                    FieldMap {
+                        path: "value".into(),
+                        source: FieldValueSource::Extracted,
+                    },
+                    FieldMap {
+                        path: "unit".into(),
+                        source: FieldValueSource::Literal { value: json!("t") },
+                    },
+                    FieldMap {
+                        path: "metric".into(),
+                        source: FieldValueSource::FromPlan {
+                            pointer: "expectations.observation_metrics.0.name".into(),
+                        },
+                    },
+                    FieldMap {
+                        path: "period".into(),
+                        source: FieldValueSource::Literal {
+                            value: json!("annual"),
+                        },
+                    },
+                ],
+            }],
+            authored_at: Utc.with_ymd_and_hms(2026, 4, 28, 0, 0, 0).unwrap(),
+            authored_by: "test".into(),
+            version: 1,
+        }
+    }
+
+    /// Build a working RegexCapture recipe — extracts the production
+    /// figure from a one-line plain-text body via a single capture
+    /// group. Mirrors the CSV/JSON/CSS helpers in shape; only the
+    /// `extraction` field varies.
+    ///
+    /// The chosen pattern is deliberately simple — `recipe_apply`
+    /// already has rich tests for the regex extractor; what these
+    /// fetch_executor tests need is a recipe that flows cleanly
+    /// through fetch → apply → insert.
+    fn working_regex_recipe(plan: &ResearchPlan, url: &str) -> FetchRecipe {
+        FetchRecipe {
+            id: Uuid::now_v7(),
+            dedup_key: Some(format!("{}:demo_regex", plan.id)),
+            plan_id: plan.id,
+            source_id: "demo_regex".into(),
+            source_url: Url::parse(url).unwrap(),
+            extraction: ExtractionSpec::RegexCapture {
+                pattern: r"production:\s*(\d+)".into(),
+                group: 1,
             },
             produces: vec![ProductionBinding {
                 record_type: RecordType::Observation,
@@ -1501,33 +1702,144 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_fetch_for_plan_skips_unwired_extraction_modes() {
-        // Coverage regression: confirms the dispatch arm for a still-
-        // unwired mode (RegexCapture, in this case) still emits Skipped
-        // rather than silently going through a wired path. When
-        // RegexCapture is promoted in a later session, replace this
-        // with a happy-path test for that mode and pick another
-        // unwired mode here. (CssSelect was the canary in Sessions
-        // 8–11 and was promoted in Session 12; if PdfTable ever lands
-        // it will inherit the role.)
+    async fn run_fetch_for_plan_succeeds_against_regex_recipe_without_calling_llm() {
+        // Session 13 happy-path: RegexCapture promoted from Skipped
+        // to a first-class wired mode. Mirrors the CSV / JSON / CSS
+        // success tests structurally; the only meaningful difference
+        // is the recipe's `extraction` variant and the body bytes.
         let plan = sample_plan();
         let store = make_store_with_accepted_plan(&plan);
 
-        let url = "https://example.test/page.txt";
-        let mut regex_recipe = working_csv_recipe(&plan, url);
-        regex_recipe.id = Uuid::now_v7();
-        regex_recipe.dedup_key = Some(format!("{}:demo_regex", plan.id));
-        regex_recipe.extraction = ExtractionSpec::RegexCapture {
-            pattern: r"production:\s*(\d+)".into(),
-            group: 1,
+        let url = "https://example.test/feed.txt";
+        let recipe = working_regex_recipe(&plan, url);
+        save_recipe(&store, &recipe).unwrap();
+
+        // The pattern `production:\s*(\d+)` captures `49000` from the
+        // body. `parse_extracted_scalar` parses it as an f64 which
+        // flows into the Observation's `value` field — same end-state
+        // as the CSV / JSON / CSS paths.
+        let body = b"daily report -- production: 49000 metric tons";
+        let fetcher = StaticFetcher::new().with(url, body);
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: "unused — recipes already authored",
+            sources: &[],
         };
-        save_recipe(&store, &regex_recipe).unwrap();
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        assert_eq!(report.plan_id, plan.id);
+        assert_eq!(report.recipes_attempted, 1);
+        assert_eq!(report.recipes_succeeded, 1);
+        assert_eq!(report.records_produced, 1);
+        assert_eq!(report.outcomes.len(), 1);
+        match &report.outcomes[0] {
+            RecipeOutcome::Succeeded {
+                records_produced, ..
+            } => assert_eq!(*records_produced, 1),
+            other => panic!("expected Succeeded, got {other:?}"),
+        }
+
+        // The fetch_runs row was opened and closed cleanly — same
+        // discipline as the CSV / JSON / CSS paths.
+        let runs = store.recent_fetch_runs_for_plan(plan.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, report.run_id);
+        assert_eq!(runs[0].recipes_attempted, 1);
+        assert_eq!(runs[0].recipes_succeeded, 1);
+        assert_eq!(runs[0].records_produced, 1);
+        assert!(runs[0].finished_at.is_some());
+        assert!(runs[0].error_summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_fetch_for_plan_reports_apply_failure_on_unmatched_regex_pattern() {
+        // Failure-shape coverage for the new RegexCapture arm: when
+        // the pattern matches nothing in the fetched body, `apply()`
+        // surfaces `ApplyError::Extraction { mode: "regex_capture" }`,
+        // which the executor maps to `FailureStage::Apply`. Mirrors
+        // the malformed-CSV, malformed-JSON, and unmatched-CSS apply-
+        // failure tests.
+        //
+        // This is the failure mode a real-world regex recipe most
+        // often hits — the LLM authors a sensible-looking pattern
+        // against the description of the source's content but the
+        // actual fetched bytes have a slightly different format. The
+        // user diagnoses via the fetch report's failure detail.
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let url = "https://example.test/empty.txt";
+        let recipe = working_regex_recipe(&plan, url);
+        save_recipe(&store, &recipe).unwrap();
+
+        // Body has no occurrence of `production:`, so the recipe's
+        // `production:\s*(\d+)` pattern matches nothing — apply
+        // errors at the extraction stage.
+        let bad_body = b"daily report -- nothing relevant here";
+        let fetcher = StaticFetcher::new().with(url, bad_body);
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: "",
+            sources: &[],
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+        assert_eq!(report.recipes_succeeded, 0);
+        match &report.outcomes[0] {
+            RecipeOutcome::Failed { stage, .. } => assert_eq!(*stage, FailureStage::Apply),
+            other => panic!("expected Failed(Apply), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_fetch_for_plan_skips_unwired_extraction_modes() {
+        // Coverage regression: confirms the dispatch arm for the only
+        // remaining unwired mode (PdfTable) still emits Skipped rather
+        // than silently going through a wired path. The canary's
+        // history walks the project's extraction-mode promotion
+        // sequence:
+        //
+        //   - Sessions 8–11: CssSelect was the canary (CSV, JSON wired).
+        //   - Session 12: CssSelect promoted; RegexCapture took over.
+        //   - Session 13: RegexCapture promoted; PdfTable is now it.
+        //
+        // PdfTable is the last unwired mode and will probably stay
+        // that way for several sessions — it carries enough complexity
+        // (PDF table-detection libraries, page rasterization,
+        // positional addressing) to deserve careful design. When
+        // PdfTable lands, this test goes away or becomes a happy-path
+        // test for PdfTable with the canary role retiring entirely
+        // (the closed extraction-mode enum has only the five we have
+        // today; ADR 0007).
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let url = "https://example.test/page.pdf";
+        let mut pdf_recipe = working_csv_recipe(&plan, url);
+        pdf_recipe.id = Uuid::now_v7();
+        pdf_recipe.dedup_key = Some(format!("{}:demo_pdf", plan.id));
+        pdf_recipe.extraction = ExtractionSpec::PdfTable {
+            page: 2,
+            table_index: 0,
+            row: 3,
+            col: 1,
+        };
+        save_recipe(&store, &pdf_recipe).unwrap();
 
         // Fixture not strictly necessary — Skipped is decided before
         // fetch — but include it so a regression that *did* attempt
         // fetch wouldn't trip on a missing fixture and look like a
         // test setup bug.
-        let fetcher = StaticFetcher::new().with(url, b"production: 49000");
+        let fetcher = StaticFetcher::new().with(url, b"%PDF-1.4 stub");
 
         let provider = UnreachableProvider;
         let ctx = ExecutorContext {
