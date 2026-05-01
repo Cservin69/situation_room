@@ -1,0 +1,60 @@
+-- situation_room schema, version 0008.
+--
+-- ADR 0007 Amendment 3: recipe-level `static_payload` field.
+--
+-- Some sources publish their content primarily as PDF — annual
+-- reports (USGS Mineral Commodity Summaries, SEC 10-K filings),
+-- regulatory texts (EUR-Lex regulation PDFs), statistical releases.
+-- The closed extraction vocabulary's `pdf_table` mode exists for
+-- this case but is not wired in the runtime today. Amendment 3
+-- adds an orthogonal recipe-level field: when `static_payload` is
+-- present, the runtime serves those bytes to extraction in place
+-- of an HTTP fetch. The bytes' provenance is orthogonal to the
+-- extraction mode — the closed enum stays at five.
+--
+-- See `docs/adr/0007-research-function.md` Amendment 3 for the
+-- design rationale (option (b) recipe-level field over option (a)
+-- sixth extraction mode).
+--
+-- ## Why nullable
+--
+-- Existing recipes carry NULL and the runtime fetches them as
+-- before. The change is additive and backward-compatible — no
+-- re-authoring required. Recipes against HTML-addressable sources
+-- (the common case) leave the field NULL; only recipes against
+-- PDF-only or otherwise un-addressable sources populate it.
+--
+-- ## DuckDB ALTER TABLE — same lessons as migrations 0005 and 0007
+--
+-- Per the comment block in `0005_research_plan_status.sql`, DuckDB
+-- rejects two paths to a `NOT NULL DEFAULT` ALTER:
+--
+--   1. `ADD COLUMN ... NOT NULL DEFAULT ...` — "Adding columns
+--      with constraints not yet supported".
+--   2. `ADD COLUMN ... DEFAULT ...; ALTER COLUMN ... SET NOT
+--      NULL;` — "Cannot alter entry because there are entries
+--      that depend on it" when indexes exist on the table.
+--
+-- The `recipes` table carries the `(plan_id, source_id)` index
+-- from migration 0003, which would block path (2). The column is
+-- nullable on purpose; absence-of-payload is the default shape
+-- for any pre-Amendment-3 recipe and for recipes against
+-- HTML-addressable sources.
+--
+-- The Rust type (`FetchRecipe.static_payload: Option<String>`) is
+-- the load-bearing invariant — same posture as `PlanStatus` is in
+-- migration 0005 and `rejection_reason` is in 0007.
+--
+-- ## No DEFAULT either
+--
+-- `ADD COLUMN ... DEFAULT ''` would distinguish "absent" from
+-- "explicitly empty payload" only by the value's emptiness, which
+-- we already do in the Rust validator
+-- (`build_validated_recipe` collapses empty/whitespace to None).
+-- A NULL column is the correct on-disk shape for "no payload."
+
+ALTER TABLE recipes ADD COLUMN static_payload TEXT;
+
+-- Record this migration.
+INSERT INTO schema_migrations (version, description)
+    VALUES (8, 'recipes.static_payload column');
