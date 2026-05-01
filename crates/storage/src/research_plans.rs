@@ -25,7 +25,31 @@
 //! Status is a TEXT column, not a DuckDB enum (see migration v5 for
 //! why). Validation lives at the storage boundary in
 //! [`PlanStatus::from_str`]. The plan row is otherwise immutable; the
-//! status column is the single mutable field.
+//! status column is the single mutable field — except for two
+//! Session-15 additions:
+//!
+//! ## Rejection feedback + lineage (Session 15)
+//!
+//! Two scalar columns added in migration v7 carry the rejection
+//! feedback loop:
+//!
+//!   - `rejection_reason: Option<String>` — free-text note the user
+//!     supplied when rejecting a plan. Set by
+//!     [`Self::set_plan_rejection`]. Validated for control characters
+//!     and length at the api boundary via
+//!     `situation_room_secure::bounds::check_user_text` before reaching
+//!     this layer.
+//!
+//!   - `reclassified_from: Option<Uuid>` — the id of the rejected plan
+//!     that prompted this re-classification. Set at INSERT time when
+//!     the plan was produced via `reclassify_plan`; immutable after.
+//!     Allows the UI to walk the rejection chain.
+//!
+//! Neither column has a NOT NULL constraint. NULL is the natural
+//! "no value" wire form: a Pending or Accepted plan has no rejection
+//! reason; a freshly-classified plan has no predecessor. See
+//! migration v7's comment block for the DuckDB-specific reason we
+//! avoid `NOT NULL` on alter-added columns.
 
 use std::fmt;
 use std::str::FromStr;
@@ -104,6 +128,11 @@ impl FromStr for PlanStatus {
 /// non-default state can. The classifier path always goes through
 /// `pipeline::research_plans_store::save_research_plan`, which sets
 /// it to `Pending` — see that helper for the policy.
+///
+/// `rejection_reason` and `reclassified_from` are Session-15
+/// additions; the typed helper exposes a separate
+/// `save_research_plan_with_lineage` constructor for the
+/// re-classification flow.
 #[derive(Debug, Clone)]
 pub struct ResearchPlanRow {
     pub id: Uuid,
@@ -119,6 +148,13 @@ pub struct ResearchPlanRow {
     pub created_at: DateTime<Utc>,
     pub classified_by: String,
     pub status: PlanStatus,
+    /// Free-text rejection note. `None` for plans that were never
+    /// rejected, plans rejected before Session 15, and rejections
+    /// where the user supplied no note.
+    pub rejection_reason: Option<String>,
+    /// The id of the rejected plan that produced this re-classification.
+    /// `None` for plans not produced via `reclassify_plan`.
+    pub reclassified_from: Option<Uuid>,
 }
 
 /// A plan row as it comes back out of storage. Same shape as
@@ -135,6 +171,8 @@ pub struct StoredResearchPlan {
     pub created_at: DateTime<Utc>,
     pub classified_by: String,
     pub status: PlanStatus,
+    pub rejection_reason: Option<String>,
+    pub reclassified_from: Option<Uuid>,
 }
 
 impl Store {
@@ -151,8 +189,8 @@ impl Store {
             "INSERT INTO research_plans (
                 id, topic, interpretation, topic_tags, geographic_scope,
                 historical_window_days, expectations, created_at, classified_by,
-                status
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                status, rejection_reason, reclassified_from
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 p.id,
                 p.topic,
@@ -164,6 +202,8 @@ impl Store {
                 p.created_at,
                 p.classified_by,
                 p.status.as_str(),
+                p.rejection_reason,
+                p.reclassified_from,
             ],
         )
         .map_err(StorageError::DuckDb)?;
@@ -182,7 +222,7 @@ impl Store {
             .prepare(
                 "SELECT id, topic, interpretation, topic_tags, geographic_scope,
                         historical_window_days, expectations, created_at, classified_by,
-                        status
+                        status, rejection_reason, reclassified_from
                  FROM research_plans WHERE id = ?",
             )
             .map_err(StorageError::DuckDb)?;
@@ -240,7 +280,7 @@ impl Store {
                     .prepare(
                         "SELECT id, topic, interpretation, topic_tags, geographic_scope,
                                 historical_window_days, expectations, created_at, classified_by,
-                                status
+                                status, rejection_reason, reclassified_from
                          FROM research_plans
                          WHERE status = ?
                          ORDER BY created_at DESC
@@ -259,7 +299,7 @@ impl Store {
                     .prepare(
                         "SELECT id, topic, interpretation, topic_tags, geographic_scope,
                                 historical_window_days, expectations, created_at, classified_by,
-                                status
+                                status, rejection_reason, reclassified_from
                          FROM research_plans
                          ORDER BY created_at DESC
                          LIMIT ?",
@@ -281,6 +321,14 @@ impl Store {
     /// Returns `StorageError::NotFound` if the id isn't present, so
     /// the caller can distinguish "transition succeeded" from "you
     /// asked about a plan that doesn't exist".
+    ///
+    /// **Does not touch `rejection_reason`.** Callers that want to
+    /// reject *with* a reason should use [`Self::set_plan_rejection`]
+    /// instead. The split is deliberate: there are two reject paths
+    /// (with-reason via `reject_plan` command, without-reason via
+    /// idempotent re-write) and conflating them on a single setter
+    /// would mean every accept/un-reject path also has to think about
+    /// the reason column.
     pub fn set_plan_status(&self, id: Uuid, status: PlanStatus) -> Result<()> {
         let conn = self
             .conn
@@ -291,6 +339,37 @@ impl Store {
             .execute(
                 "UPDATE research_plans SET status = ? WHERE id = ?",
                 params![status.as_str(), id],
+            )
+            .map_err(StorageError::DuckDb)?;
+
+        if affected == 0 {
+            return Err(StorageError::NotFound(format!("research_plan {id}")));
+        }
+        Ok(())
+    }
+
+    /// Move a plan to `Rejected` and set the `rejection_reason`
+    /// column. Idempotent. The reason is **always** written (replacing
+    /// any prior value), including when `reason` is `None` — that
+    /// represents an explicit "rejected without a note" and clears any
+    /// stale text.
+    ///
+    /// The reason string is expected to be pre-validated by the api
+    /// layer (`crates/api/src/commands.rs::reject_plan`) via
+    /// `situation_room_secure::bounds::check_user_text`. Storage does not
+    /// re-validate; we treat the boundary as the validation point.
+    pub fn set_plan_rejection(&self, id: Uuid, reason: Option<String>) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Other(format!("connection poisoned: {e}")))?;
+
+        let affected = conn
+            .execute(
+                "UPDATE research_plans
+                    SET status = ?, rejection_reason = ?
+                  WHERE id = ?",
+                params![PlanStatus::Rejected.as_str(), reason, id],
             )
             .map_err(StorageError::DuckDb)?;
 
@@ -329,6 +408,8 @@ fn row_to_stored(row: &duckdb::Row<'_>) -> Result<StoredResearchPlan> {
         created_at: row.get(7).map_err(StorageError::DuckDb)?,
         classified_by: row.get(8).map_err(StorageError::DuckDb)?,
         status: PlanStatus::from_str(&status_str)?,
+        rejection_reason: row.get(10).map_err(StorageError::DuckDb)?,
+        reclassified_from: row.get(11).map_err(StorageError::DuckDb)?,
     })
 }
 
@@ -349,6 +430,8 @@ mod tests {
             created_at: Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap(),
             classified_by: "xai".into(),
             status: PlanStatus::Pending,
+            rejection_reason: None,
+            reclassified_from: None,
         }
     }
 
@@ -370,6 +453,8 @@ mod tests {
         assert_eq!(got.expectations_json, row.expectations_json);
         assert_eq!(got.classified_by, row.classified_by);
         assert_eq!(got.status, PlanStatus::Pending);
+        assert_eq!(got.rejection_reason, None);
+        assert_eq!(got.reclassified_from, None);
     }
 
     #[test]
@@ -579,5 +664,161 @@ mod tests {
 
         let got = store.get_research_plan(row.id).unwrap().unwrap();
         assert_eq!(got.status, PlanStatus::Pending);
+    }
+
+    // -----------------------------------------------------------------
+    // Session 15 — rejection_reason + reclassified_from
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn freshly_inserted_plan_has_no_rejection_or_lineage() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let row = sample_row();
+        store.insert_research_plan(&row).unwrap();
+
+        let got = store.get_research_plan(row.id).unwrap().unwrap();
+        assert_eq!(got.rejection_reason, None);
+        assert_eq!(got.reclassified_from, None);
+    }
+
+    #[test]
+    fn set_plan_rejection_writes_status_and_reason() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let row = sample_row();
+        store.insert_research_plan(&row).unwrap();
+
+        store
+            .set_plan_rejection(row.id, Some("framed under wrong regulation".into()))
+            .unwrap();
+
+        let got = store.get_research_plan(row.id).unwrap().unwrap();
+        assert_eq!(got.status, PlanStatus::Rejected);
+        assert_eq!(
+            got.rejection_reason,
+            Some("framed under wrong regulation".into())
+        );
+    }
+
+    #[test]
+    fn set_plan_rejection_with_none_clears_existing_reason() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let row = sample_row();
+        store.insert_research_plan(&row).unwrap();
+
+        // First reject with reason.
+        store
+            .set_plan_rejection(row.id, Some("first reason".into()))
+            .unwrap();
+        // Reject again, no reason this time.
+        store.set_plan_rejection(row.id, None).unwrap();
+
+        let got = store.get_research_plan(row.id).unwrap().unwrap();
+        assert_eq!(got.status, PlanStatus::Rejected);
+        assert_eq!(got.rejection_reason, None);
+    }
+
+    #[test]
+    fn set_plan_rejection_overwrites_existing_reason() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let row = sample_row();
+        store.insert_research_plan(&row).unwrap();
+
+        store
+            .set_plan_rejection(row.id, Some("first reason".into()))
+            .unwrap();
+        store
+            .set_plan_rejection(row.id, Some("second, refined reason".into()))
+            .unwrap();
+
+        let got = store.get_research_plan(row.id).unwrap().unwrap();
+        assert_eq!(
+            got.rejection_reason,
+            Some("second, refined reason".into())
+        );
+    }
+
+    #[test]
+    fn set_plan_rejection_returns_not_found_for_unknown_id() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let err = store
+            .set_plan_rejection(Uuid::now_v7(), Some("x".into()))
+            .unwrap_err();
+        match err {
+            StorageError::NotFound(_) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_plan_status_does_not_touch_rejection_reason() {
+        // Splitting `set_plan_status` from `set_plan_rejection` is
+        // deliberate: an idempotent re-write of the status (or an
+        // accept transition) must not clobber the reason. This guards
+        // that contract.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let row = sample_row();
+        store.insert_research_plan(&row).unwrap();
+
+        store
+            .set_plan_rejection(row.id, Some("preserved reason".into()))
+            .unwrap();
+        // A second status-only update — same status, but exercises the
+        // column-untouched contract.
+        store.set_plan_status(row.id, PlanStatus::Rejected).unwrap();
+
+        let got = store.get_research_plan(row.id).unwrap().unwrap();
+        assert_eq!(got.rejection_reason, Some("preserved reason".into()));
+    }
+
+    #[test]
+    fn insert_with_lineage_round_trips() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let mut original = sample_row();
+        let original_id = original.id;
+        original.topic = "wrong framing".into();
+        store.insert_research_plan(&original).unwrap();
+
+        let mut reclassified = sample_row();
+        reclassified.id = Uuid::now_v7();
+        reclassified.topic = "wrong framing".into();
+        reclassified.reclassified_from = Some(original_id);
+        store.insert_research_plan(&reclassified).unwrap();
+
+        let got = store.get_research_plan(reclassified.id).unwrap().unwrap();
+        assert_eq!(got.reclassified_from, Some(original_id));
+    }
+
+    #[test]
+    fn rejection_reason_round_trips_through_listing_query() {
+        // Regression guard: the SELECT clauses in
+        // recent_research_plans / by_status include the new columns.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let row = sample_row();
+        store.insert_research_plan(&row).unwrap();
+        store
+            .set_plan_rejection(row.id, Some("listing test".into()))
+            .unwrap();
+
+        let listed = store
+            .recent_research_plans_by_status(Some(PlanStatus::Rejected), 10)
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].rejection_reason, Some("listing test".into()));
+        assert_eq!(listed[0].reclassified_from, None);
     }
 }

@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.3
+# Recipe Author Prompt — v1.4
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -217,8 +217,48 @@ and will fail deserialization.
   Usually `from_plan` pointing at the target event-type
   expectation's `event_type` field.
 - `headline` (string) — required. A complete English sentence
-  suitable for a feed. Usually `extracted` if the source provides
-  one; otherwise a `literal` or `from_plan`.
+  suitable for a feed.
+
+  **Default to `extracted`.** Most sources that emit events also
+  emit a per-event title, headline, or `<title>` element; that's
+  what `headline` is for. CSS selectors and JSON path expressions
+  almost always have a precise locator for the headline string,
+  even when the rest of the row is harder to pin down.
+
+  **`literal` is a trap and almost always wrong.** A `literal`
+  headline produces *the same hardcoded sentence on every fetch*,
+  on every record the recipe emits, for years. The recipe stops
+  being an extraction and becomes a one-shot record emitter. If
+  the source is a feed, an index, or a list (i.e. the recipe is
+  expected to produce more than one record per fetch over the
+  recipe's lifetime), `literal` for `headline` is wrong.
+
+  `literal` is **only** acceptable when *all* of these are true:
+  1. The source is a single-event endpoint (one specific event the
+     user cares about, e.g. a registration page for a UDB go-live
+     date or a press release about one specific announcement);
+  2. The recipe will produce exactly one record per fetch over its
+     lifetime;
+  3. That fact is structurally evident from the document excerpt
+     (the page describes one event, not a list).
+
+  **Never lift framing from the plan's `interpretation` paragraph
+  into a `literal` headline.** The interpretation is the user's
+  trust-moment text, not a runtime value. If the plan's
+  interpretation says "the workstation will track the EU AI Act go-
+  live timeline," do *not* synthesize "Scheduled go-live of the EU
+  AI Act framework" as a literal headline. The interpretation may
+  itself be wrong (the user may reject it); even when it's right,
+  it's the wrong source for a per-record string. Either extract
+  per-record headlines from the source, or use `from_plan` pointing
+  at the target expectation's name.
+
+  `from_plan` is acceptable as a middle ground when the source
+  doesn't expose a per-event headline but the plan does name the
+  event class clearly. The cost of `from_plan` over `literal` is
+  zero — the value still ends up identical across records, but the
+  link to the plan's expectation makes the recipe's intent
+  inspectable.
 - `actors` (array of entity ids) — defaults to empty. Leave
   unmapped if the source doesn't identify actors structurally.
 - `direction` (**closed enum**, optional) — one of:
@@ -274,6 +314,13 @@ rejected.
   code, a heading), and it will fail to deserialize into the
   enum. Always use `{"kind": "literal", "value": "<one of the
   allowed values>"}` for enum fields.
+- Do not lift framing from the plan's `interpretation` paragraph
+  into a `literal` value for any field that is supposed to be
+  per-record (`headline`, `value`, dates, names). The
+  interpretation is for the user, not for the runtime. A recipe
+  that hardcodes a sentence from the interpretation into
+  `headline` produces identical records on every fetch and stops
+  being an extraction.
 
 ## One-shot, no follow-up
 
@@ -286,6 +333,21 @@ you pick.
 
 ### Changelog
 
+- **v1.4** (2026-05-01) — Strengthened the `headline` field's
+  source-kind preference: `extracted` is now the explicit default
+  with a strict three-condition predicate for when `literal` is
+  acceptable (single-event endpoint, one record per fetch over
+  lifetime, structurally evident from the excerpt). Added an
+  explicit "do not lift plan-interpretation framing into literal
+  per-record fields" rule to "What NOT to produce". Motivated by
+  the Session 14 UDB case (see
+  `failure_cases/classification/2026-04-30-udb-eu-ai-act-framing-leak.md`):
+  an event recipe authored against EUR-Lex took a sentence from
+  the contaminated `interpretation` paragraph and stamped it as
+  the `literal` headline, turning a feed-style recipe into a one-
+  shot emitter. Output contract is unchanged — same schema, same
+  field-source kinds; recipes already authored remain valid (but
+  may need re-authoring when the user notices the symptom).
 - **v1** (2026-04-22) — Initial version for Phase 3c.2.
 - **v1.1** (2026-04-22) — Narrowed `record_type` to observation /
   event / relation after discovering `Assertion` can't be populated

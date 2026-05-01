@@ -142,6 +142,7 @@ fn main() -> Result<()> {
             situation_room_api::commands::get_plan,
             situation_room_api::commands::accept_plan,
             situation_room_api::commands::reject_plan,
+            situation_room_api::commands::reclassify_plan,
             situation_room_api::commands::run_fetch_for_plan,
             situation_room_api::commands::list_fetch_runs,
             situation_room_api::commands::list_recipes_for_plan

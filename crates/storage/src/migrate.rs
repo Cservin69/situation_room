@@ -56,6 +56,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "fetch_runs table",
         sql: include_str!("../../../migrations/0006_fetch_runs.sql"),
     },
+    Migration {
+        version: 7,
+        description: "research_plans: rejection_reason and reclassified_from columns",
+        sql: include_str!("../../../migrations/0007_research_plans_rejection_and_lineage.sql"),
+    },
 ];
 
 /// Apply every migration whose version is not yet in

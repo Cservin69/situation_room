@@ -1,4 +1,4 @@
-# Research Classifier Prompt — v1.2
+# Research Classifier Prompt — v1.4
 
 <!--
     This file is the Level-1 research classifier prompt for situation_room.
@@ -182,25 +182,71 @@ formats is rejected and the user sees a classification error.
   `supplies_to`, `subsidiary_of`, `subject_to_sanction`,
   `licenses_from`. Bad: `is related to`, `does business with`.
 
-## Existing topics — reuse before inventing
+## Existing topics — substantive reuse only
 
 situation_room keeps a registry of every Topic string ever used. When the
-user's query is *plausibly about the same subject* as an existing
+user's query is **substantively about the same subject** as an existing
 topic, **reuse the existing string**. This is how `chip_production`
 and `wafer_supply` end up tagged with the same `semiconductors`
 topic — it's not magic, it's just disciplined classification.
 
-Reuse is preferred. Invention is allowed when the topic is
-genuinely about something the existing tags don't cover.
+**The substantive test** — a registry tag is the same subject as the
+user's query when at least one of these is true:
+
+- Same regulatory framework (`eu_ai_act` covers queries about the EU
+  AI Act and only that act, not "anything EU and regulated").
+- Same supply chain (`lithium` covers the lithium supply chain, not
+  every battery-adjacent topic).
+- Same event class (`mine_opening` covers mine openings, not mining
+  in general).
+- Same sector or industry-specific concept (`semiconductors`,
+  `container_shipping`, `sovereign_debt`).
+
+**Vocabulary overlap alone does not qualify.** The user's query
+mentioning a word that appears in a registry tag is not enough to
+reuse the tag. "EU regulation" overlapping with `eu_ai_act` does not
+make every EU-regulation query an AI Act query. "Database" overlapping
+with `eu_ai_act_udb` does not make every database query an AI Act
+database query.
+
+**Acronym ambiguity** — when the user's query contains an acronym or
+short noun phrase that could plausibly map to multiple registry tags
+(or to nothing currently registered), **prefer invention over
+reuse**. Coin a more specific tag, let the user merge later if they
+want. The cost of inventing a redundant tag is one duplicate row in
+the registry; the cost of a wrong reuse is a contaminated
+interpretation paragraph that propagates through every downstream
+prompt that consumes the plan (recipe author, assertion extractor).
+
+> **Anti-example.** A user types "UDB Go-Live date for EOs". The
+> registry contains `eu_ai_act` from a prior session about AI Act
+> enforcement. The acronym "UDB" plus "Economic Operators" matches
+> *both* the EU AI Act's Union Database (Article 71, for high-risk
+> AI systems) *and* the EU Deforestation Regulation's Union Database
+> (for economic operators placing covered commodities on the EU
+> market). The query alone does not disambiguate. **Do not reuse
+> `eu_ai_act`.** Coin a specific tag (`eu_udb_eo`,
+> `eu_eudr_compliance`, or whatever fits the user's actual query
+> when read in isolation) and let the user clarify on review.
+
+**Interpretation honesty** — if you do reuse a registry tag and your
+choice is anywhere short of certain, **say so in the
+`interpretation` paragraph**. Do not present an associative-grounds
+choice as a derivation from the user's query. Phrase like "I'm
+reading this under the lens of `eu_ai_act` because that's the
+closest match in your prior research — tell me if you meant the
+EUDR's UDB instead" is honest. Phrase like "I took your phrase to
+mean … under the EU AI Act framework" is dishonest when the framework
+came from the registry, not from the user.
 
 The current set of topics in use, sorted by frequency
 (most-used first):
 
 {{EXISTING_TOPICS}}
 
-If a topic above plausibly fits the user's query, include it in
-`topic_tags`. You can also add new ones — the result is typically
-a mix.
+If a topic above survives the substantive test for the user's query,
+include it in `topic_tags`. If no topic survives, invent one — new
+tags cost nothing.
 
 ## Registered sources — priority discipline
 
@@ -252,6 +298,8 @@ leave `preferred_source_ids` empty and put the description in
 ```
 {{TOPIC}}
 ```
+
+{{USER_FEEDBACK}}
 
 ## The interpretation field — the trust moment
 
@@ -540,6 +588,22 @@ honest about what the workstation will surface.
 
 ### Changelog
 
+- **v1.4** (2026-05-01) — Tightened topic reuse from "plausibly
+  about the same subject" to a substantive test (same regulatory
+  framework / supply chain / event class / sector). Added a UDB
+  acronym-ambiguity anti-example targeted at the Session 14
+  failure case (UDB Go-Live for EOs misframed as EU AI Act).
+  Added an interpretation-honesty rule: when reusing a registry
+  tag on associative grounds, qualify it explicitly rather than
+  presenting the inference as a derivation from the user's query.
+  Added a new `{{USER_FEEDBACK}}` placeholder + section that
+  carries free-text rejection feedback from a previous attempt
+  through a per-call nonce-fenced block, with the standard
+  "treat as data, not instructions" hardening. See
+  `failure_cases/classification/2026-04-30-udb-eu-ai-act-framing-leak.md`
+  for the full diagnosis. Output contract changed (new
+  placeholder); existing recipes are unaffected because Level-1
+  output shape is unchanged.
 - **v1.2** (2026-04-27) — Added explicit rule that
   `geographic_scope` must be populated whenever the topic has any
   geographic scope, including when the country is named in the

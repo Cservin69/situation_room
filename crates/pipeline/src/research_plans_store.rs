@@ -7,6 +7,15 @@
 //!
 //! Mirrors the shape of [`crate::recipes_store`]; the rationale is
 //! identical (storage mustn't reverse-depend on pipeline).
+//!
+//! ## Session 15 — re-classification lineage
+//!
+//! When a plan is produced by re-classifying a rejected predecessor,
+//! the storage layer carries a `reclassified_from` UUID linking the
+//! new plan back to its predecessor. This module exposes a separate
+//! `save_research_plan_with_lineage` constructor for that flow rather
+//! than overloading `save_research_plan`'s signature, so the common
+//! case (fresh classification) keeps its terse call site.
 
 use situation_room_storage::{
     research_plans::{PlanStatus, ResearchPlanRow, StoredResearchPlan},
@@ -34,12 +43,35 @@ pub enum ResearchPlanStoreError {
 /// `classified_by` is the provider id that ran classification (e.g.
 /// `"xai"`). It's persisted as part of the plan row so audits can
 /// trace which model produced the classification.
+///
+/// The stored plan has no `reclassified_from` link — see
+/// [`save_research_plan_with_lineage`] for the re-classification
+/// path.
 pub fn save_research_plan(
     store: &Store,
     plan: &ResearchPlan,
     classified_by: &str,
 ) -> Result<(), ResearchPlanStoreError> {
-    let row = plan_to_row(plan, classified_by)?;
+    save_research_plan_with_lineage(store, plan, classified_by, None)
+}
+
+/// Persist a typed [`ResearchPlan`] to storage, recording its lineage
+/// from a previously-rejected plan.
+///
+/// `reclassified_from` is the id of the rejected plan that prompted
+/// this re-classification. `None` is equivalent to
+/// [`save_research_plan`] — the column stays NULL on the row.
+///
+/// Lineage is set at INSERT time and immutable thereafter; ADR 0011
+/// keeps plans immutable except for status, and the lineage column is
+/// row-identity metadata, not lifecycle state.
+pub fn save_research_plan_with_lineage(
+    store: &Store,
+    plan: &ResearchPlan,
+    classified_by: &str,
+    reclassified_from: Option<Uuid>,
+) -> Result<(), ResearchPlanStoreError> {
+    let row = plan_to_row(plan, classified_by, reclassified_from)?;
     store
         .insert_research_plan(&row)
         .map_err(ResearchPlanStoreError::Storage)
@@ -59,6 +91,7 @@ pub fn load_research_plan(
 fn plan_to_row(
     plan: &ResearchPlan,
     classified_by: &str,
+    reclassified_from: Option<Uuid>,
 ) -> Result<ResearchPlanRow, ResearchPlanStoreError> {
     let topic_tags_json = serde_json::to_string(&plan.topic_tags)
         .map_err(|e| ResearchPlanStoreError::Serialize(format!("topic_tags: {e}")))?;
@@ -81,6 +114,10 @@ fn plan_to_row(
         // explicitly Accept (or Reject) before downstream Phase-6
         // fetching considers them. See ADR 0007 + situation_room_HANDOFF_SESSION7.
         status: PlanStatus::Pending,
+        // Rejection feedback is only attached after a plan is rejected
+        // — never at INSERT time.
+        rejection_reason: None,
+        reclassified_from,
     })
 }
 
@@ -218,5 +255,36 @@ mod tests {
         // storage-layer audit field, not part of the plan itself.
         let stored = store.get_research_plan(plan.id).unwrap().unwrap();
         assert_eq!(stored.classified_by, "xai");
+    }
+
+    // -----------------------------------------------------------------
+    // Session 15 — lineage round-trip
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn save_with_lineage_persists_reclassified_from() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let predecessor_id = Uuid::now_v7();
+        let plan = sample_plan();
+        save_research_plan_with_lineage(&store, &plan, "xai", Some(predecessor_id)).unwrap();
+
+        let stored = store.get_research_plan(plan.id).unwrap().unwrap();
+        assert_eq!(stored.reclassified_from, Some(predecessor_id));
+    }
+
+    #[test]
+    fn save_research_plan_writes_no_lineage() {
+        // Regression guard for the simple call path: the bare
+        // save_research_plan must leave reclassified_from NULL.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan = sample_plan();
+        save_research_plan(&store, &plan, "xai").unwrap();
+
+        let stored = store.get_research_plan(plan.id).unwrap().unwrap();
+        assert_eq!(stored.reclassified_from, None);
     }
 }

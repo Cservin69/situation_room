@@ -54,8 +54,11 @@ use situation_room_pipeline::research_classifier::{
     classify_topic, ClassificationContext, ClassificationError,
     SourceDescriptor as PipelineSourceDescriptor, TopicUsage as ClassifierTopicUsage,
 };
-use situation_room_pipeline::research_plans_store::{save_research_plan, ResearchPlanStoreError};
-use situation_room_secure::bounds::{check_string, Bounds};
+use situation_room_pipeline::research_plans_store::{
+    save_research_plan, save_research_plan_with_lineage,
+    ResearchPlanStoreError,
+};
+use situation_room_secure::bounds::{check_string, check_user_text, Bounds};
 use situation_room_secure::http::SecureHttpClient;
 use situation_room_storage::research_plans::PlanStatus;
 use situation_room_storage::{Store, StorageError};
@@ -294,6 +297,9 @@ pub async fn classify(
     let ctx = ClassificationContext {
         existing_topics,
         registered_sources: state.sources.clone(),
+        // Fresh classification: no prior rejection feedback to inject.
+        // The re-classify path is `reclassify_plan` (Session 15).
+        previous_rejection_reason: None,
     };
 
     // 3. Call the LLM.
@@ -432,30 +438,94 @@ pub async fn accept_plan(
 }
 
 // ---------------------------------------------------------------------------
-// Command 5 — reject_plan
+// Command 5 — reject_plan (Session 15: now takes an optional reason)
 // ---------------------------------------------------------------------------
 
-/// Mark a plan as rejected. Hidden from default listings; retained
-/// for audit. Soft-delete; no row is removed.
+/// Mark a plan as rejected, optionally attaching a free-text reason.
+/// Hidden from default listings; retained for audit. Soft-delete; no
+/// row is removed.
 ///
-/// Returns the updated [`ResearchPlanDto`]. Idempotent. Same error
-/// semantics as [`accept_plan`].
+/// `reason` is the user's note explaining why they rejected this
+/// classification. The note is validated by
+/// [`check_user_text`] (length, control characters, zero-width chars,
+/// bidi overrides, line-ending normalization) at this boundary, and
+/// the *normalized* string is what gets persisted — so callers do
+/// NOT need to pre-normalize. `None` (or `Some` of a string that
+/// trims to empty) records the rejection without a note.
+///
+/// Returns the updated [`ResearchPlanDto`]. Idempotent: rejecting an
+/// already-rejected plan succeeds and overwrites the previous reason
+/// with whatever was supplied this call.
+///
+/// Errors:
+///   - `InvalidInput { field: "id" }` — id isn't a valid UUID.
+///   - `InvalidInput { field: "reason" }` — reason failed bounds /
+///     character-class validation.
+///   - `NotFound` — id not in store.
+///   - `Storage` — DB-level failure.
 #[tauri::command]
 pub async fn reject_plan(
     id: String,
+    reason: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<ResearchPlanDto, CommandError> {
-    set_status_and_load(id, PlanStatus::Rejected, state).await
+    let parsed: Uuid = id.parse().map_err(|e: uuid::Error| CommandError::InvalidInput {
+        field: "id".into(),
+        message: format!("not a valid UUID: {e}"),
+    })?;
+
+    // Validate + normalize the reason at the API boundary. An empty
+    // / whitespace-only note is treated as `None`: we record the
+    // rejection but leave the column NULL.
+    let normalized_reason = match reason.as_deref() {
+        None => None,
+        Some(raw) => {
+            let normalized = check_user_text(
+                "rejection_reason",
+                raw,
+                Bounds::REJECTION_REASON,
+            )
+            .map_err(|e| CommandError::InvalidInput {
+                field: "reason".into(),
+                message: e.to_string(),
+            })?;
+            if normalized.trim().is_empty() {
+                None
+            } else {
+                Some(normalized)
+            }
+        }
+    };
+
+    state
+        .store
+        .set_plan_rejection(parsed, normalized_reason)
+        .map_err(|e| match e {
+            StorageError::NotFound(_) => CommandError::NotFound { id: id.clone() },
+            other => CommandError::from(other),
+        })?;
+
+    info!(plan_id = %parsed, "plan rejected");
+
+    let stored = state
+        .store
+        .get_research_plan(parsed)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::NotFound { id: id.clone() })?;
+
+    ResearchPlanDto::from_stored(stored).map_err(|e| CommandError::Storage {
+        message: format!("plan deserialization: {e}"),
+    })
 }
 
 // ---------------------------------------------------------------------------
-// accept_plan / reject_plan share an implementation
+// accept_plan implementation (reject_plan no longer shares this body)
 // ---------------------------------------------------------------------------
 
-/// The shared body of `accept_plan` and `reject_plan`. Validates the
-/// id, transitions the status, then re-loads the plan so the wire
-/// response always reflects what's actually in the database (rather
-/// than what the caller asked for).
+/// The body of `accept_plan`. Validates the id, transitions the
+/// status, then re-loads the plan so the wire response always
+/// reflects what's actually in the database (rather than what the
+/// caller asked for).
 ///
 /// Re-loading after the write is deliberate: it costs one extra
 /// query per call, but it means the frontend can trust the returned
@@ -492,6 +562,177 @@ async fn set_status_and_load(
         .ok_or_else(|| CommandError::NotFound { id: id.clone() })?;
 
     ResearchPlanDto::from_stored(stored).map_err(|e| CommandError::Storage {
+        message: format!("plan deserialization: {e}"),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Command 5b — reclassify_plan (Session 15)
+// ---------------------------------------------------------------------------
+
+/// Re-run Level-1 classification on a topic, using the rejection
+/// reason from a previously-rejected plan as additional context for
+/// the LLM. Produces a fresh plan (new id, status = Pending) linked
+/// back to the original via `reclassified_from`.
+///
+/// `id` is the **rejected** plan to re-classify. `edited_reason`,
+/// when supplied, replaces the stored rejection reason for this
+/// classification call (the stored reason is left untouched — the
+/// edit is per-call, not a mutation). When `edited_reason` is
+/// `None`, the stored reason is used as-is.
+///
+/// Either the stored reason or `edited_reason` must be present and
+/// non-empty after validation; otherwise `InvalidInput { field:
+/// "reason" }` is returned. The classifier needs *some* feedback to
+/// do something different the second time.
+///
+/// Errors:
+///   - `InvalidInput { field: "id" }` — id isn't a valid UUID.
+///   - `InvalidInput { field: "edited_reason" }` — supplied text
+///     failed validation.
+///   - `InvalidInput { field: "reason" }` — neither the stored nor
+///     the edited reason yielded any non-empty text after validation.
+///   - `InvalidInput { field: "id", message: "plan must be rejected
+///     before reclassify" }` — caller asked to re-classify a plan
+///     not in `Rejected` status.
+///   - `NotFound` — id not in store.
+///   - `ClassificationFailed` — LLM call or plan validation failed.
+///   - `Storage` — DB-level failure.
+#[tauri::command]
+pub async fn reclassify_plan(
+    id: String,
+    edited_reason: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<ResearchPlanDto, CommandError> {
+    // 1. Boundary validation: id.
+    let parsed: Uuid = id.parse().map_err(|e: uuid::Error| CommandError::InvalidInput {
+        field: "id".into(),
+        message: format!("not a valid UUID: {e}"),
+    })?;
+
+    // 2. Load the predecessor plan + storage row (we need both: the
+    //    typed plan for its topic, the stored row for its
+    //    rejection_reason and status).
+    let stored_predecessor = state
+        .store
+        .get_research_plan(parsed)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::NotFound { id: id.clone() })?;
+
+    if stored_predecessor.status != PlanStatus::Rejected {
+        return Err(CommandError::InvalidInput {
+            field: "id".into(),
+            message: format!(
+                "plan must be rejected before reclassify (current: {})",
+                stored_predecessor.status
+            ),
+        });
+    }
+
+    // 3. Resolve the effective reason. Edited > stored > error.
+    //    `check_user_text` validates + normalizes; we feed the
+    //    normalized text into the classifier's fenced block.
+    let effective_reason: String = match edited_reason.as_deref() {
+        Some(raw) if !raw.trim().is_empty() => check_user_text(
+            "edited_reason",
+            raw,
+            Bounds::REJECTION_REASON,
+        )
+        .map_err(|e| CommandError::InvalidInput {
+            field: "edited_reason".into(),
+            message: e.to_string(),
+        })?,
+        _ => match stored_predecessor.rejection_reason.as_deref() {
+            Some(stored) if !stored.trim().is_empty() => stored.to_string(),
+            _ => {
+                return Err(CommandError::InvalidInput {
+                    field: "reason".into(),
+                    message: "no rejection reason available — supply edited_reason \
+                              or reject the plan again with a note before re-classifying"
+                        .into(),
+                });
+            }
+        },
+    };
+
+    info!(
+        predecessor = %parsed,
+        topic = %stored_predecessor.topic,
+        "reclassify_plan invoked"
+    );
+
+    // 4. Build classification context — same shape as `classify`,
+    //    plus the previous_rejection_reason injection.
+    let topic_rows = state
+        .store
+        .topics_in_use(AppState::TOPICS_INJECTION_LIMIT)
+        .map_err(CommandError::from)?;
+    let existing_topics: Vec<ClassifierTopicUsage> = topic_rows
+        .into_iter()
+        .map(|r| ClassifierTopicUsage {
+            topic: r.topic.as_str().to_string(),
+            uses: r.count,
+        })
+        .collect();
+
+    let ctx = ClassificationContext {
+        existing_topics,
+        registered_sources: state.sources.clone(),
+        previous_rejection_reason: Some(effective_reason),
+    };
+
+    // 5. Call the LLM with the original topic verbatim. The user's
+    //    topic string is stored on the predecessor and threaded
+    //    through unchanged — re-classification doesn't let the user
+    //    silently retype the topic alongside their feedback.
+    let new_plan = classify_topic(
+        state.provider.as_ref(),
+        ModelTier::Workhorse,
+        state.classifier_prompt,
+        &stored_predecessor.topic,
+        &ctx,
+    )
+    .await?;
+
+    // 6. Persist with lineage. We use the lineage-aware constructor
+    //    so the new plan's `reclassified_from` column points back to
+    //    the rejected predecessor.
+    if let Err(e) = save_research_plan_with_lineage(
+        state.store.as_ref(),
+        &new_plan,
+        "xai",
+        Some(parsed),
+    ) {
+        warn!(
+            error = %e,
+            new_plan_id = %new_plan.id,
+            predecessor = %parsed,
+            "failed to persist reclassified plan"
+        );
+        return Err(CommandError::from(e));
+    }
+
+    info!(
+        new_plan_id = %new_plan.id,
+        predecessor = %parsed,
+        "reclassified plan persisted"
+    );
+
+    // 7. Re-load through from_stored so the audit fields
+    //    (reclassified_from in particular) are visible to the
+    //    frontend without a second roundtrip.
+    let stored_new = state
+        .store
+        .get_research_plan(new_plan.id)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::Storage {
+            message: format!(
+                "newly persisted plan {} not readable on the same connection",
+                new_plan.id
+            ),
+        })?;
+
+    ResearchPlanDto::from_stored(stored_new).map_err(|e| CommandError::Storage {
         message: format!("plan deserialization: {e}"),
     })
 }

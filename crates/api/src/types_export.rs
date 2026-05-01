@@ -103,6 +103,22 @@ pub struct ResearchPlanDto {
     pub expectations: RecordExpectationsDto,
     pub created_at: DateTime<Utc>,
     pub status: PlanStatusDto,
+    /// Free-text note the user attached when rejecting. Empty string
+    /// for plans that were never rejected, plans rejected before
+    /// Session 15, and rejections where the user supplied no note.
+    /// Empty-string-as-absent matches the wire convention for
+    /// optional strings throughout the api crate (see `unit_hint`,
+    /// `display`, etc.); we don't introduce a separate `null` shape
+    /// here for parity.
+    #[serde(default)]
+    pub rejection_reason: String,
+    /// UUID of the rejected plan that prompted this re-classification,
+    /// as a string. Empty string when this plan was not produced by
+    /// the re-classify-with-feedback flow. Stringly-typed on the wire
+    /// for the same reason `id` is — ts-rs doesn't have a Uuid
+    /// primitive at the TS side.
+    #[serde(default)]
+    pub reclassified_from: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -191,6 +207,18 @@ pub struct PlanSummary {
     pub entity_count: u32,
     pub relation_count: u32,
     pub document_source_count: u32,
+    /// True when this plan has a non-empty `rejection_reason`. Lets
+    /// the listing show a "has note" indicator on rejected rows
+    /// without dragging the full text through the summary payload —
+    /// the text itself is fetched on demand via `get_plan`.
+    #[serde(default)]
+    pub has_rejection_reason: bool,
+    /// True when this plan was produced by re-classifying a
+    /// previously-rejected plan. Same payload-trimming rationale as
+    /// `has_rejection_reason`: the predecessor's id (when needed for
+    /// chain navigation) lives on the full plan DTO.
+    #[serde(default)]
+    pub is_reclassified: bool,
 }
 
 impl PlanSummary {
@@ -202,6 +230,12 @@ impl PlanSummary {
     pub fn from_stored(s: StoredResearchPlan) -> Result<Self, serde_json::Error> {
         let tags: Vec<String> = serde_json::from_str(&s.topic_tags_json)?;
         let exp: RecordExpectations = serde_json::from_str(&s.expectations_json)?;
+        let has_rejection_reason = s
+            .rejection_reason
+            .as_deref()
+            .map(|r| !r.trim().is_empty())
+            .unwrap_or(false);
+        let is_reclassified = s.reclassified_from.is_some();
 
         Ok(Self {
             id: s.id.to_string(),
@@ -214,6 +248,8 @@ impl PlanSummary {
             entity_count: exp.entity_kinds.len() as u32,
             relation_count: exp.relation_kinds.len() as u32,
             document_source_count: exp.document_sources.len() as u32,
+            has_rejection_reason,
+            is_reclassified,
         })
     }
 }
@@ -296,6 +332,12 @@ impl ResearchPlanDto {
     /// by [`Self::from_stored`]; exposed for tests and any future
     /// caller that has both pieces in hand without going through a
     /// `StoredResearchPlan`.
+    ///
+    /// `rejection_reason` and `reclassified_from` are not part of the
+    /// typed `ResearchPlan` (they're storage-layer audit fields), so
+    /// this constructor leaves them blank. Use [`Self::from_stored`]
+    /// for any plan re-read from disk; that path carries the audit
+    /// fields through.
     pub fn from_typed_with_status(p: ResearchPlan, status: PlanStatusDto) -> Self {
         Self {
             id: p.id.to_string(),
@@ -307,13 +349,17 @@ impl ResearchPlanDto {
             expectations: RecordExpectationsDto::from(p.expectations),
             created_at: p.created_at,
             status,
+            rejection_reason: String::new(),
+            reclassified_from: String::new(),
         }
     }
 
     /// Build a DTO from a [`StoredResearchPlan`] — parsing the JSON
-    /// columns and carrying the storage-layer `status` through. This
-    /// is the path used by `get_plan`, `accept_plan`, `reject_plan`,
-    /// and any other command that re-reads a plan from disk.
+    /// columns and carrying the storage-layer `status`,
+    /// `rejection_reason`, and `reclassified_from` through. This is
+    /// the path used by `get_plan`, `accept_plan`, `reject_plan`,
+    /// `reclassify_plan`, and any other command that re-reads a plan
+    /// from disk.
     pub fn from_stored(s: StoredResearchPlan) -> Result<Self, serde_json::Error> {
         let topic_tags: Vec<situation_room_core::vocab::Topic> =
             serde_json::from_str(&s.topic_tags_json)?;
@@ -321,6 +367,11 @@ impl ResearchPlanDto {
             serde_json::from_str(&s.geographic_scope_json)?;
         let expectations: RecordExpectations = serde_json::from_str(&s.expectations_json)?;
         let status: PlanStatusDto = s.status.into();
+        let rejection_reason = s.rejection_reason.unwrap_or_default();
+        let reclassified_from = s
+            .reclassified_from
+            .map(|u| u.to_string())
+            .unwrap_or_default();
 
         let plan = ResearchPlan {
             id: s.id,
@@ -332,7 +383,10 @@ impl ResearchPlanDto {
             expectations,
             created_at: s.created_at,
         };
-        Ok(Self::from_typed_with_status(plan, status))
+        let mut dto = Self::from_typed_with_status(plan, status);
+        dto.rejection_reason = rejection_reason;
+        dto.reclassified_from = reclassified_from;
+        Ok(dto)
     }
 }
 
@@ -814,6 +868,8 @@ mod tests {
             created_at: p.created_at,
             classified_by: "xai".into(),
             status: situation_room_storage::research_plans::PlanStatus::Pending,
+            rejection_reason: None,
+            reclassified_from: None,
         };
 
         let s = PlanSummary::from_stored(stored).unwrap();
@@ -825,6 +881,8 @@ mod tests {
         assert_eq!(s.entity_count, 1);
         assert_eq!(s.relation_count, 1);
         assert_eq!(s.document_source_count, 1);
+        assert!(!s.has_rejection_reason);
+        assert!(!s.is_reclassified);
     }
 
     #[test]
@@ -841,6 +899,8 @@ mod tests {
             created_at: p.created_at,
             classified_by: "xai".into(),
             status: situation_room_storage::research_plans::PlanStatus::Pending,
+            rejection_reason: None,
+            reclassified_from: None,
         };
         assert!(PlanSummary::from_stored(stored).is_err());
     }
@@ -862,9 +922,127 @@ mod tests {
             created_at: p.created_at,
             classified_by: "xai".into(),
             status: situation_room_storage::research_plans::PlanStatus::Rejected,
+            rejection_reason: None,
+            reclassified_from: None,
         };
         let dto = ResearchPlanDto::from_stored(stored).unwrap();
         assert_eq!(dto.status, PlanStatusDto::Rejected);
+    }
+
+    #[test]
+    fn plan_dto_from_stored_carries_rejection_reason_and_lineage() {
+        // Session 15: round-trip the new audit columns. Empty-string
+        // wire convention for absence is asserted in
+        // plan_dto_from_stored_with_no_audit_fields_uses_empty_strings.
+        let p = sample_plan();
+        let predecessor = uuid::Uuid::now_v7();
+        let stored = StoredResearchPlan {
+            id: p.id,
+            topic: p.topic.clone(),
+            interpretation: p.interpretation.clone(),
+            topic_tags_json: serde_json::to_string(&p.topic_tags).unwrap(),
+            geographic_scope_json: serde_json::to_string(&p.geographic_scope).unwrap(),
+            historical_window_days: p.historical_window_days,
+            expectations_json: serde_json::to_string(&p.expectations).unwrap(),
+            created_at: p.created_at,
+            classified_by: "xai".into(),
+            status: situation_room_storage::research_plans::PlanStatus::Rejected,
+            rejection_reason: Some("framed under the wrong regulation".into()),
+            reclassified_from: Some(predecessor),
+        };
+        let dto = ResearchPlanDto::from_stored(stored).unwrap();
+        assert_eq!(dto.rejection_reason, "framed under the wrong regulation");
+        assert_eq!(dto.reclassified_from, predecessor.to_string());
+    }
+
+    #[test]
+    fn plan_dto_from_stored_with_no_audit_fields_uses_empty_strings() {
+        let p = sample_plan();
+        let stored = StoredResearchPlan {
+            id: p.id,
+            topic: p.topic.clone(),
+            interpretation: p.interpretation.clone(),
+            topic_tags_json: serde_json::to_string(&p.topic_tags).unwrap(),
+            geographic_scope_json: serde_json::to_string(&p.geographic_scope).unwrap(),
+            historical_window_days: p.historical_window_days,
+            expectations_json: serde_json::to_string(&p.expectations).unwrap(),
+            created_at: p.created_at,
+            classified_by: "xai".into(),
+            status: situation_room_storage::research_plans::PlanStatus::Pending,
+            rejection_reason: None,
+            reclassified_from: None,
+        };
+        let dto = ResearchPlanDto::from_stored(stored).unwrap();
+        assert_eq!(dto.rejection_reason, "");
+        assert_eq!(dto.reclassified_from, "");
+    }
+
+    #[test]
+    fn plan_summary_with_rejection_reason_sets_has_flag() {
+        let p = sample_plan();
+        let stored = StoredResearchPlan {
+            id: p.id,
+            topic: p.topic.clone(),
+            interpretation: p.interpretation.clone(),
+            topic_tags_json: serde_json::to_string(&p.topic_tags).unwrap(),
+            geographic_scope_json: serde_json::to_string(&p.geographic_scope).unwrap(),
+            historical_window_days: p.historical_window_days,
+            expectations_json: serde_json::to_string(&p.expectations).unwrap(),
+            created_at: p.created_at,
+            classified_by: "xai".into(),
+            status: situation_room_storage::research_plans::PlanStatus::Rejected,
+            rejection_reason: Some("the framing was wrong".into()),
+            reclassified_from: None,
+        };
+        let s = PlanSummary::from_stored(stored).unwrap();
+        assert!(s.has_rejection_reason);
+        assert!(!s.is_reclassified);
+    }
+
+    #[test]
+    fn plan_summary_whitespace_only_reason_does_not_set_flag() {
+        // A reason that round-trips as whitespace-only shouldn't show
+        // a "has note" indicator on the listing — there's no note
+        // worth surfacing.
+        let p = sample_plan();
+        let stored = StoredResearchPlan {
+            id: p.id,
+            topic: p.topic.clone(),
+            interpretation: p.interpretation.clone(),
+            topic_tags_json: serde_json::to_string(&p.topic_tags).unwrap(),
+            geographic_scope_json: serde_json::to_string(&p.geographic_scope).unwrap(),
+            historical_window_days: p.historical_window_days,
+            expectations_json: serde_json::to_string(&p.expectations).unwrap(),
+            created_at: p.created_at,
+            classified_by: "xai".into(),
+            status: situation_room_storage::research_plans::PlanStatus::Rejected,
+            rejection_reason: Some("   \t  ".into()),
+            reclassified_from: None,
+        };
+        let s = PlanSummary::from_stored(stored).unwrap();
+        assert!(!s.has_rejection_reason);
+    }
+
+    #[test]
+    fn plan_summary_reclassified_sets_lineage_flag() {
+        let p = sample_plan();
+        let stored = StoredResearchPlan {
+            id: p.id,
+            topic: p.topic.clone(),
+            interpretation: p.interpretation.clone(),
+            topic_tags_json: serde_json::to_string(&p.topic_tags).unwrap(),
+            geographic_scope_json: serde_json::to_string(&p.geographic_scope).unwrap(),
+            historical_window_days: p.historical_window_days,
+            expectations_json: serde_json::to_string(&p.expectations).unwrap(),
+            created_at: p.created_at,
+            classified_by: "xai".into(),
+            status: situation_room_storage::research_plans::PlanStatus::Pending,
+            rejection_reason: None,
+            reclassified_from: Some(uuid::Uuid::now_v7()),
+        };
+        let s = PlanSummary::from_stored(stored).unwrap();
+        assert!(s.is_reclassified);
+        assert!(!s.has_rejection_reason);
     }
 
     #[test]

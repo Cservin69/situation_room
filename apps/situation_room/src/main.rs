@@ -176,6 +176,12 @@ async fn run_classify(store: &Store, cli: &Cli, topic: &str) -> Result<()> {
     let ctx = ClassificationContext {
         existing_topics,
         registered_sources,
+        // CLI does not carry a re-classification flow today; the
+        // GUI is the (Session 15) home for rejection feedback. This
+        // field is kept None so the classifier prompt's
+        // {{USER_FEEDBACK}} placeholder substitutes to empty,
+        // preserving the prior behaviour bit-for-bit.
+        previous_rejection_reason: None,
     };
 
     eprintln!(
