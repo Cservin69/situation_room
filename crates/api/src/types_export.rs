@@ -701,6 +701,15 @@ pub struct RecipeDto {
     /// provider id like `"xai"` or `"recording"` (in tests).
     pub authored_by: String,
     pub version: u32,
+    /// Bake-time-frozen payload (ADR 0007 Amendment 3). `None` for
+    /// the common HTML-addressable case (recipe fetches `source_url`
+    /// at runtime). `Some(payload)` means the recipe is "baked" —
+    /// the runtime serves these bytes to extraction in place of an
+    /// HTTP fetch, and the recipe will produce the same records
+    /// every fetch until re-authored. The frontend renders this
+    /// as a visible BAKED badge so the freshness model is explicit
+    /// in the UI.
+    pub static_payload: Option<String>,
 }
 
 impl RecipeDto {
@@ -734,6 +743,7 @@ impl RecipeDto {
             authored_at: r.authored_at,
             authored_by: r.authored_by,
             version: r.version,
+            static_payload: r.static_payload,
         }
     }
 }
@@ -1173,6 +1183,7 @@ mod tests {
             authored_at: chrono::Utc.with_ymd_and_hms(2026, 4, 28, 10, 0, 0).unwrap(),
             authored_by: "xai".into(),
             version: 1,
+            static_payload: None,
         };
         let dto = RecipeDto::from_stored(stored.clone());
         assert_eq!(dto.id, stored.id.to_string());
@@ -1186,6 +1197,8 @@ mod tests {
         // produces parsed into a JSON array with one binding
         assert!(dto.produces.is_array());
         assert_eq!(dto.produces.as_array().unwrap().len(), 1);
+        // Default shape: no baked payload.
+        assert!(dto.static_payload.is_none());
     }
 
     #[test]
@@ -1209,6 +1222,7 @@ mod tests {
             authored_at: chrono::Utc.with_ymd_and_hms(2026, 4, 28, 10, 0, 0).unwrap(),
             authored_by: "xai".into(),
             version: 1,
+            static_payload: None,
         };
         let dto = RecipeDto::from_stored(stored);
         let err = dto
@@ -1219,5 +1233,58 @@ mod tests {
         assert!(!err.is_empty(), "_parse_error should carry the serde message");
         // produces was valid; it round-tripped cleanly.
         assert!(dto.produces.is_array());
+    }
+
+    // -----------------------------------------------------------------
+    // Session 18 — static_payload field on RecipeDto (ADR 0007 A3)
+    // -----------------------------------------------------------------
+
+    /// Default shape: a `StoredRecipe` with `None` payload threads
+    /// through `from_stored` as `None` on the DTO. The frontend's
+    /// BAKED-badge predicate is `static_payload != null`, so this
+    /// is the case where the badge is hidden.
+    #[test]
+    fn recipe_dto_static_payload_is_none_when_absent() {
+        use chrono::TimeZone;
+        let stored = situation_room_storage::StoredRecipe {
+            id: uuid::Uuid::now_v7(),
+            dedup_key: Some("plan-x:html".into()),
+            plan_id: uuid::Uuid::now_v7(),
+            source_id: "html_source".into(),
+            source_url: "https://example.com/data.html".into(),
+            extraction_json: r#"{"mode":"css_select","selector":"h1"}"#.into(),
+            produces_json: "[]".into(),
+            authored_at: chrono::Utc.with_ymd_and_hms(2026, 5, 1, 10, 0, 0).unwrap(),
+            authored_by: "xai".into(),
+            version: 1,
+            static_payload: None,
+        };
+        let dto = RecipeDto::from_stored(stored);
+        assert!(dto.static_payload.is_none());
+    }
+
+    /// Baked shape: a `StoredRecipe` with `Some(payload)` threads
+    /// through `from_stored` as `Some(payload)` on the DTO,
+    /// verbatim. The frontend renders this with a BAKED badge plus
+    /// a collapsible details block showing the raw payload.
+    #[test]
+    fn recipe_dto_static_payload_round_trips_from_stored() {
+        use chrono::TimeZone;
+        let payload = r#"{"date":"2026-03-26","rate":"6.50","direction":"hold"}"#;
+        let stored = situation_room_storage::StoredRecipe {
+            id: uuid::Uuid::now_v7(),
+            dedup_key: Some("plan-x:baked".into()),
+            plan_id: uuid::Uuid::now_v7(),
+            source_id: "mnb_press".into(),
+            source_url: "https://www.mnb.hu/press_release_2026Q1.pdf".into(),
+            extraction_json: r#"{"mode":"json_path","path":"$.rate"}"#.into(),
+            produces_json: "[]".into(),
+            authored_at: chrono::Utc.with_ymd_and_hms(2026, 5, 1, 10, 0, 0).unwrap(),
+            authored_by: "xai".into(),
+            version: 1,
+            static_payload: Some(payload.into()),
+        };
+        let dto = RecipeDto::from_stored(stored);
+        assert_eq!(dto.static_payload.as_deref(), Some(payload));
     }
 }

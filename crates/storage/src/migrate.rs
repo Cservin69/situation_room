@@ -61,6 +61,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "research_plans: rejection_reason and reclassified_from columns",
         sql: include_str!("../../../migrations/0007_research_plans_rejection_and_lineage.sql"),
     },
+    Migration {
+        version: 8,
+        description: "recipes.static_payload column",
+        sql: include_str!("../../../migrations/0008_recipes_static_payload.sql"),
+    },
 ];
 
 /// Apply every migration whose version is not yet in

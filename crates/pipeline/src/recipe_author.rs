@@ -218,6 +218,24 @@ pub struct RecipeAuthoringOutput {
 
     /// What records to produce. Must have length ≥ 1.
     pub produces: Vec<AuthoredProductionBinding>,
+
+    /// Bake-time-frozen payload — see ADR 0007 Amendment 3 and the
+    /// "Strategy for PDF sources" section of the recipe-author
+    /// prompt. Empty string means absent (the common case: HTML-
+    /// addressable source, runtime fetches `source_url` normally).
+    /// A non-empty value freezes the recipe's output until
+    /// re-authored; the runtime serves the bytes to extraction in
+    /// place of an HTTP fetch.
+    ///
+    /// **Wire shape: empty-string-as-absent.** The xAI structured-
+    /// output schema rejects top-level `Option<T>` for some shapes;
+    /// the same idiom used elsewhere in the authoring path
+    /// (`unit_hint`, `assertion_guidance`, `display`) is used here.
+    /// `build_validated_recipe` collapses empty / whitespace-only
+    /// strings to `None`, parses non-empty strings as JSON to
+    /// validate well-formedness, and rejects unparseable input.
+    #[serde(default)]
+    pub static_payload: String,
 }
 
 /// Mirror of [`ExtractionSpec`] with `JsonSchema` derived.
@@ -373,6 +391,37 @@ fn build_validated_recipe(
         }
     }
 
+    // 6. static_payload: collapse empty/whitespace to None;
+    // require non-empty values to parse as JSON. The wire form is
+    // empty-string-as-absent (xAI structured-output schema rejects
+    // top-level Option<T>); the typed FetchRecipe carries a true
+    // Option<String>. ADR 0007 Amendment 3 §"Validation discipline".
+    //
+    // Why JSON-parse: the prompt instructs the LLM to bake values
+    // into a JSON document the recipe's extraction mode can address
+    // (`json_path` against `{"date":"...","rate":"..."}` etc.).
+    // Catching unparseable JSON at authoring time is cheaper than
+    // discovering it at apply time on every fetch. CSV/HTML payloads
+    // technically don't need to be JSON, but the authoring prompt
+    // canonicalizes on JSON for the bake path; if a future session
+    // wants to relax this for non-JSON payloads, the validator
+    // softens then. For now, stricter is correct.
+    let static_payload = {
+        let trimmed = output.static_payload.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            // Parse-to-validate. We don't keep the parsed Value;
+            // storage carries the raw string verbatim.
+            serde_json::from_str::<Value>(trimmed).map_err(|e| {
+                AuthoringError::InvalidRecipe(format!(
+                    "static_payload must parse as JSON: {e}"
+                ))
+            })?;
+            Some(output.static_payload)
+        }
+    };
+
     Ok(FetchRecipe {
         id: Uuid::now_v7(),
         dedup_key: None, // caller sets this — convention is
@@ -385,6 +434,7 @@ fn build_validated_recipe(
         authored_at: Utc::now(),
         authored_by: authored_by.to_string(),
         version: 1,
+        static_payload,
     })
 }
 
@@ -678,6 +728,7 @@ mod tests {
                     },
                 ],
             }],
+            static_payload: String::new(),
         }
     }
 
@@ -950,6 +1001,73 @@ mod tests {
         let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("empty field path"), "got {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Session 18 — static_payload validation (ADR 0007 Amendment 3)
+    //
+    // Wire shape is empty-string-as-absent (xAI structured-output
+    // schema rejects top-level Option<T>). Validation discipline:
+    //   - empty / whitespace-only -> None on the typed FetchRecipe
+    //   - non-empty string -> must parse as JSON, kept verbatim
+    //   - unparseable JSON -> InvalidRecipe error
+    // -----------------------------------------------------------------------
+
+    /// Default shape: `static_payload: ""` collapses to None on the
+    /// typed FetchRecipe. This is the common path — every recipe
+    /// authored against an HTML-addressable source should land here.
+    #[test]
+    fn build_validated_recipe_collapses_empty_static_payload_to_none() {
+        let recipe = build_validated_recipe(good_output(), &sample_plan(), "xai")
+            .expect("good_output has empty static_payload — must validate");
+        assert!(
+            recipe.static_payload.is_none(),
+            "empty wire-form static_payload must collapse to None, got {:?}",
+            recipe.static_payload
+        );
+    }
+
+    /// Whitespace-only payloads (tabs, newlines, runs of spaces) are
+    /// also collapsed to None — same semantics as empty. The LLM may
+    /// emit `"\n  \n"` for "no payload" and that should round-trip
+    /// to absence, not to a "whitespace recipe."
+    #[test]
+    fn build_validated_recipe_collapses_whitespace_static_payload_to_none() {
+        let mut out = good_output();
+        out.static_payload = "  \n\t  \n".into();
+        let recipe = build_validated_recipe(out, &sample_plan(), "xai")
+            .expect("whitespace-only static_payload must collapse to None");
+        assert!(recipe.static_payload.is_none());
+    }
+
+    /// Happy path: a well-formed JSON payload validates and is
+    /// preserved verbatim. The runtime hands these bytes to apply()
+    /// in place of an HTTP fetch.
+    #[test]
+    fn build_validated_recipe_accepts_well_formed_static_payload() {
+        let mut out = good_output();
+        let payload = r#"{"date":"2026-03-26","rate":"6.50","direction":"hold"}"#;
+        out.static_payload = payload.into();
+        let recipe = build_validated_recipe(out, &sample_plan(), "xai")
+            .expect("well-formed JSON static_payload must validate");
+        assert_eq!(recipe.static_payload.as_deref(), Some(payload));
+    }
+
+    /// Non-empty but unparseable JSON is rejected at authoring time.
+    /// Catching this here is cheaper than discovering it at apply
+    /// time on every fetch (the recipe would fail-on-extract every
+    /// time, which is technically graceful but wastes the user's
+    /// LLM spend).
+    #[test]
+    fn build_validated_recipe_rejects_non_empty_static_payload_that_is_not_json() {
+        let mut out = good_output();
+        out.static_payload = "this is not JSON".into();
+        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("static_payload must parse as JSON"),
+            "expected JSON-parse error, got: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.4
+# Recipe Author Prompt — v1.7
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -123,6 +123,242 @@ provided, the correct response is to set `source_url` to the most
 plausible documented endpoint you know of for the named
 `source_id` — not to echo a placeholder.
 
+### Endpoint discipline — instance vs listing
+
+A real-host URL is necessary but not sufficient. The URL must
+also be at the right *tier of resource* for what the plan asks
+for.
+
+A source typically exposes two tiers:
+
+- **Listing endpoints** — pages that enumerate items: search
+  results, indexes, RSS feeds, API listing endpoints.
+  Example: `https://eur-lex.europa.eu/search.html?...`,
+  `https://api.gdeltproject.org/api/v2/doc/doc?query=...&mode=ArtList`.
+  Each fetch returns a fresh set of current items. A recipe
+  pointed at a listing produces records *of items as they appear
+  today*.
+
+- **Instance endpoints** — pages that describe one specific
+  item: a single regulation by CELEX number, a single press
+  release, a single SEC filing.
+  Example: `https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32024R1689`.
+  Each fetch returns the same single item. A recipe pointed at
+  an instance produces records *of one specific thing*, the
+  same thing every fetch.
+
+**The plan's bucket size tells you which tier the recipe needs.**
+When the matching expectation bucket holds two or more
+expectations of the same record type, the URL must be a listing
+endpoint. The plan says "I want N kinds of events from this
+source"; a single-item endpoint structurally cannot deliver N
+kinds of anything. If the source has a registered
+`endpoint_hint` (visible in the prefetch context), prefer it —
+it's the maintainer's considered choice for "where the source's
+listing lives." Deviate from the hint only with a clear,
+source-specific reason.
+
+**Anti-example** (real failure, Session 15 Phase D, see
+`failure_cases/recipe_author/2026-05-01-eur-lex-celex-instance-naive-selector.md`):
+
+> Plan: "EU AI Act high-risk system enforcement timeline".
+> Bucket: three event-type expectations
+> (`enforcement_milestone`, `guidance_published`,
+> `national_implementation`).
+> Source: `eur_lex` with endpoint_hint at the search page.
+> LLM authored: `source_url:
+> https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32024R1689`
+> with `extraction.selector: "title"`.
+>
+> Why wrong: The CELEX URL is the AI Act's instance page — one
+> regulation. It cannot structurally yield three event-type
+> records, no matter how the rest of the recipe is shaped. The
+> right URL was the EUR-Lex search listing the prefetch already
+> handed the LLM.
+
+### Hunt the URL end-to-end
+
+The pre-fetched URL the runtime handed you is a starting clue,
+not a constraint. Sometimes the excerpt below shows you exactly
+the structure your recipe needs — listing rows, JSON arrays of
+items, CSV with a clean header. Sometimes it doesn't. The
+common ways the prefetch falls short:
+
+- **Empty search form skeleton.** The hint points at a search
+  page but no query parameter is set, so the response is the
+  search form's HTML chrome with no result rows.
+  Example: `https://eur-lex.europa.eu/search.html?scope=EURLEX&type=quick&lang=en`
+  returns a search-form skeleton; you need a `text=...`
+  parameter to get listings.
+- **Language / locale picker.** The hint serves a chooser page
+  before the real listing. The real listing lives one click
+  deeper.
+- **Format chooser.** The hint is the human-readable HTML when
+  you need the JSON / CSV / Atom variant, or vice versa. The
+  format swap is usually a query parameter or a path suffix.
+- **Redirect notice.** The hint pages redirect through a
+  consent / cookie / region-selector intermediate. The
+  destination URL is what you want.
+
+**Refine the URL.** If the excerpt isn't yet the listing of
+items the plan needs, recognize what's missing and edit the
+URL to get there: add the query parameter that triggers
+results, swap the format suffix, descend into the sub-resource,
+follow the redirect destination. Stay on the same host. Keep
+the host's documented endpoint shape; you're not inventing
+endpoints, you're addressing the right resource within them.
+
+**Stop when the refined URL is the deterministic variant a
+human reader would land on if they were looking for the items
+the plan asks about.** That's the URL the runtime should fetch
+on every refresh.
+
+**The schema has no decline path.** You must produce a recipe.
+When in doubt about the right refinement, ship the best-guess
+refinement and trust the rejection loop — the user reviews the
+recipe in the UI before it runs. A recipe with a refined URL
+the user can inspect and reject is strictly better than a
+recipe that echoes back the empty search-form skeleton.
+
+**Anti-example** (real failure, Session 15 Phase D + Session 16
+P1 verification re-run):
+
+> Plan: "EU AI Act high-risk system enforcement timeline".
+> Source: `eur_lex` with `endpoint_hint`
+> `https://eur-lex.europa.eu/search.html?scope=EURLEX&type=quick&lang=en`.
+> Excerpt: HTML for the EUR-Lex search page with no result
+> rows (no `text=` parameter set in the hint URL).
+> LLM authored: substituted its training-data knowledge of the
+> AI Act's CELEX number and pointed `source_url` at
+> `https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32024R1689`.
+>
+> Why wrong: The hint URL was a clue (search lives here), not
+> a constraint (use this exact URL). The right move was to
+> *refine* the search URL by adding a query string targeting
+> the topic — e.g.
+> `?scope=EURLEX&type=quick&lang=en&text=high-risk+AI+system`
+> — staying on the search-listing endpoint family. Substituting
+> a known instance URL is a coverage failure (one event, not
+> N) and a freshness failure (the same regulation forever, no
+> matter what enforcement actions follow).
+
+## Strategy for PDF sources — HTML first, static payload fallback
+
+Some sources publish their content primarily as PDF — annual
+reports (USGS Mineral Commodity Summaries, SEC 10-K filings),
+regulatory texts (EUR-Lex regulation PDFs), statistical
+releases. The closed extraction vocabulary's `pdf_table` mode
+exists for this case but is not yet wired in the runtime. In
+the meantime — and often as a better choice even when it lands
+— PDF sources usually have an HTML equivalent that's structured
+enough for one of the four wired modes (`json_path`,
+`css_select`, `csv_cell`, `regex_capture`).
+
+### First move: hunt for the HTML equivalent
+
+Most authoritative sources publish the same data in multiple
+formats. Your job is to recognize which format the recipe should
+target. Common patterns:
+
+- **USGS MCS.** Each commodity chapter ships as both
+  `mcsYYYY-<commodity>.pdf` and `mcsYYYY-<commodity>.html`. The
+  HTML is the right target — it carries the same tables in
+  semantic markup that `css_select` can address.
+- **SEC EDGAR.** 10-K and 10-Q filings ship as PDFs and as
+  structured filing documents on EDGAR's filing-detail pages.
+  The HTML / XBRL paths are addressable; the PDF is not.
+- **EUR-Lex regulations.** Each CELEX has both an `EN/PDF` and
+  `EN/TXT` rendering. The HTML rendering is addressable.
+
+When the HTML equivalent exists and carries the same data,
+**author against the HTML.** Use the regular extraction
+vocabulary. Leave `static_payload` as the empty string `""`.
+
+### Fallback: bake the values into the recipe (`static_payload`)
+
+When the HTML equivalent genuinely doesn't exist, *and* you've
+read the PDF in the prefetch and can transcribe the values the
+plan needs, you may bake the transcribed values into the recipe
+itself via the recipe-level `static_payload` field. The runtime
+serves these baked bytes to extraction in place of an HTTP
+fetch. The recipe's `extraction` mode still applies — the bytes
+just come from the recipe rather than the network.
+
+This is the bake-time-frozen path. The values are frozen at
+authoring time. There is no live freshness — the recipe will
+emit the same records on every fetch until re-authored. **That
+is the cost.** The benefit is that PDF-only sources become
+addressable without a `pdf_table` runtime, and the user sees a
+visible BAKED badge in the UI making the freshness model
+explicit.
+
+The transcribed payload should be a small JSON document the
+recipe's chosen extraction mode can address. Most baked recipes
+use `json_path` because JSON is the easiest shape to author
+deterministically. The runtime stores the payload string
+verbatim and feeds it to extraction byte-for-byte.
+
+### Worked example — HTML found, author against HTML
+
+> **Plan**: "global lithium production trends".
+> **Source**: `usgs_mcs`. **Prefetch URL**:
+> `https://pubs.usgs.gov/periodicals/mcs2024/mcs2024-lithium.pdf`.
+>
+> The recipe author looks at the URL, recognizes the
+> `mcsYYYY-<commodity>.html` pattern, and authors against the
+> HTML companion:
+>
+> ```
+> source_url: https://pubs.usgs.gov/periodicals/mcs2024/mcs2024-lithium.html
+> extraction:
+>   mode: css_select
+>   selector: "table.production tr:nth-child(2) td:nth-child(2)"
+> static_payload: ""
+> ```
+
+### Worked example — HTML absent, bake the values
+
+> **Plan**: "Hungarian central bank rate decisions Q1 2026".
+> **Source**: a press-release source whose website only
+> publishes PDFs. **Prefetch URL**:
+> `https://www.example-cb.hu/.../press_release_2026Q1.pdf`. No
+> HTML equivalent exists. The PDF excerpt the prefetch returned
+> shows the rate decision text.
+>
+> The recipe author transcribes the relevant fields into a
+> small JSON document and bakes it:
+>
+> ```
+> source_url: https://www.example-cb.hu/.../press_release_2026Q1.pdf
+> extraction:
+>   mode: json_path
+>   path: "$.rate"
+> static_payload: "{\"date\":\"2026-03-26\",\"rate\":\"6.50\",\"direction\":\"hold\"}"
+> ```
+>
+> The recipe will produce one observation per fetch, frozen at
+> the transcribed values, until re-authored. The user sees the
+> BAKED badge in the UI and knows the freshness contract.
+
+### Anti-example — bake when HTML exists
+
+> **Plan**: "global gold production".
+> **Source**: `usgs_mcs`. **Prefetch URL**:
+> `https://pubs.usgs.gov/periodicals/mcs2024/mcs2024-gold.pdf`.
+> An HTML equivalent at
+> `https://pubs.usgs.gov/periodicals/mcs2024/mcs2024-gold.html`
+> exists and carries the same production tables.
+>
+> The author bakes the values into `static_payload` anyway,
+> reasoning "the PDF is what was prefetched."
+>
+> Why wrong: The HTML is fetchable and structured. Baking
+> freezes a real-time data source into bake-time-frozen
+> values. The recipe will report the 2023 production figures
+> forever — even after MCS 2025 ships with 2024 figures. The
+> HTML route is the live recipe. **Bake only when there is no
+> live route.**
+
 ## Document excerpt
 
 The following is **a real excerpt of the source's current content**,
@@ -178,6 +414,18 @@ The top-level shape is:
     - `{"kind": "from_plan", "pointer": "<pointer>"}` — take the
       value from the research plan itself at the given pointer (e.g.
       `"expectations.observation_metrics.0.name"`).
+- `static_payload`: string. **Default to the empty string `""`.** A
+  bake-time-frozen JSON / CSV / HTML / text body the runtime will
+  serve to extraction in place of an HTTP fetch — see "Strategy for
+  PDF sources" above. The empty string means "no baked payload, fetch
+  `source_url` normally" (the common case for HTML-addressable
+  sources). A non-empty value freezes the recipe's output at the
+  transcribed values until re-authored, and the user sees a visible
+  BAKED badge in the UI. When non-empty, the value must be valid
+  JSON — the validator parses it at authoring time and rejects
+  unparseable input. Only bake when the source has no addressable
+  HTML equivalent and the values can be transcribed from the
+  prefetched content.
 
 ## Content type reference
 
@@ -291,6 +539,53 @@ from the fetch context and attaches the plan's `topic_tags` as
 subjects. If you try to map onto these paths, the recipe will be
 rejected.
 
+## Coverage discipline — bindings vs expectations
+
+The plan you are authoring for has buckets of expectations. The
+recipe you produce has a `produces` array of bindings. The
+relationship between bucket size and `produces.len()` matters
+for honest coverage.
+
+**The runtime extracts one scalar per fetch.** A recipe's
+`extraction` step pulls one value out of the fetched bytes (one
+JSONPath result, one CSV cell, one CSS selector match, one
+regex capture group). The `produces` array then describes how
+that single scalar — together with `literal` and `from_plan`
+sources — populates one or more record bindings.
+
+This means:
+
+- **One binding per scalar is honest.** If the recipe extracts
+  one production number and emits one observation record,
+  that's honest narrow coverage. The recipe says what it does;
+  the user reads the record count and knows the recipe under-
+  covers a multi-expectation bucket. They can author additional
+  recipes if they want, or refine the plan.
+
+- **N bindings off one scalar is honest only when each binding
+  *differs* on the dimension the scalar populates.** A CSV cell
+  that yields `"49000"` can populate one observation's `value`
+  honestly; populating *three* observation bindings whose
+  `field_mappings` all set `value` from the same `extracted` is
+  not three observations — it's one observation with redundant
+  framing. Padding the array doesn't increase coverage.
+
+- **Padded `produces` arrays are silently wrong.** When the
+  bucket has three expectations and the source structurally
+  delivers one scalar per fetch, producing three bindings whose
+  only difference is the `expectation` index pointing emits
+  three records that *look* like coverage of three expectations
+  and *are* the same value reported under three names. The
+  runtime cannot tell, the storage layer cannot tell, the
+  satisfaction panel cannot tell.
+
+**Prefer honest narrow coverage over padded bindings.** When
+the single extraction can't honestly populate the bucket's full
+expectation count, produce one binding for the most load-
+bearing expectation and let the user see the real coverage. The
+plan can be refined; additional recipes can be authored. Silent
+partial coverage is worse than visible narrow coverage.
+
 ## What NOT to produce
 
 - Do not invent new extraction modes or new `kind` values.
@@ -321,6 +616,27 @@ rejected.
   that hardcodes a sentence from the interpretation into
   `headline` produces identical records on every fetch and stops
   being an extraction.
+- Do not author against an instance URL when the plan's matching
+  bucket has two or more expectations of the same record type.
+  Instance endpoints describe one item; multi-expectation buckets
+  need a listing. See "Endpoint discipline — instance vs
+  listing" above.
+- Do not pad the `produces` array with bindings whose only
+  difference is the `expectation` index pointing. A single
+  extracted scalar populating three bindings under three
+  expectation indices produces three records that all carry the
+  same value with different framing — silent partial coverage
+  that looks like full coverage. See "Coverage discipline" above.
+- Do not author against an interstitial / chooser excerpt
+  (language picker, empty search form, format chooser, redirect
+  notice). When the prefetch hands you a chooser, refine the URL
+  to get past it. See "Hunt the URL end-to-end" above.
+- Do not substitute a training-data-known instance URL when the
+  hint's listing path appears to underdeliver. Refine the
+  listing URL with a query parameter; stay on the listing
+  endpoint family. Substituting an instance URL is a coverage
+  failure (one item, not many) and a freshness failure (same
+  item every fetch).
 
 ## One-shot, no follow-up
 
@@ -333,6 +649,62 @@ you pick.
 
 ### Changelog
 
+- **v1.7** (2026-05-01) — Added "Strategy for PDF sources — HTML
+  first, static payload fallback" section between URL discipline
+  and Document excerpt. Top-level `static_payload` field added to
+  "What to produce" with explicit empty-string default. Three
+  worked examples (HTML-found, HTML-absent-bake, anti-example
+  bake-when-HTML-exists). Motivated by ADR 0007 Amendment 3
+  (recipe-level `static_payload` field): the prompt teaches the
+  bake-when-HTML-doesn't-exist discipline so the LLM doesn't
+  reach for the BAKED path when a regular fetch would work.
+  Output contract changes: `static_payload` is now an expected
+  field on the LLM's output. Wire form is empty-string-as-absent
+  (xAI structured-output schema rejects top-level `Option<T>`);
+  the validator at `build_validated_recipe` collapses empty /
+  whitespace-only strings to `None` and JSON-parses non-empty
+  values. Existing recipes lacking `static_payload` deserialize
+  cleanly via serde defaults
+  (`#[serde(default, skip_serializing_if = "Option::is_none")]`
+  on `FetchRecipe.static_payload`); no re-authoring required.
+- **v1.6** (2026-05-01) — Added "Hunt the URL end-to-end"
+  subsection inside URL discipline (after "Endpoint discipline —
+  instance vs listing"), addressing the v1.5 verification re-run
+  failure: faced with the v1.5 "use the listing endpoint" rule
+  but a search-form skeleton excerpt (the registered
+  `endpoint_hint` for `eur_lex` had no `text=` parameter so the
+  prefetch returned a form, not result rows), the LLM
+  substituted its training-data knowledge of the AI Act's CELEX
+  number and authored against the instance URL. v1.5 named the
+  wrong-URL pattern in an anti-example; v1.6 names the third
+  option v1.5 missed — *refine* the URL by adding the missing
+  query parameter, staying on the listing endpoint family. Two
+  new "What NOT to produce" bullets (against authoring against
+  interstitial excerpts; against substituting a
+  training-data-known instance URL when the listing
+  underdelivers). Architectural reasoning: the schema has no
+  decline path, so the LLM must produce a recipe; v1.6 makes
+  "ship the best-guess refinement and trust the rejection loop"
+  the explicit stop condition. Output contract is unchanged.
+- **v1.5** (2026-05-01) — Added "Endpoint discipline — instance
+  vs listing" subsection inside URL discipline, addressing the
+  Session 15 Phase D failure
+  (`failure_cases/recipe_author/2026-05-01-eur-lex-celex-instance-naive-selector.md`):
+  on a multi-expectation event-type bucket, the LLM authored
+  against an EUR-Lex CELEX instance URL (one regulation page),
+  which structurally cannot yield N event-type records. v1.5 now
+  instructs: when the matching bucket holds two or more
+  expectations of the same record type, the URL must be a
+  listing endpoint; prefer the source's registered
+  `endpoint_hint`. Also added top-level "Coverage discipline —
+  bindings vs expectations" section naming the runtime
+  constraint (one scalar per fetch) and the difference between
+  honest narrow coverage and padded bindings. Two new "What NOT
+  to produce" bullets (against instance URLs for
+  multi-expectation buckets; against padded `produces` arrays).
+  Output contract is unchanged — same JSON Schema, same
+  field-source kinds, same binding rules. Recipes already
+  authored remain valid.
 - **v1.4** (2026-05-01) — Strengthened the `headline` field's
   source-kind preference: `extracted` is now the explicit default
   with a strict three-condition predicate for when `literal` is

@@ -760,23 +760,33 @@ async fn run_csv_recipe(
     plan: &ResearchPlan,
     recipe: &FetchRecipe,
 ) -> RecipeOutcome {
-    // Fetch.
-    let bytes = match ctx.http.fetch_bytes(recipe.source_url.as_str()).await {
-        Ok(b) => b,
-        Err(HttpFetchError::Http(msg)) => {
-            return RecipeOutcome::Failed {
-                recipe_id: recipe.id,
-                source_id: recipe.source_id.clone(),
-                stage: FailureStage::Fetch,
-                message: msg,
+    // Fetch — or, if the recipe carries a baked `static_payload`,
+    // skip the HTTP fetch and feed the baked bytes to apply().
+    // ADR 0007 Amendment 3: the bytes' provenance is orthogonal to
+    // the extraction mode. This short-circuit is duplicated at all
+    // four run_X_recipe sites rather than extracted, preserving the
+    // dispatch-contract readability per Session 9's
+    // "duplication-with-comments over premature unification" rule.
+    let bytes = if let Some(payload) = recipe.static_payload.as_ref() {
+        payload.as_bytes().to_vec()
+    } else {
+        match ctx.http.fetch_bytes(recipe.source_url.as_str()).await {
+            Ok(b) => b,
+            Err(HttpFetchError::Http(msg)) => {
+                return RecipeOutcome::Failed {
+                    recipe_id: recipe.id,
+                    source_id: recipe.source_id.clone(),
+                    stage: FailureStage::Fetch,
+                    message: msg,
+                }
             }
-        }
-        Err(HttpFetchError::NoFixture(url)) => {
-            return RecipeOutcome::Failed {
-                recipe_id: recipe.id,
-                source_id: recipe.source_id.clone(),
-                stage: FailureStage::Fetch,
-                message: format!("no fixture configured for url: {url}"),
+            Err(HttpFetchError::NoFixture(url)) => {
+                return RecipeOutcome::Failed {
+                    recipe_id: recipe.id,
+                    source_id: recipe.source_id.clone(),
+                    stage: FailureStage::Fetch,
+                    message: format!("no fixture configured for url: {url}"),
+                }
             }
         }
     };
@@ -845,23 +855,30 @@ async fn run_json_recipe(
     plan: &ResearchPlan,
     recipe: &FetchRecipe,
 ) -> RecipeOutcome {
-    // Fetch.
-    let bytes = match ctx.http.fetch_bytes(recipe.source_url.as_str()).await {
-        Ok(b) => b,
-        Err(HttpFetchError::Http(msg)) => {
-            return RecipeOutcome::Failed {
-                recipe_id: recipe.id,
-                source_id: recipe.source_id.clone(),
-                stage: FailureStage::Fetch,
-                message: msg,
+    // Fetch — or short-circuit on baked `static_payload`. See the
+    // comment in `run_csv_recipe` for the full ADR 0007 Amendment 3
+    // reasoning. Inlined here rather than extracted per Session 9's
+    // duplication-with-comments rule.
+    let bytes = if let Some(payload) = recipe.static_payload.as_ref() {
+        payload.as_bytes().to_vec()
+    } else {
+        match ctx.http.fetch_bytes(recipe.source_url.as_str()).await {
+            Ok(b) => b,
+            Err(HttpFetchError::Http(msg)) => {
+                return RecipeOutcome::Failed {
+                    recipe_id: recipe.id,
+                    source_id: recipe.source_id.clone(),
+                    stage: FailureStage::Fetch,
+                    message: msg,
+                }
             }
-        }
-        Err(HttpFetchError::NoFixture(url)) => {
-            return RecipeOutcome::Failed {
-                recipe_id: recipe.id,
-                source_id: recipe.source_id.clone(),
-                stage: FailureStage::Fetch,
-                message: format!("no fixture configured for url: {url}"),
+            Err(HttpFetchError::NoFixture(url)) => {
+                return RecipeOutcome::Failed {
+                    recipe_id: recipe.id,
+                    source_id: recipe.source_id.clone(),
+                    stage: FailureStage::Fetch,
+                    message: format!("no fixture configured for url: {url}"),
+                }
             }
         }
     };
@@ -924,23 +941,30 @@ async fn run_css_recipe(
     plan: &ResearchPlan,
     recipe: &FetchRecipe,
 ) -> RecipeOutcome {
-    // Fetch.
-    let bytes = match ctx.http.fetch_bytes(recipe.source_url.as_str()).await {
-        Ok(b) => b,
-        Err(HttpFetchError::Http(msg)) => {
-            return RecipeOutcome::Failed {
-                recipe_id: recipe.id,
-                source_id: recipe.source_id.clone(),
-                stage: FailureStage::Fetch,
-                message: msg,
+    // Fetch — or short-circuit on baked `static_payload`. See the
+    // comment in `run_csv_recipe` for the full ADR 0007 Amendment 3
+    // reasoning. Inlined here rather than extracted per Session 9's
+    // duplication-with-comments rule.
+    let bytes = if let Some(payload) = recipe.static_payload.as_ref() {
+        payload.as_bytes().to_vec()
+    } else {
+        match ctx.http.fetch_bytes(recipe.source_url.as_str()).await {
+            Ok(b) => b,
+            Err(HttpFetchError::Http(msg)) => {
+                return RecipeOutcome::Failed {
+                    recipe_id: recipe.id,
+                    source_id: recipe.source_id.clone(),
+                    stage: FailureStage::Fetch,
+                    message: msg,
+                }
             }
-        }
-        Err(HttpFetchError::NoFixture(url)) => {
-            return RecipeOutcome::Failed {
-                recipe_id: recipe.id,
-                source_id: recipe.source_id.clone(),
-                stage: FailureStage::Fetch,
-                message: format!("no fixture configured for url: {url}"),
+            Err(HttpFetchError::NoFixture(url)) => {
+                return RecipeOutcome::Failed {
+                    recipe_id: recipe.id,
+                    source_id: recipe.source_id.clone(),
+                    stage: FailureStage::Fetch,
+                    message: format!("no fixture configured for url: {url}"),
+                }
             }
         }
     };
@@ -1009,23 +1033,30 @@ async fn run_regex_recipe(
     plan: &ResearchPlan,
     recipe: &FetchRecipe,
 ) -> RecipeOutcome {
-    // Fetch.
-    let bytes = match ctx.http.fetch_bytes(recipe.source_url.as_str()).await {
-        Ok(b) => b,
-        Err(HttpFetchError::Http(msg)) => {
-            return RecipeOutcome::Failed {
-                recipe_id: recipe.id,
-                source_id: recipe.source_id.clone(),
-                stage: FailureStage::Fetch,
-                message: msg,
+    // Fetch — or short-circuit on baked `static_payload`. See the
+    // comment in `run_csv_recipe` for the full ADR 0007 Amendment 3
+    // reasoning. Inlined here rather than extracted per Session 9's
+    // duplication-with-comments rule.
+    let bytes = if let Some(payload) = recipe.static_payload.as_ref() {
+        payload.as_bytes().to_vec()
+    } else {
+        match ctx.http.fetch_bytes(recipe.source_url.as_str()).await {
+            Ok(b) => b,
+            Err(HttpFetchError::Http(msg)) => {
+                return RecipeOutcome::Failed {
+                    recipe_id: recipe.id,
+                    source_id: recipe.source_id.clone(),
+                    stage: FailureStage::Fetch,
+                    message: msg,
+                }
             }
-        }
-        Err(HttpFetchError::NoFixture(url)) => {
-            return RecipeOutcome::Failed {
-                recipe_id: recipe.id,
-                source_id: recipe.source_id.clone(),
-                stage: FailureStage::Fetch,
-                message: format!("no fixture configured for url: {url}"),
+            Err(HttpFetchError::NoFixture(url)) => {
+                return RecipeOutcome::Failed {
+                    recipe_id: recipe.id,
+                    source_id: recipe.source_id.clone(),
+                    stage: FailureStage::Fetch,
+                    message: format!("no fixture configured for url: {url}"),
+                }
             }
         }
     };
@@ -1192,6 +1223,7 @@ mod tests {
             authored_at: Utc.with_ymd_and_hms(2026, 4, 28, 0, 0, 0).unwrap(),
             authored_by: "test".into(),
             version: 1,
+            static_payload: None,
         }
     }
 
@@ -1240,6 +1272,7 @@ mod tests {
             authored_at: Utc.with_ymd_and_hms(2026, 4, 28, 0, 0, 0).unwrap(),
             authored_by: "test".into(),
             version: 1,
+            static_payload: None,
         }
     }
 
@@ -1290,6 +1323,7 @@ mod tests {
             authored_at: Utc.with_ymd_and_hms(2026, 4, 28, 0, 0, 0).unwrap(),
             authored_by: "test".into(),
             version: 1,
+            static_payload: None,
         }
     }
 
@@ -1342,6 +1376,7 @@ mod tests {
             authored_at: Utc.with_ymd_and_hms(2026, 4, 28, 0, 0, 0).unwrap(),
             authored_by: "test".into(),
             version: 1,
+            static_payload: None,
         }
     }
 
@@ -1422,6 +1457,67 @@ mod tests {
         assert_eq!(runs[0].records_produced, 1);
         assert!(runs[0].finished_at.is_some());
         assert!(runs[0].error_summary.is_none());
+    }
+
+    /// ADR 0007 Amendment 3 (Session 18): when a recipe carries
+    /// `static_payload`, the runtime serves the baked bytes to
+    /// extraction in place of an HTTP fetch.
+    ///
+    /// This test configures a `StaticFetcher` with **zero** fixtures.
+    /// If the executor were to call `fetch_bytes()` for any URL, the
+    /// fetcher would return `NoFixture` and the recipe would land as
+    /// `Failed { stage: Fetch }`. The fact that this test asserts a
+    /// `Succeeded` outcome with a record produced means the
+    /// short-circuit at the byte-acquisition site engaged correctly
+    /// — the HTTP fetcher was never asked for the URL.
+    ///
+    /// The recipe's `extraction` is `csv_cell` so `apply()` runs
+    /// against the baked CSV bytes exactly as it would against
+    /// network-fetched bytes. ADR 0007 A3 §"bytes' provenance is
+    /// orthogonal to extraction mode" — proven here.
+    #[tokio::test]
+    async fn run_fetch_for_plan_uses_static_payload_without_calling_http() {
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        // Recipe shape mirrors `working_csv_recipe` but the URL is a
+        // sentinel that *no fixture answers* — and the recipe carries
+        // baked CSV bytes that apply() can extract from.
+        let url = "https://example.test/baked-only.csv";
+        let mut recipe = working_csv_recipe(&plan, url);
+        recipe.static_payload = Some(
+            "country,production\nAustralia,88000\nChile,49000\n".into(),
+        );
+        save_recipe(&store, &recipe).unwrap();
+
+        // Zero fixtures: any HTTP fetch attempt surfaces as Failed.
+        let fetcher = StaticFetcher::new();
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: "unused — recipe already authored",
+            sources: &[],
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        assert_eq!(report.recipes_attempted, 1);
+        assert_eq!(report.recipes_succeeded, 1,
+            "static_payload short-circuit must engage; if recipes_succeeded is 0 \
+             the executor likely called fetch_bytes() and got NoFixture: {:?}",
+             report.outcomes);
+        assert_eq!(report.records_produced, 1);
+        match &report.outcomes[0] {
+            RecipeOutcome::Succeeded { records_produced, .. } => {
+                assert_eq!(*records_produced, 1);
+            }
+            other => panic!(
+                "expected Succeeded (short-circuit engaged), got: {other:?}"
+            ),
+        }
     }
 
     #[tokio::test]
@@ -2414,6 +2510,7 @@ mod tests {
             authored_at: Utc::now(),
             authored_by: "live_test".into(),
             version: 1,
+            static_payload: None,
         };
         save_recipe(&store, &recipe).unwrap();
 
@@ -2526,6 +2623,7 @@ mod tests {
             authored_at: Utc::now(),
             authored_by: "live_test".into(),
             version: 1,
+            static_payload: None,
         };
         save_recipe(&store, &recipe).unwrap();
 

@@ -52,6 +52,29 @@
   FetchReport covers that). When the user clicks "Run fetch" again,
   the badge updates with the new run's outcome for this recipe.
 
+  BAKED badge (Session 18, ADR 0007 Amendment 3)
+  -----------------------------------------------
+
+  When a recipe carries a `static_payload`, the runtime serves the
+  baked bytes to extraction in place of an HTTP fetch. The recipe
+  produces the same records on every fetch until re-authored — there
+  is no live freshness path. The freshness model is materially
+  different from the common HTML-addressable case, so the UI shows
+  it explicitly:
+
+    - **BAKED chip** in the recipe head, next to the source_id.
+      Tooltip explains the bake-time-frozen freshness contract.
+    - **Collapsible payload preview** below the produces block,
+      showing the raw baked bytes the runtime feeds to extraction.
+      Defaults closed (the payload can be large; users open it when
+      diagnosing).
+
+  The badge is shown iff `recipe.static_payload != null`. Empty-
+  string would not occur on the wire — the validator at
+  `build_validated_recipe` collapses empty / whitespace-only strings
+  to None before storage, and the executor's short-circuit treats
+  None as "fetch normally."
+
   Empty state
   -----------
 
@@ -132,6 +155,22 @@
   <article class="recipe">
     <header class="recipe-head">
       <span class="source-id">{recipe.source_id}</span>
+      {#if recipe.static_payload !== null}
+        <!--
+          BAKED badge — visible when the recipe carries a
+          static_payload. The tooltip explains the bake-time-frozen
+          freshness contract so users understand why the recipe
+          will produce identical records every fetch.
+
+          ADR 0007 Amendment 3 §"freshness model is explicit in
+          the UI" — same data shape, different freshness, made
+          visible.
+        -->
+        <span
+          class="baked-badge"
+          title="Bake-time-frozen: the runtime serves baked bytes to extraction in place of an HTTP fetch. This recipe will produce the same records on every fetch until re-authored. ADR 0007 Amendment 3."
+        >BAKED</span>
+      {/if}
       <span class="recipe-id">{shortId(recipe.id)}</span>
     </header>
 
@@ -166,6 +205,24 @@
       <summary>produces</summary>
       <pre>{prettyJson(recipe.produces)}</pre>
     </details>
+
+    {#if recipe.static_payload !== null}
+      <!--
+        Baked-payload preview — the raw bytes the runtime serves to
+        extraction in place of an HTTP fetch. Closed by default
+        (payloads may be large); users open it when diagnosing why
+        a baked recipe produced unexpected records.
+
+        Rendered as a plain <pre> rather than parsed-and-pretty —
+        the runtime hands these bytes to apply() exactly as written,
+        and any reformatting here would mislead the user about what
+        the runtime actually saw.
+      -->
+      <details class="block baked-block">
+        <summary>baked payload</summary>
+        <pre>{recipe.static_payload}</pre>
+      </details>
+    {/if}
 
     <footer class="recipe-foot">
       <span>authored {formatAuthoredAt(recipe.authored_at)}</span>
@@ -241,6 +298,40 @@
     font-size: 10px;
     color: var(--fg-quaternary);
     font-variant-numeric: tabular-nums;
+  }
+
+  /*
+   * BAKED badge — Session 18, ADR 0007 Amendment 3.
+   *
+   * A visible chip in the recipe head announcing the bake-time-frozen
+   * freshness model. Sized to sit between source_id (left) and
+   * recipe-id (right) without disrupting the existing baseline
+   * alignment. The hover tooltip carries the freshness explanation.
+   *
+   * Color discipline (ADR 0006 §"color is meaning, not decoration"):
+   * `--signal-warning` is the right semantic — baked recipes
+   * deserve the user's attention because their freshness contract
+   * differs from the default. Not negative (the recipe isn't broken)
+   * and not positive (the recipe isn't healthier than a live one) —
+   * warning, because it's information the user must hold in mind.
+   *
+   * If global.css doesn't expose `--signal-warning` yet, the
+   * fallback chain via var() is `--signal-warning, --fg-secondary` —
+   * the badge degrades to a neutral chip rather than vanishing.
+   */
+  .baked-badge {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    padding: 2px 6px;
+    border-radius: 2px;
+    color: var(--signal-warning, var(--fg-secondary));
+    border: 1px solid var(--signal-warning, var(--border-subtle));
+    background: var(--bg-canvas);
+    cursor: help;
+    /* sit on the same baseline as source-id and recipe-id */
+    align-self: center;
   }
 
   /*
@@ -393,6 +484,22 @@
        review pane; the user can scroll within the block. */
     max-height: 320px;
     overflow-y: auto;
+  }
+
+  /*
+   * Baked-payload block — same shape as the extraction/produces
+   * blocks but with a left-edge accent in the warning tone, so the
+   * user's eye picks up the bake-time-frozen distinction even when
+   * the BAKED badge in the head has scrolled out of view.
+   */
+  .baked-block {
+    border-left: 2px solid var(--signal-warning, var(--border-subtle));
+  }
+  .baked-block summary {
+    color: var(--signal-warning, var(--fg-secondary));
+  }
+  .baked-block summary:hover {
+    color: var(--fg-primary);
   }
 
   .recipe-foot {

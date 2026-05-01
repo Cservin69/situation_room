@@ -34,6 +34,11 @@ pub struct RecipeRow {
     pub authored_at: DateTime<Utc>,
     pub authored_by: String,
     pub version: u32,
+    /// Bake-time-frozen payload served to extraction in place of an
+    /// HTTP fetch. `None` means the runtime fetches `source_url`
+    /// normally; `Some(bytes)` short-circuits the fetch and feeds
+    /// these bytes to the apply stage. See ADR 0007 Amendment 3.
+    pub static_payload: Option<String>,
 }
 
 /// A recipe row as it comes back out of storage. Same shape as
@@ -50,6 +55,10 @@ pub struct StoredRecipe {
     pub authored_at: DateTime<Utc>,
     pub authored_by: String,
     pub version: u32,
+    /// Bake-time-frozen payload — see [`RecipeRow::static_payload`].
+    /// `None` for recipes authored before Session 18 (migration 0008
+    /// adds the column nullable; existing rows read NULL).
+    pub static_payload: Option<String>,
 }
 
 impl Store {
@@ -66,8 +75,9 @@ impl Store {
         conn.execute(
             "INSERT INTO recipes (
                 id, dedup_key, plan_id, source_id, source_url,
-                extraction, produces, authored_at, authored_by, version
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                extraction, produces, authored_at, authored_by, version,
+                static_payload
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 r.id,
                 r.dedup_key,
@@ -79,6 +89,7 @@ impl Store {
                 r.authored_at,
                 r.authored_by,
                 r.version as i64,
+                r.static_payload,
             ],
         )
         .map_err(StorageError::DuckDb)?;
@@ -96,7 +107,8 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id, dedup_key, plan_id, source_id, source_url,
-                        extraction, produces, authored_at, authored_by, version
+                        extraction, produces, authored_at, authored_by, version,
+                        static_payload
                  FROM recipes WHERE id = ?",
             )
             .map_err(StorageError::DuckDb)?;
@@ -121,7 +133,8 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id, dedup_key, plan_id, source_id, source_url,
-                        extraction, produces, authored_at, authored_by, version
+                        extraction, produces, authored_at, authored_by, version,
+                        static_payload
                  FROM recipes
                  WHERE dedup_key = ?
                  ORDER BY version DESC
@@ -175,7 +188,8 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id, dedup_key, plan_id, source_id, source_url,
-                        extraction, produces, authored_at, authored_by, version
+                        extraction, produces, authored_at, authored_by, version,
+                        static_payload
                  FROM recipes
                  WHERE plan_id = ?
                  ORDER BY authored_at DESC, version DESC",
@@ -206,6 +220,7 @@ fn row_to_stored(row: &duckdb::Row<'_>) -> Result<StoredRecipe> {
             let v: i64 = row.get(9).map_err(StorageError::DuckDb)?;
             v as u32
         },
+        static_payload: row.get(10).map_err(StorageError::DuckDb)?,
     })
 }
 
@@ -226,6 +241,7 @@ mod tests {
             authored_at: Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap(),
             authored_by: "xai".into(),
             version: 1,
+            static_payload: None,
         }
     }
 
@@ -336,5 +352,82 @@ mod tests {
         store.migrate().unwrap();
         let recipes = store.recipes_for_plan(Uuid::now_v7()).unwrap();
         assert!(recipes.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Session 18 — static_payload field (ADR 0007 Amendment 3)
+    // -----------------------------------------------------------------
+
+    /// Default shape: a recipe authored without baked bytes round-trips
+    /// with `static_payload: None`. Migration 0008 made the column
+    /// nullable so this is the on-disk shape for HTML-addressable
+    /// recipes (the common case).
+    #[test]
+    fn recipe_round_trips_with_no_static_payload() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let id = Uuid::now_v7();
+        let row = sample_row(id); // sample_row sets static_payload: None
+        store.insert_recipe(&row).unwrap();
+
+        let got = store.get_recipe(id).unwrap().expect("row should exist");
+        assert!(got.static_payload.is_none(),
+            "expected None for unbaked recipe, got {:?}", got.static_payload);
+    }
+
+    /// Bake-time-frozen shape: a recipe with a JSON payload round-trips
+    /// the bytes verbatim. The runtime serves these to extraction in
+    /// place of an HTTP fetch (`fetch_executor` short-circuit; ADR
+    /// 0007 Amendment 3 §"Runtime path").
+    #[test]
+    fn recipe_round_trips_with_static_payload() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let id = Uuid::now_v7();
+        let mut row = sample_row(id);
+        let payload = r#"{"date":"2026-03-26","rate":"6.50","direction":"hold"}"#;
+        row.static_payload = Some(payload.into());
+        store.insert_recipe(&row).unwrap();
+
+        let got = store.get_recipe(id).unwrap().expect("row should exist");
+        assert_eq!(got.static_payload.as_deref(), Some(payload));
+    }
+
+    /// `recipes_for_plan` (the executor's primary read path) carries
+    /// the field through. Without this guarantee the executor would
+    /// read NULL for every payload-bearing recipe and skip the
+    /// short-circuit.
+    #[test]
+    fn recipes_for_plan_carries_static_payload_through() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_id = Uuid::now_v7();
+
+        let mut unbaked = sample_row(Uuid::now_v7());
+        unbaked.plan_id = plan_id;
+        unbaked.dedup_key = Some("unbaked".into());
+        store.insert_recipe(&unbaked).unwrap();
+
+        let mut baked = sample_row(Uuid::now_v7());
+        baked.plan_id = plan_id;
+        baked.dedup_key = Some("baked".into());
+        baked.static_payload = Some(r#"{"x":1}"#.into());
+        store.insert_recipe(&baked).unwrap();
+
+        let recipes = store.recipes_for_plan(plan_id).unwrap();
+        assert_eq!(recipes.len(), 2);
+        // Order is `authored_at DESC, version DESC`; both rows share
+        // both. Match by dedup_key rather than position.
+        let unbaked_back = recipes.iter()
+            .find(|r| r.dedup_key.as_deref() == Some("unbaked"))
+            .expect("unbaked recipe present");
+        let baked_back = recipes.iter()
+            .find(|r| r.dedup_key.as_deref() == Some("baked"))
+            .expect("baked recipe present");
+        assert!(unbaked_back.static_payload.is_none());
+        assert_eq!(baked_back.static_payload.as_deref(), Some(r#"{"x":1}"#));
     }
 }

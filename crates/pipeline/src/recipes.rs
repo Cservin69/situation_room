@@ -101,6 +101,39 @@ pub struct FetchRecipe {
     /// Monotonically increasing version, starting at 1. Incremented on
     /// semantic re-authoring (see module docs).
     pub version: u32,
+
+    /// Bake-time-frozen payload served to extraction in place of an
+    /// HTTP fetch.
+    ///
+    /// `None` (the default for any recipe authored before Session 18,
+    /// and for every recipe authored against an HTML-addressable
+    /// source) means the runtime fetches `source_url` normally and
+    /// hands the response bytes to `apply()`. `Some(bytes)` means the
+    /// runtime skips the HTTP fetch and hands the *baked* bytes to
+    /// `apply()` instead — the extraction mode runs against the
+    /// payload exactly as if it had come over the network.
+    ///
+    /// **Bake-time-frozen freshness.** A recipe with `Some(payload)`
+    /// produces the same records on every fetch, until re-authored.
+    /// There is no live data path. The cost is freshness; the benefit
+    /// is that PDF-only and otherwise un-addressable sources become
+    /// expressible without expanding the closed extraction-mode enum
+    /// (which stays at five — see ADR 0007 Amendment 3).
+    ///
+    /// **The bytes' provenance is orthogonal to the extraction mode.**
+    /// A baked CSV is still a `csv_cell` recipe; a baked JSON is
+    /// still a `json_path` recipe. The runtime branches on this
+    /// field at byte-acquisition time only — `apply()` never sees
+    /// the distinction.
+    ///
+    /// **Serde discipline.** `#[serde(default,
+    /// skip_serializing_if = "Option::is_none")]` keeps existing
+    /// recipe JSON deserializing cleanly (legacy recipes lack the
+    /// field; default is `None`) and keeps the wire form compact for
+    /// the common HTML-addressable case (the field is omitted
+    /// rather than emitted as `null`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_payload: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +366,7 @@ mod tests {
             authored_at: Utc.with_ymd_and_hms(2026, 4, 20, 12, 0, 0).unwrap(),
             authored_by: "sk-a...z9qp".into(), // fingerprint format per ApiKey::fingerprint
             version: 1,
+            static_payload: None,
         }
     }
 
@@ -502,5 +536,70 @@ mod tests {
             serde_json::to_string(&RecordType::Observation).unwrap(),
             "\"observation\""
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Session 18 — static_payload field (ADR 0007 Amendment 3)
+    // -----------------------------------------------------------------
+
+    /// `static_payload: None` is omitted from the wire form. The
+    /// `skip_serializing_if = "Option::is_none"` keeps the JSON
+    /// compact for the common HTML-addressable case.
+    #[test]
+    fn static_payload_is_optional_and_omits_when_absent() {
+        let r = sample_recipe(); // sample_recipe sets static_payload: None
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            !json.contains("static_payload"),
+            "expected static_payload omitted from wire form, got: {json}"
+        );
+    }
+
+    /// A baked recipe round-trips the payload verbatim. The bytes
+    /// land in `apply()` exactly as if they had come over the
+    /// network — no JSON re-encoding, no escaping artifacts.
+    #[test]
+    fn fetch_recipe_with_static_payload_roundtrips() {
+        let mut r = sample_recipe();
+        let payload = r#"{"date":"2026-03-26","rate":"6.50","direction":"hold"}"#;
+        r.static_payload = Some(payload.into());
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("static_payload"));
+        let back: FetchRecipe = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(back.static_payload.as_deref(), Some(payload));
+    }
+
+    /// Backward-compat: a recipe JSON written before Session 18 (no
+    /// `static_payload` field at all) deserializes cleanly thanks to
+    /// `#[serde(default)]`. This is the load-bearing guarantee for
+    /// Migration 0008's "additive, no re-authoring required" claim.
+    #[test]
+    fn legacy_recipe_without_static_payload_field_deserializes() {
+        // Authored a `FetchRecipe` JSON literally, with NO
+        // `static_payload` key. If serde-default doesn't kick in,
+        // this fails with `missing field: static_payload`.
+        let json = r#"{
+            "id": "01904ad6-9c7f-7000-8000-000000000000",
+            "dedup_key": "legacy:test:obs",
+            "plan_id": "01904ad6-9c80-7000-8000-000000000000",
+            "source_id": "legacy_source",
+            "source_url": "https://example.test/data.csv",
+            "extraction": {"mode": "csv_cell", "column": "value"},
+            "produces": [{
+                "record_type": "observation",
+                "expectation": {"list": "observation_metric", "index": 0},
+                "field_mappings": [
+                    {"path": "value", "source": {"kind": "extracted"}}
+                ]
+            }],
+            "authored_at": "2026-04-22T12:00:00Z",
+            "authored_by": "xai",
+            "version": 1
+        }"#;
+        let r: FetchRecipe = serde_json::from_str(json)
+            .expect("legacy recipe JSON must deserialize via serde default");
+        assert!(r.static_payload.is_none(),
+            "legacy recipe should default to None, got {:?}", r.static_payload);
     }
 }

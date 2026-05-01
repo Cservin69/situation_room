@@ -605,3 +605,192 @@ shapes the prompt may need to address eventually:
 Both go in the failure-mode taxonomy that the deferred ADR 0012
 (re-author-on-failure) will need; neither prompts code or prompt
 changes in Session 12.
+
+---
+
+Reviewed 2026-05-01 (Session 18). Amendment 3 to the runtime path,
+prompted by the recurring problem of PDF-only sources sitting
+outside the addressable extraction vocabulary.
+
+**Amendment 3: Recipe-level `static_payload` field — the bake path
+for un-addressable sources.** A new optional field on
+[`FetchRecipe`](../../crates/pipeline/src/recipes.rs):
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub static_payload: Option<String>,
+```
+
+When `Some(payload)`, the runtime serves those bytes to the apply
+stage in place of an HTTP fetch. When `None` (the default), the
+runtime fetches `source_url` normally — preserving every existing
+recipe's behavior verbatim.
+
+**The bytes' provenance is orthogonal to the extraction mode.** A
+baked CSV is still a `csv_cell` recipe; a baked JSON is still a
+`json_path` recipe. The runtime branches on this field at
+byte-acquisition time only — `apply()` never sees the distinction.
+This is the architectural reason `static_payload` is a recipe-level
+field rather than a sixth extraction mode (option (b) below).
+
+### Why this exists
+
+The closed extraction vocabulary's `pdf_table` mode exists for
+PDF sources but is not yet wired in the runtime (the prerequisite
+table-detection libraries, page rasterization, and positional
+addressing each carry enough complexity to deserve their own
+focused session). Until `pdf_table` lands, PDF-only sources are
+stuck: the LLM authors recipes that target the PDF, the runtime
+returns `Skipped { reason: "pdf_table not implemented" }`, and
+the user sees no records.
+
+The Session 17 motivating cases were:
+- USGS MCS chapters (PDF as primary publication, HTML available
+  alongside);
+- SEC EDGAR 10-K filings (PDF and HTML both addressable);
+- EUR-Lex regulation full texts (PDF and HTML renderings);
+- press releases from sources whose websites only publish PDFs
+  (e.g. small central banks, regulatory notices).
+
+The first three have HTML equivalents and the right move — taught
+in recipe-author prompt v1.7's "Strategy for PDF sources" section
+— is to author against the HTML. The fourth has no HTML route.
+For the fourth, the LLM can read the prefetched PDF excerpt at
+authoring time, transcribe the relevant fields into a small JSON
+document, and bake that document into the recipe via
+`static_payload`. The runtime then serves the baked bytes through
+the same `json_path` extraction the LLM authored, producing
+records on every fetch.
+
+### Bake-time-frozen freshness
+
+A recipe with `static_payload = Some(payload)` produces the same
+records on every fetch, until re-authored. There is no live data
+path. **The cost is freshness; the benefit is that PDF-only and
+otherwise un-addressable sources become expressible without
+expanding the closed extraction-mode enum.** The closed enum stays
+at five.
+
+The freshness model is materially different from the common
+HTML-addressable case, so the UI shows it explicitly:
+
+- A visible **BAKED badge** in the recipe head, with a tooltip
+  explaining the freshness contract;
+- A **collapsible payload preview** showing the raw baked bytes
+  the runtime feeds to extraction.
+
+A user looking at the recipes panel for a plan can tell at a
+glance which recipes are live and which are bake-time-frozen.
+
+### Why option (b), not option (a)
+
+Two architectural shapes were considered:
+
+**(a) A sixth extraction mode `static_payload`.** A new variant
+on the closed `ExtractionSpec` enum carrying the baked bytes
+directly. *Rejected.* The bytes are not an extraction strategy —
+they're an alternative *source* of bytes the existing extraction
+strategies operate on. Mixing the two collapses a clean
+distinction. A baked CSV needs `csv_cell` extraction; a baked
+JSON needs `json_path` extraction; a baked HTML page would need
+`css_select`. Forcing a sixth mode would either duplicate every
+existing mode (`static_csv`, `static_json`, `static_css`, …) or
+collapse them into a single `static_payload` mode that re-invents
+the dispatch ladder `apply()` already runs.
+
+**(b) A recipe-level field orthogonal to extraction mode.**
+*Selected.* A new optional field on `FetchRecipe`. The closed
+extraction enum stays at five; the runtime gains one branch (at
+byte-acquisition time, before `apply()`); existing recipes
+deserialize unchanged via serde defaults; existing extraction
+modes operate on baked bytes exactly as on fetched bytes.
+
+The decisive consideration: the bytes' *provenance* (network vs
+baked) is genuinely orthogonal to *what to do with the bytes*
+(extraction mode). Modeling the orthogonal axes orthogonally is
+the cheaper long-term shape.
+
+### Validation discipline
+
+The wire form is empty-string-as-absent (xAI's structured-output
+schema rejects top-level `Option<T>` for some shapes; the
+`unit_hint`, `assertion_guidance`, and `display` fields use the
+same idiom). The Rust validator (`build_validated_recipe`) does:
+
+1. Empty / whitespace-only string → `None`. Common case for
+   every HTML-addressable recipe.
+2. Non-empty string → `serde_json::from_str::<Value>(payload)`
+   to validate well-formedness. The parsed Value is discarded —
+   storage carries the raw string verbatim — but unparseable
+   input is rejected at authoring time rather than at every
+   subsequent fetch.
+
+JSON-only validation reflects the prompt's bake discipline (the
+LLM is taught to bake JSON documents the recipe's extraction
+mode can address). If a future session needs to relax this for
+non-JSON payloads (CSV, HTML), the validator softens then. For
+now, stricter is correct.
+
+### Migration shape
+
+Migration `0008_recipes_static_payload.sql` adds the column as
+nullable TEXT. **Additive, backward-compatible, no re-authoring
+required.** Existing recipes carry NULL; the runtime treats NULL
+as "fetch normally," which is the pre-Amendment-3 behavior. New
+recipes default to NULL except where the LLM explicitly bakes a
+payload.
+
+The DuckDB-ALTER trap from migrations 0005 and 0007 applies (an
+`ADD COLUMN ... NOT NULL DEFAULT ...` is rejected; index
+dependencies block the split-then-set-NOT-NULL path); the
+nullable column sidesteps it. The Rust type
+`FetchRecipe.static_payload: Option<String>` is the load-bearing
+invariant — same posture as `PlanStatus` in 0005 and
+`rejection_reason` in 0007.
+
+### Code references
+
+- Field definition:
+  `crates/pipeline/src/recipes.rs::FetchRecipe::static_payload`
+- Authoring validation:
+  `crates/pipeline/src/recipe_author.rs::build_validated_recipe`
+  (step 6 — collapse + JSON-parse + reject unparseable)
+- Authoring wire form:
+  `crates/pipeline/src/recipe_author.rs::RecipeAuthoringOutput::static_payload`
+- Runtime short-circuit:
+  `crates/pipeline/src/fetch_executor.rs` — inlined in all four
+  `run_X_recipe` functions (CSV, JSON, CSS, regex), per Session 9's
+  duplication-with-comments-over-premature-unification rule
+- Apply boundary:
+  `crates/pipeline/src/recipe_apply.rs::apply` — does NOT branch
+  on `static_payload`; the executor decides byte provenance before
+  calling apply
+- Storage schema:
+  `migrations/0008_recipes_static_payload.sql`
+- Storage row:
+  `crates/storage/src/recipes.rs::RecipeRow` and `StoredRecipe`
+- Wire DTO:
+  `crates/api/src/types_export.rs::RecipeDto::static_payload`
+- UI rendering:
+  `apps/desktop/src/components/RecipesPanel.svelte` (BAKED badge,
+  collapsible payload preview)
+- Authoring discipline:
+  `config/prompts/recipe_author.md` v1.7, "Strategy for PDF
+  sources — HTML first, static payload fallback" section
+
+### Bounded scope
+
+Amendment 3 does **not** wire `pdf_table` extraction. It
+sidesteps the need for `pdf_table` for the cases where bake-
+time transcription is sufficient. `pdf_table` may still be
+implemented later for cases where freshness matters and the
+HTML route doesn't exist (live regulatory PDFs, dated annual
+reports the user wants tracked over time without re-authoring).
+The closed-enum invariant is unchanged — implementing
+`pdf_table` would be wiring an existing enum variant to a
+runtime path, not adding a sixth.
+
+Amendment 3 also does **not** affect the runtime's LLM-free
+invariant (ADR 0007 §"runtime path"). The bytes are baked at
+*authoring* time by the LLM and stored verbatim; the *runtime*
+serves stored bytes deterministically. The two-level split holds.

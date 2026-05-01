@@ -702,6 +702,7 @@ mod tests {
             authored_at: Utc.with_ymd_and_hms(2026, 4, 22, 0, 0, 0).unwrap(),
             authored_by: "xai".into(),
             version: 1,
+            static_payload: None,
         }
     }
 

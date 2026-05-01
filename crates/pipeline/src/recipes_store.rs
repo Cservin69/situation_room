@@ -90,6 +90,7 @@ fn recipe_to_row(r: &FetchRecipe) -> Result<RecipeRow, RecipeStoreError> {
         authored_at: r.authored_at,
         authored_by: r.authored_by.clone(),
         version: r.version,
+        static_payload: r.static_payload.clone(),
     })
 }
 
@@ -112,6 +113,7 @@ fn stored_to_recipe(s: StoredRecipe) -> Result<FetchRecipe, RecipeStoreError> {
         authored_at: s.authored_at,
         authored_by: s.authored_by,
         version: s.version,
+        static_payload: s.static_payload,
     })
 }
 
@@ -147,6 +149,7 @@ mod tests {
             authored_at: Utc.with_ymd_and_hms(2026, 4, 22, 0, 0, 0).unwrap(),
             authored_by: "xai".into(),
             version: 1,
+            static_payload: None,
         }
     }
 

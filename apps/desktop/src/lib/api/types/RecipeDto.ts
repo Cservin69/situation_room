@@ -52,4 +52,15 @@ produces: unknown, authored_at: string,
  * Identifier for what authored this recipe — typically a
  * provider id like `"xai"` or `"recording"` (in tests).
  */
-authored_by: string, version: number, };
+authored_by: string, version: number, 
+/**
+ * Bake-time-frozen payload (ADR 0007 Amendment 3). `None` for
+ * the common HTML-addressable case (recipe fetches `source_url`
+ * at runtime). `Some(payload)` means the recipe is "baked" —
+ * the runtime serves these bytes to extraction in place of an
+ * HTTP fetch, and the recipe will produce the same records
+ * every fetch until re-authored. The frontend renders this
+ * as a visible BAKED badge so the freshness model is explicit
+ * in the UI.
+ */
+static_payload: string | null, };
