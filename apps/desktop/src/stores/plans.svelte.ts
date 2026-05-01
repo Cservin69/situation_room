@@ -47,6 +47,7 @@ import {
   getPlan,
   acceptPlan as apiAcceptPlan,
   rejectPlan as apiRejectPlan,
+  reclassifyPlan as apiReclassifyPlan,
   runFetchForPlan as apiRunFetchForPlan,
   listFetchRuns as apiListFetchRuns,
   listRecipesForPlan as apiListRecipesForPlan,
@@ -242,14 +243,97 @@ export async function acceptSelected(): Promise<boolean> {
 }
 
 /**
- * Mark the currently-selected plan as rejected. Same optimistic
- * shape as `acceptSelected`. After a successful reject under a
- * filter that hides rejected plans (Pending, Accepted), the row
- * vanishes from the listing — that's the soft-delete behaviour
- * showing through.
+ * Mark the currently-selected plan as rejected, optionally attaching
+ * a reason. Same optimistic shape as `acceptSelected`. After a
+ * successful reject under a filter that hides rejected plans
+ * (Pending, Accepted), the row vanishes from the listing — that's
+ * the soft-delete behaviour showing through.
+ *
+ * `reason` is the user's free-text note from the reject dialog.
+ * `null` (or empty/whitespace string) records the rejection without
+ * a note. The note is validated by the backend; backend rejection
+ * surfaces as `plans.error` and the optimistic status is rolled
+ * back. The dialog should still be considered "open" by its caller
+ * so the user can edit and resubmit; this helper only returns the
+ * boolean success result, leaving dialog state to the caller.
  */
-export async function rejectSelected(): Promise<boolean> {
-  return await transitionSelected('rejected', apiRejectPlan);
+export async function rejectSelected(
+  reason: string | null = null,
+): Promise<boolean> {
+  const current = plans.selected;
+  if (!current) return false;
+  const previousStatus = current.status;
+  plans.mutating = true;
+  plans.error = null;
+  // Optimistic: also project the reason locally so the review pane
+  // can show "rejected with reason" immediately. Rolled back on
+  // failure alongside the status.
+  plans.selected = {
+    ...current,
+    status: 'rejected',
+    rejection_reason: reason ?? '',
+  };
+  try {
+    const updated = await apiRejectPlan(current.id, reason);
+    plans.selected = updated;
+    await refreshRecent();
+    return true;
+  } catch (e) {
+    plans.error = asCommandError(e);
+    if (plans.selected && plans.selected.id === current.id) {
+      plans.selected = { ...current, status: previousStatus };
+    }
+    return false;
+  } finally {
+    plans.mutating = false;
+  }
+}
+
+/**
+ * Re-classify the currently-selected plan (which must be in
+ * `rejected` status) using the rejection reason as additional
+ * context for the classifier. Persists a fresh plan with status =
+ * `pending` linked back to the predecessor via `reclassified_from`,
+ * selects it on success, and refreshes the listing.
+ *
+ * `editedReason`, when supplied, replaces the stored rejection
+ * reason for this single classification call. `null` (or empty)
+ * uses the predecessor's stored reason as-is. The backend rejects
+ * the call if neither yields any non-empty text after validation.
+ *
+ * On success: `plans.selected` becomes the new plan; the user
+ * lands on the freshly-classified review pane. On failure:
+ * `plans.selected` is unchanged; `plans.error` carries the
+ * reason; the rejected predecessor remains the selection.
+ *
+ * Toggles `plans.classifying` (not `plans.mutating`) because this
+ * is a Level-1 LLM call — same network footprint as a fresh
+ * `classify`. The topic-input spinner reuses the same flag.
+ */
+export async function reclassifySelected(
+  editedReason: string | null = null,
+): Promise<boolean> {
+  const current = plans.selected;
+  if (!current) return false;
+  if (current.status !== 'rejected') return false;
+  plans.classifying = true;
+  plans.error = null;
+  try {
+    const fresh = await apiReclassifyPlan(current.id, editedReason);
+    plans.selected = fresh;
+    // The new plan is Pending; flip the filter so the user sees
+    // it land in the listing.
+    if (plans.statusFilter !== 'all' && plans.statusFilter !== 'pending') {
+      plans.statusFilter = 'pending';
+    }
+    await refreshRecent();
+    return true;
+  } catch (e) {
+    plans.error = asCommandError(e);
+    return false;
+  } finally {
+    plans.classifying = false;
+  }
 }
 
 async function transitionSelected(

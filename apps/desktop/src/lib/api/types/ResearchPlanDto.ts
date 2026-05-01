@@ -19,4 +19,22 @@ import type { RecordExpectationsDto } from "./RecordExpectationsDto";
  * clean: `pipeline` doesn't know about ts-rs; `api` owns the wire
  * schema.
  */
-export type ResearchPlanDto = { id: string, topic: string, interpretation: string, topic_tags: Array<string>, geographic_scope: Array<GeoScopeDto>, historical_window_days: number, expectations: RecordExpectationsDto, created_at: string, status: PlanStatusDto, };
+export type ResearchPlanDto = { id: string, topic: string, interpretation: string, topic_tags: Array<string>, geographic_scope: Array<GeoScopeDto>, historical_window_days: number, expectations: RecordExpectationsDto, created_at: string, status: PlanStatusDto, 
+/**
+ * Free-text note the user attached when rejecting. Empty string
+ * for plans that were never rejected, plans rejected before
+ * Session 15, and rejections where the user supplied no note.
+ * Empty-string-as-absent matches the wire convention for
+ * optional strings throughout the api crate (see `unit_hint`,
+ * `display`, etc.); we don't introduce a separate `null` shape
+ * here for parity.
+ */
+rejection_reason: string, 
+/**
+ * UUID of the rejected plan that prompted this re-classification,
+ * as a string. Empty string when this plan was not produced by
+ * the re-classify-with-feedback flow. Stringly-typed on the wire
+ * for the same reason `id` is — ts-rs doesn't have a Uuid
+ * primitive at the TS side.
+ */
+reclassified_from: string, };

@@ -26,7 +26,13 @@
 <script lang="ts">
   import type { ResearchPlanDto } from '$lib/api/types/ResearchPlanDto';
   import type { GeoScopeDto } from '$lib/api/types/GeoScopeDto';
-  import { plans, formatCreatedAt, acceptSelected, rejectSelected } from '$stores/plans.svelte';
+  import {
+    plans,
+    formatCreatedAt,
+    acceptSelected,
+    rejectSelected,
+    reclassifySelected,
+  } from '$stores/plans.svelte';
   import Chip from '$components/common/Chip.svelte';
   import StatusPill from '$components/common/StatusPill.svelte';
   import Bucket from '$components/panels/Bucket.svelte';
@@ -34,6 +40,7 @@
   import RunFetchButton from '$components/RunFetchButton.svelte';
   import FetchReport from '$components/FetchReport.svelte';
   import RecipesPanel from '$components/RecipesPanel.svelte';
+  import RejectDialog from '$components/dialogs/RejectDialog.svelte';
 
   interface Props {
     plan: ResearchPlanDto;
@@ -49,12 +56,48 @@
     return g.display.trim().length > 0 ? g.display : g.code;
   }
 
-  // The handlers go through the runes store helpers, which do the
-  // optimistic update + rollback dance. We just await the boolean
-  // return and ignore failures — the store has already populated
-  // `plans.error` for the toast / banner layer to surface.
+  // Dialog state for reject + reclassify. Local to this component;
+  // the runes store handles the network mutation, the component
+  // handles only the open/closed transition.
+  let rejectDialogOpen = $state(false);
+  let reclassifyDialogOpen = $state(false);
+
   async function onAccept() { await acceptSelected(); }
-  async function onReject() { await rejectSelected(); }
+
+  function onRejectClick() {
+    // The dialog drives the mutation when its onSubmit fires. The
+    // button itself just opens.
+    rejectDialogOpen = true;
+  }
+
+  async function onRejectSubmit(reason: string) {
+    const ok = await rejectSelected(reason.trim().length > 0 ? reason : null);
+    if (ok) rejectDialogOpen = false;
+    // On failure: dialog stays open, user sees `plans.error` via
+    // the parent error banner and can edit + resubmit.
+  }
+  function onRejectCancel() { rejectDialogOpen = false; }
+
+  function onReclassifyClick() {
+    // Pre-fill the dialog with the stored rejection reason so the
+    // user can edit before retrying. If the user clears the field
+    // entirely the backend uses the stored reason as-is (per
+    // `reclassify_plan`'s edited-vs-stored fallback rule).
+    reclassifyDialogOpen = true;
+  }
+
+  async function onReclassifySubmit(editedReason: string) {
+    // Pass null when user didn't edit (effectively unchanged from
+    // initial); otherwise pass the edit. We can't distinguish
+    // "user typed the same thing back" from "user didn't edit" but
+    // it doesn't matter — the backend treats both as "use this
+    // text as the reason."
+    const ok = await reclassifySelected(
+      editedReason.trim().length > 0 ? editedReason : null,
+    );
+    if (ok) reclassifyDialogOpen = false;
+  }
+  function onReclassifyCancel() { reclassifyDialogOpen = false; }
 </script>
 
 <article class="plan">
@@ -77,9 +120,20 @@
           type="button"
           class="btn btn-secondary"
           disabled={plans.mutating}
-          onclick={onReject}
+          onclick={onRejectClick}
         >
           reject
+        </button>
+      {:else if plan.status === 'rejected'}
+        <StatusPill status={plan.status} />
+        <button
+          type="button"
+          class="btn btn-primary"
+          disabled={plans.classifying}
+          onclick={onReclassifyClick}
+          title="Re-classify with the rejection note as feedback"
+        >
+          {plans.classifying ? 're-classifying…' : 're-classify'}
         </button>
       {:else}
         <StatusPill status={plan.status} />
@@ -97,6 +151,33 @@
     <span class="trust-label">interpretation</span>
     <p>{plan.interpretation}</p>
   </section>
+
+  <!-- Lineage banner: surfaces when this plan was produced by
+       re-classifying a rejected predecessor. The id link is
+       informational only today (no chain-walking UI yet — Session 16+);
+       the visible "reclassified from" string is enough to alert the
+       reader that the prior framing influenced this plan's
+       feedback-fed prompt. See ADR 0011. -->
+  {#if plan.reclassified_from && plan.reclassified_from.length > 0}
+    <section class="lineage">
+      <span class="lineage-label">reclassified from</span>
+      <code class="lineage-id">{plan.reclassified_from}</code>
+    </section>
+  {/if}
+
+  <!-- Rejection-reason panel: shown only on rejected plans. The
+       reason is what the next re-classification will feed back into
+       the classifier prompt (see Session 15 §classifier-feedback);
+       surfacing it here makes that flow visible. The "edit and
+       re-classify" entry point is the re-classify button in the
+       header — clicking it opens the same dialog with this text
+       pre-filled. -->
+  {#if plan.status === 'rejected' && plan.rejection_reason && plan.rejection_reason.trim().length > 0}
+    <section class="rejection">
+      <span class="rejection-label">rejection note</span>
+      <p>{plan.rejection_reason}</p>
+    </section>
+  {/if}
 
   <!-- Topic tags + geographic scope on a single row -->
   <section class="strip">
@@ -191,6 +272,26 @@
        that hasn't been fetched yet. -->
   <RecipesPanel />
 </article>
+
+{#if rejectDialogOpen}
+  <RejectDialog
+    topic={plan.topic}
+    initial=""
+    submitting={plans.mutating}
+    onSubmit={onRejectSubmit}
+    onCancel={onRejectCancel}
+  />
+{/if}
+
+{#if reclassifyDialogOpen}
+  <RejectDialog
+    topic={plan.topic}
+    initial={plan.rejection_reason ?? ''}
+    submitting={plans.classifying}
+    onSubmit={onReclassifySubmit}
+    onCancel={onReclassifyCancel}
+  />
+{/if}
 
 <style>
   .plan {
@@ -320,6 +421,55 @@
     color: var(--fg-primary);
     font-size: 13px;
     line-height: 1.55;
+  }
+
+  /* Lineage banner — small, inline, low-key. The visual weight
+     should signal "this is metadata about provenance," not "this
+     is the most important thing on the page." */
+  .lineage {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 4px 12px;
+    font-size: 11px;
+    color: var(--fg-tertiary);
+  }
+  .lineage-label {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .lineage-id {
+    font-family: var(--font-mono);
+    color: var(--fg-secondary);
+    font-size: 10px;
+  }
+
+  /* Rejection note panel — dimmer than the trust paragraph because
+     it's history, not the active interpretation. The warning-tone
+     left border ties it visually to the warning palette without
+     shouting. */
+  .rejection {
+    background: var(--bg-panel-alt);
+    border: 1px solid var(--border-subtle);
+    border-left: 2px solid var(--signal-warning);
+    border-radius: 2px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .rejection-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--signal-warning);
+  }
+  .rejection p {
+    margin: 0;
+    color: var(--fg-secondary);
+    font-size: 12px;
+    line-height: 1.55;
+    white-space: pre-wrap;
   }
 
   /* Strip (topics + scope) */

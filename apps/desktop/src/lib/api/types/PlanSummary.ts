@@ -11,4 +11,18 @@ import type { PlanStatusDto } from "./PlanStatusDto";
  * error rather than a misleading zero — better to surface the
  * corruption than hide it.
  */
-export type PlanSummary = { id: string, topic: string, created_at: string, status: PlanStatusDto, topic_tag_count: number, observation_count: number, event_count: number, entity_count: number, relation_count: number, document_source_count: number, };
+export type PlanSummary = { id: string, topic: string, created_at: string, status: PlanStatusDto, topic_tag_count: number, observation_count: number, event_count: number, entity_count: number, relation_count: number, document_source_count: number, 
+/**
+ * True when this plan has a non-empty `rejection_reason`. Lets
+ * the listing show a "has note" indicator on rejected rows
+ * without dragging the full text through the summary payload —
+ * the text itself is fetched on demand via `get_plan`.
+ */
+has_rejection_reason: boolean, 
+/**
+ * True when this plan was produced by re-classifying a
+ * previously-rejected plan. Same payload-trimming rationale as
+ * `has_rejection_reason`: the predecessor's id (when needed for
+ * chain navigation) lives on the full plan DTO.
+ */
+is_reclassified: boolean, };
