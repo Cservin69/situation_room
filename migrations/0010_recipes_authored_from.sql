@@ -1,0 +1,81 @@
+-- situation_room schema, version 0010.
+--
+-- ADR 0014: stub-authored recipe provenance — a visible signal.
+--
+-- The fetch executor's `author_one` already takes one of two
+-- branches when building the document excerpt fed to the Level-2
+-- recipe author:
+--   * pre-fetched real bytes from the source's endpoint_hint
+--     (`prefetch_excerpt` returned `Some`), or
+--   * a stub describing the source from the plan + URL only
+--     (`stub_excerpt`, taken when the source has no endpoint_hint,
+--     the hint is unparseable, or the pre-fetch failed).
+--
+-- The branch is invisible to anything downstream of authoring.
+-- A recipe authored from a stub may produce records on every
+-- subsequent fetch with no signal anywhere — recipe row, FetchReport,
+-- inspection panel — that distinguishes it from a recipe authored
+-- against the source's actual response shape. ADR 0007's "every
+-- number traceable to a source" promise depends on the user being
+-- able to assess the *quality* of that trace; this column closes
+-- that gap.
+--
+-- See `docs/adr/0014-stub-authored-recipe-provenance.md` for the
+-- design rationale (one column over a sibling table; not a
+-- RecipeOutcome field; option 3 — silent self-healing — deferred
+-- with explicit amendment triggers).
+--
+-- ## Why nullable
+--
+-- Existing recipes (Sessions 1–20) carry NULL. The Rust load path
+-- coerces NULL → `AuthoredFrom::Unknown`. New recipes always carry
+-- a populated value (`fetched_bytes` or `stub_excerpt`), set by
+-- the executor in `author_one`. The change is additive and
+-- backward-compatible — no re-authoring required.
+--
+-- The Unknown variant is honest about what's known: a NULL row
+-- predates the column, and back-filling without a defensible
+-- heuristic would be a retroactive truth claim about historical
+-- authoring runs the new code never witnessed.
+--
+-- ## DuckDB ALTER TABLE — same lessons as migrations 0005, 0007, 0008
+--
+-- Per the comment block in `0005_research_plan_status.sql`, DuckDB
+-- rejects two paths to a `NOT NULL DEFAULT` ALTER:
+--
+--   1. `ADD COLUMN ... NOT NULL DEFAULT ...` — "Adding columns
+--      with constraints not yet supported".
+--   2. `ADD COLUMN ... DEFAULT ...; ALTER COLUMN ... SET NOT
+--      NULL;` — "Cannot alter entry because there are entries
+--      that depend on it" when indexes exist on the table.
+--
+-- The `recipes` table carries the `(plan_id, source_id)` index
+-- from migration 0003, which would block path (2). Same shape
+-- as migration 0008 (`static_payload`): the column is nullable on
+-- purpose, and the load-bearing invariant lives in the Rust enum
+-- (`AuthoredFrom` in `crates/storage/src/recipes.rs`), same posture
+-- as `PlanStatus` is in 0005 and `static_payload`'s `Option<String>`
+-- is in 0008.
+--
+-- ## No DEFAULT either
+--
+-- `ADD COLUMN ... DEFAULT 'unknown'` would distinguish "absent" from
+-- "explicitly Unknown" only by which session wrote the row, which is
+-- not a distinction the load path can use. NULL on disk → Unknown
+-- in Rust is the correct shape: "we never asked the executor about
+-- this row." A row written by Session-21+-aware code never carries
+-- NULL.
+--
+-- ## Why not bump version
+--
+-- This is a cosmetic change (in ADR 0007's "Versioning vs migration"
+-- vocabulary), not a semantic one — the recipe still produces the
+-- same records. The column adds a metadata fact about the *authoring*
+-- of the recipe, not about what records the recipe means. No version
+-- bump for any existing row.
+
+ALTER TABLE recipes ADD COLUMN authored_from TEXT;
+
+-- Record this migration.
+INSERT INTO schema_migrations (version, description)
+    VALUES (10, 'recipes.authored_from column');

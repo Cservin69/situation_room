@@ -648,6 +648,52 @@ impl FetchRunSummaryDto {
 // RecipeDto — wire shape for inspecting authored recipes
 // ---------------------------------------------------------------------------
 
+/// Where the recipe-author prompt's document excerpt came from.
+/// Wire mirror of [`situation_room_storage::AuthoredFrom`]. ADR 0014.
+///
+/// ## Why a separate DTO type rather than `#[derive(TS)]` on the
+/// storage enum
+///
+/// Storage doesn't take ts-rs as a dependency (same boundary
+/// rationale as for `RecipeDto` vs the typed `FetchRecipe` — see the
+/// long comment above). A small mirror here keeps storage free of
+/// tooling deps and gives the frontend a stable type at exactly one
+/// location. The `From` impl below is the single conversion point.
+///
+/// ## Wire form discipline
+///
+/// `serde(rename_all = "snake_case")` matches the storage enum
+/// byte-for-byte, so values produced by either side deserialize on
+/// the other. The frontend's `AuthoredFromDto` TS type is a literal
+/// union of the same three strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredFromDto {
+    /// Pre-fetch returned the source's actual response bytes; the
+    /// LLM had ground truth at authoring time.
+    FetchedBytes,
+    /// Pre-fetch failed (or the source has no endpoint_hint); the
+    /// LLM saw a synthesized stub and guessed the response shape.
+    /// The frontend renders this as the `STUB-AUTHORED` chip and
+    /// surfaces a hint banner in the flag dialog.
+    StubExcerpt,
+    /// Migration v10 default for legacy rows. Renders as no chip;
+    /// absence is the signal.
+    Unknown,
+}
+
+impl From<situation_room_storage::AuthoredFrom> for AuthoredFromDto {
+    fn from(a: situation_room_storage::AuthoredFrom) -> Self {
+        use situation_room_storage::AuthoredFrom as A;
+        match a {
+            A::FetchedBytes => AuthoredFromDto::FetchedBytes,
+            A::StubExcerpt => AuthoredFromDto::StubExcerpt,
+            A::Unknown => AuthoredFromDto::Unknown,
+        }
+    }
+}
+
 /// Wire shape for a recipe as the frontend renders it in the
 /// inspection panel.
 ///
@@ -710,6 +756,18 @@ pub struct RecipeDto {
     /// as a visible BAKED badge so the freshness model is explicit
     /// in the UI.
     pub static_payload: Option<String>,
+    /// Where the recipe-author prompt's document excerpt came from
+    /// (real bytes vs. stub) at authoring time. ADR 0014.
+    ///
+    /// The frontend renders `StubExcerpt` as a visible
+    /// `STUB-AUTHORED` chip on the recipe card and as an
+    /// informational banner in the flag dialog. `FetchedBytes`
+    /// renders no chip (the absence is the signal: the recipe is
+    /// grounded). `Unknown` renders no chip either — it's the
+    /// pre-ADR-0014 legacy value, and showing a chip for "we don't
+    /// know" would create noise on every existing recipe in the
+    /// database the moment the operator updates.
+    pub authored_from: AuthoredFromDto,
 }
 
 impl RecipeDto {
@@ -744,6 +802,10 @@ impl RecipeDto {
             authored_by: r.authored_by,
             version: r.version,
             static_payload: r.static_payload,
+            // ADR 0014: storage already coerced NULL → Unknown; we
+            // just lift the typed value into wire form via the
+            // `From` impl above.
+            authored_from: r.authored_from.into(),
         }
     }
 }
@@ -1225,6 +1287,8 @@ mod tests {
             authored_by: "xai".into(),
             version: 1,
             static_payload: None,
+            // ADR 0014: StoredRecipe test fixture; provenance not exercised here.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
         };
         let dto = RecipeDto::from_stored(stored.clone());
         assert_eq!(dto.id, stored.id.to_string());
@@ -1264,6 +1328,8 @@ mod tests {
             authored_by: "xai".into(),
             version: 1,
             static_payload: None,
+            // ADR 0014: StoredRecipe test fixture; provenance not exercised here.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
         };
         let dto = RecipeDto::from_stored(stored);
         let err = dto
@@ -1299,6 +1365,8 @@ mod tests {
             authored_by: "xai".into(),
             version: 1,
             static_payload: None,
+            // ADR 0014: StoredRecipe test fixture; provenance not exercised here.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
         };
         let dto = RecipeDto::from_stored(stored);
         assert!(dto.static_payload.is_none());
@@ -1324,6 +1392,8 @@ mod tests {
             authored_by: "xai".into(),
             version: 1,
             static_payload: Some(payload.into()),
+            // ADR 0014: StoredRecipe test fixture; provenance not exercised here.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
         };
         let dto = RecipeDto::from_stored(stored);
         assert_eq!(dto.static_payload.as_deref(), Some(payload));
@@ -1351,5 +1421,100 @@ mod tests {
             "fetched the channel <title>, not the article titles"
         );
         assert_eq!(dto.created_at.to_rfc3339(), "2026-05-02T08:30:00+00:00");
+    }
+
+    // -----------------------------------------------------------------
+    // Session 21 — authored_from on RecipeDto (ADR 0014)
+    // -----------------------------------------------------------------
+
+    /// `AuthoredFromDto` and `situation_room_storage::AuthoredFrom`
+    /// must serialize byte-for-byte identically. The `From` impl
+    /// above is the only conversion path; if the wire forms ever
+    /// drift, the chip in the UI silently misreads `stub_excerpt`
+    /// rows as `Unknown` (no chip) — exactly the failure ADR 0014
+    /// is closing.
+    #[test]
+    fn authored_from_dto_wire_form_matches_storage_enum() {
+        for (storage, expected_dto) in [
+            (
+                situation_room_storage::AuthoredFrom::FetchedBytes,
+                AuthoredFromDto::FetchedBytes,
+            ),
+            (
+                situation_room_storage::AuthoredFrom::StubExcerpt,
+                AuthoredFromDto::StubExcerpt,
+            ),
+            (
+                situation_room_storage::AuthoredFrom::Unknown,
+                AuthoredFromDto::Unknown,
+            ),
+        ] {
+            let dto: AuthoredFromDto = storage.into();
+            assert_eq!(dto, expected_dto);
+
+            let storage_json = serde_json::to_string(&storage).unwrap();
+            let dto_json = serde_json::to_string(&dto).unwrap();
+            assert_eq!(
+                storage_json, dto_json,
+                "AuthoredFromDto and storage AuthoredFrom must serialize identically; got dto={dto_json}, storage={storage_json}"
+            );
+        }
+    }
+
+    /// A `StoredRecipe` whose authoring fell back to the stub path
+    /// surfaces as `AuthoredFromDto::StubExcerpt` on the wire. This
+    /// is the GDELT 429 case from the Session 20 live run — the
+    /// single concrete instance that motivated ADR 0014. Pinning it
+    /// guards against a future refactor that drops the field from
+    /// `from_stored` and silently coerces every recipe to
+    /// FetchedBytes.
+    #[test]
+    fn recipe_dto_surfaces_stub_excerpt_authored_from() {
+        use chrono::TimeZone;
+        let stored = situation_room_storage::StoredRecipe {
+            id: uuid::Uuid::now_v7(),
+            dedup_key: Some("plan-x:gdelt".into()),
+            plan_id: uuid::Uuid::now_v7(),
+            source_id: "gdelt".into(),
+            source_url: "https://api.gdeltproject.org/api/v2/doc/doc?query=...".into(),
+            extraction_json: r#"{"mode":"json_path","path":"$.articles[0].title"}"#.into(),
+            produces_json: "[]".into(),
+            authored_at: chrono::Utc.with_ymd_and_hms(2026, 5, 2, 9, 27, 17).unwrap(),
+            authored_by: "xai".into(),
+            version: 1,
+            static_payload: None,
+            authored_from: situation_room_storage::AuthoredFrom::StubExcerpt,
+        };
+        let dto = RecipeDto::from_stored(stored);
+        assert_eq!(dto.authored_from, AuthoredFromDto::StubExcerpt);
+    }
+
+    /// Legacy rows (pre-v10) load as `Unknown` from storage and
+    /// surface as `Unknown` on the wire — no chip, no banner, just
+    /// the absence of a positive signal. This is the load-bearing
+    /// guarantee for "no UI noise on every existing recipe the
+    /// moment migration v10 runs."
+    #[test]
+    fn recipe_dto_surfaces_unknown_authored_from_for_legacy_rows() {
+        use chrono::TimeZone;
+        let stored = situation_room_storage::StoredRecipe {
+            id: uuid::Uuid::now_v7(),
+            dedup_key: Some("plan-x:legacy".into()),
+            plan_id: uuid::Uuid::now_v7(),
+            source_id: "legacy_source".into(),
+            source_url: "https://example.com/data.csv".into(),
+            extraction_json: r#"{"mode":"csv_cell","column":"value"}"#.into(),
+            produces_json: "[]".into(),
+            authored_at: chrono::Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap(),
+            authored_by: "xai".into(),
+            version: 1,
+            static_payload: None,
+            // Migration v10 NULL → AuthoredFrom::Unknown coercion
+            // happens in storage; here we simulate that having
+            // already happened.
+            authored_from: situation_room_storage::AuthoredFrom::Unknown,
+        };
+        let dto = RecipeDto::from_stored(stored);
+        assert_eq!(dto.authored_from, AuthoredFromDto::Unknown);
     }
 }

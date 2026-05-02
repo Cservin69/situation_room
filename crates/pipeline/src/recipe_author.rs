@@ -489,6 +489,13 @@ fn build_validated_recipe(
         authored_by: authored_by.to_string(),
         version: 1,
         static_payload,
+        // ADR 0014: the validator has no view of the excerpt's
+        // origin. The caller (fetch_executor::author_one) stamps
+        // the real value alongside `source_id` and `dedup_key`.
+        // Default Unknown is the honest "not set yet" value; if
+        // a caller forgets to stamp, the chip in the UI will say
+        // so rather than silently coerce to FetchedBytes.
+        authored_from: situation_room_storage::AuthoredFrom::Unknown,
     })
 }
 

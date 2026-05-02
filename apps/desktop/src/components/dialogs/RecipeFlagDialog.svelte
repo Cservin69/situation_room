@@ -40,6 +40,7 @@
 -->
 <script lang="ts">
   import { untrack } from 'svelte';
+  import type { AuthoredFromDto } from '$lib/api/types/AuthoredFromDto';
 
   interface Props {
     /**
@@ -54,6 +55,29 @@
      * the stored note; for a fresh flag this is the empty string.
      */
     initial?: string;
+    /**
+     * Authoring provenance of the recipe being flagged. ADR 0014.
+     *
+     * When `'stub_excerpt'`, the dialog renders an informational
+     * hint banner above the textarea — context the operator
+     * should see *before* typing a feedback note. The hint
+     * suggests re-running fetch first if the source might be
+     * reachable now, since a successful pre-fetch on the next
+     * authoring run produces a recipe authored from real bytes
+     * (which may obviate the operator's correction entirely).
+     *
+     * For `'fetched_bytes'` and `'unknown'` the dialog renders
+     * no banner — `'fetched_bytes'` because the recipe is
+     * grounded and the gap doesn't apply, `'unknown'` because
+     * the legacy state is not actionable advice the operator
+     * needs at the moment of flagging.
+     *
+     * Defaults to `'unknown'` so callers that haven't been
+     * updated to thread the prop through still mount cleanly
+     * (no banner, no behavior change). New callers should always
+     * pass the recipe's actual `authored_from` value.
+     */
+    authoredFrom?: AuthoredFromDto;
     /**
      * True while the parent's submit handler is in flight. Drives
      * the Submit button's disabled state and the spinner.
@@ -72,6 +96,7 @@
   let {
     sourceId,
     initial = '',
+    authoredFrom = 'unknown',
     submitting = false,
     onSubmit,
     onCancel,
@@ -98,7 +123,24 @@
   const overSoftWarn = $derived(charsTyped > SOFT_WARN_AT);
   const overHardLimit = $derived(charsTyped > HARD_LIMIT);
   const willClear = $derived(note.trim().length === 0);
-  const wasNonEmpty = initial.trim().length > 0;
+  // Session 21 P4 fix — derived, not eager-captured. The original
+  // line `const wasNonEmpty = initial.trim().length > 0;` triggered
+  // the Svelte 5 `state_referenced_locally` warning because
+  // `initial` is a reactive `$props()` value and the eager read
+  // captured only the snapshot at component-mount. In practice the
+  // dialog is mounted fresh on each open (so the snapshot read
+  // happened to be correct), but the warning is still load-bearing:
+  // any future contributor changing the call site to keep the
+  // dialog alive across opens would silently get a stale
+  // `wasNonEmpty`. `$derived` is the correct shape and removes the
+  // warning at the source.
+  const wasNonEmpty = $derived(initial.trim().length > 0);
+  // ADR 0014: the hint banner above the textarea renders iff the
+  // flagged recipe was stub-authored. `fetched_bytes` and
+  // `unknown` both render no banner — `fetched_bytes` because the
+  // gap doesn't apply; `unknown` because legacy rows aren't
+  // actionable in this dialog.
+  const showStubHint = $derived(authoredFrom === 'stub_excerpt');
 
   function handleSubmit() {
     if (overHardLimit || submitting) return;
@@ -134,6 +176,33 @@
     </header>
 
     <section class="body">
+      {#if showStubHint}
+        <!--
+          ADR 0014 hint banner — visible iff the recipe was
+          stub-authored. Distinct from the freeform note field
+          below: it's deliberate context the operator should see
+          *before* typing. The banner does not gate submission.
+
+          Copy is informational, not directive — the operator may
+          still want to flag the recipe (e.g. "the stub guess
+          happened to be wrong even where the source is reachable"
+          is a legitimate flag). The hint just surfaces the
+          alternative recovery path so the operator chooses
+          deliberately rather than typing without knowing the
+          recipe wasn't grounded in real bytes.
+        -->
+        <aside class="stub-hint" role="note">
+          <span class="stub-hint-label">heads up</span>
+          <p class="stub-hint-body">
+            This recipe was authored without the source's actual
+            response — the LLM saw a fallback description, not the
+            real bytes. Flagging is still useful, but if the source
+            is reachable now, running fetch again will let the next
+            authoring run see real bytes and may obviate this
+            correction entirely.
+          </p>
+        </aside>
+      {/if}
       <label for="flag-note">
         What is wrong with this recipe?
         <span class="hint">
@@ -263,6 +332,44 @@
     font-size: 12px;
     color: var(--fg-tertiary);
     line-height: 1.5;
+  }
+
+  /*
+   * ADR 0014 stub-hint banner. Sits above the textarea label;
+   * a left border + warning hue mark it as "structural context"
+   * rather than the chrome label/hint/counter triad. Same
+   * `--signal-warning` color the chip uses, for visual rhyme:
+   * the chip on the recipe card and the banner here are
+   * announcing the same fact in two surfaces.
+   *
+   * `align-items: baseline` aligns the inline "heads up" tag
+   * with the first line of the body paragraph, even when the
+   * paragraph wraps over multiple lines.
+   */
+  .stub-hint {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    padding: 10px 12px;
+    background: var(--bg-inset);
+    border-left: 3px solid var(--signal-warning, var(--border-accent));
+    border-radius: 3px;
+    margin-bottom: 4px;
+  }
+  .stub-hint-label {
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--signal-warning, var(--fg-secondary));
+  }
+  .stub-hint-body {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--fg-secondary);
   }
 
   textarea {

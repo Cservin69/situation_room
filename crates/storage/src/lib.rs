@@ -32,7 +32,7 @@ pub use connection::Store;
 pub use fetch_runs::{FetchRunRow, StoredFetchRun};
 pub use queries::TopicUsage;
 pub use recipe_feedback::{RecipeFeedbackRow, StoredRecipeFeedback};
-pub use recipes::{RecipeRow, StoredRecipe};
+pub use recipes::{AuthoredFrom, RecipeRow, StoredRecipe};
 pub use research_plans::{PlanStatus, ResearchPlanRow, StoredResearchPlan};
 
 use thiserror::Error;

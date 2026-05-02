@@ -703,6 +703,9 @@ mod tests {
             authored_by: "xai".into(),
             version: 1,
             static_payload: None,
+            // ADR 0014: recipe_apply tests don't exercise authoring;
+            // FetchedBytes is the optimistic-case default.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
         }
     }
 

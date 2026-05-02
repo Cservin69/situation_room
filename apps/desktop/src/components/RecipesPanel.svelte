@@ -75,6 +75,43 @@
   to None before storage, and the executor's short-circuit treats
   None as "fetch normally."
 
+  STUB-AUTHORED chip (Session 21, ADR 0014)
+  ------------------------------------------
+
+  When `recipe.authored_from === 'stub_excerpt'`, the recipe was
+  authored without the source's actual response bytes — the LLM
+  saw a synthesized stub describing the source from the plan + URL
+  only, and guessed the response shape. This happens when the
+  source has no `endpoint_hint`, the hint is unparseable, or the
+  pre-fetch returned an HTTP/transport error (e.g. the GDELT 429
+  case from the Session 20 live run).
+
+  Stockpile's central architectural claim — every number traceable
+  to a source (ADR 0007) — depends on the user being able to assess
+  the *quality* of the trace. A stub-authored recipe is a *guess*
+  at the response shape; one authored from real bytes is *grounded*.
+  The chip surfaces the difference at a glance.
+
+    - **STUB-AUTHORED chip** in the recipe head. `--signal-warning`
+      hue (warranted attention, not destructive). Tooltip explains
+      the gap and points at the recovery path: re-run fetch when
+      the source becomes reachable.
+    - **Hint banner** in the flag dialog (RecipeFlagDialog) when
+      flagging a stub-authored recipe — context the operator should
+      see *before* typing a feedback note.
+
+  No chip renders for `'fetched_bytes'` (the optimistic case;
+  absence of the chip is the signal) or `'unknown'` (legacy
+  pre-ADR-0014 rows; showing a chip for "we don't know" would
+  create noise on every existing recipe the moment migration v10
+  runs).
+
+  ADR 0014 §"What the user does NOT see (option 3, deferred)"
+  documents why this is a passive surface only — the silent
+  re-author-on-real-bytes path is deferred with explicit amendment
+  triggers; today the chip is the user's hook for triggering the
+  manual path themselves.
+
   Empty state
   -----------
 
@@ -200,6 +237,30 @@
           title="Bake-time-frozen: the runtime serves baked bytes to extraction in place of an HTTP fetch. This recipe will produce the same records on every fetch until re-authored. ADR 0007 Amendment 3."
         >BAKED</span>
       {/if}
+      {#if recipe.authored_from === 'stub_excerpt'}
+        <!--
+          STUB-AUTHORED chip — ADR 0014. Visible when the recipe
+          was authored without the source's actual response bytes
+          (no endpoint_hint, unparseable hint, or pre-fetch failure).
+          The tooltip names the gap and the recovery path.
+
+          No onclick: the chip is passive, surfacing the fact
+          without committing the user to a remediation policy.
+          The recovery path is "run fetch when the source is
+          reachable, the next authoring run will see real bytes" —
+          which the user does via the existing RunFetchButton.
+
+          ADR 0014 §"What the user does NOT see (option 3, deferred)"
+          documents why this isn't a button: silent self-healing
+          would change ADR 0007's runtime-is-LLM-free invariant
+          and warrants its own ADR amendment, gated on
+          operational data we don't have yet.
+        -->
+        <span
+          class="stub-authored-chip"
+          title="Authored from a fallback description, not the source's actual response. The recipe is a guess at the response shape. If the source becomes reachable, run fetch again — a future session may surface a 're-author from real bytes' path. ADR 0014."
+        >STUB-AUTHORED</span>
+      {/if}
       {#if feedback}
         <!--
           FLAGGED chip — ADR 0013. Visible when the operator has
@@ -305,10 +366,22 @@
     `initial` is the existing note text for this source if there
     is one, else empty. Submitting empty routes through
     `flagRecipe` → `clearRecipeFeedback`.
+
+    `authoredFrom` is sourced from the matching recipe row — the
+    dialog renders a hint banner when the recipe was stub-authored
+    (ADR 0014). `plans.recipes` is ordered newest-first by the
+    storage layer (`ORDER BY authored_at DESC, version DESC`), so
+    `find` against `source_id` returns the current recipe — the
+    one whose feedback the operator is editing. Falling back to
+    `'unknown'` keeps the dialog's prop type stable when the
+    recipe isn't found (an edge case: the recipe was deleted
+    between opening and rendering, which is currently not
+    reachable but the fallback costs nothing).
   -->
   <RecipeFlagDialog
     sourceId={flagDialogSourceId}
     initial={plans.recipeFeedback[flagDialogSourceId]?.note ?? ''}
+    authoredFrom={plans.recipes.find(r => r.source_id === flagDialogSourceId)?.authored_from ?? 'unknown'}
     submitting={flagSubmitting}
     onSubmit={onFlagSubmit}
     onCancel={closeFlagDialog}
@@ -424,6 +497,51 @@
     background: var(--bg-canvas);
     cursor: help;
     /* sit on the same baseline as source-id and recipe-id */
+    align-self: center;
+  }
+
+  /*
+   * STUB-AUTHORED chip — Session 21, ADR 0014.
+   *
+   * A visible chip in the recipe head announcing the authoring-
+   * provenance gap: the LLM saw a synthesized stub, not the
+   * source's actual response, when this recipe was written. The
+   * recipe may still be working perfectly — the chip is not a
+   * verdict on correctness, just on what evidence the author had.
+   *
+   * Color discipline (ADR 0006 §"color is meaning, not decoration"):
+   * `--signal-warning` is the right semantic — the recipe deserves
+   * the user's attention because its grounding is weaker than the
+   * default. Same hue as BAKED (which is also "deserves attention,
+   * different freshness contract"); the two cases are
+   * conceptually adjacent ("the runtime path is meaningfully
+   * non-default for this recipe"), and the visual rhyme is
+   * intentional. Distinct *content* — "BAKED" vs "STUB-AUTHORED" —
+   * does the disambiguation, not distinct hues.
+   *
+   * Same baseline + sizing as `.baked-badge` so a recipe that's
+   * both baked AND stub-authored renders both chips coherently
+   * left-to-right next to the source-id. (The combination is rare
+   * but reachable: a baked-payload recipe whose authoring
+   * pre-fetch failed before the LLM produced the bake.)
+   *
+   * `cursor: help` (not `pointer`) because the chip is passive —
+   * no click target, just a tooltip hover. The remediation surface
+   * is the existing RunFetchButton elsewhere on the screen, not
+   * this chip. ADR 0014 §"What the user does NOT see" documents
+   * why this is intentional.
+   */
+  .stub-authored-chip {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    padding: 2px 6px;
+    border-radius: 2px;
+    color: var(--signal-warning, var(--fg-secondary));
+    border: 1px solid var(--signal-warning, var(--border-subtle));
+    background: var(--bg-canvas);
+    cursor: help;
     align-self: center;
   }
 

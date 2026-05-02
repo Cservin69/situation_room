@@ -588,12 +588,25 @@ async fn author_one(
 
     // Build the document excerpt. Prefer real bytes from the
     // endpoint_hint; fall back to a stub describing the source.
-    let excerpt = match &hint_for_prefetch {
+    //
+    // ADR 0014: which branch we took here is the load-bearing
+    // signal for `authored_from`. We track it as a boolean
+    // alongside the excerpt and stamp the recipe after authoring.
+    // Three sub-cases all collapse to the same StubExcerpt outcome:
+    //   * no descriptor / no endpoint_hint at all (`hint_for_prefetch
+    //     == None`),
+    //   * endpoint_hint present but pre-fetch returned None (network
+    //     error, 4xx/5xx, body too large),
+    //   * endpoint_hint unparseable (already replaced with placeholder
+    //     above; arrives here as `hint_for_prefetch == None`).
+    // The FetchedBytes case is the single happy path: prefetch_excerpt
+    // returned Some.
+    let (excerpt, used_real_bytes) = match &hint_for_prefetch {
         Some(url) => match prefetch_excerpt(ctx, url, source_id).await {
-            Some(real) => real,
-            None => stub_excerpt(plan, source_id, Some(url.as_str())),
+            Some(real) => (real, true),
+            None => (stub_excerpt(plan, source_id, Some(url.as_str())), false),
         },
-        None => stub_excerpt(plan, source_id, None),
+        None => (stub_excerpt(plan, source_id, None), false),
     };
 
     // Look up any operator feedback the user attached to this
@@ -641,6 +654,24 @@ async fn author_one(
     // blank.
     recipe.source_id = source_id.to_string();
     recipe.dedup_key = Some(format!("{}:{}", plan.id, source_id));
+    // ADR 0014: stamp the authoring provenance signal. The
+    // validator left it `Unknown`; here is the only place that
+    // knows the truth, derived from the same branch the excerpt
+    // came from a few lines up. A visible `info` log makes the
+    // signal observable in the executor's tracing output without
+    // requiring the operator to look at the recipes panel.
+    recipe.authored_from = if used_real_bytes {
+        situation_room_storage::AuthoredFrom::FetchedBytes
+    } else {
+        situation_room_storage::AuthoredFrom::StubExcerpt
+    };
+    info!(
+        plan_id = %plan.id,
+        source_id = %source_id,
+        recipe_id = %recipe.id,
+        authored_from = recipe.authored_from.as_str(),
+        "recipe authored; provenance stamped"
+    );
 
     Ok(recipe)
 }
@@ -1250,6 +1281,8 @@ mod tests {
             authored_by: "test".into(),
             version: 1,
             static_payload: None,
+            // ADR 0014: test fixture; provenance not exercised here.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
         }
     }
 
@@ -1299,6 +1332,8 @@ mod tests {
             authored_by: "test".into(),
             version: 1,
             static_payload: None,
+            // ADR 0014: test fixture; provenance not exercised here.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
         }
     }
 
@@ -1350,6 +1385,8 @@ mod tests {
             authored_by: "test".into(),
             version: 1,
             static_payload: None,
+            // ADR 0014: test fixture; provenance not exercised here.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
         }
     }
 
@@ -1403,6 +1440,8 @@ mod tests {
             authored_by: "test".into(),
             version: 1,
             static_payload: None,
+            // ADR 0014: test fixture; provenance not exercised here.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
         }
     }
 
@@ -2537,6 +2576,8 @@ mod tests {
             authored_by: "live_test".into(),
             version: 1,
             static_payload: None,
+            // ADR 0014: test fixture; provenance not exercised here.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
         };
         save_recipe(&store, &recipe).unwrap();
 
@@ -2650,6 +2691,8 @@ mod tests {
             authored_by: "live_test".into(),
             version: 1,
             static_payload: None,
+            // ADR 0014: test fixture; provenance not exercised here.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
         };
         save_recipe(&store, &recipe).unwrap();
 
@@ -2679,5 +2722,146 @@ mod tests {
         let runs = store.recent_fetch_runs_for_plan(plan.id, 5).unwrap();
         assert!(!runs.is_empty());
         assert!(runs[0].finished_at.is_some(), "fetch_run must be closed");
+    }
+
+    // -----------------------------------------------------------------
+    // Session 21 — authored_from stamping (ADR 0014)
+    // -----------------------------------------------------------------
+
+    /// Happy path: when `prefetch_excerpt` returns real bytes, the
+    /// recipe lands with `authored_from = FetchedBytes`. This is the
+    /// optimistic case — most production recipes hit it.
+    #[tokio::test]
+    async fn author_one_stamps_fetched_bytes_when_prefetch_succeeds() {
+        use situation_room_storage::AuthoredFrom;
+
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        // Both URLs in the fixture: pre-fetch sees real bytes and
+        // recipe execution finds its CSV body.
+        let hint_url = "https://api.example.com/csv-demo.csv";
+        let hint_body = b"country,production\nChile,49000\n";
+        let canned_recipe_url = "https://api.example.com/data.csv";
+        let recipe_body = b"country,production\nChile,49000\n";
+        let fetcher = StaticFetcher::new()
+            .with(hint_url, hint_body)
+            .with(canned_recipe_url, recipe_body);
+
+        let sources = vec![SourceDescriptor {
+            id: "demo_csv".into(),
+            display_name: "CSV Demo".into(),
+            description: "Used by tests.".into(),
+            authoritative_for: vec![],
+            endpoint_hint: Some(hint_url.into()),
+        }];
+
+        let provider = RecordingProvider::new();
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            sources: &sources,
+        };
+
+        let _report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        // The recipe is persisted; load it back and assert the
+        // stamped value. Using `recipes_for_plan` matches the load
+        // path the UI uses (RecipesPanel reads recipes via the same
+        // store method); the field must survive the same path.
+        let recipes = store.recipes_for_plan(plan.id).unwrap();
+        assert_eq!(recipes.len(), 1, "exactly one recipe was authored");
+        assert_eq!(
+            recipes[0].authored_from,
+            AuthoredFrom::FetchedBytes,
+            "happy-path authoring must stamp FetchedBytes"
+        );
+    }
+
+    /// Stub-excerpt path: when pre-fetch fails (here: hint URL not
+    /// in the fixture map → NoFixture error), the recipe lands with
+    /// `authored_from = StubExcerpt`. This is the motivating case
+    /// for ADR 0014 — exactly what happened to GDELT in the Session
+    /// 20 live run.
+    #[tokio::test]
+    async fn author_one_stamps_stub_excerpt_when_prefetch_fails() {
+        use situation_room_storage::AuthoredFrom;
+
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        // Hint URL is *not* in the fixture map → pre-fetch returns
+        // None. Recipe-execution URL *is* fixtured so the fetch run
+        // completes (the stub-authored recipe still runs against
+        // the canned URL).
+        let hint_url = "https://api.example.com/missing-fixture.csv";
+        let canned_recipe_url = "https://api.example.com/data.csv";
+        let csv = b"country,production\nChile,49000\n";
+        let fetcher = StaticFetcher::new().with(canned_recipe_url, csv);
+
+        let sources = vec![SourceDescriptor {
+            id: "demo_csv".into(),
+            display_name: "CSV Demo".into(),
+            description: "Used by tests.".into(),
+            authoritative_for: vec![],
+            endpoint_hint: Some(hint_url.into()),
+        }];
+
+        let provider = RecordingProvider::new();
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            sources: &sources,
+        };
+
+        let _report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        let recipes = store.recipes_for_plan(plan.id).unwrap();
+        assert_eq!(recipes.len(), 1);
+        assert_eq!(
+            recipes[0].authored_from,
+            AuthoredFrom::StubExcerpt,
+            "pre-fetch failure must stamp StubExcerpt"
+        );
+    }
+
+    /// No descriptor → no endpoint_hint → stub excerpt. Same outcome
+    /// as the prefetch-failed path; pinned separately because the
+    /// code path is distinct (the `hint_for_prefetch` is None from
+    /// the start, vs. Some-then-None from a failed fetch).
+    #[tokio::test]
+    async fn author_one_stamps_stub_excerpt_when_descriptor_absent() {
+        use situation_room_storage::AuthoredFrom;
+
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let canned_recipe_url = "https://api.example.com/data.csv";
+        let csv = b"country,production\nChile,49000\n";
+        let fetcher = StaticFetcher::new().with(canned_recipe_url, csv);
+
+        // sources slice empty: no descriptor for "demo_csv".
+        let provider = RecordingProvider::new();
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            sources: &[],
+        };
+
+        let _report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        let recipes = store.recipes_for_plan(plan.id).unwrap();
+        assert_eq!(recipes.len(), 1);
+        assert_eq!(
+            recipes[0].authored_from,
+            AuthoredFrom::StubExcerpt,
+            "missing descriptor must stamp StubExcerpt"
+        );
     }
 }

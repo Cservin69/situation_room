@@ -134,6 +134,38 @@ pub struct FetchRecipe {
     /// rather than emitted as `null`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_payload: Option<String>,
+
+    /// Where the recipe-author prompt's document excerpt came from —
+    /// real fetched bytes or a synthesized stub. ADR 0014.
+    ///
+    /// Set by the fetch executor's
+    /// [`fetch_executor::author_one`](super::fetch_executor) after
+    /// `author_recipe` returns, derived from the same branch the
+    /// excerpt itself came from. The validator
+    /// [`recipe_author::build_validated_recipe`](super::recipe_author)
+    /// has no view of the excerpt's origin and leaves the field at
+    /// its default (`Unknown`); the executor stamps the real value
+    /// alongside `source_id` and `dedup_key`.
+    ///
+    /// **Why the chip exists.** A recipe authored from a stub is a
+    /// *guess* at the source's response shape; one authored from
+    /// real bytes is grounded. Stockpile's central architectural
+    /// claim — every number traceable to a source (ADR 0007) —
+    /// depends on the user being able to assess the *quality* of
+    /// that trace, not just its existence. The chip in the
+    /// inspection panel surfaces the difference; the deferred
+    /// option-3 self-healing path (ADR 0014 §"What the user does
+    /// NOT see") would consume this field as its trigger.
+    ///
+    /// **Serde discipline.** `#[serde(default)]` keeps recipe JSON
+    /// from earlier sessions (no `authored_from` field at all)
+    /// deserializing cleanly — they default to `Unknown`, the
+    /// honest "we don't know" value. The field always serializes
+    /// (no skip_serializing_if), because for new recipes the value
+    /// is meaningful and we want it on the wire even when it's
+    /// `Unknown` — that's the legacy-data signal.
+    #[serde(default)]
+    pub authored_from: situation_room_storage::AuthoredFrom,
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +399,10 @@ mod tests {
             authored_by: "sk-a...z9qp".into(), // fingerprint format per ApiKey::fingerprint
             version: 1,
             static_payload: None,
+            // ADR 0014: tests that don't otherwise care about authoring
+            // provenance default to FetchedBytes (the optimistic case).
+            // Tests below pin StubExcerpt and Unknown explicitly.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
         }
     }
 
@@ -574,6 +610,10 @@ mod tests {
     /// `static_payload` field at all) deserializes cleanly thanks to
     /// `#[serde(default)]`. This is the load-bearing guarantee for
     /// Migration 0008's "additive, no re-authoring required" claim.
+    ///
+    /// Session 21 (ADR 0014) added a second serde-default field
+    /// `authored_from`; the same JSON literal must continue to
+    /// deserialize without it, defaulting to `Unknown`.
     #[test]
     fn legacy_recipe_without_static_payload_field_deserializes() {
         // Authored a `FetchRecipe` JSON literally, with NO
@@ -601,5 +641,55 @@ mod tests {
             .expect("legacy recipe JSON must deserialize via serde default");
         assert!(r.static_payload.is_none(),
             "legacy recipe should default to None, got {:?}", r.static_payload);
+        // ADR 0014: legacy recipes lack `authored_from` too — must
+        // default to Unknown, not FetchedBytes (which would be a
+        // retroactive truth claim about authoring runs the new code
+        // never witnessed).
+        assert_eq!(
+            r.authored_from,
+            situation_room_storage::AuthoredFrom::Unknown,
+            "legacy recipe should default authored_from to Unknown"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Session 21 — authored_from field (ADR 0014)
+    // -----------------------------------------------------------------
+
+    /// `authored_from` round-trips through JSON for each variant. The
+    /// chip in the UI consumes this exact wire form via the DTO
+    /// pipeline; if serde rename_all drifted (e.g. someone changed
+    /// the enum to `rename_all = "kebab-case"`) the chip would
+    /// silently stop appearing on every recipe.
+    #[test]
+    fn fetch_recipe_authored_from_roundtrips_each_variant() {
+        use situation_room_storage::AuthoredFrom;
+
+        for variant in [
+            AuthoredFrom::FetchedBytes,
+            AuthoredFrom::StubExcerpt,
+            AuthoredFrom::Unknown,
+        ] {
+            let mut r = sample_recipe();
+            r.authored_from = variant;
+            let json = serde_json::to_string(&r).unwrap();
+            let back: FetchRecipe = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.authored_from, variant);
+        }
+    }
+
+    /// A recipe authored against a stub serializes the variant on
+    /// the wire as `"stub_excerpt"` — the exact string the DB
+    /// column carries and the frontend's TypeScript type expects.
+    #[test]
+    fn fetch_recipe_serializes_stub_excerpt_lowercase_snake() {
+        use situation_room_storage::AuthoredFrom;
+        let mut r = sample_recipe();
+        r.authored_from = AuthoredFrom::StubExcerpt;
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains(r#""authored_from":"stub_excerpt""#),
+            "expected snake_case wire form, got: {json}"
+        );
     }
 }

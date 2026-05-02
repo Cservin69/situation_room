@@ -71,6 +71,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "recipe_feedback table",
         sql: include_str!("../../../migrations/0009_recipe_feedback.sql"),
     },
+    Migration {
+        version: 10,
+        description: "recipes.authored_from column",
+        sql: include_str!("../../../migrations/0010_recipes_authored_from.sql"),
+    },
 ];
 
 /// Apply every migration whose version is not yet in

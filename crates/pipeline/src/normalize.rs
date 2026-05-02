@@ -163,6 +163,8 @@ mod tests {
             authored_by: "test".into(),
             version: 1,
             static_payload: None,
+            // ADR 0014: normalize tests don't exercise authoring.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
         }
     }
 

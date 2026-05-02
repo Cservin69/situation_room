@@ -91,6 +91,10 @@ fn recipe_to_row(r: &FetchRecipe) -> Result<RecipeRow, RecipeStoreError> {
         authored_by: r.authored_by.clone(),
         version: r.version,
         static_payload: r.static_payload.clone(),
+        // ADR 0014: thread the provenance signal through. The
+        // executor stamps the value on the typed FetchRecipe
+        // before save_recipe is called; storage just persists it.
+        authored_from: r.authored_from,
     })
 }
 
@@ -114,6 +118,10 @@ fn stored_to_recipe(s: StoredRecipe) -> Result<FetchRecipe, RecipeStoreError> {
         authored_by: s.authored_by,
         version: s.version,
         static_payload: s.static_payload,
+        // ADR 0014: storage's row_to_stored already coerced NULL →
+        // Unknown, so legacy rows arrive here with the right value
+        // without further work in this layer.
+        authored_from: s.authored_from,
     })
 }
 
@@ -150,6 +158,12 @@ mod tests {
             authored_by: "xai".into(),
             version: 1,
             static_payload: None,
+            // ADR 0014: tests in this module focus on JSON-string
+            // round-trips and dedup_key lookup; FetchedBytes is the
+            // optimistic-case default. Round-trip of authored_from
+            // itself is covered in `crates/storage/src/recipes.rs`
+            // and `crates/pipeline/src/recipes.rs`.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
         }
     }
 
@@ -182,5 +196,27 @@ mod tests {
             .unwrap()
             .expect("present");
         assert_eq!(back.id, recipe.id);
+    }
+
+    /// ADR 0014: a StubExcerpt-stamped recipe round-trips through
+    /// the typed marshalling layer end-to-end. The two-direction
+    /// pass exercises both `recipe_to_row` (FetchRecipe → RecipeRow,
+    /// `authored_from` copied) and `stored_to_recipe` (StoredRecipe
+    /// → FetchRecipe, value preserved). If either side were to drop
+    /// the field the chip in the UI would silently never appear.
+    #[test]
+    fn recipe_marshals_authored_from_stub_excerpt_through_storage() {
+        use situation_room_storage::AuthoredFrom;
+
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let mut recipe = sample();
+        recipe.authored_from = AuthoredFrom::StubExcerpt;
+        let id = recipe.id;
+        save_recipe(&store, &recipe).unwrap();
+
+        let back = load_recipe(&store, id).unwrap().expect("present");
+        assert_eq!(back.authored_from, AuthoredFrom::StubExcerpt);
     }
 }
