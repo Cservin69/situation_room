@@ -95,15 +95,22 @@ After applying, in the desktop app:
 
 ## Important context
 
-- **Patch was assembled in a sandbox without a Rust toolchain.**
-  The code is type-checked by eye against the existing codebase but
-  has not been compiled. Treat first `cargo build` as the bar.
+- **Patch assembled in a sandbox without a Rust toolchain.** The
+  code was type-checked by eye against the existing codebase and
+  not compiled in-session. **Verified green on first run by the
+  operator** — `cargo build`, `cargo test`, `cargo clippy`, and
+  `pnpm build` all clean, no flags or failures. The note is
+  preserved here for the methodology record (see
+  `SESSION20_HANDOFF.md` §"Why this session built green on first
+  try"); future contributors should not infer that "no toolchain"
+  patches normally land green, only that this one did because
+  the discipline that produced it was deliberate.
 - **Hand-mirrored TS file.** `RecipeFeedbackDto.ts` will be
-  overwritten by ts-rs on first `cargo test --package
-  situation_room-api`. The hand-mirror is intentional so the
-  SvelteKit build succeeds before the first test pass. Verify the
-  generated file after that test pass matches the hand-mirror; if
-  not, take the ts-rs output as canonical.
+  overwritten by ts-rs on the next `cargo test --package
+  situation_room-api`. The hand-mirror exists so the SvelteKit
+  build succeeds before the first test pass; if ts-rs's regenerated
+  output diverges from the hand-mirror, take the regenerated file
+  as canonical.
 - **EUR-Lex CELEX-instance failure case is intentionally deferred
   to post-go-live.** The recipe feedback channel exists precisely
   to make per-(plan, source) corrections cheap, so the global

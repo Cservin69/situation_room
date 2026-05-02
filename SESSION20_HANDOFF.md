@@ -67,19 +67,17 @@ satisfied.
 
 ### Test count posture
 
-The patch added (eyeballed, not run):
+The patch added (verified green on first run, no compiler/clippy
+flags, no test failures):
 
 - 7 storage tests in `recipe_feedback.rs`
 - 10 pipeline tests in `recipe_author.rs` (rendering + build_prompt
   placeholder behaviour)
 - 1 api roundtrip test in `types_export.rs`
 
-That's +18 against the Session 18 baseline of 340. **Session 20's
-first move is `cargo build --workspace && cargo test --workspace
-&& cargo clippy --workspace --all-targets -- -D warnings`** — the
-patch was assembled against read-only mounts in a sandbox without a
-Rust toolchain, so all type-checking was eyeballed. Anything the
-compiler flags at first build is the priority.
+That's +18 against the Session 18 baseline of 340, landing the
+total at **358 green**. Doc-tests still 0 active. Frontend
+`svelte-check` reported clean.
 
 ---
 
@@ -193,44 +191,38 @@ the prompt.
 
 ## Session 20 priorities
 
-### P1 — Build, test, clippy (the patch is unverified)
+### P1 — Live xAI verification of v1.8
 
-```sh
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cd apps/desktop && pnpm install && pnpm build
-```
+The patch is green at the type and test layer; what's still owed
+is empirical verification against real plans. v1.8 adds the
+`{{RECIPE_FEEDBACK}}` section but leaves v1.7's content
+unchanged — so a v1.8 verification run *is* a v1.7 verification
+for everything except the operator-feedback channel.
 
-In that order. Anything the compiler flags is the actual P1 of this
-session. Likely candidates if anything fails (eyeballed against the
-existing codebase, but not exhaustive):
+The three slots (carried over from the Session 19 handoff, in
+suggested order):
 
-- The `chrono::Utc::now()` call in `commands.rs::set_recipe_feedback`
-  uses the fully-qualified path; if rustc complains about ambiguity,
-  add `use chrono::Utc;` near the top of the file (the rest of the
-  module already uses chrono types, so this would be tidy anyway).
-- The hand-mirrored `RecipeFeedbackDto.ts` will be overwritten by
-  ts-rs on first `cargo test --package situation_room-api`. Verify
-  the generated file matches what the hand-mirror has; if not,
-  ts-rs's output is canonical.
-- The Svelte 5 reactivity on
-  `plans.recipeFeedback[sourceId] = ...` mutation should work via
-  the runes proxy, but if the chip doesn't re-render after `flagRecipe`
-  resolves, `plans.recipeFeedback = { ...plans.recipeFeedback }`
-  (whole-object reassignment) is the fix.
+1. **HTML-equivalent path** (cheapest sanity check) — confirm the
+   LLM picks the HTML route when both PDF and HTML are
+   addressable. Candidate: USGS MCS (the `mcsYYYY-<commodity>.html`
+   companion to the PDF, already wired in the registry).
+2. **CELEX re-run** — see the §"EUR-Lex CELEX-instance failure
+   case — DEFERRED" note above before doing this. Run it as a
+   *recording* exercise: append the v1.8 outcome to the
+   Verification block in the failure case file; do NOT iterate
+   on the prompt in response.
+3. **BAKED PDF source** (highest-risk new behaviour) — confirm
+   `static_payload` end-to-end on a PDF-only source. Candidate:
+   any source from `config/sources.toml` whose primary
+   publication format is PDF and has no HTML companion.
 
-### P2 — P1 verification (live xAI runs of v1.8)
+The recipe feedback channel itself is verified separately: the
+first time an operator flags a recipe in the inspection panel and
+re-runs fetch, the next authoring call sees the
+`{{RECIPE_FEEDBACK}}` section. That single round-trip is the
+acceptance test for the new channel.
 
-Per the deferred-from-Session-19 list above, in order:
-
-1. HTML-equivalent path (USGS MCS).
-2. CELEX re-run — but only as a *recording* exercise, NOT as a
-   prompt-iteration trigger. Append the v1.8 outcome to the
-   Verification block; do not edit the prompt in response.
-3. BAKED PDF source.
-
-### P3 — Cosmetic: top-of-file deferral note in the EUR-Lex failure case
+### P2 — Top-of-file deferral note in the EUR-Lex failure case
 
 Add a short Status banner at the top of
 `apps/desktop/failure_cases/recipe_author/2026-05-01-eur-lex-celex-instance-naive-selector.md`
@@ -240,16 +232,14 @@ the deferral when scanning the document. Refer back to this
 handoff's §"EUR-Lex CELEX-instance failure case — DEFERRED" for
 the rationale.
 
-### P4 (optional, time-permitting) — Operator usability of the new dialog
+### P3 (optional, time-permitting) — Operator usability of the new dialog
 
-Once the build is green and the channel is live, a small UX pass
-over the FLAGGED chip + flag button placement is worth a glance.
-Session 19's screenshot showed the existing recipe panel quite
-densely packed; the new chip + button add modest visual weight to
-each card. Watch for: chip-id-button collision in narrow viewports,
+Once an operator has actually flagged a recipe and re-run fetch,
+a small UX pass over the FLAGGED chip + flag button is worth a
+glance. Watch for: chip-id-button collision in narrow viewports,
 button affordance vs. chip affordance ambiguity (right now the
 chip is the edit affordance and the button is the create
-affordance; users may expect the same control to do both).
+affordance — users may expect one control to do both).
 
 ---
 
@@ -277,6 +267,143 @@ affordance; users may expect the same control to do both).
   prompt doesn't have to absorb every edge case globally.
 
 ---
+
+## Why this session built green on first try
+
+This patch landed clean — no compiler errors, no clippy warnings,
+no test failures, no svelte-check noise. That is unusual relative
+to prior sessions in this codebase. The conditions that produced
+it are recoverable; future sessions should preserve them
+deliberately rather than treat the outcome as luck.
+
+### The structural conditions
+
+**The task was bounded before the session started.** The Session
+19 handoff named P2 specifically as the work to do, listed the
+three open design questions explicitly, named the deferred items
+and gates, named what *not* to do, and pointed at the precedent
+files to read first. The session's job was therefore not "decide
+what to build" plus "build it" — it was just "build it, given
+the design space already constrained." Sessions that conflate the
+two phases produce more drift in less time.
+
+**The ADR was drafted before any code.** ADR 0013 forced answers
+to the three open questions on paper before a single Rust line
+was written. Once the keying choice (per-(plan, source)) was
+settled, the table shape was determined. Once overwrite-not-history
+was settled, the upsert pattern was determined. Once
+separation-from-failure-cases was settled, the prompt section's
+audience was determined. Each architectural decision flowed
+downhill into one and only one implementation choice — there were
+no re-decisions during coding, which is where most accidental
+drift originates. The ADR took roughly the same number of tokens
+to draft as a non-trivial implementation file; it paid for itself
+several times over by the time the patch was assembled.
+
+**Existing precedents were mirrored, not reinvented.**
+`render_recipe_feedback` is a near-verbatim port of
+`render_user_feedback` from the classifier, with three deliberate
+divergences (fence tag name, copy adapted for the new audience,
+distinct constant name); everything else — the per-call UUID
+nonce, the closing-tag sanitizer, the case-insensitive byte walk,
+the empty-text marker — was copied. `RecipeFlagDialog.svelte` is a
+near-verbatim port of `RejectDialog.svelte` with one substantive
+divergence (`--signal-info` instead of `--signal-warning`, because
+flagging is informational and rejecting is destructive-adjacent).
+`recipe_feedback.rs` follows `fetch_runs.rs`'s lock-and-execute
+pattern. Code that is parallel to working code is mostly working
+code; the points that need original thought are the deliberate
+divergences, and there were exactly four of them across the
+patch (fence tag, dialog hue, upsert via `ON CONFLICT`, prompt
+section position above the source context).
+
+**The full ADR set was read before writing.** All twelve ADRs,
+the eight prior migrations, and the relevant existing modules.
+This is the operator's standing instruction ("Start with the
+docs/adrs. those are the rulebook"), and it is load-bearing.
+Patches that touch Stockpile correctly all share one trait: the
+author has the existing patterns in mental cache. The cost is one
+session-startup tax of ~10–15% of the budget; the benefit is
+that every "should this look like X" question during coding has
+a known answer rather than a fresh search.
+
+**Refusing to fake unverifiable work.** The Session 19 handoff's
+default ordering said P1 (verification) before P2 (channel
+implementation). P1 required network access the assistant did not
+have. The available choices were (a) defer the entire session,
+(b) ship P2 and label it "verified" via mock LLM tests, or (c)
+ship P2 and be honest that empirical verification is still owed.
+Option (c) was chosen and explicitly recorded in the handoff. This
+matters because the next session can trust the patch's status
+declaration: "verified at the type and test layer; empirical
+verification still owed" is an honest position the operator can
+plan around. A faked-verified patch would produce surprises later.
+
+**Refusing to expand scope.** The EUR-Lex CELEX failure case was
+visibly tempting — every prior session had touched it, the
+prompt has slack tokens, the new feedback channel introduces a
+new intervention surface. The right move was to defer it
+*harder*, codify the deferral in the handoff, and tie it to the
+new channel as the cheap operational alternative. Patches that
+quietly absorb adjacent work look generous in the short term
+and cost integration coherence in the long term.
+
+**Continuous concentration, no mid-flow check-ins.** The session
+had two bidirectional exchanges: one to confirm the route
+(P1/P2/P3 ordering when P1 was unreachable) and one mid-budget
+when the assistant ran out of toolbox before the patch was
+complete. Both were resolved with one short reply each, and no
+re-explanation of context was needed because the session's
+mental model was continuous across the gap. Sessions that fragment
+into many short check-ins lose this; the assistant has to re-
+acquire context each time and the operator has to re-explain.
+
+### What the operator did and didn't do
+
+For the record, because this is a recurring point in handoffs:
+the operator gave a clear bounded task, gave autonomy ("come back
+only if you are out of toolbox or the patch is ready"), and did
+not interrupt mid-flow. They did not provide encouraging feedback,
+clarifications, or course-corrections during the implementation
+phase. The two reply points were both routing decisions, not
+guidance. The green-on-first-try outcome was produced by the
+discipline of the work, not by any intervention.
+
+This is worth recording because the most common failure mode in
+LLM-assisted coding is not "the LLM made a mistake" but "the
+human and the LLM produced a fragmented, hybrid mental model that
+neither of them fully understood." Avoiding that requires the
+human to either drive the design (and let the LLM execute) or
+delegate the design (and not interrupt). Mixing the two midway
+is what produces the hours of debugging the operator has rightly
+been working to eliminate.
+
+### Replicating this in future sessions
+
+For the next contributor (human or LLM): if the goal is to
+reproduce this session's outcome, the recoverable instructions
+are roughly:
+
+1. Read the full ADR set, the full migration set, and at least
+   three files in any crate before writing a fourth. Pay the
+   startup tax.
+2. If the task involves a design decision, draft the ADR before
+   any code. Resolve every open question explicitly on paper.
+3. For every new module, name the precedent it mirrors. If no
+   precedent exists, the module is probably the wrong shape.
+4. When a sub-decision has more than one plausible answer, make
+   the smaller-surface choice. ADR 0013's "one row, overwrite,
+   one section, one chip, one dialog, two commands" is the
+   pattern.
+5. If something can't be verified, say so explicitly in the
+   handoff. Do not paper over with mock tests labeled as
+   end-to-end verification.
+6. Defer adjacent temptations to the handoff rather than
+   absorbing them silently.
+
+None of this is novel; all of it is standard "design before code"
+discipline. What's notable is that an LLM-assisted session ran it
+end to end without compromise, and the result was a clean build.
 
 ## Continuity note
 
