@@ -787,28 +787,52 @@ fn render_recipe_feedback(reason: Option<&str>, fence_id: &str) -> String {
 fn sanitize_for_fence(s: &str, fence_id: &str) -> String {
     let with_nonce_close = format!("</recipe_feedback {fence_id}>");
     let inert_with_nonce = format!("</_recipe_feedback {fence_id}>");
+    let needle_with_nonce = with_nonce_close.as_bytes();
+    let needle_bare = b"</recipe_feedback>";
+    let inert_bare = "</_recipe_feedback>";
 
-    let lower = s.to_lowercase();
-    let needle_lower_with_nonce = with_nonce_close.to_lowercase();
-    let needle_lower_bare = "</recipe_feedback>";
-
+    // Walk `s` directly, never an aliased lowercased copy. The earlier
+    // implementation walked `s.to_lowercase().as_bytes()` alongside
+    // `s.as_bytes()` under one shared index `i`, claiming byte-
+    // alignment between the two. That claim is false in general UTF-8:
+    // `to_lowercase` can change the byte length of a character (`İ`
+    // U+0130 is 2 B, lowercase `i̇` is 3 B; `K` U+212A is 3 B,
+    // lowercase `k` is 1 B; `Å` U+212B is 3 B, lowercase `å` is 2 B;
+    // others). Once the indices diverge, the slice into the lowercase
+    // copy can either panic (when `i > lower.len()`) or silently miss
+    // a closing-tag occurrence in `s`. This form scans `s` directly,
+    // so byte positions always correspond to real positions in the
+    // input. See `research_classifier::sanitize_for_fence` for the
+    // canonical comment block — both functions share this invariant.
+    //
+    // Both needles are pure ASCII, so case-insensitive matching via
+    // `eq_ignore_ascii_case` on the byte slices of `s` is exactly
+    // right: it folds A–Z to a–z and leaves all bytes ≥ 0x80
+    // unchanged. That property guarantees a multi-byte UTF-8 sequence
+    // in `s` can never spuriously match an ASCII needle byte.
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     let bytes = s.as_bytes();
-    let lower_bytes = lower.as_bytes();
 
-    // Index by bytes safely: both `s` and `lower` are ASCII-equivalent
-    // at the positions we're matching (the needles are ASCII; non-
-    // ASCII characters never match and are copied through unchanged).
+    // Loop invariant: `i` is always at a UTF-8 character boundary in
+    // `s`. The matched-needle path advances by needle.len() bytes
+    // (all guaranteed ASCII because they case-fold to an ASCII needle,
+    // and ASCII bytes never sit inside a multi-byte sequence). The
+    // else-branch advances by `ch_len` of the next char in `s`, which
+    // is a whole-character step by construction.
     while i < bytes.len() {
-        let remaining = &lower_bytes[i..];
-        if remaining.starts_with(needle_lower_with_nonce.as_bytes()) {
+        if i + needle_with_nonce.len() <= bytes.len()
+            && bytes[i..i + needle_with_nonce.len()].eq_ignore_ascii_case(needle_with_nonce)
+        {
             out.push_str(&inert_with_nonce);
-            i += needle_lower_with_nonce.len();
-        } else if remaining.starts_with(needle_lower_bare.as_bytes()) {
-            out.push_str("</_recipe_feedback>");
-            i += needle_lower_bare.len();
+            i += needle_with_nonce.len();
+        } else if i + needle_bare.len() <= bytes.len()
+            && bytes[i..i + needle_bare.len()].eq_ignore_ascii_case(needle_bare)
+        {
+            out.push_str(inert_bare);
+            i += needle_bare.len();
         } else {
+            // Copy the next whole character through.
             let ch_len = match s[i..].chars().next() {
                 Some(c) => c.len_utf8(),
                 None => break,
@@ -1424,6 +1448,77 @@ mod tests {
         let payload = "the LLM wrote \"Magyarország\" when it should have said \"HU\" 🤦";
         let out = sanitize_for_fence(payload, "abcd1234");
         assert_eq!(out, payload);
+    }
+
+    // ---- sanitize_for_fence — Unicode length-change regressions -----------
+    //
+    // The earlier byte-aligned-lowercase implementation assumed
+    // `s.to_lowercase()` preserves byte-position alignment with `s`.
+    // It does not: some characters change byte length under Unicode
+    // case folding. The cases below all reach `sanitize_for_fence`
+    // because `check_user_text` does not filter them — only ASCII
+    // controls, zero-width characters, and bidi overrides are
+    // rejected. Each test pins a previously-broken behaviour.
+    // Mirrors the regression suite in `research_classifier`.
+
+    /// `İ` (U+0130, 2 B) lowercases to `i̇` (3 B). Under the old
+    /// byte-aligned implementation, the bare closing tag that follows
+    /// it was matched at the wrong offset, duplicating the `<` and
+    /// dropping the trailing character.
+    #[test]
+    fn sanitize_for_fence_handles_lowercase_byte_length_growth() {
+        let s = "İ</recipe_feedback>X";
+        let out = sanitize_for_fence(s, "abcd1234");
+        assert_eq!(out, "İ</_recipe_feedback>X");
+    }
+
+    /// `Å` (U+212B ANGSTROM SIGN, 3 B) lowercases to `å` (2 B). Under
+    /// the old byte-aligned implementation, the bare closing tag was
+    /// not detected because `i` jumped past it in the lowercased view;
+    /// the closing tag survived in the output. The outer fence's nonce
+    /// kept the structural defense intact, but the bare-tag belt-and-
+    /// suspenders broke.
+    #[test]
+    fn sanitize_for_fence_handles_lowercase_byte_length_shrink_angstrom() {
+        let s = "Å</recipe_feedback>more";
+        let out = sanitize_for_fence(s, "abcd1234");
+        assert!(
+            !out.contains("</recipe_feedback>"),
+            "bare closing tag must be sanitized; got: {out}"
+        );
+        assert!(out.contains("</_recipe_feedback>"));
+        assert!(out.starts_with("Å"));
+        assert!(out.ends_with("more"));
+    }
+
+    /// `K` (U+212A KELVIN SIGN, 3 B) lowercases to `k` (1 B), the
+    /// largest shrink the BMP affords. Under the old byte-aligned
+    /// implementation, this could panic with a slice-out-of-bounds
+    /// (`&lower_bytes[i..]` with `i > lower.len()`) once `i` advanced
+    /// far enough past `K`. Inputs as short as 5 bytes (`Kabcd`)
+    /// trigger it.
+    #[test]
+    fn sanitize_for_fence_does_not_panic_on_kelvin_prefix() {
+        let s = "Kabcd";
+        let out = sanitize_for_fence(s, "abcd1234");
+        assert_eq!(out, "Kabcd");
+    }
+
+    /// Combined: `K` plus a real bare closing tag. Old implementation
+    /// could panic before reaching the tag or leave the tag
+    /// unsanitized; new implementation produces the inert form and
+    /// preserves the surrounding text.
+    #[test]
+    fn sanitize_for_fence_handles_lowercase_byte_length_shrink_kelvin_with_tag() {
+        let s = "K</recipe_feedback>tail";
+        let out = sanitize_for_fence(s, "abcd1234");
+        assert!(
+            !out.contains("</recipe_feedback>"),
+            "bare closing tag must be sanitized; got: {out}"
+        );
+        assert!(out.contains("</_recipe_feedback>"));
+        assert!(out.starts_with("K"));
+        assert!(out.ends_with("tail"));
     }
 
     /// `build_prompt` substitutes the `{{RECIPE_FEEDBACK}}` placeholder

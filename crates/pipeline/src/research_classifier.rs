@@ -751,40 +751,58 @@ fn sanitize_for_fence(s: &str, fence_id: &str) -> String {
     // suffix and leave it dangling.
     let with_nonce_close = format!("</user_feedback {fence_id}>");
     let inert_with_nonce = format!("</_user_feedback {fence_id}>");
+    let needle_with_nonce = with_nonce_close.as_bytes();
+    let needle_bare = b"</user_feedback>";
+    let inert_bare = "</_user_feedback>";
 
-    // Build a case-insensitive replacement by walking the string. For
-    // the bare form this is the only correct approach; the nonce form
-    // includes a UUID we generated, so case sensitivity there is
-    // moot. We handle both uniformly via a single pass.
-    let lower = s.to_lowercase();
-    let needle_lower_with_nonce = with_nonce_close.to_lowercase();
-    let needle_lower_bare = "</user_feedback>";
-
+    // Walk `s` directly, never an aliased lowercased copy.
+    //
+    // The earlier implementation walked `s.to_lowercase().as_bytes()`
+    // alongside `s.as_bytes()` under one shared index `i`, claiming
+    // byte-alignment between the two. That claim is false in general
+    // UTF-8: `to_lowercase` can change the byte length of a character
+    // (`İ` U+0130 is 2 B, lowercase `i̇` is 3 B; `K` U+212A is 3 B,
+    // lowercase `k` is 1 B; `Å` U+212B is 3 B, lowercase `å` is 2 B;
+    // others). Once the indices diverge, the slice into the lowercase
+    // copy can either panic (when `i > lower.len()`) or, more
+    // dangerously, silently miss a closing-tag occurrence in `s`. This
+    // form scans `s` directly, so byte positions always correspond to
+    // real positions in the input.
+    //
+    // Both needles are pure ASCII, so case-insensitive matching via
+    // `eq_ignore_ascii_case` on the byte slices of `s` is exactly
+    // right: it folds A–Z to a–z and leaves all bytes ≥ 0x80
+    // unchanged. The latter property is what guarantees a
+    // multi-byte UTF-8 sequence in `s` can never spuriously match
+    // an ASCII needle byte — non-ASCII haystack bytes only equal
+    // identical non-ASCII needle bytes, and the needle has none.
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     let bytes = s.as_bytes();
-    let lower_bytes = lower.as_bytes();
 
-    // We can index by bytes safely because both `s` and `lower` are
-    // ASCII-equivalent at the positions we're matching (the needles
-    // are ASCII, and `to_lowercase` preserves byte-position alignment
-    // for ASCII characters; for non-ASCII characters we never match
-    // anything, and we copy them through unchanged).
+    // Loop invariant: `i` is always a UTF-8 character boundary in `s`.
+    // Two paths advance it:
+    //   - matched-needle: advances by needle.len() bytes, all of which
+    //     are guaranteed ASCII (the haystack slice case-folds to an
+    //     ASCII needle, which forces those haystack bytes to be ASCII
+    //     too — see eq_ignore_ascii_case property above). ASCII bytes
+    //     never sit inside a multi-byte UTF-8 sequence, so we land on
+    //     a boundary.
+    //   - else-branch: advances by `ch_len` of the next char in `s`,
+    //     which is a whole-character step by construction.
     while i < bytes.len() {
-        let remaining = &lower_bytes[i..];
-        if remaining.starts_with(needle_lower_with_nonce.as_bytes()) {
+        if i + needle_with_nonce.len() <= bytes.len()
+            && bytes[i..i + needle_with_nonce.len()].eq_ignore_ascii_case(needle_with_nonce)
+        {
             out.push_str(&inert_with_nonce);
-            i += needle_lower_with_nonce.len();
-        } else if remaining.starts_with(needle_lower_bare.as_bytes()) {
-            out.push_str("</_user_feedback>");
-            i += needle_lower_bare.len();
+            i += needle_with_nonce.len();
+        } else if i + needle_bare.len() <= bytes.len()
+            && bytes[i..i + needle_bare.len()].eq_ignore_ascii_case(needle_bare)
+        {
+            out.push_str(inert_bare);
+            i += needle_bare.len();
         } else {
-            // Copy the next character (not byte) through. Find the
-            // char boundary by walking until we hit one.
-            //
-            // Performance note: this is O(n) for each iteration in
-            // the worst case (long combining sequences), making the
-            // whole loop O(n²). For 2 KB inputs that's 4M ops — fine.
+            // Copy the next whole character through.
             let ch_len = match s[i..].chars().next() {
                 Some(c) => c.len_utf8(),
                 None => break,
@@ -1310,6 +1328,79 @@ mod tests {
         let s = "Magyarország — a jog visszamenőleges?";
         let out = sanitize_for_fence(s, "abc123");
         assert_eq!(out, s);
+    }
+
+    // ---- sanitize_for_fence — Unicode length-change regressions -----------
+    //
+    // The earlier byte-aligned-lowercase implementation assumed
+    // `s.to_lowercase()` preserves byte-position alignment with `s`.
+    // It does not: some characters change byte length under Unicode
+    // case folding. The cases below all reach `sanitize_for_fence`
+    // because `check_user_text` does not filter them — only ASCII
+    // controls, zero-width characters, and bidi overrides are
+    // rejected. Each test pins a previously-broken behaviour.
+
+    /// `İ` (U+0130, 2 B) lowercases to `i̇` (3 B). Under the old
+    /// byte-aligned implementation, the bare closing tag that follows
+    /// it was matched at the wrong offset, duplicating the `<` and
+    /// dropping the trailing character.
+    #[test]
+    fn sanitize_handles_lowercase_byte_length_growth() {
+        let s = "İ</user_feedback>X";
+        let out = sanitize_for_fence(s, "abc123");
+        assert_eq!(out, "İ</_user_feedback>X");
+    }
+
+    /// `Å` (U+212B ANGSTROM SIGN, 3 B) lowercases to `å` (2 B). Under
+    /// the old byte-aligned implementation, the bare closing tag was
+    /// not detected at all because `i` jumped past it in the
+    /// lowercased view; the closing tag survived in the output. This
+    /// is the defense-in-depth concern: the outer fence's nonce is
+    /// still safe, but the bare-tag belt-and-suspenders broke.
+    #[test]
+    fn sanitize_handles_lowercase_byte_length_shrink_angstrom() {
+        let s = "Å</user_feedback>more";
+        let out = sanitize_for_fence(s, "abc123");
+        assert!(
+            !out.contains("</user_feedback>"),
+            "bare closing tag must be sanitized; got: {out}"
+        );
+        assert!(out.contains("</_user_feedback>"));
+        // Surrounding content preserved verbatim.
+        assert!(out.starts_with("Å"));
+        assert!(out.ends_with("more"));
+    }
+
+    /// `K` (U+212A KELVIN SIGN, 3 B) lowercases to `k` (1 B), the
+    /// largest shrink the BMP affords. Under the old byte-aligned
+    /// implementation, this could panic with a slice-out-of-bounds
+    /// (`&lower_bytes[i..]` with `i > lower.len()`) once `i` advanced
+    /// far enough past `K`. Inputs as short as 5 bytes (`Kabcd`)
+    /// trigger it. The fence-level test below uses such an input.
+    #[test]
+    fn sanitize_does_not_panic_on_kelvin_prefix() {
+        // Length-5 input with a 3-byte leading char and 2-byte tail.
+        // The old implementation panicked here; the new one walks
+        // `s` directly and never indexes past its own end.
+        let s = "Kabcd";
+        let out = sanitize_for_fence(s, "abc123");
+        assert_eq!(out, "Kabcd");
+    }
+
+    /// Combined: `K` plus a real bare closing tag. Old implementation
+    /// would either panic before reaching the tag or leave the tag
+    /// unsanitized; new implementation must produce the inert form.
+    #[test]
+    fn sanitize_handles_lowercase_byte_length_shrink_kelvin_with_tag() {
+        let s = "K</user_feedback>tail";
+        let out = sanitize_for_fence(s, "abc123");
+        assert!(
+            !out.contains("</user_feedback>"),
+            "bare closing tag must be sanitized; got: {out}"
+        );
+        assert!(out.contains("</_user_feedback>"));
+        assert!(out.starts_with("K"));
+        assert!(out.ends_with("tail"));
     }
 
     // ---- adversarial payloads through render_user_feedback ----------------
