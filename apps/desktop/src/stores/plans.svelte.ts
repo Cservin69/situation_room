@@ -51,6 +51,8 @@ import {
   runFetchForPlan as apiRunFetchForPlan,
   listFetchRuns as apiListFetchRuns,
   listRecipesForPlan as apiListRecipesForPlan,
+  setRecipeFeedback as apiSetRecipeFeedback,
+  listRecipeFeedbackForPlan as apiListRecipeFeedbackForPlan,
   asCommandError,
 } from '$lib/api/client';
 import type { PlanSummary } from '$lib/api/types/PlanSummary';
@@ -60,6 +62,7 @@ import type { CommandErrorDto } from '$lib/api/types/CommandErrorDto';
 import type { FetchReportDto } from '$lib/api/types/FetchReportDto';
 import type { FetchRunSummaryDto } from '$lib/api/types/FetchRunSummaryDto';
 import type { RecipeDto } from '$lib/api/types/RecipeDto';
+import type { RecipeFeedbackDto } from '$lib/api/types/RecipeFeedbackDto';
 
 export type StatusFilter = PlanStatusDto | 'all';
 
@@ -103,6 +106,20 @@ interface PlansState {
    * panel pretty-prints them as JSON.
    */
   recipes: RecipeDto[];
+  /**
+   * Operator-feedback notes attached to the selected plan, keyed by
+   * `source_id`. ADR 0013. The recipe-inspection panel reads this
+   * map to decide whether to render the indicator chip on each
+   * recipe card; the flag dialog reads it to pre-fill an existing
+   * note when the operator opens the dialog to edit.
+   *
+   * `Record<source_id, RecipeFeedbackDto>` rather than a Map because
+   * Svelte 5 runes track plain-object property mutations through
+   * proxies; Map mutations don't trigger reactivity without
+   * `$state.raw` plus reassignment, and we want straightforward
+   * `delete plans.recipeFeedback[id]` semantics on clear.
+   */
+  recipeFeedback: Record<string, RecipeFeedbackDto>;
   error: CommandErrorDto | null;
 }
 
@@ -119,6 +136,7 @@ export const plans: PlansState = $state({
   fetchReport: null,
   fetchRuns: [],
   recipes: [],
+  recipeFeedback: {},
   error: null,
 });
 
@@ -198,6 +216,7 @@ export async function selectPlan(id: string): Promise<void> {
   plans.fetchReport = null;
   plans.fetchRuns = [];
   plans.recipes = [];
+  plans.recipeFeedback = {};
   try {
     plans.selected = await getPlan(id);
     // Pull the recent fetch-run history alongside the plan body so
@@ -210,6 +229,10 @@ export async function selectPlan(id: string): Promise<void> {
     // renders. Empty list is the legitimate state for a plan that
     // hasn't been fetched yet.
     void refreshRecipes(id).catch(() => {});
+    // ADR 0013: load the per-(plan, source) feedback notes so the
+    // recipe panel's indicator chips render in lockstep with the
+    // recipes themselves. Empty map is the common case.
+    void refreshRecipeFeedback(id).catch(() => {});
   } catch (e) {
     plans.error = asCommandError(e);
   } finally {
@@ -226,6 +249,7 @@ export function clearSelection(): void {
   plans.fetchReport = null;
   plans.fetchRuns = [];
   plans.recipes = [];
+  plans.recipeFeedback = {};
 }
 
 /**
@@ -460,5 +484,125 @@ export async function refreshRecipes(planId: string): Promise<void> {
     // plans.recipes here — preserving the previous list is more
     // useful than blanking it on a transient failure.
     plans.error = asCommandError(e);
+  }
+}
+
+/**
+ * Refresh the recipe-feedback map for a plan. ADR 0013. Pure read;
+ * called alongside `selectPlan` and after each successful
+ * `flagRecipe` / `clearRecipeFeedback` so the indicator chips stay
+ * in sync with what's actually persisted.
+ *
+ * Wire shape is `RecipeFeedbackDto[]`; the store keeps it as a
+ * `Record<source_id, RecipeFeedbackDto>` so per-recipe lookups in
+ * the panel are O(1) and reactivity is property-grained.
+ */
+export async function refreshRecipeFeedback(planId: string): Promise<void> {
+  try {
+    const list = await apiListRecipeFeedbackForPlan(planId);
+    const next: Record<string, RecipeFeedbackDto> = {};
+    for (const fb of list) {
+      next[fb.source_id] = fb;
+    }
+    plans.recipeFeedback = next;
+  } catch (e) {
+    // Non-fatal: same rationale as refreshFetchRuns / refreshRecipes.
+    // Don't reset the map; preserving the previous state is more
+    // useful than blanking it on a transient failure.
+    plans.error = asCommandError(e);
+  }
+}
+
+/**
+ * Flag a recipe by attaching a free-text operator note for the
+ * (selected plan, source_id) pair. ADR 0013. Optimistic: updates
+ * `plans.recipeFeedback[sourceId]` immediately so the chip / dialog
+ * reflect the change without a refresh roundtrip; rolls back on
+ * backend error.
+ *
+ * Returns `true` on success. The caller (the dialog's submit
+ * handler) closes the dialog on `true`, leaves it open on `false`
+ * so the user sees the error and can edit + resubmit.
+ *
+ * No-op when nothing is selected (the panel is hidden in that
+ * state, but the guard makes the function safe to call defensively).
+ */
+export async function flagRecipe(
+  sourceId: string,
+  note: string,
+): Promise<boolean> {
+  const current = plans.selected;
+  if (!current) return false;
+
+  const trimmed = note.trim();
+  if (trimmed.length === 0) {
+    // Empty after trim → clear path. Mirror the backend's
+    // single-command-collapse so the store has one entry point per
+    // user intent.
+    return clearRecipeFeedback(sourceId);
+  }
+
+  const previous = plans.recipeFeedback[sourceId];
+  // Optimistic write. The created_at is approximate (the backend
+  // stamps the canonical value); the chip cares about presence,
+  // not exact timestamp.
+  plans.recipeFeedback[sourceId] = {
+    plan_id: current.id,
+    source_id: sourceId,
+    note: trimmed,
+    created_at: new Date().toISOString(),
+  };
+  plans.mutating = true;
+  plans.error = null;
+  try {
+    const persisted = await apiSetRecipeFeedback(current.id, sourceId, trimmed);
+    if (persisted) {
+      // Replace the optimistic row with the canonical persisted one
+      // so subsequent reads see the backend's `created_at`.
+      plans.recipeFeedback[sourceId] = persisted;
+    }
+    return true;
+  } catch (e) {
+    // Roll back the optimistic update on failure.
+    if (previous) {
+      plans.recipeFeedback[sourceId] = previous;
+    } else {
+      delete plans.recipeFeedback[sourceId];
+    }
+    plans.error = asCommandError(e);
+    return false;
+  } finally {
+    plans.mutating = false;
+  }
+}
+
+/**
+ * Clear the operator-feedback note for a (selected plan, source_id)
+ * pair. ADR 0013. Optimistic: removes the entry from
+ * `plans.recipeFeedback` immediately, restores it on backend error.
+ *
+ * Returns `true` on success. Idempotent: clearing an already-cleared
+ * source succeeds.
+ */
+export async function clearRecipeFeedback(sourceId: string): Promise<boolean> {
+  const current = plans.selected;
+  if (!current) return false;
+
+  const previous = plans.recipeFeedback[sourceId];
+  delete plans.recipeFeedback[sourceId];
+  plans.mutating = true;
+  plans.error = null;
+  try {
+    await apiSetRecipeFeedback(current.id, sourceId, null);
+    return true;
+  } catch (e) {
+    // Roll back: restore the previous note if there was one.
+    if (previous) {
+      plans.recipeFeedback[sourceId] = previous;
+    }
+    plans.error = asCommandError(e);
+    return false;
+  } finally {
+    plans.mutating = false;
   }
 }

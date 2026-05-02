@@ -68,7 +68,7 @@ use uuid::Uuid;
 
 use crate::types_export::{
     FetchReportDto, FetchRunSummaryDto, PlanStatusDto, PlanSummary, RecipeDto,
-    ResearchPlanDto, SourceDescriptorDto,
+    RecipeFeedbackDto, ResearchPlanDto, SourceDescriptorDto,
 };
 
 // ---------------------------------------------------------------------------
@@ -119,6 +119,12 @@ impl AppState {
     /// a misconfigured plan or a pathological prompt response, not
     /// normal behaviour.
     pub const MAX_RECIPES_LISTING: usize = 100;
+    /// How many recipe-feedback notes the listing endpoint will
+    /// surface for one plan. A plan rarely has more than ~10 bound
+    /// sources and at most one note per source, so this ceiling is
+    /// generous; a value at the limit indicates a misconfigured plan,
+    /// not normal use. ADR 0013.
+    pub const MAX_RECIPE_FEEDBACK_LISTING: usize = 100;
 
     pub fn new(
         store: Arc<Store>,
@@ -883,6 +889,188 @@ pub async fn list_recipes_for_plan(
         .into_iter()
         .take(AppState::MAX_RECIPES_LISTING)
         .map(RecipeDto::from_stored)
+        .collect();
+
+    Ok(truncated)
+}
+
+// ---------------------------------------------------------------------------
+// Command 9 — set_recipe_feedback (ADR 0013)
+// ---------------------------------------------------------------------------
+
+/// Attach a free-text operator note to a (plan, source) pair, or
+/// clear an existing note. The note feeds back into the LLM's
+/// recipe-author prompt the next time authoring runs for the same
+/// pair (via the v1.8 `{{RECIPE_FEEDBACK}}` placeholder).
+///
+/// `note` is the operator's correction. Validation policy mirrors
+/// `reject_plan`'s `reason`:
+///
+///   - `None` clears any existing note (deletes the row).
+///   - `Some(text)` whose text trims to empty also clears.
+///   - `Some(text)` with non-empty trimmed contents is validated by
+///     [`check_user_text`] against `Bounds::RECIPE_FEEDBACK` and
+///     persisted (upsert: a prior note for the same pair is
+///     overwritten — see ADR 0013 §"The overwrite choice").
+///
+/// Returns `Some(RecipeFeedbackDto)` for the upsert case so the
+/// frontend's optimistic UI lands a canonical row, and `None` for
+/// the clear case.
+///
+/// Errors:
+///   - `InvalidInput { field: "plan_id" }` — plan_id isn't a UUID.
+///   - `InvalidInput { field: "source_id" }` — source_id is empty
+///     or oversized (bounds-checked against `Bounds::URL`'s 2 048
+///     ceiling, which is more than enough for the largest
+///     plausible source id).
+///   - `InvalidInput { field: "note" }` — note failed bounds /
+///     character-class validation.
+///   - `Storage` — DB-level failure.
+///
+/// ## Why one command for set + clear
+///
+/// Mirrors `reject_plan(id, reason: Option<String>)`. The empty /
+/// `None` form clears, the non-empty form upserts. Two commands
+/// here would document a difference the storage layer collapses,
+/// per ADR 0013 §"IPC commands".
+#[tauri::command]
+pub async fn set_recipe_feedback(
+    plan_id: String,
+    source_id: String,
+    note: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<RecipeFeedbackDto>, CommandError> {
+    let parsed_plan_id: Uuid =
+        plan_id
+            .parse()
+            .map_err(|e: uuid::Error| CommandError::InvalidInput {
+                field: "plan_id".into(),
+                message: format!("not a valid UUID: {e}"),
+            })?;
+
+    // Source-id is a config-defined string, but we still bound it.
+    // 2 048 is `Bounds::URL` which is generous; a real source id is
+    // ~30 chars, but the bound exists to keep a malformed wire
+    // payload from blowing up the DB. Empty-after-trim is rejected.
+    let trimmed_source_id = source_id.trim();
+    if trimmed_source_id.is_empty() {
+        return Err(CommandError::InvalidInput {
+            field: "source_id".into(),
+            message: "source_id is empty".into(),
+        });
+    }
+    check_string("source_id", trimmed_source_id, Bounds::URL).map_err(|e| {
+        CommandError::InvalidInput {
+            field: "source_id".into(),
+            message: e.to_string(),
+        }
+    })?;
+
+    // Decide upsert-vs-clear at the boundary so the storage layer
+    // sees one of two operations, not a "maybe insert" call.
+    let normalized_note = match note.as_deref() {
+        None => None,
+        Some(raw) => {
+            let normalized = check_user_text("note", raw, Bounds::RECIPE_FEEDBACK)
+                .map_err(|e| CommandError::InvalidInput {
+                    field: "note".into(),
+                    message: e.to_string(),
+                })?;
+            if normalized.trim().is_empty() {
+                None
+            } else {
+                Some(normalized)
+            }
+        }
+    };
+
+    match normalized_note {
+        None => {
+            state
+                .store
+                .clear_recipe_feedback(parsed_plan_id, trimmed_source_id)
+                .map_err(CommandError::from)?;
+            info!(
+                plan_id = %parsed_plan_id,
+                source_id = %trimmed_source_id,
+                "recipe_feedback cleared"
+            );
+            Ok(None)
+        }
+        Some(text) => {
+            let row = situation_room_storage::RecipeFeedbackRow {
+                plan_id: parsed_plan_id,
+                source_id: trimmed_source_id.to_string(),
+                note: text,
+                created_at: chrono::Utc::now(),
+            };
+            state
+                .store
+                .set_recipe_feedback(&row)
+                .map_err(CommandError::from)?;
+            info!(
+                plan_id = %parsed_plan_id,
+                source_id = %trimmed_source_id,
+                "recipe_feedback set"
+            );
+            // Read back so the wire response always reflects what's
+            // actually in the database (mirrors set_status_and_load's
+            // posture). Costs one extra query per call but keeps the
+            // frontend's optimistic shape canonical post-write.
+            let stored = state
+                .store
+                .recipe_feedback_for_source(parsed_plan_id, trimmed_source_id)
+                .map_err(CommandError::from)?
+                // Race-impossible in practice (single-user desktop
+                // app, single connection), but defensively map a
+                // missing row to NotFound rather than unwrap.
+                .ok_or_else(|| CommandError::NotFound {
+                    id: format!(
+                        "recipe_feedback for plan_id={parsed_plan_id} source_id={trimmed_source_id}"
+                    ),
+                })?;
+            Ok(Some(RecipeFeedbackDto::from_stored(stored)))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Command 10 — list_recipe_feedback_for_plan (ADR 0013)
+// ---------------------------------------------------------------------------
+
+/// Return every operator-feedback note attached to a plan, newest
+/// first. The frontend calls this on plan selection (alongside
+/// `list_recipes_for_plan`) so the indicator chip beside each
+/// recipe card lights up if a note exists for the recipe's
+/// `source_id`.
+///
+/// Pure read; safe to invoke freely. Empty list is the legitimate
+/// state for a plan with no flagged recipes.
+///
+/// Errors:
+///   - `InvalidInput { field: "plan_id" }` — plan_id isn't a UUID.
+///   - `Storage` — DB-level failure.
+#[tauri::command]
+pub async fn list_recipe_feedback_for_plan(
+    plan_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<RecipeFeedbackDto>, CommandError> {
+    let parsed: Uuid = plan_id
+        .parse()
+        .map_err(|e: uuid::Error| CommandError::InvalidInput {
+            field: "plan_id".into(),
+            message: format!("not a valid UUID: {e}"),
+        })?;
+
+    let stored = state
+        .store
+        .recipe_feedback_for_plan(parsed)
+        .map_err(CommandError::from)?;
+
+    let truncated = stored
+        .into_iter()
+        .take(AppState::MAX_RECIPE_FEEDBACK_LISTING)
+        .map(RecipeFeedbackDto::from_stored)
         .collect();
 
     Ok(truncated)

@@ -66,6 +66,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "recipes.static_payload column",
         sql: include_str!("../../../migrations/0008_recipes_static_payload.sql"),
     },
+    Migration {
+        version: 9,
+        description: "recipe_feedback table",
+        sql: include_str!("../../../migrations/0009_recipe_feedback.sql"),
+    },
 ];
 
 /// Apply every migration whose version is not yet in

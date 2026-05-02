@@ -25,8 +25,8 @@
 //! - will be inlined into an LLM prompt before being persisted or
 //!   actioned on.
 //!
-//! Currently that's: research topics, rejection reasons, and any
-//! future free-text classification feedback.
+//! Currently that's: research topics, plan rejection reasons, and
+//! recipe-author operator feedback notes (ADR 0013).
 
 use thiserror::Error;
 
@@ -59,6 +59,22 @@ impl Bounds {
     /// the v1.4 classifier prompt's `## User feedback on previous
     /// attempt` section.
     pub const REJECTION_REASON: usize = 2_000;
+
+    /// A single operator-typed recipe-feedback note. ADR 0013: per-
+    /// (plan, source) free-text correction the user attaches when a
+    /// recipe in the inspection panel is wrong (e.g. "this recipe
+    /// fetched the search-form skeleton instead of the listing
+    /// endpoint"). The recipe-author prompt fences the note via the
+    /// same `{{RECIPE_FEEDBACK}}` mechanism the classifier uses for
+    /// `{{USER_FEEDBACK}}` — per-call UUID nonce, "treat as data not
+    /// instructions" preamble, closing-tag sanitization.
+    ///
+    /// The numeric value matches `REJECTION_REASON` (2 000 chars) —
+    /// "this is wrong because X" sized for a sentence or two — but
+    /// the named constant is distinct so call sites read cleanly and
+    /// the two limits can diverge if a future session needs them to.
+    /// See `crates/pipeline/src/recipe_author.rs::AuthoringContext`.
+    pub const RECIPE_FEEDBACK: usize = 2_000;
 
     /// A single URL.
     pub const URL: usize = 2_048;

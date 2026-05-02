@@ -145,7 +145,9 @@ fn main() -> Result<()> {
             situation_room_api::commands::reclassify_plan,
             situation_room_api::commands::run_fetch_for_plan,
             situation_room_api::commands::list_fetch_runs,
-            situation_room_api::commands::list_recipes_for_plan
+            situation_room_api::commands::list_recipes_for_plan,
+            situation_room_api::commands::set_recipe_feedback,
+            situation_room_api::commands::list_recipe_feedback_for_plan
         ])
         .run(tauri::generate_context!())
         .context("running tauri")?;

@@ -90,7 +90,7 @@
   selection boundaries because plans.recipes is reset on selectPlan.
 -->
 <script lang="ts">
-  import { plans } from '$stores/plans.svelte';
+  import { plans, flagRecipe } from '$stores/plans.svelte';
   import type { RecipeDto } from '$lib/api/types/RecipeDto';
   import {
     outcomeTone,
@@ -98,6 +98,34 @@
     outcomeDetail,
     outcomeForRecipe,
   } from '$lib/outcomes';
+  import RecipeFlagDialog from '$components/dialogs/RecipeFlagDialog.svelte';
+
+  // ADR 0013: which recipe (if any) currently has its flag dialog
+  // open. We key by `source_id` rather than `recipe.id` because the
+  // feedback channel itself is keyed per (plan, source) — opening
+  // the dialog on the same source's later recipe version should land
+  // on the same persisted note. Null = no dialog open.
+  let flagDialogSourceId: string | null = $state(null);
+  let flagSubmitting = $state(false);
+
+  function openFlagDialog(sourceId: string) {
+    flagDialogSourceId = sourceId;
+  }
+  function closeFlagDialog() {
+    flagDialogSourceId = null;
+  }
+  async function onFlagSubmit(note: string) {
+    if (!flagDialogSourceId) return;
+    flagSubmitting = true;
+    try {
+      const ok = await flagRecipe(flagDialogSourceId, note);
+      if (ok) flagDialogSourceId = null;
+      // On failure: dialog stays open, plans.error renders in the
+      // parent banner, user can edit + resubmit.
+    } finally {
+      flagSubmitting = false;
+    }
+  }
 
   function shortId(id: string): string {
     // UUIDv7s are too long for inline display; first 8 chars are
@@ -152,6 +180,7 @@
   {@const tone = outcomeTone(outcome)}
   {@const label = outcomeLabel(outcome)}
   {@const detail = outcomeDetail(outcome)}
+  {@const feedback = plans.recipeFeedback[recipe.source_id]}
   <article class="recipe">
     <header class="recipe-head">
       <span class="source-id">{recipe.source_id}</span>
@@ -171,7 +200,40 @@
           title="Bake-time-frozen: the runtime serves baked bytes to extraction in place of an HTTP fetch. This recipe will produce the same records on every fetch until re-authored. ADR 0007 Amendment 3."
         >BAKED</span>
       {/if}
+      {#if feedback}
+        <!--
+          FLAGGED chip — ADR 0013. Visible when the operator has
+          attached a feedback note for this (plan, source) pair.
+          Clicking opens the dialog to edit; the note's full text
+          shows on hover via the title attribute. The chip uses
+          --signal-info because the recipe is annotated, not
+          discarded — the freshness/lifecycle isn't broken; the
+          author just has additional context for the next attempt.
+        -->
+        <button
+          type="button"
+          class="flagged-chip"
+          title={feedback.note}
+          onclick={() => openFlagDialog(recipe.source_id)}
+        >FLAGGED</button>
+      {/if}
       <span class="recipe-id">{shortId(recipe.id)}</span>
+      <!--
+        Flag button — always present so the operator can attach a
+        note even on a recipe that's never failed (e.g. a wrong-
+        shape extraction the user noticed by reading the records).
+        When already flagged, the FLAGGED chip is the primary edit
+        affordance; this button is a secondary entry point for the
+        unflagged state.
+      -->
+      {#if !feedback}
+        <button
+          type="button"
+          class="flag-button"
+          title="Attach a note about what's wrong with this recipe — fed into the next authoring attempt for this source."
+          onclick={() => openFlagDialog(recipe.source_id)}
+        >flag</button>
+      {/if}
     </header>
 
     <!--
@@ -232,6 +294,27 @@
   </article>
 {/snippet}
 
+{#if flagDialogSourceId !== null}
+  <!--
+    Flag dialog mount. Keyed implicitly by the {#if} block — the
+    dialog mounts fresh whenever flagDialogSourceId becomes
+    non-null, so the `initial` prop captured at construction time
+    is the right value (matches RejectDialog's
+    `untrack(() => initial)` pattern).
+
+    `initial` is the existing note text for this source if there
+    is one, else empty. Submitting empty routes through
+    `flagRecipe` → `clearRecipeFeedback`.
+  -->
+  <RecipeFlagDialog
+    sourceId={flagDialogSourceId}
+    initial={plans.recipeFeedback[flagDialogSourceId]?.note ?? ''}
+    submitting={flagSubmitting}
+    onSubmit={onFlagSubmit}
+    onCancel={closeFlagDialog}
+  />
+{/if}
+
 <style>
   .recipes-panel {
     background: var(--bg-panel);
@@ -282,7 +365,15 @@
   .recipe-head {
     display: flex;
     align-items: baseline;
-    justify-content: space-between;
+    /*
+     * No `justify-content: space-between` — that distributes space
+     * equally between every item, which breaks down when the head
+     * gains a variable trailing slot (the flag button or the
+     * FLAGGED chip). Instead, we push the right-side cluster
+     * (recipe-id + optional flag button) via `margin-left: auto`
+     * on .recipe-id; items before .recipe-id (source-id, BAKED,
+     * FLAGGED chips) flow left-to-right with the gap.
+     */
     gap: 8px;
   }
 
@@ -298,6 +389,8 @@
     font-size: 10px;
     color: var(--fg-quaternary);
     font-variant-numeric: tabular-nums;
+    /* push to the right; trailing items follow with the gap */
+    margin-left: auto;
   }
 
   /*
@@ -332,6 +425,59 @@
     cursor: help;
     /* sit on the same baseline as source-id and recipe-id */
     align-self: center;
+  }
+
+  /*
+   * FLAGGED chip — ADR 0013. Shown when the operator has attached a
+   * feedback note for the recipe's (plan, source) pair. Same baseline
+   * + sizing as .baked-badge, different hue: --signal-info because
+   * the flag is informational (the recipe is annotated, not in a
+   * degraded freshness state). Clickable: opens the dialog to edit.
+   */
+  .flagged-chip {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    padding: 2px 6px;
+    border-radius: 2px;
+    color: var(--signal-info, var(--fg-secondary));
+    border: 1px solid var(--signal-info, var(--border-subtle));
+    background: var(--bg-canvas);
+    cursor: pointer;
+    align-self: center;
+    transition: filter var(--duration-ui) var(--ease);
+  }
+  .flagged-chip:hover {
+    filter: brightness(1.15);
+  }
+
+  /*
+   * Flag button — secondary entry point on unflagged recipes. Sits
+   * to the right of the recipe-id so it doesn't displace the head's
+   * primary identifiers, and uses --fg-tertiary so it reads as
+   * subordinate to the source-id and recipe-id. The FLAGGED chip
+   * (when present) is the primary edit affordance; this button is
+   * the "add a note" entry point.
+   */
+  .flag-button {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+    padding: 2px 8px;
+    border-radius: 2px;
+    color: var(--fg-tertiary);
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    cursor: pointer;
+    align-self: center;
+    transition: border-color var(--duration-ui) var(--ease),
+                color var(--duration-ui) var(--ease);
+  }
+  .flag-button:hover {
+    border-color: var(--signal-info, var(--border-accent));
+    color: var(--fg-primary);
   }
 
   /*

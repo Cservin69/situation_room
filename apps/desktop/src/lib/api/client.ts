@@ -19,6 +19,7 @@ import type { CommandErrorDto } from './types/CommandErrorDto';
 import type { FetchReportDto } from './types/FetchReportDto';
 import type { FetchRunSummaryDto } from './types/FetchRunSummaryDto';
 import type { RecipeDto } from './types/RecipeDto';
+import type { RecipeFeedbackDto } from './types/RecipeFeedbackDto';
 
 /**
  * Run Level-1 classification on a topic. Persists the resulting plan
@@ -170,6 +171,53 @@ export async function listFetchRuns(
  */
 export async function listRecipesForPlan(planId: string): Promise<RecipeDto[]> {
   return invoke<RecipeDto[]>('list_recipes_for_plan', { planId });
+}
+
+/**
+ * Set or clear the operator-feedback note for a (plan, source)
+ * pair. ADR 0013.
+ *
+ * - `note: string` (non-empty after trim) — upserts; the prior note
+ *   for the same (plan, source) is overwritten. Returns the
+ *   persisted `RecipeFeedbackDto`.
+ * - `note: null` or empty / whitespace-only — clears the row.
+ *   Returns `null`.
+ *
+ * The backend validates the note via `check_user_text` against
+ * `Bounds::RECIPE_FEEDBACK` (length, control characters, zero-width
+ * chars, bidi overrides, line-ending normalization). The dialog
+ * enforces a soft limit on the frontend; hard validation is the
+ * trust boundary's job.
+ *
+ * Throws `{ kind: 'invalid_input', field: 'plan_id' | 'source_id'
+ * | 'note', message }` for bad inputs; `{ kind: 'storage' }` for
+ * DB-level failures.
+ */
+export async function setRecipeFeedback(
+  planId: string,
+  sourceId: string,
+  note: string | null,
+): Promise<RecipeFeedbackDto | null> {
+  return invoke<RecipeFeedbackDto | null>('set_recipe_feedback', {
+    planId,
+    sourceId,
+    note,
+  });
+}
+
+/**
+ * List every operator-feedback note attached to a plan, newest
+ * first. Pure read; safe to call on plan selection. Empty list is
+ * the legitimate state for a plan with no flagged recipes. ADR 0013.
+ *
+ * Throws `{ kind: 'invalid_input' }` if `planId` isn't a UUID.
+ */
+export async function listRecipeFeedbackForPlan(
+  planId: string,
+): Promise<RecipeFeedbackDto[]> {
+  return invoke<RecipeFeedbackDto[]>('list_recipe_feedback_for_plan', {
+    planId,
+  });
 }
 
 /**

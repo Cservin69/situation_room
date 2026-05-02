@@ -749,6 +749,47 @@ impl RecipeDto {
 }
 
 // ---------------------------------------------------------------------------
+// RecipeFeedbackDto — wire shape for ADR 0013 operator feedback
+// ---------------------------------------------------------------------------
+
+/// Per-(plan, source) operator note attached via the recipe-inspection
+/// panel's flag affordance. Fed back to the LLM as `{{RECIPE_FEEDBACK}}`
+/// the next time recipe-authoring runs for the same (plan, source).
+///
+/// Stored as a single row per (plan, source) — overwrite, not history
+/// (ADR 0013 §"The overwrite choice"). The frontend renders the chip
+/// next to the recipe card; hover surfaces the note text.
+///
+/// Wire identifiers are `String`-form UUIDs to keep the TS type
+/// consistent with `RecipeDto.plan_id` and `PlanSummary.id`. The
+/// `created_at` carries the time the note was last set (so a re-flag
+/// surfaces a fresh timestamp); on `clear`, the row is deleted and
+/// no DTO is emitted.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct RecipeFeedbackDto {
+    pub plan_id: String,
+    pub source_id: String,
+    pub note: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl RecipeFeedbackDto {
+    /// Lift a [`situation_room_storage::StoredRecipeFeedback`] into
+    /// wire shape. Pure renaming + UUID stringification; no parse
+    /// failures possible because the storage layer's columns are
+    /// already strongly typed.
+    pub fn from_stored(r: situation_room_storage::StoredRecipeFeedback) -> Self {
+        Self {
+            plan_id: r.plan_id.to_string(),
+            source_id: r.source_id,
+            note: r.note,
+            created_at: r.created_at,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1286,5 +1327,29 @@ mod tests {
         };
         let dto = RecipeDto::from_stored(stored);
         assert_eq!(dto.static_payload.as_deref(), Some(payload));
+    }
+
+    /// ADR 0013 — `StoredRecipeFeedback` lifts cleanly into the wire
+    /// DTO. Pure renaming + UUID-to-string; verifying the round-trip
+    /// catches the kind of accidental field-rename drift that ts-rs
+    /// would otherwise only catch on TS rebuild.
+    #[test]
+    fn recipe_feedback_dto_round_trips_from_stored() {
+        use chrono::TimeZone;
+        let plan_id = uuid::Uuid::now_v7();
+        let stored = situation_room_storage::StoredRecipeFeedback {
+            plan_id,
+            source_id: "gdelt".into(),
+            note: "fetched the channel <title>, not the article titles".into(),
+            created_at: chrono::Utc.with_ymd_and_hms(2026, 5, 2, 8, 30, 0).unwrap(),
+        };
+        let dto = RecipeFeedbackDto::from_stored(stored);
+        assert_eq!(dto.plan_id, plan_id.to_string());
+        assert_eq!(dto.source_id, "gdelt");
+        assert_eq!(
+            dto.note,
+            "fetched the channel <title>, not the article titles"
+        );
+        assert_eq!(dto.created_at.to_rfc3339(), "2026-05-02T08:30:00+00:00");
     }
 }

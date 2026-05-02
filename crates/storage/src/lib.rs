@@ -22,6 +22,7 @@ pub mod fetch_runs;
 pub mod migrate;
 pub mod observations;
 pub mod queries;
+pub mod recipe_feedback;
 pub mod record_dispatch;
 pub mod recipes;
 pub mod relations;
@@ -30,6 +31,7 @@ pub mod research_plans;
 pub use connection::Store;
 pub use fetch_runs::{FetchRunRow, StoredFetchRun};
 pub use queries::TopicUsage;
+pub use recipe_feedback::{RecipeFeedbackRow, StoredRecipeFeedback};
 pub use recipes::{RecipeRow, StoredRecipe};
 pub use research_plans::{PlanStatus, ResearchPlanRow, StoredResearchPlan};
 

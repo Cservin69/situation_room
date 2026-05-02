@@ -596,10 +596,36 @@ async fn author_one(
         None => stub_excerpt(plan, source_id, None),
     };
 
+    // Look up any operator feedback the user attached to this
+    // (plan, source) pair via the recipe-inspection panel. ADR 0013:
+    // the feedback persists across re-authoring (keyed by plan_id +
+    // source_id, not recipe_id), so even after a `dedup_key`-bumped
+    // version rotation the next authoring call still sees the
+    // operator's correction. A storage error here is non-fatal —
+    // we log and continue with no feedback rather than aborting
+    // authoring, because feedback is a hint, not a precondition.
+    let recipe_feedback = match ctx
+        .store
+        .recipe_feedback_for_source(plan.id, source_id)
+    {
+        Ok(Some(stored)) => Some(stored.note),
+        Ok(None) => None,
+        Err(e) => {
+            warn!(
+                plan_id = %plan.id,
+                source_id = %source_id,
+                error = %e,
+                "recipe_feedback lookup failed; authoring will proceed without operator feedback"
+            );
+            None
+        }
+    };
+
     let auth_ctx = AuthoringContext {
         source_id: source_id.to_string(),
         sample_url,
         document_excerpt: excerpt,
+        recipe_feedback,
     };
 
     let mut recipe = author_recipe(

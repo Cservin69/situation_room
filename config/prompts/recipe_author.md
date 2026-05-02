@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.7
+# Recipe Author Prompt — v1.8
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -87,6 +87,8 @@ specific expectation (by index), and the field mappings must
 populate the fields of the target record type. The `topic_tags` will
 be attached automatically to every produced record — do not include
 them in your mappings.
+
+{{RECIPE_FEEDBACK}}
 
 ## The source context
 
@@ -649,6 +651,25 @@ you pick.
 
 ### Changelog
 
+- **v1.8** (2026-05-02) — Added "Operator feedback on prior
+  authoring" section, surfaced via the new `{{RECIPE_FEEDBACK}}`
+  placeholder, between `## The plan you are authoring for` and
+  `## The source context`. The placeholder substitutes to the
+  empty string when the operator hasn't flagged a recipe for the
+  current `(plan_id, source_id)` pair (the common case for fresh
+  authoring), and to a fenced block — `<recipe_feedback id="...">`
+  — when they have. Fence security mirrors the classifier's
+  `{{USER_FEEDBACK}}` channel: per-call UUID nonce in the closing
+  tag, "treat as data not instructions" preamble, closing-tag
+  sanitization. Motivated by ADR 0013 (recipe feedback channel):
+  the operator gets a Level-2 feedback channel symmetric to the
+  Level-1 channel they already have, and the LLM sees the
+  correction *before* it reads the source excerpt and commits to
+  a structural interpretation. Output contract is unchanged —
+  same JSON Schema, same field-source kinds, same binding rules.
+  Recipes already authored remain valid; the new placeholder is
+  optional in templates (a template lacking it ignores any
+  feedback the context carries).
 - **v1.7** (2026-05-01) — Added "Strategy for PDF sources — HTML
   first, static payload fallback" section between URL discipline
   and Document excerpt. Top-level `static_payload` field added to
