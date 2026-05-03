@@ -53,6 +53,7 @@ import {
   listRecipesForPlan as apiListRecipesForPlan,
   setRecipeFeedback as apiSetRecipeFeedback,
   listRecipeFeedbackForPlan as apiListRecipeFeedbackForPlan,
+  recordsForPlan as apiRecordsForPlan,
   asCommandError,
 } from '$lib/api/client';
 import type { PlanSummary } from '$lib/api/types/PlanSummary';
@@ -63,6 +64,7 @@ import type { FetchReportDto } from '$lib/api/types/FetchReportDto';
 import type { FetchRunSummaryDto } from '$lib/api/types/FetchRunSummaryDto';
 import type { RecipeDto } from '$lib/api/types/RecipeDto';
 import type { RecipeFeedbackDto } from '$lib/api/types/RecipeFeedbackDto';
+import type { RecordsByPlanDto } from '$lib/api/types/RecordsByPlanDto';
 
 export type StatusFilter = PlanStatusDto | 'all';
 
@@ -120,6 +122,19 @@ interface PlansState {
    * `delete plans.recipeFeedback[id]` semantics on clear.
    */
   recipeFeedback: Record<string, RecipeFeedbackDto>;
+  /**
+   * Records produced by the selected plan's recipes, bucketed by
+   * record type (Session 22). `null` means "we haven't asked yet"
+   * (selection is fresh, or selection is a pending plan that can't
+   * have records). Distinguishing `null` from an all-empty bucket
+   * matters for the UI: a pending plan never shows "0 records yet"
+   * empty-state copy because the question doesn't apply.
+   *
+   * Refreshed alongside the plan body and after each successful
+   * `runFetch`. Cleared on `clearSelection` and at the start of
+   * `selectPlan`.
+   */
+  records: RecordsByPlanDto | null;
   error: CommandErrorDto | null;
 }
 
@@ -137,6 +152,7 @@ export const plans: PlansState = $state({
   fetchRuns: [],
   recipes: [],
   recipeFeedback: {},
+  records: null,
   error: null,
 });
 
@@ -205,10 +221,17 @@ export async function classifyTopic(topic: string): Promise<void> {
  *
  * Resets the per-plan fetch and recipe state so the previously-viewed
  * plan's history doesn't leak across the selection boundary, then
- * asynchronously refreshes the fetch-run history and the authored-
- * recipes list for the newly-selected plan. Both refreshes are
- * fire-and-forget; failures are non-fatal and surface as an error
- * banner without blocking the plan body from rendering.
+ * asynchronously refreshes the fetch-run history, the authored-
+ * recipes list, the recipe-feedback map, and the records bucket for
+ * the newly-selected plan. All refreshes are fire-and-forget;
+ * failures are non-fatal and surface as an error banner without
+ * blocking the plan body from rendering.
+ *
+ * Records are only refreshed when the plan is past the `pending`
+ * lifecycle state — calling `records_for_plan` on a pending plan is
+ * an InvalidInput error, by design (a plan that has never been
+ * fetched can't have records, and the command surfaces that
+ * lifecycle state explicitly rather than masking it as "empty").
  */
 export async function selectPlan(id: string): Promise<void> {
   plans.loading = true;
@@ -217,8 +240,10 @@ export async function selectPlan(id: string): Promise<void> {
   plans.fetchRuns = [];
   plans.recipes = [];
   plans.recipeFeedback = {};
+  plans.records = null;
   try {
-    plans.selected = await getPlan(id);
+    const plan = await getPlan(id);
+    plans.selected = plan;
     // Pull the recent fetch-run history alongside the plan body so
     // the review pane can render "we ran this 3 times" context
     // without a second user action. Failure to load the history is
@@ -233,6 +258,14 @@ export async function selectPlan(id: string): Promise<void> {
     // recipe panel's indicator chips render in lockstep with the
     // recipes themselves. Empty map is the common case.
     void refreshRecipeFeedback(id).catch(() => {});
+    // Session 22: load the records bucket if the plan is past
+    // pending. For a pending plan, the records call is invalid (no
+    // fetch has happened yet); leave `plans.records` as null so the
+    // bucket panels render their "no expectations / no records"
+    // states based purely on the plan's expectations.
+    if (plan.status !== 'pending') {
+      void refreshRecords(id).catch(() => {});
+    }
   } catch (e) {
     plans.error = asCommandError(e);
   } finally {
@@ -250,6 +283,7 @@ export function clearSelection(): void {
   plans.fetchRuns = [];
   plans.recipes = [];
   plans.recipeFeedback = {};
+  plans.records = null;
 }
 
 /**
@@ -379,6 +413,14 @@ async function transitionSelected(
     const updated = await call(current.id);
     plans.selected = updated;
     await refreshRecent();
+    // Session 22: a fresh accept makes records *queryable* (the
+    // command refuses pending plans). Kick a refresh so the bucket
+    // panels stop showing "no fetch yet" empty-state and start
+    // showing "expectations present, no records yet" empty-state
+    // (or the actual records, after the first fetch).
+    if (optimistic === 'accepted') {
+      void refreshRecords(updated.id).catch(() => {});
+    }
     return true;
   } catch (e) {
     plans.error = asCommandError(e);
@@ -441,6 +483,11 @@ export async function runFetch(): Promise<boolean> {
     // but refreshing is cheap and keeps the panel in sync if the
     // plan's bound sources ever expand.
     void refreshRecipes(current.id).catch(() => {});
+    // Session 22: a fetch run is the only thing that produces
+    // records, so refresh the bucket alongside the runs and recipes.
+    // The records command is safe at this point — the plan must
+    // have been Accepted for the fetch to have run.
+    void refreshRecords(current.id).catch(() => {});
     return true;
   } catch (e) {
     plans.error = asCommandError(e);
@@ -509,6 +556,33 @@ export async function refreshRecipeFeedback(planId: string): Promise<void> {
     // Non-fatal: same rationale as refreshFetchRuns / refreshRecipes.
     // Don't reset the map; preserving the previous state is more
     // useful than blanking it on a transient failure.
+    plans.error = asCommandError(e);
+  }
+}
+
+/**
+ * Refresh the records bucket for a plan (Session 22). Pure read;
+ * called alongside `selectPlan` (when the plan is past pending),
+ * after a successful `runFetch`, and after a successful accept (to
+ * flip the bucket panels from "no fetch yet" to "no records yet"
+ * empty state).
+ *
+ * Like the other background refreshes, this doesn't toggle any
+ * spinner. Failure surfaces as an error banner; the cached
+ * `plans.records` is preserved on transient failure so a network
+ * blip doesn't blank populated bucket panels.
+ *
+ * The backend refuses pending plans with InvalidInput. Callers are
+ * expected to gate on plan status; this helper does not re-check
+ * (and the backend's check is the canonical one in any case).
+ */
+export async function refreshRecords(planId: string): Promise<void> {
+  try {
+    plans.records = await apiRecordsForPlan(planId);
+  } catch (e) {
+    // Non-fatal: same rationale as refreshFetchRuns. Preserving the
+    // previous bucket is more useful than blanking populated panels
+    // because a background refresh hit a transient error.
     plans.error = asCommandError(e);
   }
 }

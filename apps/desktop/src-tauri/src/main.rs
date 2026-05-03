@@ -21,7 +21,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use situation_room_api::commands::AppState;
-use situation_room_llm::XaiProvider;
+use situation_room_llm::{AnthropicProvider, LlmProvider, XaiProvider};
 use situation_room_pipeline::research_classifier::SourceDescriptor;
 use situation_room_secure::{
     http::{SecureHttpClient, SecureHttpConfig},
@@ -89,13 +89,17 @@ fn main() -> Result<()> {
     // We hold the client in an Arc and hand the provider a Clone
     // (SecureHttpClient is internally Arc-wrapped, so Clone shares
     // the underlying connection pool — what we want).
+    //
+    // `pick_provider` reads `LLM_PROVIDER` (default `"xai"`) and
+    // builds the matching concrete provider, type-erased to
+    // `Arc<dyn LlmProvider + Send + Sync>` so AppState can hold one
+    // shape regardless of which provider is configured. Session 23
+    // promoted Anthropic from stub to real; both providers are now
+    // viable picks.
     let http = SecureHttpClient::new(SecureHttpConfig::default())
         .context("building secure http client")?;
     let http_arc = Arc::new(http.clone());
-    let provider = XaiProvider::from_env(http).context(
-        "XAI_API_KEY not found — set it in the environment or in a .env file at the workspace root",
-    )?;
-    let provider = Arc::new(provider);
+    let provider = pick_provider(http)?;
 
     // --- Source descriptors -----------------------------------------
     //
@@ -153,6 +157,58 @@ fn main() -> Result<()> {
         .context("running tauri")?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// LLM provider selection
+// ---------------------------------------------------------------------------
+
+/// Environment variable that picks which LLM provider the binary uses
+/// at boot. Default is `"xai"`; set to `"anthropic"` to switch to
+/// Claude. Documented in `.env.example`.
+const LLM_PROVIDER_ENV: &str = "LLM_PROVIDER";
+
+/// Build the LLM provider chosen at boot. Reads `LLM_PROVIDER` (default
+/// `"xai"`), constructs the matching concrete provider, and type-erases
+/// it to `Arc<dyn LlmProvider + Send + Sync>` so AppState carries one
+/// shape regardless of which provider is configured.
+///
+/// Returns a clear error if the chosen provider's API key isn't set —
+/// rather than silently falling back to the other provider, which
+/// would surprise an operator who explicitly asked for one.
+fn pick_provider(
+    http: SecureHttpClient,
+) -> Result<Arc<dyn LlmProvider + Send + Sync>> {
+    let choice = std::env::var(LLM_PROVIDER_ENV)
+        .ok()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "xai".to_string());
+
+    info!(provider = %choice, "selecting LLM provider");
+
+    match choice.as_str() {
+        "xai" | "grok" => {
+            let p = XaiProvider::from_env(http).context(
+                "XAI_API_KEY not found — set it in the environment or in a .env file at the workspace root",
+            )?;
+            Ok(Arc::new(p))
+        }
+        "anthropic" | "claude" => {
+            let p = AnthropicProvider::from_env(http).context(
+                "ANTHROPIC_API_KEY not found — set it in the environment or in a .env file at the workspace root",
+            )?;
+            Ok(Arc::new(p))
+        }
+        other => {
+            // The operator typed something unrecognised. Don't fall
+            // through to a default — surface the typo so the next
+            // boot uses the provider they actually meant.
+            anyhow::bail!(
+                "unknown LLM_PROVIDER {other:?}; valid values are 'xai' or 'anthropic'"
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

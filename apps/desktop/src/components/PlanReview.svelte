@@ -13,7 +13,9 @@
       `display`; the `code` is in the title attribute for hover. When
       `display` is empty, the chip falls back to `code`.
     - Six bucket panels (Observation, Event, Entity, Relation, Document,
-      Assertion) on a CSS grid.
+      Assertion) on a CSS grid. Each bucket renders its expectations
+      AND any records produced by the plan's recipes that fall into
+      that bucket (Session 22).
 
   ## Accept / Reject (Session 7 §P1)
 
@@ -22,6 +24,28 @@
   a status pill, because the decision isn't reversible from this UI:
   rejecting a wrong reject means classifying a fresh plan, not
   un-rejecting (handoff §"explicitly NOT": no edit-the-plan flow).
+
+  ## Records-on-the-workstation (Session 22)
+
+  Each bucket renders, in order:
+
+    1. Expectations rows (existing) — the LLM-stated intent.
+    2. Records section (new) — the records produced for this plan
+       and matching this record type.
+
+  The records section only appears when `plans.records !== null` (we
+  have asked the backend at least once). For pending plans the call
+  is invalid, so `plans.records` stays null and the records section
+  is hidden entirely. For accepted-or-rejected plans with no fetch
+  runs yet, the records bucket is loaded but empty, and we show "0
+  records yet" inline so the operator knows the panel is up to date,
+  not stale.
+
+  Per-expectation slotting (rendering each record under the specific
+  expectation it satisfies) is deferred — the provenance string
+  carries recipe id but not binding tag, so we can't tell which
+  expectation a record matches without changes to the recipe-apply
+  pipeline. See Session 23 handoff for the architectural follow-up.
 -->
 <script lang="ts">
   import type { ResearchPlanDto } from '$lib/api/types/ResearchPlanDto';
@@ -37,6 +61,7 @@
   import StatusPill from '$components/common/StatusPill.svelte';
   import Bucket from '$components/panels/Bucket.svelte';
   import ExpectationRow from '$components/panels/ExpectationRow.svelte';
+  import RecordCard from '$components/panels/RecordCard.svelte';
   import RunFetchButton from '$components/RunFetchButton.svelte';
   import FetchReport from '$components/FetchReport.svelte';
   import RecipesPanel from '$components/RecipesPanel.svelte';
@@ -98,6 +123,23 @@
     if (ok) reclassifyDialogOpen = false;
   }
   function onReclassifyCancel() { reclassifyDialogOpen = false; }
+
+  // Records-loaded sentinel + per-bucket counts. Reading these in
+  // derived values keeps the template short and makes the empty-
+  // state logic readable.
+  //
+  // `plans.records` is `null` when we haven't fetched (pending plan,
+  // or before the first selectPlan refresh resolves). Distinguishing
+  // null from all-empty matters because "we haven't asked" should
+  // hide the records section entirely; "we asked, got nothing" should
+  // show "0 records yet" inline.
+  let recordsLoaded = $derived(plans.records !== null);
+  let obsRecords = $derived(plans.records?.observations ?? []);
+  let eventRecords = $derived(plans.records?.events ?? []);
+  let entityRecords = $derived(plans.records?.entities ?? []);
+  let relationRecords = $derived(plans.records?.relations ?? []);
+  let documentRecords = $derived(plans.records?.documents ?? []);
+  let assertionRecords = $derived(plans.records?.assertions ?? []);
 </script>
 
 <article class="plan">
@@ -203,9 +245,24 @@
     {/if}
   </section>
 
-  <!-- Six bucket panels -->
+  <!-- Six bucket panels.
+
+       Each bucket renders expectations rows from the plan, then —
+       when records have been loaded for this plan — a records
+       section with one RecordCard per record. The records section is
+       visually separated from expectations by a thin divider.
+
+       The "0 records yet" hint shows when expectations exist but no
+       records have been produced; it does NOT show when expectations
+       are also empty (the bucket already shows "no expectations by
+       design" in that case via Bucket's empty-state logic).
+  -->
   <section class="buckets">
-    <Bucket title="observation" count={plan.expectations.observation_metrics.length}>
+    <Bucket
+      title="observation"
+      count={plan.expectations.observation_metrics.length}
+      recordsCount={obsRecords.length}
+    >
       {#each plan.expectations.observation_metrics as m (m.name)}
         <ExpectationRow label={m.name} rationale={m.rationale}>
           {#snippet aside()}
@@ -213,15 +270,47 @@
           {/snippet}
         </ExpectationRow>
       {/each}
+      {#if recordsLoaded}
+        <div class="records">
+          <span class="records-label">records ({obsRecords.length})</span>
+          {#if obsRecords.length === 0 && plan.expectations.observation_metrics.length > 0}
+            <p class="records-empty">0 records yet — run a fetch to populate</p>
+          {:else}
+            {#each obsRecords as r (r.id)}
+              <RecordCard kind="observation" record={r} />
+            {/each}
+          {/if}
+        </div>
+      {/if}
     </Bucket>
 
-    <Bucket title="event" count={plan.expectations.event_types.length}>
+    <Bucket
+      title="event"
+      count={plan.expectations.event_types.length}
+      recordsCount={eventRecords.length}
+    >
       {#each plan.expectations.event_types as e (e.event_type)}
         <ExpectationRow label={e.event_type} rationale={e.rationale} />
       {/each}
+      {#if recordsLoaded}
+        <div class="records">
+          <span class="records-label">records ({eventRecords.length})</span>
+          {#if eventRecords.length === 0 && plan.expectations.event_types.length > 0}
+            <p class="records-empty">0 records yet — run a fetch to populate</p>
+          {:else}
+            {#each eventRecords as r (r.id)}
+              <RecordCard kind="event" record={r} />
+            {/each}
+          {/if}
+        </div>
+      {/if}
     </Bucket>
 
-    <Bucket title="entity" count={plan.expectations.entity_kinds.length}>
+    <Bucket
+      title="entity"
+      count={plan.expectations.entity_kinds.length}
+      recordsCount={entityRecords.length}
+    >
       {#each plan.expectations.entity_kinds as e (e.kind)}
         <ExpectationRow label={e.kind} rationale={e.rationale}>
           {#snippet aside()}
@@ -229,15 +318,47 @@
           {/snippet}
         </ExpectationRow>
       {/each}
+      {#if recordsLoaded}
+        <div class="records">
+          <span class="records-label">records ({entityRecords.length})</span>
+          {#if entityRecords.length === 0 && plan.expectations.entity_kinds.length > 0}
+            <p class="records-empty">0 records yet — run a fetch to populate</p>
+          {:else}
+            {#each entityRecords as r (r.id)}
+              <RecordCard kind="entity" record={r} />
+            {/each}
+          {/if}
+        </div>
+      {/if}
     </Bucket>
 
-    <Bucket title="relation" count={plan.expectations.relation_kinds.length}>
+    <Bucket
+      title="relation"
+      count={plan.expectations.relation_kinds.length}
+      recordsCount={relationRecords.length}
+    >
       {#each plan.expectations.relation_kinds as r (r.kind)}
         <ExpectationRow label={r.kind} rationale={r.rationale} />
       {/each}
+      {#if recordsLoaded}
+        <div class="records">
+          <span class="records-label">records ({relationRecords.length})</span>
+          {#if relationRecords.length === 0 && plan.expectations.relation_kinds.length > 0}
+            <p class="records-empty">0 records yet — run a fetch to populate</p>
+          {:else}
+            {#each relationRecords as r (r.id)}
+              <RecordCard kind="relation" record={r} />
+            {/each}
+          {/if}
+        </div>
+      {/if}
     </Bucket>
 
-    <Bucket title="document" count={plan.expectations.document_sources.length}>
+    <Bucket
+      title="document"
+      count={plan.expectations.document_sources.length}
+      recordsCount={documentRecords.length}
+    >
       {#each plan.expectations.document_sources as s, i (i)}
         <ExpectationRow label={s.description} rationale={'preferred ids: ' + (s.preferred_source_ids.length > 0 ? s.preferred_source_ids.join(', ') : '(none — match by description)')}>
           {#snippet aside()}
@@ -247,11 +368,39 @@
           {/snippet}
         </ExpectationRow>
       {/each}
+      {#if recordsLoaded}
+        <div class="records">
+          <span class="records-label">records ({documentRecords.length})</span>
+          {#if documentRecords.length === 0 && plan.expectations.document_sources.length > 0}
+            <p class="records-empty">0 records yet — run a fetch to populate</p>
+          {:else}
+            {#each documentRecords as r (r.id)}
+              <RecordCard kind="document" record={r} />
+            {/each}
+          {/if}
+        </div>
+      {/if}
     </Bucket>
 
-    <Bucket title="assertion" count={plan.expectations.assertion_guidance ? 1 : 0}>
+    <Bucket
+      title="assertion"
+      count={plan.expectations.assertion_guidance ? 1 : 0}
+      recordsCount={assertionRecords.length}
+    >
       {#if plan.expectations.assertion_guidance}
         <p class="guidance">{plan.expectations.assertion_guidance}</p>
+      {/if}
+      {#if recordsLoaded}
+        <div class="records">
+          <span class="records-label">records ({assertionRecords.length})</span>
+          {#if assertionRecords.length === 0 && plan.expectations.assertion_guidance}
+            <p class="records-empty">0 records yet — run a fetch to populate</p>
+          {:else}
+            {#each assertionRecords as r (r.id)}
+              <RecordCard kind="assertion" record={r} />
+            {/each}
+          {/if}
+        </div>
       {/if}
     </Bucket>
   </section>
@@ -516,5 +665,32 @@
     font-size: 12px;
     color: var(--fg-secondary);
     line-height: 1.55;
+  }
+
+  /* Records section — sits below expectations rows in each Bucket.
+     Visually separated from expectations by a thin top divider so
+     the operator can tell at a glance which rows are "intent" and
+     which are "produced data." */
+  .records {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding-top: 8px;
+    margin-top: 4px;
+    border-top: 1px dashed var(--border-subtle);
+  }
+  .records-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-quaternary);
+    padding-bottom: 2px;
+  }
+  .records-empty {
+    margin: 0;
+    color: var(--fg-quaternary);
+    font-style: italic;
+    font-size: 11px;
+    padding: 2px 6px;
   }
 </style>

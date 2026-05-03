@@ -36,7 +36,7 @@ use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-use situation_room_llm::{ModelTier, XaiProvider};
+use situation_room_llm::{AnthropicProvider, LlmProvider, ModelTier, XaiProvider};
 use situation_room_pipeline::research_classifier::{
     classify_topic, ClassificationContext, SourceDescriptor, TopicUsage as ClassifierTopicUsage,
 };
@@ -149,11 +149,14 @@ async fn run_classify(store: &Store, cli: &Cli, topic: &str) -> Result<()> {
 
     // 1. Build the LLM provider. SecureHttpClient applies the same
     //    network defenses as every other situation_room HTTP call.
+    //    `pick_provider` reads `LLM_PROVIDER` (default `"xai"`) and
+    //    builds the matching concrete provider. Session 23 promoted
+    //    Anthropic from stub to real; both providers are now valid
+    //    picks. The trait object is what the classify_topic function
+    //    takes (`&dyn LlmProvider`) so the call site is unchanged.
     let http = SecureHttpClient::new(SecureHttpConfig::default())
         .context("building secure http client")?;
-    let provider = XaiProvider::from_env(http).context(
-        "XAI_API_KEY not found — set it in the environment or in a .env file at the workspace root",
-    )?;
+    let provider = pick_provider(http)?;
 
     // 2. Existing-topics injection — the classifier's hygiene context.
     let topic_rows = store
@@ -190,9 +193,11 @@ async fn run_classify(store: &Store, cli: &Cli, topic: &str) -> Result<()> {
         ctx.registered_sources.len()
     );
 
-    // 4. Classify.
+    // 4. Classify. `provider.as_ref()` deref-coerces the
+    //    `Box<dyn LlmProvider>` into the `&dyn LlmProvider` the
+    //    classifier takes.
     let plan = classify_topic(
-        &provider,
+        provider.as_ref(),
         ModelTier::Workhorse,
         CLASSIFIER_PROMPT,
         topic,
@@ -201,8 +206,12 @@ async fn run_classify(store: &Store, cli: &Cli, topic: &str) -> Result<()> {
     .await
     .context("classification failed")?;
 
-    // 5. Persist.
-    save_research_plan(store, &plan, "xai").context("persisting plan")?;
+    // 5. Persist. The lineage column carries the provider id chosen
+    //    at boot — `"xai"`, `"anthropic"`, or whatever future
+    //    providers register. This is the source of truth for "which
+    //    LLM ran this classification" and survives when the running
+    //    binary moves between providers.
+    save_research_plan(store, &plan, provider.id()).context("persisting plan")?;
 
     // 6. Stderr summary, stdout pretty JSON.
     eprintln!(
@@ -219,6 +228,58 @@ async fn run_classify(store: &Store, cli: &Cli, topic: &str) -> Result<()> {
     println!("{pretty}");
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// LLM provider selection
+// ---------------------------------------------------------------------------
+
+/// Environment variable that picks which LLM provider the binary uses
+/// at boot. Default is `"xai"`; set to `"anthropic"` to switch to
+/// Claude. Documented in `.env.example`.
+const LLM_PROVIDER_ENV: &str = "LLM_PROVIDER";
+
+/// Build the LLM provider chosen at boot. Reads `LLM_PROVIDER` (default
+/// `"xai"`), constructs the matching concrete provider, and type-erases
+/// it so the rest of the function can call `classify_topic` without
+/// knowing which provider it got. Mirrors the desktop binary's helper
+/// of the same name; the two are intentionally duplicated rather than
+/// shared because pulling the helper into a library crate would expose
+/// app-level boot decisions through a crate boundary.
+///
+/// Returns a clear error if the chosen provider's API key isn't set —
+/// rather than silently falling back to the other provider, which
+/// would surprise an operator who explicitly asked for one.
+fn pick_provider(
+    http: SecureHttpClient,
+) -> Result<Box<dyn LlmProvider + Send + Sync>> {
+    let choice = std::env::var(LLM_PROVIDER_ENV)
+        .ok()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "xai".to_string());
+
+    eprintln!("provider: {choice}");
+
+    match choice.as_str() {
+        "xai" | "grok" => {
+            let p = XaiProvider::from_env(http).context(
+                "XAI_API_KEY not found — set it in the environment or in a .env file at the workspace root",
+            )?;
+            Ok(Box::new(p))
+        }
+        "anthropic" | "claude" => {
+            let p = AnthropicProvider::from_env(http).context(
+                "ANTHROPIC_API_KEY not found — set it in the environment or in a .env file at the workspace root",
+            )?;
+            Ok(Box::new(p))
+        }
+        other => {
+            anyhow::bail!(
+                "unknown LLM_PROVIDER {other:?}; valid values are 'xai' or 'anthropic'"
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

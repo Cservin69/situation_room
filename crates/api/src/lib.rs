@@ -10,16 +10,18 @@
 //! (or a future web server) without dragging Tauri into the
 //! dependency graph everywhere.
 //!
-//! ## What's here, in Session 6
+//! ## What's here
 //!
-//! - [`commands`] — three `#[tauri::command]` handlers wrapping the
-//!   pipeline's `classify_topic` / `recent_research_plans` /
-//!   `load_research_plan`, plus the [`commands::AppState`] container
+//! - [`commands`] — `#[tauri::command]` handlers wrapping pipeline /
+//!   storage operations, plus the [`commands::AppState`] container
 //!   the binary populates.
-//! - [`types_export`] — wire-shape DTOs with `ts-rs` derives that emit
-//!   `.ts` files into `apps/desktop/src/lib/api/types/` when the
-//!   crate's tests are run. Owning the wire schema in a dedicated set
-//!   of types keeps `pipeline` free of any tooling dependency.
+//! - [`types_export`] — wire-shape DTOs for the plan + recipe + fetch
+//!   surfaces with `ts-rs` derives that emit `.ts` files into
+//!   `apps/desktop/src/lib/api/types/` when the crate's tests are run.
+//!   Owning the wire schema in a dedicated set of types keeps
+//!   `pipeline` free of any tooling dependency.
+//! - [`records_dto`] (Session 22) — wire-shape DTOs for records
+//!   produced by a plan's recipes. Renders the workstation surface.
 //!
 //! ## Removed in Session 6
 //!
@@ -31,4 +33,6 @@
 //! empty module is a worse signal than its absence.
 
 pub mod commands;
+pub mod commands_records;
+pub mod records_dto;
 pub mod types_export;

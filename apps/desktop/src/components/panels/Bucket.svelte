@@ -3,24 +3,54 @@
 
   One of six (Observation, Event, Entity, Relation, Document, Assertion).
   Each bucket shows:
-    - the bucket name and a count
+    - the bucket name and an expectations count
     - a list of expectation rows (one per metric / event type / entity
       kind / relation kind / source nomination)
-    - rationales rendered inline at small size; empty buckets render the
-      "(no expectations for this type — by design)" line per the handoff.
+    - rationales rendered inline at small size
+    - the records produced for the plan that fall into this bucket
+      (Session 22), rendered as record cards under the expectations
 
   Children compose via a snippet so the parent decides how each row
-  renders (a metric row is different from an entity-kind row).
+  renders (a metric row is different from an entity-kind row, and a
+  record card is different again).
+
+  ## Empty-state logic
+
+  The "(no expectations for this type — by design)" line shows only
+  when *both* expectations and records are empty for this bucket. If
+  records exist without expectations (a recipe produced records the
+  plan didn't anticipate), the bucket still renders so the operator
+  can see what came in. The "by design" copy would be misleading in
+  that case — the records contradict the assertion.
+
+  When expectations exist but records don't (or haven't loaded yet),
+  the parent renders the expectations rows and a separate "0 records
+  yet" hint inline; that hint is not Bucket's responsibility because
+  whether it should appear depends on the records-loaded sentinel
+  (`plans.records !== null`), which only the parent has visibility
+  into.
 -->
 <script lang="ts">
   import type { Snippet } from 'svelte';
   interface Props {
     title: string;
+    /**
+     * Number of expectations of this type from the plan. Drives
+     * the count display in the header.
+     */
     count: number;
+    /**
+     * Number of records of this type produced by the plan's recipes
+     * (Session 22). Used for the empty-state decision: the "no
+     * expectations by design" copy only appears when both this and
+     * `count` are zero. Defaults to 0 for callers that haven't
+     * loaded records yet (legacy + pending-plan paths).
+     */
+    recordsCount?: number;
     /** Snippet that renders the rows. Receives no arguments. */
     children?: Snippet;
   }
-  let { title, count, children }: Props = $props();
+  let { title, count, recordsCount = 0, children }: Props = $props();
 </script>
 
 <section class="bucket">
@@ -29,7 +59,7 @@
     <span class="count">{count}</span>
   </header>
   <div class="body">
-    {#if count === 0}
+    {#if count === 0 && recordsCount === 0}
       <p class="empty">(no expectations for this type — by design)</p>
     {:else if children}
       {@render children()}

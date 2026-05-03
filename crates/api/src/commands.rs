@@ -46,7 +46,7 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use situation_room_llm::{ModelTier, XaiProvider};
+use situation_room_llm::{LlmProvider, ModelTier};
 use situation_room_pipeline::fetch_executor::{
     run_fetch_for_plan as run_fetch_for_plan_impl, ExecutorContext, FetchExecutorError,
 };
@@ -81,8 +81,12 @@ use crate::types_export::{
 ///
 /// Holds:
 /// - the DuckDB [`Store`] (already thread-safe internally),
-/// - the LLM provider (a concrete [`XaiProvider`] today; if/when we
-///   support more providers, lift to a trait object),
+/// - the LLM provider as a trait object — the binary picks a concrete
+///   provider (xAI or Anthropic) based on the `LLM_PROVIDER` env var
+///   at boot, then hands it in here. The trait object is the
+///   single-source-of-truth identifier for "which provider ran this
+///   classification" — `provider.id()` is what we persist into
+///   `research_plans.classified_by`.
 /// - a shared [`SecureHttpClient`] used both for LLM calls (inside
 ///   the provider) and for the fetch executor's source fetches —
 ///   one client, ADR 0009 §"The rule",
@@ -100,7 +104,13 @@ use crate::types_export::{
 /// configurability, lift it to a field.
 pub struct AppState {
     pub store: Arc<Store>,
-    pub provider: Arc<XaiProvider>,
+    /// Type-erased provider. The `+ Send + Sync` bounds are required
+    /// for `Arc<dyn _>` to be `Send + Sync` itself — the trait
+    /// declares them as supertraits, but for trait objects the auto-
+    /// trait bounds must be spelled explicitly. tauri::State<T>
+    /// requires T: Send + Sync + 'static and this is what satisfies
+    /// it.
+    pub provider: Arc<dyn LlmProvider + Send + Sync>,
     pub http: Arc<SecureHttpClient>,
     pub classifier_prompt: &'static str,
     pub recipe_author_prompt: &'static str,
@@ -128,7 +138,7 @@ impl AppState {
 
     pub fn new(
         store: Arc<Store>,
-        provider: Arc<XaiProvider>,
+        provider: Arc<dyn LlmProvider + Send + Sync>,
         http: Arc<SecureHttpClient>,
         classifier_prompt: &'static str,
         recipe_author_prompt: &'static str,
@@ -321,7 +331,7 @@ pub async fn classify(
     // 4. Persist. Failure here means the user's classification effort
     //    is lost on refresh; surface it as an error rather than
     //    silently returning a non-persisted plan.
-    if let Err(e) = save_research_plan(state.store.as_ref(), &plan, "xai") {
+    if let Err(e) = save_research_plan(state.store.as_ref(), &plan, state.provider.id()) {
         warn!(error = %e, plan_id = %plan.id, "failed to persist plan");
         return Err(CommandError::from(e));
     }
@@ -706,7 +716,7 @@ pub async fn reclassify_plan(
     if let Err(e) = save_research_plan_with_lineage(
         state.store.as_ref(),
         &new_plan,
-        "xai",
+        state.provider.id(),
         Some(parsed),
     ) {
         warn!(
