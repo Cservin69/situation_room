@@ -1,0 +1,71 @@
+-- situation_room schema, version 0011.
+--
+-- ADR 0012 §"Storage: recipe version chain": recipe lineage column.
+--
+-- Track A (Session 26) — manual re-author UI. When the operator
+-- triggers a re-author from the recipe inspection panel, the new
+-- recipe row carries `prior_recipe_id = <old.id>` so the version
+-- chain is walkable. The operator's "this recipe failed; try again
+-- with this hint" workflow becomes a first-class data shape on the
+-- recipe row, not just a transient UI moment.
+--
+-- ## Why nullable
+--
+-- Existing recipes (Sessions 1–25) carry NULL — they are the heads
+-- of their own (single-node) lineage chains. New recipes authored
+-- in the normal `load_or_author_recipes` path also carry NULL —
+-- only re-authored recipes get a non-null pointer. The Rust load
+-- path coerces NULL → `None`. The change is additive and
+-- backward-compatible — no re-authoring required.
+--
+-- ## DuckDB ALTER TABLE — same lessons as migrations 0005, 0007,
+-- 0008, 0010
+--
+-- Per the comment block in `0005_research_plan_status.sql`, DuckDB
+-- rejects two paths to a `NOT NULL DEFAULT` ALTER:
+--
+--   1. `ADD COLUMN ... NOT NULL DEFAULT ...` — "Adding columns
+--      with constraints not yet supported".
+--   2. `ADD COLUMN ... DEFAULT ...; ALTER COLUMN ... SET NOT
+--      NULL;` — "Cannot alter entry because there are entries
+--      that depend on it" when indexes exist on the table.
+--
+-- The `recipes` table carries the `(plan_id, source_id)` index
+-- from migration 0003, which would block path (2). Same shape as
+-- migrations 0008 (`static_payload`) and 0010 (`authored_from`):
+-- the column is nullable on purpose, and the load-bearing
+-- invariant is the Rust enum (`Option<Uuid>`).
+--
+-- ## No DEFAULT either
+--
+-- `ADD COLUMN ... DEFAULT NULL` is the same on-disk shape as no
+-- default at all (DuckDB stores NULL); the explicit form would
+-- not change behaviour. Omitting the DEFAULT keeps the migration
+-- minimal and matches the prior nullable-column migrations
+-- (0007 `rejection_reason`, 0008 `static_payload`, 0010
+-- `authored_from`).
+--
+-- ## Why no index on this column
+--
+-- Lineage chain walks (`Store::recipe_lineage`) start with a
+-- specific recipe id (already PK-indexed) and follow the pointer
+-- one hop per iteration, capped by `MAX_RECIPE_LINEAGE_DEPTH`.
+-- The chain depth is bounded by the operator's re-author cadence
+-- (typically 1–3 nodes; ADR 0012 §"Executor retry loop" caps the
+-- automated path at 3 nodes when it lands). One recipe per (plan,
+-- source) is the steady state; lineage is rare enough that
+-- indexing the column is premature optimization.
+--
+-- ## Why not bump version
+--
+-- This is a cosmetic change (in ADR 0007's "Versioning vs migration"
+-- vocabulary), not a semantic one — the recipe still produces the
+-- same records. The column adds a metadata fact about the *authoring
+-- history* of the recipe, not about what records the recipe means.
+-- No version bump for any existing row.
+
+ALTER TABLE recipes ADD COLUMN prior_recipe_id UUID;
+
+-- Record this migration.
+INSERT INTO schema_migrations (version, description)
+    VALUES (11, 'recipes.prior_recipe_id column');

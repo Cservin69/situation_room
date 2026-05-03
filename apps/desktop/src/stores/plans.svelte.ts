@@ -53,6 +53,7 @@ import {
   listRecipesForPlan as apiListRecipesForPlan,
   setRecipeFeedback as apiSetRecipeFeedback,
   listRecipeFeedbackForPlan as apiListRecipeFeedbackForPlan,
+  reauthorRecipe as apiReauthorRecipe,
   recordsForPlan as apiRecordsForPlan,
   asCommandError,
 } from '$lib/api/client';
@@ -674,6 +675,54 @@ export async function clearRecipeFeedback(sourceId: string): Promise<boolean> {
     if (previous) {
       plans.recipeFeedback[sourceId] = previous;
     }
+    plans.error = asCommandError(e);
+    return false;
+  } finally {
+    plans.mutating = false;
+  }
+}
+
+/**
+ * Manually re-author a recipe — Track A, ADR 0012 amendment 1.
+ *
+ * Calls the backend `reauthor_recipe` command with the prior
+ * recipe's id and the operator's optional note from the
+ * ReauthorDialog. On success, refreshes the recipe list for the
+ * selected plan so the new recipe (with `prior_recipe_id` populated
+ * pointing back at the prior) appears in the inspection panel — the
+ * lineage chip on the new card is the operator's confirmation that
+ * the version chain extended.
+ *
+ * Returns `true` on success. The dialog closes on `true`; on `false`
+ * it stays open so the operator sees `plans.error` and can retry or
+ * cancel.
+ *
+ * No-op when nothing is selected (the panel hides the button in
+ * that state, but the guard makes the function safe to call
+ * defensively).
+ */
+export async function reauthorRecipe(
+  recipeId: string,
+  operatorNote: string | null = null,
+): Promise<boolean> {
+  const current = plans.selected;
+  if (!current) return false;
+
+  // Pure write — no optimistic update available because the new
+  // recipe id is server-assigned (UUIDv7 minted in the validator)
+  // and the new extraction spec / produces bindings come back from
+  // the LLM. The dialog spinner covers the latency window (5–10s
+  // typical, sometimes 30s+ when xAI is slow).
+  plans.mutating = true;
+  plans.error = null;
+  try {
+    await apiReauthorRecipe(recipeId, operatorNote);
+    // The new recipe lands in storage with a higher version on the
+    // same dedup_key. Refresh the recipe list so the panel shows
+    // both the new head and the lineage chip pointing back.
+    await refreshRecipes(current.id);
+    return true;
+  } catch (e) {
     plans.error = asCommandError(e);
     return false;
   } finally {

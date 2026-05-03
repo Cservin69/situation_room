@@ -1,0 +1,72 @@
+-- situation_room schema, version 0012.
+--
+-- ADR 0012 amendment 1 (Track A, Session 25/26): the reason a
+-- re-authored recipe was triggered.
+--
+-- Migration 0011 added `prior_recipe_id` (ADR 0012's vocabulary for
+-- the lineage pointer; Session 25's handoff called it `reauthored_from`
+-- — same column, different name; we landed on the ADR's terminology
+-- since prior sessions had already started writing code against it).
+-- That column makes the lineage *walkable*. This migration adds the
+-- prose that goes alongside the pointer: the failure message from
+-- the prior recipe's last fetch attempt + the operator's note from
+-- the dialog (whichever is richer).
+--
+-- ## Why on the recipe row, not on a sibling event log
+--
+-- The reason is read at exactly one moment: when a future session
+-- audits why this recipe exists in the form it does. That audit
+-- starts from the recipe id (in the inspection panel, in a query, in
+-- a debugger) and asks "what motivated this?" Putting the reason on
+-- the recipe row puts the answer one column-read away. A separate
+-- `recipe_reauthor_events` table would force the query to JOIN
+-- through `prior_recipe_id` to reconstruct the same fact — denormalized
+-- into an extra table for no gain.
+--
+-- The Session 15 README chose the same posture for `rejection_reason`
+-- on `research_plans` (carries the latest reason; chain-walk via
+-- `reclassified_from` for the history). This migration mirrors the
+-- pattern.
+--
+-- ## Why nullable
+--
+-- First-authored recipes carry NULL — they were not motivated by any
+-- prior failure. The Rust load path coerces NULL → `None`. Same shape
+-- as `prior_recipe_id` (migration 0011). The two columns travel
+-- together: a row with `Some(prior)` should also carry
+-- `Some(reauthor_reason)`, but the SQL doesn't enforce this — the
+-- write path in `Store::insert_recipe` is the load-bearing invariant
+-- (the typed `RecipeRow` has both fields and the `reauthor_recipe`
+-- command stamps both atomically).
+--
+-- ## DuckDB ALTER TABLE — same lessons as migrations 0005, 0007,
+-- 0008, 0010, 0011
+--
+-- Per the comment block in `0005_research_plan_status.sql`, DuckDB
+-- rejects `ADD COLUMN ... NOT NULL DEFAULT ...` on a table with
+-- existing indexes. The `recipes` table carries indexes from
+-- migration 0003 + 0011; this migration uses a plain nullable column
+-- per the established discipline.
+--
+-- ## No DEFAULT either
+--
+-- A DEFAULT empty-string would conflate "no reason captured" (the
+-- pre-Track-A state) with "operator submitted an empty reason" (which
+-- the validator rejects upstream — `Bounds::RECIPE_FEEDBACK` is the
+-- gate, and an empty submission is allowed only as the "clear note"
+-- gesture, not as a re-author trigger). NULL on disk is the right
+-- shape for "no reason exists for this row."
+--
+-- ## Why not bump version
+--
+-- This is metadata about the *authoring history*, not about what
+-- records the recipe means. The recipe still produces the same
+-- records. Same posture as 0011: lineage and reason are sibling
+-- audit-trail facts, neither of which changes the runtime contract
+-- (per ADR 0007 §"Versioning vs migration").
+
+ALTER TABLE recipes ADD COLUMN reauthor_reason TEXT;
+
+-- Record this migration.
+INSERT INTO schema_migrations (version, description)
+    VALUES (12, 'recipes.reauthor_reason column');

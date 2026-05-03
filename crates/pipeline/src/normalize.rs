@@ -165,6 +165,8 @@ mod tests {
             static_payload: None,
             // ADR 0014: normalize tests don't exercise authoring.
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         }
     }
 

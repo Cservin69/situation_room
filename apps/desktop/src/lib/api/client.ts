@@ -21,6 +21,7 @@ import type { FetchReportDto } from './types/FetchReportDto';
 import type { FetchRunSummaryDto } from './types/FetchRunSummaryDto';
 import type { RecipeDto } from './types/RecipeDto';
 import type { RecipeFeedbackDto } from './types/RecipeFeedbackDto';
+import type { RecipeFetchAttemptDto } from './types/RecipeFetchAttemptDto';
 import type { RecordsByPlanDto } from './types/RecordsByPlanDto';
 
 /**
@@ -219,6 +220,71 @@ export async function listRecipeFeedbackForPlan(
 ): Promise<RecipeFeedbackDto[]> {
   return invoke<RecipeFeedbackDto[]>('list_recipe_feedback_for_plan', {
     planId,
+  });
+}
+
+/**
+ * Look up the most recent recorded fetch attempt for a recipe.
+ * Track A, ADR 0012 amendment 1.
+ *
+ * The re-author dialog calls this on mount so the operator sees the
+ * exact bytes + failure message the runtime captured at the failed
+ * apply, before deciding to spend an LLM call on a re-author.
+ *
+ * Returns the attempt for any recipe with at least one captured row
+ * (today: any recipe whose latest run failed at apply stage); `null`
+ * otherwise. The dialog renders empty-state copy ("no bytes captured
+ * for this recipe — re-authoring may guess at the response shape")
+ * when the result is `null`.
+ *
+ * Throws `{ kind: 'invalid_input' }` if `recipeId` isn't a UUID.
+ */
+export async function latestAttemptForRecipe(
+  recipeId: string,
+): Promise<RecipeFetchAttemptDto | null> {
+  return invoke<RecipeFetchAttemptDto | null>('latest_attempt_for_recipe', {
+    recipeId,
+  });
+}
+
+/**
+ * Manually re-author a recipe — Track A, ADR 0012 amendment 1.
+ *
+ * The operator triggers this after seeing a recipe fail at apply
+ * stage in the fetch report. The backend:
+ *
+ *   1. Loads the prior recipe and the plan it belongs to.
+ *   2. Pulls the bytes the runtime saw at the failed apply (captured
+ *      into `recipe_fetch_attempts` at fetch time).
+ *   3. Calls the LLM with the bytes + failure message + the
+ *      operator's optional note.
+ *   4. Persists the new recipe with `prior_recipe_id` + `reauthor_reason`.
+ *
+ * `recipeId` is the prior recipe's id. `operatorNote`, when supplied,
+ * is the operator's correction ("the source emits unwrapped <title>,
+ * not CDATA-wrapped") — the same shape as the flag-feedback note,
+ * scoped to this re-author event. Empty / `null` is allowed; the
+ * failure message alone may be rich enough.
+ *
+ * Returns the new {@link RecipeDto}; the frontend uses
+ * `prior_recipe_id` and `reauthor_reason` to render the lineage chip.
+ *
+ * Throws:
+ *  - `{ kind: 'invalid_input', field: 'recipe_id' }` — bad UUID.
+ *  - `{ kind: 'invalid_input', field: 'operator_note' }` — bounds /
+ *    character-class violation.
+ *  - `{ kind: 'not_found' }` — recipe id (or its plan) is stale.
+ *  - `{ kind: 'reauthor_failed', prior_recipe_id, message }` — no
+ *    captured failed-apply bytes for this recipe (the operator
+ *    should run fetch first), or the LLM authoring call failed.
+ */
+export async function reauthorRecipe(
+  recipeId: string,
+  operatorNote: string | null = null,
+): Promise<RecipeDto> {
+  return invoke<RecipeDto>('reauthor_recipe', {
+    recipeId,
+    operatorNote,
   });
 }
 

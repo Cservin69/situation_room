@@ -151,6 +151,15 @@ fn main() -> Result<()> {
             situation_room_api::commands::list_recipes_for_plan,
             situation_room_api::commands::set_recipe_feedback,
             situation_room_api::commands::list_recipe_feedback_for_plan,
+            // Track A (Session 25/26 — manual re-author UI). Loads the
+            // prior recipe + its captured failed-apply bytes, calls
+            // the LLM to author a corrected recipe, persists the new
+            // recipe with `prior_recipe_id` and `reauthor_reason`
+            // populated. The Session 23.1 IPC-registration guard
+            // would catch the omission, but the registration belongs
+            // in the same commit as the command per the hard rule.
+            situation_room_api::commands::latest_attempt_for_recipe,
+            situation_room_api::commands::reauthor_recipe,
             // Session 22 added the records-rendering join (storage
             // query + DTO + #[tauri::command] function), but the
             // command wasn't added to this macro list — so Tauri

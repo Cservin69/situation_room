@@ -136,6 +136,39 @@ pub struct RecipeRow {
     /// `Unknown` is reserved for recipes whose authoring predates
     /// migration v10.
     pub authored_from: AuthoredFrom,
+    /// The recipe this row supersedes. `Some(prior.id)` for a
+    /// re-authored recipe (Track A, Session 26 — manual re-author UI),
+    /// `None` for first-authored recipes and for any row written before
+    /// migration v11. ADR 0012 §"Storage: recipe version chain".
+    ///
+    /// Walkable chain: each row points at most one hop back; the
+    /// chain terminates when a row's `prior_recipe_id` is `None`.
+    /// `Store::recipe_lineage` walks this with a depth cap so a
+    /// pathological cycle (which the executor would never produce
+    /// but a hand-edit could) is caught rather than infinite-looped.
+    ///
+    /// **Why nullable on disk.** Migration v11 added the column
+    /// nullable. Existing rows arrive with NULL → `None` here. The
+    /// re-author path stamps `Some(prior.id)`; the normal authoring
+    /// path stamps `None` explicitly so the field is never silently
+    /// inherited from a stale struct value.
+    pub prior_recipe_id: Option<Uuid>,
+
+    /// Why this row exists in the form it does, when it was written
+    /// by a re-author event. Captured from the prior recipe's last
+    /// fetch failure message and (optionally) the operator's note
+    /// from the dialog. `None` for first-authored recipes.
+    ///
+    /// Travels alongside [`Self::prior_recipe_id`]: a row with
+    /// `Some(prior)` should also carry `Some(reauthor_reason)`. The
+    /// SQL doesn't enforce this — the typed `RecipeRow` and the
+    /// `reauthor_recipe` command path are the load-bearing
+    /// invariant. Track A, Session 25/26.
+    ///
+    /// **Why nullable on disk.** Migration v12 added the column
+    /// nullable. Existing rows (and all first-authored recipes) carry
+    /// NULL.
+    pub reauthor_reason: Option<String>,
 }
 
 /// A recipe row as it comes back out of storage. Same shape as
@@ -160,6 +193,16 @@ pub struct StoredRecipe {
     /// Reads NULL → `Unknown` for recipes authored before migration
     /// v10. Reads the recorded variant otherwise.
     pub authored_from: AuthoredFrom,
+    /// The recipe this row supersedes — see
+    /// [`RecipeRow::prior_recipe_id`]. NULL on disk → `None` here
+    /// (the chain head: this row was authored fresh, not re-authored
+    /// from a prior). Track A, Session 26.
+    pub prior_recipe_id: Option<Uuid>,
+    /// Why this row was re-authored — see [`RecipeRow::reauthor_reason`].
+    /// NULL on disk → `None` here. First-authored recipes carry None;
+    /// re-authored rows carry the failure message + operator note.
+    /// Track A, Session 25/26.
+    pub reauthor_reason: Option<String>,
 }
 
 impl Store {
@@ -177,8 +220,8 @@ impl Store {
             "INSERT INTO recipes (
                 id, dedup_key, plan_id, source_id, source_url,
                 extraction, produces, authored_at, authored_by, version,
-                static_payload, authored_from
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                static_payload, authored_from, prior_recipe_id, reauthor_reason
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 r.id,
                 r.dedup_key,
@@ -192,6 +235,8 @@ impl Store {
                 r.version as i64,
                 r.static_payload,
                 r.authored_from.as_str(),
+                r.prior_recipe_id,
+                r.reauthor_reason,
             ],
         )
         .map_err(StorageError::DuckDb)?;
@@ -210,7 +255,7 @@ impl Store {
             .prepare(
                 "SELECT id, dedup_key, plan_id, source_id, source_url,
                         extraction, produces, authored_at, authored_by, version,
-                        static_payload, authored_from
+                        static_payload, authored_from, prior_recipe_id, reauthor_reason
                  FROM recipes WHERE id = ?",
             )
             .map_err(StorageError::DuckDb)?;
@@ -236,7 +281,7 @@ impl Store {
             .prepare(
                 "SELECT id, dedup_key, plan_id, source_id, source_url,
                         extraction, produces, authored_at, authored_by, version,
-                        static_payload, authored_from
+                        static_payload, authored_from, prior_recipe_id, reauthor_reason
                  FROM recipes
                  WHERE dedup_key = ?
                  ORDER BY version DESC
@@ -291,7 +336,7 @@ impl Store {
             .prepare(
                 "SELECT id, dedup_key, plan_id, source_id, source_url,
                         extraction, produces, authored_at, authored_by, version,
-                        static_payload, authored_from
+                        static_payload, authored_from, prior_recipe_id, reauthor_reason
                  FROM recipes
                  WHERE plan_id = ?
                  ORDER BY authored_at DESC, version DESC",
@@ -305,7 +350,76 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Walk the lineage chain for a recipe — the row itself, then its
+    /// `prior_recipe_id` predecessor, then that row's predecessor, and
+    /// so on until the chain head (a row whose `prior_recipe_id` is
+    /// `None`). ADR 0012 §"Storage: recipe version chain".
+    ///
+    /// Returns the chain newest-to-oldest, with `recipe_id` itself in
+    /// position 0. An empty Vec means `recipe_id` doesn't exist; a
+    /// single-element Vec means the recipe has no prior (chain head).
+    ///
+    /// The chain depth is bounded by [`MAX_RECIPE_LINEAGE_DEPTH`].
+    /// Hitting the cap is a hard error, not silent truncation — a
+    /// real lineage that long would mean the operator has re-authored
+    /// the same source 32 times in one plan, which is past the
+    /// "something is structurally wrong" bar (ADR 0012 §"Frontier LLM
+    /// pushback discipline" caps useful retries at 2). A *cycle*
+    /// (which the executor would never produce but a hand-edit could)
+    /// also trips this cap rather than infinite-looping.
+    pub fn recipe_lineage(&self, recipe_id: Uuid) -> Result<Vec<StoredRecipe>> {
+        let mut chain = Vec::new();
+        let mut cursor = Some(recipe_id);
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+
+        while let Some(id) = cursor {
+            if !seen.insert(id) {
+                // Cycle. The executor cannot produce one, so reaching
+                // here means a hand-edit. Refuse to walk further; the
+                // caller surfaces the error.
+                return Err(StorageError::Other(format!(
+                    "recipe lineage contains a cycle at id {id}"
+                )));
+            }
+            if chain.len() >= MAX_RECIPE_LINEAGE_DEPTH {
+                return Err(StorageError::Other(format!(
+                    "recipe lineage exceeds depth cap of {MAX_RECIPE_LINEAGE_DEPTH} \
+                     (start id: {recipe_id})"
+                )));
+            }
+            match self.get_recipe(id)? {
+                Some(stored) => {
+                    cursor = stored.prior_recipe_id;
+                    chain.push(stored);
+                }
+                None => {
+                    // The pointer references a row that doesn't
+                    // exist. This is a soft inconsistency — could
+                    // happen if a manual cleanup deleted the prior
+                    // row without unlinking the pointer — but it's
+                    // not catastrophic: we return what we have so
+                    // far and let the caller decide. An empty `chain`
+                    // (recipe_id itself missing) is still the right
+                    // signal for "not found" at the entry point.
+                    break;
+                }
+            }
+        }
+
+        Ok(chain)
+    }
 }
+
+/// Maximum number of nodes in a recipe lineage chain before
+/// [`Store::recipe_lineage`] returns an error. ADR 0012 §"Executor
+/// retry loop" caps automated retries at 2 (so 3 total nodes per
+/// chain in the eventual automated path); the manual path has no
+/// cap but a real chain longer than 32 implies the operator is
+/// trapped in oscillation and should stop. The number is deliberately
+/// generous — more than the manual path will plausibly produce —
+/// while still small enough to bound a pathological cycle's runtime.
+pub const MAX_RECIPE_LINEAGE_DEPTH: usize = 32;
 
 fn row_to_stored(row: &duckdb::Row<'_>) -> Result<StoredRecipe> {
     Ok(StoredRecipe {
@@ -339,6 +453,19 @@ fn row_to_stored(row: &duckdb::Row<'_>) -> Result<StoredRecipe> {
                 Some(s) => AuthoredFrom::from_str(&s)?,
             }
         },
+        // ADR 0012 §"Storage: recipe version chain": NULL → None.
+        // Recipes authored before migration v11 carry NULL; new
+        // first-authored recipes also carry NULL (they have no
+        // prior). Only re-authored recipes (Track A, Session 26)
+        // carry Some(prior.id). The duckdb crate's UUID converter
+        // handles `Option<Uuid>` directly — no string round-trip
+        // needed, unlike `authored_from` whose closed enum lives
+        // in Rust.
+        prior_recipe_id: row.get(12).map_err(StorageError::DuckDb)?,
+        // Track A, Session 25/26: reauthor_reason travels alongside
+        // prior_recipe_id. NULL → None for first-authored recipes;
+        // re-authored rows carry Some(failure_msg + operator_note).
+        reauthor_reason: row.get(13).map_err(StorageError::DuckDb)?,
     })
 }
 
@@ -365,6 +492,14 @@ mod tests {
             // case, the one most code paths take in production. New
             // tests below pin StubExcerpt and Unknown explicitly.
             authored_from: AuthoredFrom::FetchedBytes,
+            // ADR 0012: tests that don't exercise re-authoring leave
+            // `prior_recipe_id` at None — the chain head, the shape of
+            // a first-authored recipe. The new lineage tests below
+            // explicitly populate Some(prior).
+            prior_recipe_id: None,
+            // Track A: paired with prior_recipe_id. None for
+            // first-authored recipes. Re-author tests populate both.
+            reauthor_reason: None,
         }
     }
 
@@ -718,5 +853,333 @@ mod tests {
             .expect("stub recipe present");
         assert_eq!(fetched_back.authored_from, AuthoredFrom::FetchedBytes);
         assert_eq!(stub_back.authored_from, AuthoredFrom::StubExcerpt);
+    }
+
+    // -----------------------------------------------------------------
+    // Session 26 / Track A — prior_recipe_id and lineage walk
+    // -----------------------------------------------------------------
+
+    /// Default shape: a first-authored recipe carries `None` for
+    /// `prior_recipe_id`. Migration v11 made the column nullable; the
+    /// load path coerces NULL → None. This is the on-disk shape for
+    /// every recipe authored before Session 26 and for every fresh
+    /// (non-re-authored) recipe afterward.
+    #[test]
+    fn recipe_round_trips_with_no_prior_recipe_id() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let id = Uuid::now_v7();
+        let row = sample_row(id); // sample_row sets prior_recipe_id: None
+        store.insert_recipe(&row).unwrap();
+
+        let got = store.get_recipe(id).unwrap().expect("row should exist");
+        assert!(
+            got.prior_recipe_id.is_none(),
+            "expected None for first-authored recipe, got {:?}",
+            got.prior_recipe_id
+        );
+    }
+
+    /// Re-authored shape: a recipe with `Some(prior.id)` round-trips
+    /// the pointer verbatim. Track A's manual re-author UI lands the
+    /// new recipe with this field populated; the storage layer must
+    /// preserve it for `recipe_lineage` to walk.
+    #[test]
+    fn recipe_round_trips_with_prior_recipe_id() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let prior_id = Uuid::now_v7();
+        let prior = sample_row(prior_id);
+        store.insert_recipe(&prior).unwrap();
+
+        let new_id = Uuid::now_v7();
+        let mut new_row = sample_row(new_id);
+        new_row.dedup_key = Some("re_authored".into());
+        new_row.version = 2;
+        new_row.prior_recipe_id = Some(prior_id);
+        store.insert_recipe(&new_row).unwrap();
+
+        let got = store.get_recipe(new_id).unwrap().expect("row should exist");
+        assert_eq!(got.prior_recipe_id, Some(prior_id));
+    }
+
+    /// `recipes_for_plan` carries the field through. Without this
+    /// guarantee the inspection panel would never see lineage even
+    /// when it exists in the DB. Mirrors the static_payload and
+    /// authored_from equivalents.
+    #[test]
+    fn recipes_for_plan_carries_prior_recipe_id_through() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_id = Uuid::now_v7();
+
+        let mut head = sample_row(Uuid::now_v7());
+        head.plan_id = plan_id;
+        head.dedup_key = Some("dk".into());
+        head.version = 1;
+        let head_id = head.id;
+        store.insert_recipe(&head).unwrap();
+
+        let mut tail = sample_row(Uuid::now_v7());
+        tail.plan_id = plan_id;
+        tail.dedup_key = Some("dk".into());
+        tail.version = 2;
+        tail.prior_recipe_id = Some(head_id);
+        let tail_id = tail.id;
+        store.insert_recipe(&tail).unwrap();
+
+        let recipes = store.recipes_for_plan(plan_id).unwrap();
+        assert_eq!(recipes.len(), 2);
+        let head_back = recipes
+            .iter()
+            .find(|r| r.id == head_id)
+            .expect("head recipe present");
+        let tail_back = recipes
+            .iter()
+            .find(|r| r.id == tail_id)
+            .expect("tail recipe present");
+        assert_eq!(head_back.prior_recipe_id, None);
+        assert_eq!(tail_back.prior_recipe_id, Some(head_id));
+    }
+
+    /// `recipe_lineage` on a missing id returns an empty Vec, not an
+    /// error. The chain entry-point is "not found"; the caller
+    /// surfaces that as `RecipeNotFound`. This mirrors the existing
+    /// `get_recipe(missing)` shape (`Ok(None)`) — same posture: not
+    /// finding something is not an error condition.
+    #[test]
+    fn recipe_lineage_returns_empty_for_missing_id() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let chain = store.recipe_lineage(Uuid::now_v7()).unwrap();
+        assert!(chain.is_empty());
+    }
+
+    /// `recipe_lineage` on a chain head returns a single-element Vec.
+    /// This is the steady-state shape for any recipe authored without
+    /// re-authoring — the most common case in production.
+    #[test]
+    fn recipe_lineage_returns_one_for_chain_head() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let id = Uuid::now_v7();
+        let row = sample_row(id);
+        store.insert_recipe(&row).unwrap();
+
+        let chain = store.recipe_lineage(id).unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].id, id);
+        assert!(chain[0].prior_recipe_id.is_none());
+    }
+
+    /// `recipe_lineage` walks a 3-deep chain newest-to-oldest. The
+    /// canonical Track A scenario: operator re-authored a recipe
+    /// twice. Each row points one hop back; the walk terminates at
+    /// the chain head whose `prior_recipe_id` is `None`.
+    #[test]
+    fn recipe_lineage_walks_three_deep_chain() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let v1_id = Uuid::now_v7();
+        let v1 = sample_row(v1_id);
+        store.insert_recipe(&v1).unwrap();
+
+        let v2_id = Uuid::now_v7();
+        let mut v2 = sample_row(v2_id);
+        v2.dedup_key = Some("dk".into());
+        v2.version = 2;
+        v2.prior_recipe_id = Some(v1_id);
+        store.insert_recipe(&v2).unwrap();
+
+        let v3_id = Uuid::now_v7();
+        let mut v3 = sample_row(v3_id);
+        v3.dedup_key = Some("dk".into());
+        v3.version = 3;
+        v3.prior_recipe_id = Some(v2_id);
+        store.insert_recipe(&v3).unwrap();
+
+        let chain = store.recipe_lineage(v3_id).unwrap();
+        assert_eq!(chain.len(), 3, "chain should be 3 nodes");
+        assert_eq!(chain[0].id, v3_id);
+        assert_eq!(chain[1].id, v2_id);
+        assert_eq!(chain[2].id, v1_id);
+        // The head of the chain has no prior.
+        assert!(chain[2].prior_recipe_id.is_none());
+    }
+
+    /// `recipe_lineage` detects cycles. The executor cannot produce
+    /// one — re-authoring always points at an existing earlier UUIDv7,
+    /// and v7 ids are time-monotonic — but a hand-edit could. The
+    /// walker refuses to loop and returns an error naming the
+    /// offending id; better to surface the inconsistency than spin
+    /// forever or silently truncate.
+    #[test]
+    fn recipe_lineage_rejects_cycle() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let a_id = Uuid::now_v7();
+        let b_id = Uuid::now_v7();
+
+        // Insert a normally, then b pointing at a.
+        let a = sample_row(a_id);
+        store.insert_recipe(&a).unwrap();
+
+        let mut b = sample_row(b_id);
+        b.dedup_key = Some("dk_b".into());
+        b.prior_recipe_id = Some(a_id);
+        store.insert_recipe(&b).unwrap();
+
+        // Now hand-rewire a to point at b — closing the cycle. This
+        // is not reachable through the executor; we synthesize the
+        // condition with a raw UPDATE to verify the walker's defense
+        // against pathological data.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE recipes SET prior_recipe_id = ? WHERE id = ?",
+                params![b_id, a_id],
+            )
+            .unwrap();
+        }
+
+        let err = store.recipe_lineage(a_id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cycle"),
+            "error should name the cycle; got {msg}"
+        );
+    }
+
+    /// Reaching the depth cap surfaces as a hard error, not silent
+    /// truncation. A pathological lineage longer than the cap means
+    /// the operator has re-authored the same source past the
+    /// "something is structurally wrong" bar (ADR 0012 §"Frontier
+    /// LLM pushback discipline" caps useful retries at 2) — refusing
+    /// to walk further is the correct signal.
+    #[test]
+    fn recipe_lineage_caps_at_max_depth() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        // Build a chain MAX_RECIPE_LINEAGE_DEPTH + 1 nodes long. Each
+        // row points at the prior id; the head has prior_recipe_id =
+        // None. The walker should refuse to traverse more than
+        // MAX_RECIPE_LINEAGE_DEPTH nodes.
+        let mut prior: Option<Uuid> = None;
+        let mut last: Option<Uuid> = None;
+        for i in 0..=MAX_RECIPE_LINEAGE_DEPTH {
+            let id = Uuid::now_v7();
+            let mut row = sample_row(id);
+            row.dedup_key = Some(format!("dk_{i}"));
+            row.version = (i as u32) + 1;
+            row.prior_recipe_id = prior;
+            store.insert_recipe(&row).unwrap();
+            prior = Some(id);
+            last = Some(id);
+        }
+
+        let err = store.recipe_lineage(last.unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("depth cap"),
+            "error should mention the depth cap; got {msg}"
+        );
+    }
+
+    /// Pre-v11 rows (no `prior_recipe_id` column at insert time) load
+    /// as `None`. Simulates the legacy state by writing a row then
+    /// nulling the column directly via raw SQL — duckdb's
+    /// nullable-column shape lets this exercise the load path's
+    /// NULL → None coercion against actual NULL on disk.
+    #[test]
+    fn recipe_with_null_prior_recipe_id_loads_as_none() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let id = Uuid::now_v7();
+        let mut row = sample_row(id);
+        // Pretend the executor wrote a Some, then a manual edit
+        // nulled it. The storage layer must coerce that NULL to None
+        // honestly (the chain head shape) rather than retain stale
+        // state from the struct.
+        row.prior_recipe_id = Some(Uuid::now_v7());
+        store.insert_recipe(&row).unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE recipes SET prior_recipe_id = NULL WHERE id = ?",
+                params![id],
+            )
+            .unwrap();
+        }
+
+        let got = store.get_recipe(id).unwrap().expect("row should exist");
+        assert!(
+            got.prior_recipe_id.is_none(),
+            "NULL on disk must coerce to None"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Track A, Session 25/26 — reauthor_reason
+    // -----------------------------------------------------------------
+
+    /// Default shape: a first-authored recipe carries `None` for
+    /// `reauthor_reason`. Migration v12 made the column nullable; the
+    /// load path coerces NULL → None. Mirrors the prior_recipe_id
+    /// equivalent.
+    #[test]
+    fn recipe_round_trips_with_no_reauthor_reason() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let id = Uuid::now_v7();
+        let row = sample_row(id);
+        store.insert_recipe(&row).unwrap();
+
+        let got = store.get_recipe(id).unwrap().expect("row should exist");
+        assert!(
+            got.reauthor_reason.is_none(),
+            "expected None for first-authored recipe, got {:?}",
+            got.reauthor_reason
+        );
+    }
+
+    /// Re-authored shape: a recipe with `Some(reason)` round-trips the
+    /// reason verbatim. Track A's manual re-author UI lands the new
+    /// recipe with both `prior_recipe_id` and `reauthor_reason`
+    /// populated; the storage layer must preserve the reason for the
+    /// inspection panel and any future audit query.
+    #[test]
+    fn recipe_round_trips_with_reauthor_reason() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let prior_id = Uuid::now_v7();
+        let prior = sample_row(prior_id);
+        store.insert_recipe(&prior).unwrap();
+
+        let new_id = Uuid::now_v7();
+        let mut new_row = sample_row(new_id);
+        new_row.dedup_key = Some("re_authored".into());
+        new_row.version = 2;
+        new_row.prior_recipe_id = Some(prior_id);
+        let reason =
+            "extraction [regex_capture]: pattern matched nothing\n\
+             operator note: BBC RSS does not wrap title in CDATA";
+        new_row.reauthor_reason = Some(reason.into());
+        store.insert_recipe(&new_row).unwrap();
+
+        let got = store.get_recipe(new_id).unwrap().expect("row should exist");
+        assert_eq!(got.reauthor_reason.as_deref(), Some(reason));
+        assert_eq!(got.prior_recipe_id, Some(prior_id));
     }
 }

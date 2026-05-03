@@ -656,6 +656,8 @@ mod tests {
             version: 1,
             static_payload: None,
             authored_from: AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         };
         store.insert_recipe(&row).unwrap();
         id

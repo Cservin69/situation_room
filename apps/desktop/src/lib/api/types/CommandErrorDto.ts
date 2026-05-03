@@ -11,4 +11,4 @@
  * `commands.rs` check the JSON shape; this type is just the TS
  * declaration the frontend consumes.
  */
-export type CommandErrorDto = { "kind": "invalid_input", field: string, message: string, } | { "kind": "classification_failed", message: string, } | { "kind": "storage", message: string, } | { "kind": "not_found", id: string, } | { "kind": "fetch_failed", recipes_attempted: number, recipes_succeeded: number, message: string, };
+export type CommandErrorDto = { "kind": "invalid_input", field: string, message: string, } | { "kind": "classification_failed", message: string, } | { "kind": "storage", message: string, } | { "kind": "not_found", id: string, } | { "kind": "fetch_failed", recipes_attempted: number, recipes_succeeded: number, message: string, } | { "kind": "reauthor_failed", prior_recipe_id: string, message: string, };

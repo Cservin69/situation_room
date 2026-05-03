@@ -166,6 +166,47 @@ pub struct FetchRecipe {
     /// `Unknown` — that's the legacy-data signal.
     #[serde(default)]
     pub authored_from: situation_room_storage::AuthoredFrom,
+
+    /// The recipe this row supersedes, if any. ADR 0012 §"Storage:
+    /// recipe version chain". `None` for a first-authored recipe
+    /// (the chain head); `Some(prior.id)` for a re-authored recipe
+    /// (Track A, Session 26 — manual re-author UI).
+    ///
+    /// Stamped on the typed [`FetchRecipe`] by the manual-re-author
+    /// entry point in `pipeline::recipe_author::reauthor_recipe`,
+    /// alongside `version = old.version + 1` and
+    /// `dedup_key = old.dedup_key`. The fresh-authoring path leaves
+    /// the field at `None` explicitly — the validator
+    /// `build_validated_recipe` always writes `None`, and the
+    /// fetch-executor's `author_one` does not stamp a value (so
+    /// the recipe row is the chain head of its own lineage).
+    ///
+    /// **Serde discipline.** `#[serde(default,
+    /// skip_serializing_if = "Option::is_none")]` matches the
+    /// existing `dedup_key` and `static_payload` shape: legacy
+    /// recipe JSON without the field deserializes cleanly to
+    /// `None`, and the wire form is compact for the common case
+    /// (no prior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_recipe_id: Option<Uuid>,
+
+    /// Why this recipe was re-authored, if it was. Captured from the
+    /// prior recipe's last fetch failure message + the operator's
+    /// note from the re-author dialog. `None` for a first-authored
+    /// recipe; `Some(reason)` for a re-authored one (Track A,
+    /// Session 25/26).
+    ///
+    /// Travels alongside [`Self::prior_recipe_id`]: a row with
+    /// `Some(prior)` should also carry `Some(reauthor_reason)`. The
+    /// pipeline-layer `reauthor_recipe` entry point stamps both
+    /// atomically; the storage layer carries them through.
+    ///
+    /// **Serde discipline.** Same shape as `prior_recipe_id`,
+    /// `dedup_key`, `static_payload`: skip when None so legacy
+    /// recipe JSON without the field deserializes cleanly and the
+    /// wire form stays compact for the common case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reauthor_reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +444,8 @@ mod tests {
             // provenance default to FetchedBytes (the optimistic case).
             // Tests below pin StubExcerpt and Unknown explicitly.
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         }
     }
 

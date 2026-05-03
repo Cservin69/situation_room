@@ -76,6 +76,21 @@ const MIGRATIONS: &[Migration] = &[
         description: "recipes.authored_from column",
         sql: include_str!("../../../migrations/0010_recipes_authored_from.sql"),
     },
+    Migration {
+        version: 11,
+        description: "recipes.prior_recipe_id column",
+        sql: include_str!("../../../migrations/0011_recipes_prior_recipe_id.sql"),
+    },
+    Migration {
+        version: 12,
+        description: "recipes.reauthor_reason column",
+        sql: include_str!("../../../migrations/0012_recipes_reauthor_reason.sql"),
+    },
+    Migration {
+        version: 13,
+        description: "recipe_fetch_attempts table",
+        sql: include_str!("../../../migrations/0013_recipe_fetch_attempts.sql"),
+    },
 ];
 
 /// Apply every migration whose version is not yet in

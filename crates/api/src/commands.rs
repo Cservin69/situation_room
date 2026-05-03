@@ -50,13 +50,19 @@ use situation_room_llm::{LlmProvider, ModelTier};
 use situation_room_pipeline::fetch_executor::{
     run_fetch_for_plan as run_fetch_for_plan_impl, ExecutorContext, FetchExecutorError,
 };
+use situation_room_pipeline::recipe_author::{
+    reauthor_recipe as reauthor_recipe_impl, AuthoringError,
+};
+use situation_room_pipeline::recipes_store::{
+    load_recipe as load_recipe_impl, save_recipe as save_recipe_impl, RecipeStoreError,
+};
 use situation_room_pipeline::research_classifier::{
     classify_topic, ClassificationContext, ClassificationError,
     SourceDescriptor as PipelineSourceDescriptor, TopicUsage as ClassifierTopicUsage,
 };
 use situation_room_pipeline::research_plans_store::{
-    save_research_plan, save_research_plan_with_lineage,
-    ResearchPlanStoreError,
+    load_research_plan as load_research_plan_impl, save_research_plan,
+    save_research_plan_with_lineage, ResearchPlanStoreError,
 };
 use situation_room_secure::bounds::{check_string, check_user_text, Bounds};
 use situation_room_secure::http::SecureHttpClient;
@@ -68,7 +74,7 @@ use uuid::Uuid;
 
 use crate::types_export::{
     FetchReportDto, FetchRunSummaryDto, PlanStatusDto, PlanSummary, RecipeDto,
-    RecipeFeedbackDto, ResearchPlanDto, SourceDescriptorDto,
+    RecipeFeedbackDto, RecipeFetchAttemptDto, ResearchPlanDto, SourceDescriptorDto,
 };
 
 // ---------------------------------------------------------------------------
@@ -196,6 +202,19 @@ pub enum CommandError {
         recipes_succeeded: u32,
         message: String,
     },
+
+    /// The manual re-author (Track A) failed before producing a new
+    /// recipe. Distinct from `FetchFailed` because the frontend
+    /// renders the two differently — `FetchFailed` lives in the
+    /// fetch-report panel; re-author failures live in the dialog
+    /// the operator just closed. Carries the prior recipe id so the
+    /// dialog can show the operator which recipe didn't get
+    /// superseded.
+    #[error("re-author failed for recipe {prior_recipe_id}: {message}")]
+    ReauthorFailed {
+        prior_recipe_id: String,
+        message: String,
+    },
 }
 
 impl From<ClassificationError> for CommandError {
@@ -221,6 +240,14 @@ impl From<StorageError> for CommandError {
 
 impl From<ResearchPlanStoreError> for CommandError {
     fn from(e: ResearchPlanStoreError) -> Self {
+        CommandError::Storage {
+            message: e.to_string(),
+        }
+    }
+}
+
+impl From<RecipeStoreError> for CommandError {
+    fn from(e: RecipeStoreError) -> Self {
         CommandError::Storage {
             message: e.to_string(),
         }
@@ -1107,6 +1134,287 @@ impl SourceDescriptorDto {
 }
 
 // ---------------------------------------------------------------------------
+// Command 11 — latest_attempt_for_recipe (Track A, ADR 0012 amendment 1)
+// ---------------------------------------------------------------------------
+
+/// Look up the most recent recorded fetch attempt for a recipe.
+/// Track A: the re-author dialog opens this command when it mounts so
+/// the operator sees the exact bytes + failure message the runtime
+/// captured at the failed apply, before deciding to spend an LLM call
+/// on a re-author.
+///
+/// Returns `Some(dto)` for any recipe with at least one captured
+/// attempt (today: any recipe whose latest run failed at apply
+/// stage); `None` otherwise. The frontend's empty-state copy says
+/// "no bytes captured for this recipe — re-authoring may guess at
+/// the response shape."
+///
+/// Errors:
+///   - `InvalidInput { field: "recipe_id" }` — bad UUID.
+///   - `Storage` — DB-level failure.
+#[tauri::command]
+pub async fn latest_attempt_for_recipe(
+    recipe_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<RecipeFetchAttemptDto>, CommandError> {
+    let parsed: Uuid =
+        recipe_id
+            .parse()
+            .map_err(|e: uuid::Error| CommandError::InvalidInput {
+                field: "recipe_id".into(),
+                message: format!("not a valid UUID: {e}"),
+            })?;
+
+    let stored = state
+        .store
+        .latest_attempt_for_recipe(parsed)
+        .map_err(CommandError::from)?;
+
+    Ok(stored.map(RecipeFetchAttemptDto::from_stored))
+}
+
+// ---------------------------------------------------------------------------
+// Command 12 — reauthor_recipe (Track A, ADR 0012 amendment 1)
+// ---------------------------------------------------------------------------
+
+/// Manually re-author a failed recipe, given the operator's optional
+/// note. This is the operationalised form of ADR 0012 §"Manual-practice
+/// protocol": the operator reads the failure, optionally diagnoses it,
+/// and asks the LLM for a corrected recipe.
+///
+/// **Why this isn't `run_fetch` again.** `run_fetch_for_plan` only
+/// authors recipes that don't yet exist for the plan; once a recipe
+/// exists for `(plan, source)`, fetch reuses it. To get a *new* recipe
+/// for an existing pair, the operator triggers re-authoring — which
+/// is what this command does.
+///
+/// **Why the bytes come from storage, not a fresh fetch.** ADR 0012
+/// amendment 1 §"Capture failed-apply bytes": the bytes that triggered
+/// the failure are ground truth for re-authoring. A fresh fetch would
+/// see whatever the source serves *now*, which may have changed
+/// (sources rotate front-page content, rate-limit intermittently,
+/// or A/B-test response shapes). The executor captured the failed-
+/// apply bytes into `recipe_fetch_attempts` (migration 0013) at the
+/// moment of the failure; we read them back here.
+///
+/// ## Inputs
+///
+/// - `recipe_id` — the prior recipe whose failure prompted the
+///   re-author. Must parse as a UUID and reference an existing
+///   recipe (else `NotFound`).
+/// - `operator_note` — optional free-text correction. Validated
+///   through `check_user_text` against `Bounds::RECIPE_FEEDBACK`
+///   (control-character rejection, length cap, line-ending
+///   normalization). Empty / `None` is allowed: the failure message
+///   alone may be rich enough.
+///
+/// ## Behaviour
+///
+/// 1. Validate inputs.
+/// 2. Load the prior recipe and the plan it belongs to. Reject with
+///    `NotFound` if either is missing.
+/// 3. Look up the latest fetch attempt for the recipe. If none
+///    exists, surface `ReauthorFailed` — re-authoring without ground-
+///    truth bytes would be guessing, which is exactly what ADR 0012
+///    forbids.
+/// 4. Call `pipeline::recipe_author::reauthor_recipe` with the bytes
+///    + failure message + operator note. The new recipe is stamped
+///    with `prior_recipe_id = old.id` and `reauthor_reason = …`.
+/// 5. Persist via `save_recipe`. The new row becomes the highest-
+///    version recipe for the same `dedup_key` (`{plan_id}:{source_id}`),
+///    so the executor's next `run_fetch_for_plan` picks it up.
+/// 6. Return the new `RecipeDto`.
+///
+/// ## Errors
+///
+/// - `InvalidInput { field: "recipe_id" }` — not a UUID.
+/// - `InvalidInput { field: "operator_note" }` — bounds /
+///   character-class violation.
+/// - `NotFound { id }` — recipe id, or its plan id, missing.
+/// - `ReauthorFailed { prior_recipe_id, message }` — no captured
+///   failed-apply bytes for the recipe (the executor never recorded
+///   one; the operator should run fetch first), or the LLM authoring
+///   call failed, or the resulting recipe failed validation.
+/// - `Storage { message }` — DB-level failure.
+///
+/// ## Authoring provenance
+///
+/// The new recipe is stamped `authored_from = FetchedBytes`. ADR 0012
+/// amendment 1 §"Manual path almost always uses real bytes": the
+/// operator triggered re-author after seeing a failure, which means
+/// the source is reachable enough to surface a failed apply, which
+/// means the bytes we recorded are the source's actual response.
+/// `FetchedBytes` is the right default here. (A future "re-author
+/// against a stub-authored recipe with no captured bytes" path would
+/// stamp `StubExcerpt` — that path doesn't exist yet, and the absence
+/// of captured bytes is itself a `ReauthorFailed` outcome above.)
+#[tauri::command]
+pub async fn reauthor_recipe(
+    recipe_id: String,
+    operator_note: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<RecipeDto, CommandError> {
+    // 1. Parse the recipe id.
+    let parsed_recipe_id: Uuid = recipe_id
+        .parse()
+        .map_err(|e: uuid::Error| CommandError::InvalidInput {
+            field: "recipe_id".into(),
+            message: format!("not a valid UUID: {e}"),
+        })?;
+
+    // 2. Validate the operator note. Empty / None / blank-after-trim
+    //    all collapse to None — same shape as `set_recipe_feedback`
+    //    and `reject_plan`.
+    let normalized_note: Option<String> = match operator_note.as_deref() {
+        None => None,
+        Some(raw) => match check_user_text("operator_note", raw, Bounds::RECIPE_FEEDBACK) {
+            Ok(normalized) if normalized.trim().is_empty() => None,
+            Ok(normalized) => Some(normalized),
+            Err(violation) => {
+                return Err(CommandError::InvalidInput {
+                    field: "operator_note".into(),
+                    message: violation.to_string(),
+                })
+            }
+        },
+    };
+
+    info!(
+        recipe_id = %parsed_recipe_id,
+        has_note = normalized_note.is_some(),
+        "reauthor_recipe command invoked"
+    );
+
+    // 3. Load the prior recipe.
+    let prior = load_recipe_impl(state.store.as_ref(), parsed_recipe_id)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::NotFound {
+            id: parsed_recipe_id.to_string(),
+        })?;
+
+    // 4. Load the plan the recipe belongs to. Required for
+    //    `reauthor_recipe` to thread expectations through to the
+    //    LLM. A missing plan is a structural inconsistency (recipes
+    //    point at plans via FK semantics in the typed pipeline);
+    //    surface as NotFound so the frontend handles it the same way
+    //    it handles a missing recipe.
+    let plan = load_research_plan_impl(state.store.as_ref(), prior.plan_id)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::NotFound {
+            id: prior.plan_id.to_string(),
+        })?;
+
+    // 5. Pull the latest fetch attempt for the recipe — the bytes the
+    //    runtime saw + the failure message it produced.
+    let attempt = state
+        .store
+        .latest_attempt_for_recipe(parsed_recipe_id)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::ReauthorFailed {
+            prior_recipe_id: parsed_recipe_id.to_string(),
+            message: "no captured fetch attempt exists for this recipe; \
+                      run fetch and observe a failure before re-authoring"
+                .into(),
+        })?;
+
+    // The capture only records on apply-failure today (executor's
+    // `record_apply_failure_attempt`). A `succeeded: true` row in
+    // `recipe_fetch_attempts` would be unexpected (the table never
+    // gets one written today) but checking is defensive — re-authoring
+    // a successful recipe is structurally meaningless.
+    if attempt.succeeded {
+        return Err(CommandError::ReauthorFailed {
+            prior_recipe_id: parsed_recipe_id.to_string(),
+            message: "the recipe's latest attempt succeeded; nothing to re-author"
+                .into(),
+        });
+    }
+
+    let failure_message = attempt
+        .failure_message
+        .as_deref()
+        .unwrap_or("(failure message not captured)");
+    let bytes = attempt.bytes_excerpt.as_deref().unwrap_or("").as_bytes();
+
+    // 6. Call into pipeline.
+    let mut new_recipe = match reauthor_recipe_impl(
+        state.provider.as_ref(),
+        ModelTier::Workhorse,
+        state.recipe_author_prompt,
+        &plan,
+        &prior,
+        bytes,
+        failure_message,
+        normalized_note.as_deref(),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => match e {
+            // An LLM error (network, gateway, schema rejection) is a
+            // re-author failure — surface as ReauthorFailed so the
+            // dialog renders it next to the prior recipe id.
+            AuthoringError::Llm(_)
+            | AuthoringError::NoStructuredOutput
+            | AuthoringError::OutputParse(_)
+            | AuthoringError::BadUrl(_)
+            | AuthoringError::InvalidRecipe(_)
+            | AuthoringError::Prompt(_) => {
+                warn!(
+                    prior_recipe_id = %parsed_recipe_id,
+                    error = %e,
+                    "reauthor_recipe authoring failed"
+                );
+                return Err(CommandError::ReauthorFailed {
+                    prior_recipe_id: parsed_recipe_id.to_string(),
+                    message: e.to_string(),
+                });
+            }
+        },
+    };
+
+    // 7. Stamp authoring provenance — see the doc-comment §"Authoring
+    //    provenance". The pipeline `reauthor_recipe` left
+    //    `authored_from = Unknown` (the default the validator
+    //    produces); we set it to FetchedBytes here because the bytes
+    //    came from a real fetch the executor performed earlier in
+    //    the same session.
+    new_recipe.authored_from = situation_room_storage::AuthoredFrom::FetchedBytes;
+
+    // 8. Persist. The same `dedup_key` plus a higher `version` makes
+    //    the new row the head of the version chain; subsequent
+    //    fetches read it via `load_recipes_for_plan_latest` (which
+    //    selects max-version per source).
+    save_recipe_impl(state.store.as_ref(), &new_recipe).map_err(CommandError::from)?;
+
+    info!(
+        prior_recipe_id = %parsed_recipe_id,
+        new_recipe_id = %new_recipe.id,
+        new_version = new_recipe.version,
+        "reauthor_recipe persisted new recipe"
+    );
+
+    // 9. Return the new recipe via the same DTO shape used everywhere
+    //    else. The frontend's recipe panel observes a row with
+    //    `prior_recipe_id = Some(...)` and renders the lineage chip.
+    //    We round-trip through StoredRecipe for the wire conversion;
+    //    re-loading from storage also confirms persistence — a defense
+    //    against a silent write failure between save and return.
+    let stored = state
+        .store
+        .get_recipe(new_recipe.id)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::Storage {
+            message: format!(
+                "re-authored recipe {} was not readable after save",
+                new_recipe.id
+            ),
+        })?;
+
+    Ok(RecipeDto::from_stored(stored))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1164,5 +1472,20 @@ mod tests {
             CommandError::NotFound { id } => assert_eq!(id, "abc"),
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    /// Track A: the new variant carries both the prior recipe id and
+    /// the message; the frontend's dialog renders both, so both must
+    /// be present and discoverable on the wire.
+    #[test]
+    fn command_error_reauthor_failed_serializes_with_kind_and_prior_id() {
+        let e = CommandError::ReauthorFailed {
+            prior_recipe_id: "019dee9a-ba75-7533-aa4f-ee673f03fece".into(),
+            message: "no captured fetch attempt exists for this recipe".into(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""kind":"reauthor_failed""#));
+        assert!(json.contains(r#""prior_recipe_id":"019dee9a-ba75-7533-aa4f-ee673f03fece""#));
+        assert!(json.contains("no captured fetch attempt"));
     }
 }

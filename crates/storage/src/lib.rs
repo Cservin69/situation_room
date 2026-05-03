@@ -23,6 +23,7 @@ pub mod migrate;
 pub mod observations;
 pub mod queries;
 pub mod recipe_feedback;
+pub mod recipe_fetch_attempts;
 pub mod record_dispatch;
 pub mod recipes;
 pub mod relations;
@@ -32,7 +33,10 @@ pub use connection::Store;
 pub use fetch_runs::{FetchRunRow, StoredFetchRun};
 pub use queries::{RecordsByPlan, TopicUsage};
 pub use recipe_feedback::{RecipeFeedbackRow, StoredRecipeFeedback};
-pub use recipes::{AuthoredFrom, RecipeRow, StoredRecipe};
+pub use recipe_fetch_attempts::{
+    truncate_excerpt, RecipeFetchAttemptRow, StoredRecipeFetchAttempt, MAX_EXCERPT_BYTES,
+};
+pub use recipes::{AuthoredFrom, RecipeRow, StoredRecipe, MAX_RECIPE_LINEAGE_DEPTH};
 pub use research_plans::{PlanStatus, ResearchPlanRow, StoredResearchPlan};
 
 use thiserror::Error;

@@ -105,7 +105,9 @@ use crate::http_fetcher::{FetchError as HttpFetchError, HttpFetcher};
 use crate::recipe_apply::{apply, ApplyContext, ApplyError};
 use crate::recipe_author::{author_recipe, AuthoringContext, AuthoringError};
 use crate::recipes::{ExtractionSpec, FetchRecipe};
-use crate::recipes_store::{load_recipes_for_plan, save_recipe, RecipeStoreError};
+use crate::recipes_store::{
+    load_latest_recipes_for_plan, load_recipes_for_plan, save_recipe, RecipeStoreError,
+};
 use crate::research::{DocumentSourceHint, ResearchPlan};
 use crate::research_classifier::SourceDescriptor;
 use crate::research_plans_store::{load_research_plan, ResearchPlanStoreError};
@@ -313,7 +315,7 @@ pub async fn run_fetch_for_plan(
     let recipes_attempted: u32 = recipes.len() as u32;
 
     for recipe in &recipes {
-        let outcome = run_one_recipe(ctx, &plan, recipe).await;
+        let outcome = run_one_recipe(ctx, &plan, recipe, run_id).await;
         match &outcome {
             RecipeOutcome::Succeeded {
                 records_produced, ..
@@ -676,6 +678,11 @@ async fn author_one(
         sample_url,
         document_excerpt: excerpt,
         recipe_feedback,
+        // First-authoring path: no prior failure exists. The
+        // re-author entry point in `recipe_author::reauthor_recipe`
+        // is the only call site that populates these.
+        previous_failure_reason: None,
+        operator_guidance: None,
     };
 
     let mut recipe = author_recipe(
@@ -915,12 +922,13 @@ async fn run_one_recipe(
     ctx: &ExecutorContext<'_>,
     plan: &ResearchPlan,
     recipe: &FetchRecipe,
+    run_id: Uuid,
 ) -> RecipeOutcome {
     match &recipe.extraction {
-        ExtractionSpec::CsvCell { .. } => run_csv_recipe(ctx, plan, recipe).await,
-        ExtractionSpec::JsonPath { .. } => run_json_recipe(ctx, plan, recipe).await,
-        ExtractionSpec::CssSelect { .. } => run_css_recipe(ctx, plan, recipe).await,
-        ExtractionSpec::RegexCapture { .. } => run_regex_recipe(ctx, plan, recipe).await,
+        ExtractionSpec::CsvCell { .. } => run_csv_recipe(ctx, plan, recipe, run_id).await,
+        ExtractionSpec::JsonPath { .. } => run_json_recipe(ctx, plan, recipe, run_id).await,
+        ExtractionSpec::CssSelect { .. } => run_css_recipe(ctx, plan, recipe, run_id).await,
+        ExtractionSpec::RegexCapture { .. } => run_regex_recipe(ctx, plan, recipe, run_id).await,
         ExtractionSpec::PdfTable { .. } => RecipeOutcome::Skipped {
             recipe_id: recipe.id,
             source_id: recipe.source_id.clone(),
@@ -929,11 +937,53 @@ async fn run_one_recipe(
     }
 }
 
+/// Record a per-(recipe, run) attempt with the bytes that triggered an
+/// apply-stage failure. Track A, ADR 0012 amendment 1.
+///
+/// Called from each `run_X_recipe` immediately before returning the
+/// `RecipeOutcome::Failed { stage: Apply, .. }`. The attempt row is
+/// the ground truth the manual `reauthor_recipe` Tauri command reads
+/// from when the operator triggers a re-author.
+///
+/// Storage failure here is non-fatal — the outcome is still returned
+/// to the caller, the run continues, and we log the lost capture at
+/// `warn` level. The audit trail loses a row but the user-facing
+/// behaviour is unchanged. ADR 0007 §"runtime path" — the runtime is
+/// LLM-free, so it must also be defensive against any one auxiliary
+/// write failing.
+fn record_apply_failure_attempt(
+    store: &Store,
+    run_id: Uuid,
+    recipe_id: Uuid,
+    bytes: &[u8],
+    failure_message: &str,
+) {
+    let row = situation_room_storage::recipe_fetch_attempts::RecipeFetchAttemptRow {
+        id: Uuid::now_v7(),
+        recipe_id,
+        run_id,
+        attempted_at: Utc::now(),
+        succeeded: false,
+        failure_message: Some(failure_message.to_string()),
+        bytes_excerpt: Some(situation_room_storage::truncate_excerpt(bytes)),
+    };
+    if let Err(e) = store.insert_recipe_fetch_attempt(&row) {
+        warn!(
+            run_id = %run_id,
+            recipe_id = %recipe_id,
+            error = %e,
+            "failed to record recipe fetch attempt; the bytes-and-failure capture is lost \
+             for this run but the outcome itself is preserved"
+        );
+    }
+}
+
 /// CSV runtime path: fetch → apply → insert.
 async fn run_csv_recipe(
     ctx: &ExecutorContext<'_>,
     plan: &ResearchPlan,
     recipe: &FetchRecipe,
+    run_id: Uuid,
 ) -> RecipeOutcome {
     // Fetch — or short-circuit on baked `static_payload`. Track D:
     // 429 responses with a parseable `Retry-After` are now distinct
@@ -956,11 +1006,15 @@ async fn run_csv_recipe(
     let records = match apply(apply_ctx) {
         Ok(rs) => rs,
         Err(e) => {
+            // Track A: capture the bytes + failure message so the
+            // manual re-author command later sees ground truth.
+            let message = describe_apply_error(&e);
+            record_apply_failure_attempt(ctx.store, run_id, recipe.id, &bytes, &message);
             return RecipeOutcome::Failed {
                 recipe_id: recipe.id,
                 source_id: recipe.source_id.clone(),
                 stage: FailureStage::Apply,
-                message: describe_apply_error(&e),
+                message,
             }
         }
     };
@@ -1008,6 +1062,7 @@ async fn run_json_recipe(
     ctx: &ExecutorContext<'_>,
     plan: &ResearchPlan,
     recipe: &FetchRecipe,
+    run_id: Uuid,
 ) -> RecipeOutcome {
     // Fetch — see `fetch_recipe_bytes` for the static-payload
     // short-circuit and Track-D rate-limit handling.
@@ -1027,11 +1082,15 @@ async fn run_json_recipe(
     let records = match apply(apply_ctx) {
         Ok(rs) => rs,
         Err(e) => {
+            // Track A: capture the bytes + failure message so the
+            // manual re-author command later sees ground truth.
+            let message = describe_apply_error(&e);
+            record_apply_failure_attempt(ctx.store, run_id, recipe.id, &bytes, &message);
             return RecipeOutcome::Failed {
                 recipe_id: recipe.id,
                 source_id: recipe.source_id.clone(),
                 stage: FailureStage::Apply,
-                message: describe_apply_error(&e),
+                message,
             }
         }
     };
@@ -1073,6 +1132,7 @@ async fn run_css_recipe(
     ctx: &ExecutorContext<'_>,
     plan: &ResearchPlan,
     recipe: &FetchRecipe,
+    run_id: Uuid,
 ) -> RecipeOutcome {
     // Fetch — see `fetch_recipe_bytes` for the static-payload
     // short-circuit and Track-D rate-limit handling.
@@ -1092,11 +1152,15 @@ async fn run_css_recipe(
     let records = match apply(apply_ctx) {
         Ok(rs) => rs,
         Err(e) => {
+            // Track A: capture the bytes + failure message so the
+            // manual re-author command later sees ground truth.
+            let message = describe_apply_error(&e);
+            record_apply_failure_attempt(ctx.store, run_id, recipe.id, &bytes, &message);
             return RecipeOutcome::Failed {
                 recipe_id: recipe.id,
                 source_id: recipe.source_id.clone(),
                 stage: FailureStage::Apply,
-                message: describe_apply_error(&e),
+                message,
             }
         }
     };
@@ -1144,6 +1208,7 @@ async fn run_regex_recipe(
     ctx: &ExecutorContext<'_>,
     plan: &ResearchPlan,
     recipe: &FetchRecipe,
+    run_id: Uuid,
 ) -> RecipeOutcome {
     // Fetch — see `fetch_recipe_bytes` for the static-payload
     // short-circuit and Track-D rate-limit handling.
@@ -1163,11 +1228,15 @@ async fn run_regex_recipe(
     let records = match apply(apply_ctx) {
         Ok(rs) => rs,
         Err(e) => {
+            // Track A: capture the bytes + failure message so the
+            // manual re-author command later sees ground truth.
+            let message = describe_apply_error(&e);
+            record_apply_failure_attempt(ctx.store, run_id, recipe.id, &bytes, &message);
             return RecipeOutcome::Failed {
                 recipe_id: recipe.id,
                 source_id: recipe.source_id.clone(),
                 stage: FailureStage::Apply,
-                message: describe_apply_error(&e),
+                message,
             }
         }
     };
@@ -1317,6 +1386,8 @@ mod tests {
             static_payload: None,
             // ADR 0014: test fixture; provenance not exercised here.
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         }
     }
 
@@ -1368,6 +1439,8 @@ mod tests {
             static_payload: None,
             // ADR 0014: test fixture; provenance not exercised here.
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         }
     }
 
@@ -1421,6 +1494,8 @@ mod tests {
             static_payload: None,
             // ADR 0014: test fixture; provenance not exercised here.
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         }
     }
 
@@ -1476,6 +1551,8 @@ mod tests {
             static_payload: None,
             // ADR 0014: test fixture; provenance not exercised here.
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         }
     }
 
@@ -2002,6 +2079,76 @@ mod tests {
             RecipeOutcome::Failed { stage, .. } => assert_eq!(*stage, FailureStage::Apply),
             other => panic!("expected Failed(Apply), got {other:?}"),
         }
+    }
+
+    /// Track A, ADR 0012 amendment 1: an apply-stage failure must
+    /// persist a `recipe_fetch_attempts` row so the manual
+    /// `reauthor_recipe` Tauri command later sees the bytes that
+    /// triggered the failure as ground truth.
+    ///
+    /// The shape we assert:
+    /// - The outcome is `Failed { stage: Apply }` (the established
+    ///   contract).
+    /// - `Store::latest_attempt_for_recipe(recipe.id)` returns
+    ///   `Some(_)` with the recipe id, the same run id the executor
+    ///   opened, `succeeded: false`, the failure message verbatim,
+    ///   and the bytes the runtime fetched.
+    #[tokio::test]
+    async fn apply_stage_failure_persists_a_recipe_fetch_attempt_row() {
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let url = "https://example.test/no-match.txt";
+        let recipe = working_regex_recipe(&plan, url);
+        let recipe_id = recipe.id;
+        save_recipe(&store, &recipe).unwrap();
+
+        // Bytes that don't match the recipe's pattern — guaranteed
+        // apply failure.
+        let bytes = b"unrelated content with no matching pattern";
+        let fetcher = StaticFetcher::new().with(url, bytes);
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: "",
+            sources: &[],
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+        match &report.outcomes[0] {
+            RecipeOutcome::Failed { stage, .. } => assert_eq!(*stage, FailureStage::Apply),
+            other => panic!("expected Failed(Apply), got {other:?}"),
+        }
+
+        // The capture must exist, name the recipe, carry the bytes,
+        // and carry the failure message that the recipe-author would
+        // see in the dialog.
+        let attempt = store
+            .latest_attempt_for_recipe(recipe_id)
+            .unwrap()
+            .expect("apply-stage failure must record a fetch attempt");
+        assert_eq!(attempt.recipe_id, recipe_id);
+        assert!(!attempt.succeeded);
+        let msg = attempt
+            .failure_message
+            .as_deref()
+            .expect("failure message must be captured");
+        assert!(
+            msg.to_lowercase().contains("regex") || msg.to_lowercase().contains("matched"),
+            "failure message should describe a regex/match failure; got: {msg}"
+        );
+        let excerpt = attempt
+            .bytes_excerpt
+            .as_deref()
+            .expect("bytes excerpt must be captured");
+        assert_eq!(
+            excerpt,
+            std::str::from_utf8(bytes).unwrap(),
+            "excerpt must carry the runtime bytes verbatim under the cap"
+        );
     }
 
     #[tokio::test]
@@ -2621,6 +2768,8 @@ mod tests {
             static_payload: None,
             // ADR 0014: test fixture; provenance not exercised here.
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         };
         save_recipe(&store, &recipe).unwrap();
 
@@ -2736,6 +2885,8 @@ mod tests {
             static_payload: None,
             // ADR 0014: test fixture; provenance not exercised here.
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         };
         save_recipe(&store, &recipe).unwrap();
 

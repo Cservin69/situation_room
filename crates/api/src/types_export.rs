@@ -300,6 +300,17 @@ pub enum CommandErrorDto {
         recipes_succeeded: u32,
         message: String,
     },
+    /// Track A, ADR 0012 amendment 1: the manual re-author command
+    /// failed before producing a new recipe. Distinct from
+    /// `FetchFailed` because the frontend renders the two
+    /// differently — `FetchFailed` lives in the fetch-report panel;
+    /// re-author failures live in the dialog the operator just
+    /// closed. The `prior_recipe_id` lets the dialog tell the
+    /// operator which recipe didn't get superseded.
+    ReauthorFailed {
+        prior_recipe_id: String,
+        message: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +812,29 @@ pub struct RecipeDto {
     /// know" would create noise on every existing recipe in the
     /// database the moment the operator updates.
     pub authored_from: AuthoredFromDto,
+    /// The recipe id this row supersedes, if any. ADR 0012 §"Storage:
+    /// recipe version chain". `None` for first-authored recipes (the
+    /// chain head); `Some(prior_id)` for re-authored recipes (Track
+    /// A, Session 25/26 — manual re-author UI). The frontend renders
+    /// `Some` as a small lineage chip in the recipe head, citing the
+    /// prior id.
+    ///
+    /// Wire form: empty-string-as-absent. The xAI structured-output
+    /// schema convention used elsewhere on this DTO doesn't apply
+    /// here (this DTO isn't an LLM output), but the same wire
+    /// shape is used so the frontend's "Some-vs-None" branch is
+    /// consistent across `static_payload`, `dedup_key`, and the
+    /// re-author lineage. `Option<String>` of a UUID string is
+    /// the chosen idiom — distinct from the typed `Uuid` so the
+    /// TypeScript surface stays a plain string.
+    pub prior_recipe_id: Option<String>,
+    /// Why this recipe was re-authored, if it was. The persisted
+    /// short form: failure message + (optional) operator note. `None`
+    /// for first-authored recipes; `Some(text)` for re-authored ones.
+    /// Travels alongside [`Self::prior_recipe_id`]: a `Some(prior)`
+    /// row carries a `Some(reason)`. The frontend's lineage chip
+    /// surfaces the reason as a tooltip / details disclosure.
+    pub reauthor_reason: Option<String>,
 }
 
 impl RecipeDto {
@@ -839,6 +873,11 @@ impl RecipeDto {
             // just lift the typed value into wire form via the
             // `From` impl above.
             authored_from: r.authored_from.into(),
+            // Track A, Session 25/26: lineage to the wire. UUID →
+            // string for the TS surface (the rest of the DTO uses
+            // `String` for ids, not `Uuid`).
+            prior_recipe_id: r.prior_recipe_id.map(|id| id.to_string()),
+            reauthor_reason: r.reauthor_reason,
         }
     }
 }
@@ -880,6 +919,56 @@ impl RecipeFeedbackDto {
             source_id: r.source_id,
             note: r.note,
             created_at: r.created_at,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RecipeFetchAttemptDto — wire shape for ADR 0012 amendment 1 captures
+// ---------------------------------------------------------------------------
+
+/// Per-(recipe, run) attempt as it crosses the IPC boundary for the
+/// re-author dialog. Track A. The dialog shows the failure message
+/// verbatim and the bytes the runtime saw, so the operator reviews
+/// the same evidence the LLM will see at re-author time.
+///
+/// `bytes_excerpt` is the head of the response, capped server-side
+/// at `MAX_EXCERPT_BYTES` (64 KiB; see
+/// `crates/storage/src/recipe_fetch_attempts.rs`). The wire type is
+/// `Option<String>` rather than always-string because:
+///
+///   - A failure stage *before* bytes were obtained (DNS, TCP,
+///     transport-level error before the body) leaves no excerpt.
+///   - A row from before this migration would also lack one.
+///
+/// `failure_message` is similarly `Option<String>` for symmetry; in
+/// practice every captured row from Track A has both populated, but
+/// the wire shape doesn't pin that and shouldn't (storage can carry
+/// looser shapes than the runtime emits).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct RecipeFetchAttemptDto {
+    pub id: String,
+    pub recipe_id: String,
+    pub run_id: String,
+    pub attempted_at: DateTime<Utc>,
+    pub succeeded: bool,
+    pub failure_message: Option<String>,
+    pub bytes_excerpt: Option<String>,
+}
+
+impl RecipeFetchAttemptDto {
+    /// Lift a [`situation_room_storage::StoredRecipeFetchAttempt`]
+    /// into wire shape. Pure renaming + UUID stringification.
+    pub fn from_stored(r: situation_room_storage::StoredRecipeFetchAttempt) -> Self {
+        Self {
+            id: r.id.to_string(),
+            recipe_id: r.recipe_id.to_string(),
+            run_id: r.run_id.to_string(),
+            attempted_at: r.attempted_at,
+            succeeded: r.succeeded,
+            failure_message: r.failure_message,
+            bytes_excerpt: r.bytes_excerpt,
         }
     }
 }
@@ -1218,6 +1307,26 @@ mod tests {
         assert!(json.contains(r#""kind":"invalid_input""#));
     }
 
+    /// Track A, ADR 0012 amendment 1: the new ReauthorFailed variant
+    /// must round-trip through the shadow DTO with the same kind tag
+    /// as the real `CommandError` variant. The generated TS union
+    /// gains a new branch on this; the frontend's discriminated-union
+    /// match on `error.kind === 'reauthor_failed'` must see the same
+    /// JSON the real Tauri serialization produces.
+    #[test]
+    fn command_error_dto_reauthor_failed_serializes_with_kind_and_prior_id() {
+        let e = CommandErrorDto::ReauthorFailed {
+            prior_recipe_id: "019dee9a-ba75-7533-aa4f-ee673f03fece".into(),
+            message: "no captured fetch attempt exists for this recipe".into(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""kind":"reauthor_failed""#), "got {json}");
+        assert!(
+            json.contains(r#""prior_recipe_id":"019dee9a-ba75-7533-aa4f-ee673f03fece""#),
+            "got {json}"
+        );
+    }
+
     // -----------------------------------------------------------------
     // Session 8 — fetch executor DTOs
     // -----------------------------------------------------------------
@@ -1345,6 +1454,8 @@ mod tests {
             static_payload: None,
             // ADR 0014: StoredRecipe test fixture; provenance not exercised here.
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         };
         let dto = RecipeDto::from_stored(stored.clone());
         assert_eq!(dto.id, stored.id.to_string());
@@ -1386,6 +1497,8 @@ mod tests {
             static_payload: None,
             // ADR 0014: StoredRecipe test fixture; provenance not exercised here.
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         };
         let dto = RecipeDto::from_stored(stored);
         let err = dto
@@ -1423,6 +1536,8 @@ mod tests {
             static_payload: None,
             // ADR 0014: StoredRecipe test fixture; provenance not exercised here.
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         };
         let dto = RecipeDto::from_stored(stored);
         assert!(dto.static_payload.is_none());
@@ -1450,6 +1565,8 @@ mod tests {
             static_payload: Some(payload.into()),
             // ADR 0014: StoredRecipe test fixture; provenance not exercised here.
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         };
         let dto = RecipeDto::from_stored(stored);
         assert_eq!(dto.static_payload.as_deref(), Some(payload));
@@ -1540,6 +1657,8 @@ mod tests {
             version: 1,
             static_payload: None,
             authored_from: situation_room_storage::AuthoredFrom::StubExcerpt,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         };
         let dto = RecipeDto::from_stored(stored);
         assert_eq!(dto.authored_from, AuthoredFromDto::StubExcerpt);
@@ -1569,6 +1688,8 @@ mod tests {
             // happens in storage; here we simulate that having
             // already happened.
             authored_from: situation_room_storage::AuthoredFrom::Unknown,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         };
         let dto = RecipeDto::from_stored(stored);
         assert_eq!(dto.authored_from, AuthoredFromDto::Unknown);

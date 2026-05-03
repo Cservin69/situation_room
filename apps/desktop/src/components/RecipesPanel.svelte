@@ -127,15 +127,18 @@
   selection boundaries because plans.recipes is reset on selectPlan.
 -->
 <script lang="ts">
-  import { plans, flagRecipe } from '$stores/plans.svelte';
+  import { plans, flagRecipe, reauthorRecipe } from '$stores/plans.svelte';
   import type { RecipeDto } from '$lib/api/types/RecipeDto';
+  import type { RecipeFetchAttemptDto } from '$lib/api/types/RecipeFetchAttemptDto';
   import {
     outcomeTone,
     outcomeLabel,
     outcomeDetail,
     outcomeForRecipe,
   } from '$lib/outcomes';
+  import { latestAttemptForRecipe, asCommandError } from '$lib/api/client';
   import RecipeFlagDialog from '$components/dialogs/RecipeFlagDialog.svelte';
+  import ReauthorDialog from '$components/dialogs/ReauthorDialog.svelte';
 
   // ADR 0013: which recipe (if any) currently has its flag dialog
   // open. We key by `source_id` rather than `recipe.id` because the
@@ -161,6 +164,62 @@
       // parent banner, user can edit + resubmit.
     } finally {
       flagSubmitting = false;
+    }
+  }
+
+  // Track A, ADR 0012 amendment 1: which recipe (if any) currently
+  // has its re-author dialog open. Keyed by `recipe.id`, not
+  // `source_id`, because the dialog operates on the *specific* prior
+  // recipe row — the bytes excerpt and failure message belong to
+  // that exact recipe's last fetch attempt, not to a (plan, source)
+  // pair (which has its own current head). Null = no dialog open.
+  let reauthorDialogRecipe: RecipeDto | null = $state(null);
+  // The latest captured attempt for the recipe whose dialog is open.
+  // Loaded asynchronously when the dialog opens; null while pending.
+  // The dialog mounts before the load resolves and shows a small
+  // "loading" placeholder in the bytes panel (the dialog is built to
+  // tolerate empty bytes anyway — see ReauthorDialog's `bytesEmpty`
+  // path).
+  let reauthorAttempt: RecipeFetchAttemptDto | null = $state(null);
+  let reauthorLoadingAttempt = $state(false);
+  let reauthorSubmitting = $state(false);
+
+  async function openReauthorDialog(recipe: RecipeDto) {
+    reauthorDialogRecipe = recipe;
+    reauthorAttempt = null;
+    reauthorLoadingAttempt = true;
+    try {
+      reauthorAttempt = await latestAttemptForRecipe(recipe.id);
+    } catch (e) {
+      // The capture-fetch is non-fatal — the dialog still opens with
+      // empty bytes and the failure-message panel from the outcome.
+      // Surface the error in the global banner so the operator sees
+      // it but can still proceed.
+      plans.error = asCommandError(e);
+    } finally {
+      reauthorLoadingAttempt = false;
+    }
+  }
+
+  function closeReauthorDialog() {
+    reauthorDialogRecipe = null;
+    reauthorAttempt = null;
+    reauthorLoadingAttempt = false;
+  }
+
+  async function onReauthorSubmit(note: string | null) {
+    if (!reauthorDialogRecipe) return;
+    reauthorSubmitting = true;
+    try {
+      const ok = await reauthorRecipe(reauthorDialogRecipe.id, note);
+      if (ok) {
+        reauthorDialogRecipe = null;
+        reauthorAttempt = null;
+      }
+      // On failure: dialog stays open, plans.error renders in the
+      // parent banner, user can edit + resubmit or cancel.
+    } finally {
+      reauthorSubmitting = false;
     }
   }
 
@@ -278,6 +337,29 @@
           onclick={() => openFlagDialog(recipe.source_id)}
         >FLAGGED</button>
       {/if}
+      {#if recipe.prior_recipe_id !== null}
+        <!--
+          RE-AUTHORED chip — Track A, ADR 0012 amendment 1. Visible
+          when this recipe row supersedes a prior one through the
+          manual re-author flow. Cites the prior recipe's short id;
+          hover surfaces the persisted reauthor_reason so the
+          operator sees why this recipe exists in the form it does.
+
+          --signal-info hue: lineage is informational (the recipe is
+          part of a chain) rather than a defect signal. Same family
+          as the FLAGGED chip, distinct content.
+
+          No onclick today: the prior recipe id is exposed as text
+          for the operator to grep / look up in storage directly.
+          A future session may turn this into a button that opens
+          a drilldown view of the version chain — when that pane
+          earns its weight, the chip becomes the entry point.
+        -->
+        <span
+          class="reauthored-chip"
+          title={recipe.reauthor_reason ?? `Re-authored from recipe ${shortId(recipe.prior_recipe_id)}`}
+        >RE-AUTHORED FROM {shortId(recipe.prior_recipe_id)}</span>
+      {/if}
       <span class="recipe-id">{shortId(recipe.id)}</span>
       <!--
         Flag button — always present so the operator can attach a
@@ -294,6 +376,33 @@
           title="Attach a note about what's wrong with this recipe — fed into the next authoring attempt for this source."
           onclick={() => openFlagDialog(recipe.source_id)}
         >flag</button>
+      {/if}
+      <!--
+        Re-author button — Track A, ADR 0012 amendment 1. Visible
+        only when the latest fetch outcome is `Failed @ apply` (the
+        canonical Class B / Class B-adjacent failure shape). The
+        operator clicks; the dialog opens, loads the latest captured
+        attempt for this recipe (bytes + failure message), and lets
+        the operator add an optional diagnosis note before
+        triggering the LLM call.
+
+        Why not visible for `Failed @ fetch` / `Failed @ insert`:
+          * Fetch failures have no captured bytes (the runtime never
+            got a body); re-authoring would guess at the response
+            shape exactly the way ADR 0012 forbids.
+          * Insert failures are storage-side; re-authoring the
+            extraction can't fix a DB problem.
+        Both surface in the existing FetchReport panel; the operator
+        addresses them through the source-curation path, not through
+        re-authoring.
+      -->
+      {#if outcome && outcome.kind === 'failed' && outcome.stage === 'apply'}
+        <button
+          type="button"
+          class="reauthor-button"
+          title="Open the re-author dialog: shows the failure message + the bytes the runtime saw, lets you add a diagnosis note, then asks the LLM for a corrected recipe. ADR 0012 amendment 1."
+          onclick={() => openReauthorDialog(recipe)}
+        >re-author</button>
       {/if}
     </header>
 
@@ -385,6 +494,49 @@
     submitting={flagSubmitting}
     onSubmit={onFlagSubmit}
     onCancel={closeFlagDialog}
+  />
+{/if}
+
+{#if reauthorDialogRecipe !== null}
+  <!--
+    Re-author dialog mount — Track A, ADR 0012 amendment 1.
+
+    The dialog mounts fresh whenever `reauthorDialogRecipe` becomes
+    non-null. The `latestAttemptForRecipe` call kicked off in
+    `openReauthorDialog` resolves into `reauthorAttempt` while the
+    dialog is open; the UI tolerates the loading window via
+    ReauthorDialog's `bytesEmpty` path (the dialog is built to
+    render an explanatory placeholder when `bytesExcerpt === ''`).
+
+    `failureMessage` is sourced in priority order:
+      1. The captured attempt's `failure_message` (load-bearing,
+         pulled from `recipe_fetch_attempts` — exactly what the
+         executor recorded at the moment of failure).
+      2. The current run's outcome `message` for the recipe (still
+         the same string at the wire level since the executor
+         records it from the same source).
+      3. A placeholder explaining the gap.
+    Most cases get (1); (2) is the fallback when the capture call
+    is still in flight or returned null; (3) only fires for hand-
+    edited DBs.
+  -->
+  {@const reauthorOutcome = outcomeForRecipe(
+    reauthorDialogRecipe.id,
+    plans.fetchReport?.outcomes,
+  )}
+  {@const reauthorMsg =
+    reauthorAttempt?.failure_message ??
+    (reauthorOutcome && reauthorOutcome.kind === 'failed'
+      ? reauthorOutcome.message
+      : '(failure message not captured)')}
+  <ReauthorDialog
+    sourceId={reauthorDialogRecipe.source_id}
+    priorRecipeShortId={shortId(reauthorDialogRecipe.id)}
+    failureMessage={reauthorMsg}
+    bytesExcerpt={reauthorAttempt?.bytes_excerpt ?? ''}
+    submitting={reauthorSubmitting || reauthorLoadingAttempt}
+    onSubmit={onReauthorSubmit}
+    onCancel={closeReauthorDialog}
   />
 {/if}
 
@@ -595,6 +747,67 @@
   }
   .flag-button:hover {
     border-color: var(--signal-info, var(--border-accent));
+    color: var(--fg-primary);
+  }
+
+  /*
+   * Re-authored chip — Track A, ADR 0012 amendment 1. Visible on a
+   * recipe row whose `prior_recipe_id` is non-null: this row is the
+   * head of a re-author chain. Mirrors the FLAGGED chip's chrome
+   * (small caps mono, --signal-info hue) because the meaning is the
+   * same family — informational annotation, not a defect signal.
+   *
+   * Wider than FLAGGED because it carries the prior recipe's short
+   * id inline ("RE-AUTHORED FROM 019dee9a"). The text is the affordance:
+   * the operator can copy / grep / look up the prior id directly. No
+   * cursor:pointer because this is a passive label, not a button —
+   * a future drilldown view of the version chain may turn it into
+   * one (per the comment on the chip's mount site).
+   */
+  .reauthored-chip {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    padding: 2px 6px;
+    border-radius: 2px;
+    color: var(--signal-info, var(--fg-secondary));
+    border: 1px solid var(--signal-info, var(--border-subtle));
+    background: var(--bg-canvas);
+    align-self: center;
+    white-space: nowrap;
+  }
+
+  /*
+   * Re-author button — Track A, ADR 0012 amendment 1. Visible only
+   * when the latest fetch outcome for this recipe is Failed @ apply
+   * (the canonical Class B failure shape). Same chrome family as the
+   * flag button — both are "act on this recipe" affordances that sit
+   * subordinate to the head's primary identifiers — but distinct
+   * hover hue (--signal-warning) because re-authoring spends LLM
+   * budget and re-authoring deserves slightly louder visual weight
+   * than flagging.
+   *
+   * align-self: center so it lines up with the chips and the recipe-id
+   * across the head row regardless of the row's natural flex height.
+   */
+  .reauthor-button {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+    padding: 2px 8px;
+    border-radius: 2px;
+    color: var(--fg-tertiary);
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    cursor: pointer;
+    align-self: center;
+    transition: border-color var(--duration-ui) var(--ease),
+                color var(--duration-ui) var(--ease);
+  }
+  .reauthor-button:hover {
+    border-color: var(--signal-warning, var(--border-accent));
     color: var(--fg-primary);
   }
 

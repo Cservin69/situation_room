@@ -505,6 +505,128 @@ Until automation: **no new code is required.** The protocol in
 
 ---
 
+## Amendment 1 (Session 25/26) — Manual re-author UI
+
+**Status**: Accepted, in effect.
+**Scope**: A UI affordance + the storage and pipeline plumbing the UI
+needs. **The gate count remains at 2/10.** This amendment does not
+move the gate; it operationalises the manual-practice protocol from
+§"Part 1" into a UI-driven entry point. The automated retry loop is
+still deferred until the gate is met. Future sessions reading this
+amendment for permission to retry-loop: there is none here.
+
+### What this amendment adds
+
+- A `re-author` button on each recipe card whose latest fetch
+  outcome is `Failed @ apply`. Clicking opens a dialog showing the
+  failure message, the bytes the runtime saw at the failed apply,
+  and an optional textarea for an operator note.
+- A `RE-AUTHORED FROM <short_id>` chip on the head of any recipe
+  whose `prior_recipe_id` is non-null. The chip surfaces the
+  persisted re-author reason on hover (the failure message + the
+  operator's note, joined with a labelled line — see
+  `compose_reauthor_reason` in `crates/pipeline/src/recipe_author.rs`).
+- Per-(recipe, run) capture of the bytes-and-message tuple at the
+  moment of an Apply-stage failure, into the new
+  `recipe_fetch_attempts` table (migration 0013).
+- `reauthor_reason: Option<String>` on the `recipes` row (migration
+  0012), travelling alongside `prior_recipe_id` (migration 0011).
+- Two new Tauri commands, `latest_attempt_for_recipe` and
+  `reauthor_recipe`, registered in `apps/desktop/src-tauri/src/main.rs`.
+
+### Why the bytes come from storage, not a fresh fetch
+
+The dialog reads the bytes the runtime saw at the failed apply, not
+the bytes the source serves *now*. Two reasons:
+
+1. **Ground truth.** The operator triggered re-author because the
+   recipe failed against a specific response. Re-fetching at
+   re-author time would see whatever the source serves at *that*
+   moment — which may have changed (rotated content, A/B-tested
+   shapes, intermittent rate-limits) and may no longer reproduce
+   the failure. The bytes the runtime captured are the bytes the
+   recipe will be tested against; the LLM should see the same
+   evidence.
+2. **Bandwidth.** A fresh fetch at re-author time spends the
+   source's rate-limit budget for no diagnostic value beyond what
+   the captured bytes already provide.
+
+The capture is deliberately scoped to **Apply-stage failures only**.
+Fetch-stage failures have no body to capture; Insert-stage failures
+are storage-side and re-authoring the extraction can't fix a DB
+problem. Both surface in the existing `FetchReport` panel and the
+operator addresses them through the source-curation path, not
+through re-authoring. The dialog's `re-author` button is hidden on
+non-apply failures by design.
+
+### How this fits the gate
+
+§"Part 1 — Manual-first interim practice" lists six steps the
+operator goes through manually. This amendment turns steps 1–4
+(observe, retrieve bytes, retrieve failure reason, optionally
+diagnose) into a UI flow, and step 5 (compose the re-author call)
+into a dialog action. Step 6 (decide what to do with the result)
+remains manual — the new recipe is persisted, the operator runs
+fetch again, and they read the next outcome.
+
+The gate (§"When to automate") asks for 10 distinct Class B
+failures with documented predicate strings. **The UI does not
+introduce a predicate.** It does not detect "this is Class B." It
+only makes manual re-authoring lower-friction so the operator
+hits the gate sooner. Every re-author is still operator-triggered;
+every diagnosis is still operator-supplied (or absent, in which
+case the LLM works from the failure message alone).
+
+### Predicate-string discrepancy noted but not resolved
+
+In the course of populating the first Class B documented case
+(`docs/failure_cases/class_b/2026-05-03_rss_feeds.md`), one
+real-world failure surfaced an apply-stage message of the form
+"pattern matched nothing" against an expected predicate string of
+`"matched 0 times"`. The two are semantically equivalent but
+**lexically distinct** — a future automated predicate matching on
+substring equality would miss "pattern matched nothing" while
+catching "matched 0 times."
+
+This amendment **does not resolve the discrepancy**. Resolving it
+prematurely (e.g., by hand-coding both forms) is exactly the kind
+of guess the gate exists to prevent. The discrepancy is recorded
+here so the eventual automated predicate work treats both forms as
+evidence rather than discovering the second form mid-implementation
+and being tempted to special-case it. When the gate is met and the
+automated path moves forward, the predicate set should be derived
+from the documented Class B cases, not retrofitted to existing code.
+
+### What this amendment does NOT do
+
+- It does not implement the automated retry loop.
+- It does not introduce a predicate string in code.
+- It does not add a `decline_reason` to recipe authoring outputs
+  (Track B, deferred).
+- It does not change the `authored_from` provenance model from
+  ADR 0014. The new recipe is stamped `FetchedBytes` because the
+  bytes used at re-author time came from a real fetch the executor
+  performed earlier in the session.
+- It does not move the gate.
+
+### Code references (Track A, post-amendment)
+
+- `migrations/0011_recipes_prior_recipe_id.sql` (Session 26)
+- `migrations/0012_recipes_reauthor_reason.sql` (Session 27)
+- `migrations/0013_recipe_fetch_attempts.sql` (Session 27)
+- `crates/storage/src/recipe_fetch_attempts.rs` — capture table API
+- `crates/storage/src/recipes.rs` — `reauthor_reason` column
+- `crates/pipeline/src/recipe_author.rs` — `compose_reauthor_reason`
+- `crates/pipeline/src/fetch_executor.rs` —
+  `record_apply_failure_attempt` + run_id threading
+- `crates/api/src/commands.rs` — `latest_attempt_for_recipe`,
+  `reauthor_recipe`
+- `apps/desktop/src/components/dialogs/ReauthorDialog.svelte`
+- `apps/desktop/src/components/RecipesPanel.svelte` — chip + button
+- `apps/desktop/src/stores/plans.svelte.ts` — `reauthorRecipe`
+
+---
+
 ## Review notes
 
 **ADR drafted and hardened 2026-04-30 (Session 14).**

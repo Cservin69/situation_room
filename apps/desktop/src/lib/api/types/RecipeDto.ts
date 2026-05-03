@@ -78,4 +78,31 @@ static_payload: string | null,
  * know" would create noise on every existing recipe in the
  * database the moment the operator updates.
  */
-authored_from: AuthoredFromDto, };
+authored_from: AuthoredFromDto, 
+/**
+ * The recipe id this row supersedes, if any. ADR 0012 §"Storage:
+ * recipe version chain". `None` for first-authored recipes (the
+ * chain head); `Some(prior_id)` for re-authored recipes (Track
+ * A, Session 25/26 — manual re-author UI). The frontend renders
+ * `Some` as a small lineage chip in the recipe head, citing the
+ * prior id.
+ *
+ * Wire form: empty-string-as-absent. The xAI structured-output
+ * schema convention used elsewhere on this DTO doesn't apply
+ * here (this DTO isn't an LLM output), but the same wire
+ * shape is used so the frontend's "Some-vs-None" branch is
+ * consistent across `static_payload`, `dedup_key`, and the
+ * re-author lineage. `Option<String>` of a UUID string is
+ * the chosen idiom — distinct from the typed `Uuid` so the
+ * TypeScript surface stays a plain string.
+ */
+prior_recipe_id: string | null, 
+/**
+ * Why this recipe was re-authored, if it was. The persisted
+ * short form: failure message + (optional) operator note. `None`
+ * for first-authored recipes; `Some(text)` for re-authored ones.
+ * Travels alongside [`Self::prior_recipe_id`]: a `Some(prior)`
+ * row carries a `Some(reason)`. The frontend's lineage chip
+ * surfaces the reason as a tooltip / details disclosure.
+ */
+reauthor_reason: string | null, };

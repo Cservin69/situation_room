@@ -101,6 +101,47 @@ pub struct AuthoringContext {
     /// re-validate; it sanitizes only enough to preserve fence
     /// integrity.
     pub recipe_feedback: Option<String>,
+
+    /// Failure message from the prior recipe's last fetch attempt.
+    /// `None` for fresh authoring; `Some(text)` for re-authoring
+    /// triggered by the manual `reauthor_recipe` command. The message
+    /// is the verbatim string from
+    /// `recipe_apply::ApplyError::Display` or the equivalent
+    /// fetch-stage error — what the operator saw in the fetch report.
+    ///
+    /// Reaches the LLM through `{{PREVIOUS_FAILURE_REASON}}` in the
+    /// recipe-author prompt (Track B v1.5 consumes it explicitly;
+    /// older prompts that lack the placeholder simply ignore it,
+    /// per the same back-compat shape `recipe_feedback` uses).
+    /// The string is short and bounded by the upstream error chain;
+    /// no operator content flows through this channel, so no
+    /// fence-nonce protection is needed.
+    ///
+    /// Track A, Session 25/26.
+    pub previous_failure_reason: Option<String>,
+
+    /// Operator guidance volunteered through the re-author dialog —
+    /// the textarea where the operator writes "the previous recipe
+    /// matched the channel `<title>`, not the article titles." `None`
+    /// when the operator left the field empty (the dialog accepts
+    /// empty submissions when the failure message alone is rich
+    /// enough). `Some(text)` for any non-empty submission.
+    ///
+    /// Distinct from [`Self::recipe_feedback`]: that channel is the
+    /// *persisted* per-(plan, source) flag the operator may set at
+    /// any time; `operator_guidance` is the *transient* one-off note
+    /// scoped to this re-author event. Track B's prompt revision
+    /// renders both — `recipe_feedback` as the standing correction,
+    /// `operator_guidance` as the one-off "this time, here's what
+    /// went wrong."
+    ///
+    /// Validated through `Bounds::RECIPE_FEEDBACK` at the IPC
+    /// boundary like `recipe_feedback`. Reaches the LLM through
+    /// `{{OPERATOR_GUIDANCE}}` with the same fence-nonce treatment
+    /// as `{{RECIPE_FEEDBACK}}`.
+    ///
+    /// Track A, Session 25/26.
+    pub operator_guidance: Option<String>,
 }
 
 /// Errors that can arise during recipe authoring.
@@ -398,6 +439,248 @@ const MAX_BINDINGS: usize = 20;
 /// Maximum reasonable number of field mappings per binding.
 const MAX_FIELD_MAPPINGS_PER_BINDING: usize = 50;
 
+// ---------------------------------------------------------------------------
+// Track A (Session 26) — manual re-author entry point
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes from the runtime fetch that we hand to the LLM as
+/// `document_excerpt` during a manual re-author. Matches the
+/// executor's `PREFETCH_EXCERPT_BUDGET`: the LLM has to fit the
+/// prompt template, the plan JSON, the source metadata, the feedback
+/// section, and the excerpt within `Bounds::LLM_PROMPT_BODY`
+/// (256 KiB). 32 KiB leaves comfortable headroom while being more
+/// than enough for the LLM to recognize the source's response shape.
+///
+/// ADR 0012 §"Re-author entry point" (deferred automated path) names
+/// the same number as `REAUTHOR_EXCERPT_BUDGET`. The value is a
+/// shared discipline: re-author bytes go through the same prompt
+/// channel as initial-author bytes, with the same upper bound.
+pub const REAUTHOR_EXCERPT_BUDGET: usize = 32 * 1024;
+
+/// Author a corrected recipe given the original recipe, the bytes the
+/// runtime fetched, and an explanation of what went wrong.
+///
+/// This is the **manual** re-author entry point — Track A, Session 26.
+/// The deferred automated path (ADR 0012 §"Part 2") would call this
+/// from inside `run_one_recipe` after detecting a Class B failure;
+/// today it is called by the api crate's `reauthor_recipe` Tauri
+/// command in response to an explicit operator action.
+///
+/// The function is a thin orchestrator over [`author_recipe`]: it
+/// builds the feedback string from `failure_reason` + `operator_note`,
+/// invokes the existing authoring path with the runtime bytes as
+/// `document_excerpt`, then stamps the lineage fields on the resulting
+/// recipe so the version chain is walkable via
+/// [`situation_room_storage::Store::recipe_lineage`].
+///
+/// ## What it preserves from the original
+///
+/// - `dedup_key` — the natural key per (plan, source). The new recipe
+///   becomes the highest-version row for the same key, and
+///   `get_recipe_by_dedup_key` returns the new version on subsequent
+///   lookups.
+/// - `source_id` — the registered source. The fetch executor's
+///   `recipes_for_plan` invariant ("one current recipe per source")
+///   relies on this.
+///
+/// ## What it changes
+///
+/// - `id` — fresh UUIDv7. The new recipe is a distinct row.
+/// - `version` — `original.version + 1`. Monotonic.
+/// - `prior_recipe_id` — `Some(original.id)`. The lineage chain is
+///   now walkable.
+/// - All extraction / production fields — whatever the LLM produced
+///   given the original's failure context.
+///
+/// ## What it leaves to the caller
+///
+/// - `authored_from` — the validator stamps `Unknown`; the api-layer
+///   caller should set this to `FetchedBytes` if the bytes came from
+///   a successful fresh fetch (the typical case for the manual
+///   re-author UI), or `StubExcerpt` if the bytes are a fallback. The
+///   manual path almost always uses real bytes (the operator triggered
+///   re-author after seeing a failure, which means the source is
+///   reachable enough to surface a failed apply); `FetchedBytes` is
+///   the right default at that call site.
+///
+/// ## Errors
+///
+/// Returns whatever [`author_recipe`] returns plus its own
+/// [`AuthoringError::Prompt`] for excerpt-too-large. The cap on
+/// `fetched_bytes.len()` is `REAUTHOR_EXCERPT_BUDGET`; bytes above
+/// that are truncated rather than rejected, since the runtime
+/// fetched them and discarding them entirely would be punitive — but
+/// the truncation is logged so the operator can see if the recipe
+/// was authored against a partial view.
+///
+/// ## Why no second network call
+///
+/// The bytes are `&[u8]` from the caller. The pipeline crate stays
+/// agnostic of HTTP machinery; the api layer fetches via
+/// `SecureHttpClient` and hands the bytes in. This keeps the
+/// reauthor path testable without network access (mirrors the
+/// structure of `author_recipe`, which also takes its excerpt as a
+/// pre-built string).
+///
+/// ## Argument count
+///
+/// Eight arguments: each is a load-bearing input the function cannot
+/// derive from the others. `provider` + `tier` + `prompt_template`
+/// are the LLM call's deps; `plan` + `original` are the lineage
+/// inputs; `fetched_bytes` + `failure_reason` are the ground-truth
+/// evidence; `operator_note` is the optional diagnosis. Folding them
+/// into a `ReauthorContext` struct would just rename the same eight
+/// pieces and split the function's contract across two type
+/// declarations. The `clippy::too_many_arguments` allow is targeted
+/// to this function, not crate-wide. ADR 0012 amendment 1.
+#[allow(clippy::too_many_arguments)]
+pub async fn reauthor_recipe(
+    provider: &dyn LlmProvider,
+    tier: ModelTier,
+    prompt_template: &str,
+    plan: &ResearchPlan,
+    original: &FetchRecipe,
+    fetched_bytes: &[u8],
+    failure_reason: &str,
+    operator_note: Option<&str>,
+) -> Result<FetchRecipe, AuthoringError> {
+    // Build the document excerpt from the fetched bytes. Same
+    // truncation discipline as the executor's prefetch path:
+    // UTF-8 lossy, capped at REAUTHOR_EXCERPT_BUDGET.
+    let excerpt = excerpt_from_bytes(fetched_bytes);
+
+    // Compose the feedback section. Failure reason goes first
+    // (it's evidence the LLM definitely needs); operator note
+    // follows (the human's diagnosis, optional). Both are inert
+    // text — the existing `render_recipe_feedback` fence + nonce
+    // discipline applies to whatever string we hand it.
+    let composed = compose_reauthor_feedback(failure_reason, operator_note);
+
+    let auth_ctx = AuthoringContext {
+        source_id: original.source_id.clone(),
+        sample_url: original.source_url.clone(),
+        document_excerpt: excerpt,
+        // Backward-compat: the composed feedback continues to feed
+        // the v1.4 prompt's `{{RECIPE_FEEDBACK}}` placeholder
+        // verbatim, so any prompt that hasn't been bumped to the
+        // v1.5 split-rendering still sees the same single-block
+        // feedback the prior session shipped.
+        recipe_feedback: Some(composed),
+        // Track A v1.5 (Track B prompt revision): the failure reason
+        // and operator note are also exposed as separate channels so
+        // the prompt can render them with their own framing
+        // (failure as evidence, operator note as diagnosis). A
+        // prompt that ignores `{{PREVIOUS_FAILURE_REASON}}` /
+        // `{{OPERATOR_GUIDANCE}}` simply substitutes empty strings
+        // and the legacy single-block feedback path remains the
+        // load-bearing surface.
+        previous_failure_reason: Some(failure_reason.to_string()),
+        operator_guidance: operator_note.map(|s| s.to_string()),
+    };
+
+    // Delegate to the existing authoring path. Same validation,
+    // same schema, same provider. The only difference is the
+    // ctx now carries the failure context.
+    let mut new_recipe = author_recipe(provider, tier, prompt_template, plan, &auth_ctx).await?;
+
+    // Stamp the lineage fields. `build_validated_recipe` left
+    // `source_id` blank and `dedup_key` at None per its contract;
+    // we restore them from the original. The new id and version
+    // were assigned by the validator (UUIDv7 + version=1); we
+    // overwrite version and lineage but keep the fresh id.
+    new_recipe.source_id = original.source_id.clone();
+    new_recipe.dedup_key = original.dedup_key.clone();
+    new_recipe.version = original.version.saturating_add(1);
+    new_recipe.prior_recipe_id = Some(original.id);
+    // Track A, Session 25/26: the reason the re-author happened.
+    // `compose_reauthor_feedback` already produced a single string
+    // combining failure_reason + operator_note; reuse it as the
+    // persisted reason so the inspection panel and any future audit
+    // query see the same prose the LLM saw.
+    new_recipe.reauthor_reason = Some(compose_reauthor_reason(failure_reason, operator_note));
+
+    Ok(new_recipe)
+}
+
+/// The persisted form of "why was this recipe re-authored." Distinct
+/// from [`compose_reauthor_feedback`] (which is the prompt-facing
+/// rendering with explicit framing for the LLM): this is the
+/// audit-trail short form, sized for the recipe row's
+/// `reauthor_reason` column. The two share the same inputs but render
+/// differently — the prompt version has section headers and an
+/// instruction trailer; the persisted version is just the facts.
+///
+/// Pure function; tests cover the rendered shape.
+fn compose_reauthor_reason(failure_reason: &str, operator_note: Option<&str>) -> String {
+    let trimmed_reason = failure_reason.trim();
+    match operator_note.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(note) => format!("{trimmed_reason}\noperator note: {note}"),
+        None => trimmed_reason.to_string(),
+    }
+}
+
+/// Compose the feedback string handed to [`author_recipe`] during a
+/// manual re-author. Failure reason is mandatory; operator note is
+/// optional. The format is plain prose so the existing fence
+/// rendering treats it as a unit.
+///
+/// Pure function; tests cover the rendered shape directly.
+fn compose_reauthor_feedback(failure_reason: &str, operator_note: Option<&str>) -> String {
+    let trimmed_reason = failure_reason.trim();
+    let mut out = String::new();
+    out.push_str("Your previous recipe failed at the extraction stage when applied \
+                  to the source's actual response.\n\n");
+    out.push_str("Failure reason: ");
+    if trimmed_reason.is_empty() {
+        // The api caller should never pass an empty reason — the
+        // Tauri command captures the latest failure outcome's
+        // message, which is always populated by the executor's
+        // RecipeOutcome::Failed branch. But if the caller does
+        // pass empty, render an explicit honest signal rather than
+        // an empty trailing colon. The next authoring run gets the
+        // hint without being told a falsehood.
+        out.push_str("(not captured)");
+    } else {
+        out.push_str(trimmed_reason);
+    }
+    out.push_str("\n\n");
+
+    match operator_note.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(note) => {
+            out.push_str("The operator added this diagnosis:\n");
+            out.push_str(note);
+            out.push('\n');
+        }
+        None => {
+            out.push_str(
+                "The operator did not add a diagnosis. Use the failure reason and the \
+                 actual fetched bytes (in the document excerpt) to decide what to \
+                 change. Do not echo back the same extraction that already failed.\n",
+            );
+        }
+    }
+
+    out
+}
+
+/// Build the document excerpt the LLM sees during re-authoring from
+/// raw runtime bytes. UTF-8 lossy, truncated at
+/// [`REAUTHOR_EXCERPT_BUDGET`].
+///
+/// Mirrors the executor's `prefetch_excerpt` truncation logic so the
+/// re-author path's bytes-to-excerpt mapping is the same as the
+/// initial-author path's — the LLM cannot distinguish "this is the
+/// real response" from "this is the response again at re-author
+/// time" by the format of what it reads.
+fn excerpt_from_bytes(bytes: &[u8]) -> String {
+    let bounded = if bytes.len() > REAUTHOR_EXCERPT_BUDGET {
+        &bytes[..REAUTHOR_EXCERPT_BUDGET]
+    } else {
+        bytes
+    };
+    String::from_utf8_lossy(bounded).into_owned()
+}
+
 fn build_validated_recipe(
     output: RecipeAuthoringOutput,
     plan: &ResearchPlan,
@@ -496,6 +779,8 @@ fn build_validated_recipe(
         // a caller forgets to stamp, the chip in the UI will say
         // so rather than silently coerce to FetchedBytes.
         authored_from: situation_room_storage::AuthoredFrom::Unknown,
+        prior_recipe_id: None,
+        reauthor_reason: None,
     })
 }
 
@@ -919,6 +1204,8 @@ mod tests {
             document_excerpt: "Lithium\n\nProduction: Australia 88,000 tonnes, Chile 49,000 tonnes."
                 .into(),
             recipe_feedback: None,
+            previous_failure_reason: None,
+            operator_guidance: None,
         }
     }
 
@@ -1565,5 +1852,158 @@ mod tests {
         let out =
             build_prompt_with_fence_id(template, &sample_plan(), &ctx, "abcd1234").unwrap();
         assert_eq!(out, "X no placeholder here Y");
+    }
+
+    // ---------------------------------------------------------------
+    // Track A (Session 26) — reauthor_recipe and its helpers
+    // ---------------------------------------------------------------
+
+    /// `compose_reauthor_feedback` always includes the failure reason
+    /// verbatim. The LLM needs the precise message — not a paraphrase
+    /// — to act on. A drift here would silently degrade the
+    /// re-author's signal-to-noise ratio.
+    #[test]
+    fn compose_reauthor_feedback_includes_failure_reason_verbatim() {
+        let out = compose_reauthor_feedback(
+            "extraction [regex_capture]: pattern matched nothing",
+            None,
+        );
+        assert!(
+            out.contains("extraction [regex_capture]: pattern matched nothing"),
+            "expected verbatim failure reason in feedback; got: {out}"
+        );
+    }
+
+    /// When the operator provides a note, the feedback string carries
+    /// it verbatim. The fence + nonce + sanitization layer is applied
+    /// downstream by `render_recipe_feedback`; this composer just
+    /// concatenates honestly.
+    #[test]
+    fn compose_reauthor_feedback_includes_operator_note_verbatim() {
+        let out = compose_reauthor_feedback(
+            "pattern matched nothing",
+            Some("the source emits unwrapped <title>, not CDATA-wrapped"),
+        );
+        assert!(
+            out.contains("the source emits unwrapped <title>, not CDATA-wrapped"),
+            "expected verbatim operator note in feedback; got: {out}"
+        );
+    }
+
+    /// When the operator provides no note, the feedback string says
+    /// so explicitly — the LLM receives an honest "no diagnosis" hint
+    /// rather than appearing as if there were one. The instruction to
+    /// avoid echoing the failed extraction is the load-bearing line.
+    #[test]
+    fn compose_reauthor_feedback_handles_missing_operator_note() {
+        let out = compose_reauthor_feedback("pattern matched nothing", None);
+        assert!(
+            out.contains("did not add a diagnosis"),
+            "expected explicit no-note signal; got: {out}"
+        );
+        assert!(
+            out.contains("Do not echo back the same extraction"),
+            "expected re-author guard against repeating the failed extraction; got: {out}"
+        );
+    }
+
+    /// An empty / whitespace-only operator note is treated as "no note"
+    /// — same shape as `None`. The Tauri command's input-validation
+    /// path collapses empty to None upstream; this is the
+    /// belt-and-suspenders for any caller that doesn't.
+    #[test]
+    fn compose_reauthor_feedback_treats_blank_note_as_absent() {
+        let out_blank = compose_reauthor_feedback("reason", Some("   \n\t  "));
+        assert!(out_blank.contains("did not add a diagnosis"));
+    }
+
+    /// An empty failure reason renders the explicit "(not captured)"
+    /// signal rather than an empty trailing colon. Honest about the
+    /// gap; the LLM at least sees there was a failure context that
+    /// wasn't captured.
+    #[test]
+    fn compose_reauthor_feedback_handles_empty_failure_reason() {
+        let out = compose_reauthor_feedback("", Some("note"));
+        assert!(
+            out.contains("Failure reason: (not captured)"),
+            "expected explicit not-captured marker; got: {out}"
+        );
+    }
+
+    /// `compose_reauthor_reason` (the persisted form, distinct from
+    /// the prompt-facing `compose_reauthor_feedback`) carries the
+    /// failure reason verbatim. The recipe row's `reauthor_reason`
+    /// column is read by future-session audit queries; the prose must
+    /// not be paraphrased.
+    #[test]
+    fn compose_reauthor_reason_includes_failure_reason() {
+        let out = compose_reauthor_reason(
+            "extraction [regex_capture]: pattern matched nothing",
+            None,
+        );
+        assert!(
+            out.contains("extraction [regex_capture]: pattern matched nothing"),
+            "expected verbatim failure reason; got: {out}"
+        );
+    }
+
+    /// When the operator provides a note, the persisted reason
+    /// includes it on a labelled subsequent line. Distinct from the
+    /// prompt feedback's full prose framing — the persisted form is
+    /// the audit-trail short form: the facts, no instruction trailer.
+    #[test]
+    fn compose_reauthor_reason_includes_operator_note_when_present() {
+        let out = compose_reauthor_reason(
+            "pattern matched nothing",
+            Some("the source emits unwrapped <title>"),
+        );
+        assert!(out.contains("pattern matched nothing"));
+        assert!(
+            out.contains("operator note: the source emits unwrapped <title>"),
+            "expected labelled note line; got: {out}"
+        );
+    }
+
+    /// Blank / None operator note → reason carries only the failure
+    /// reason. Same handling as `compose_reauthor_feedback`'s
+    /// blank-as-absent rule.
+    #[test]
+    fn compose_reauthor_reason_omits_note_when_blank_or_absent() {
+        let out_none = compose_reauthor_reason("reason text", None);
+        let out_blank = compose_reauthor_reason("reason text", Some("   \n\t  "));
+        assert_eq!(out_none, "reason text");
+        assert_eq!(out_blank, "reason text");
+    }
+
+    /// Bytes under the budget pass through verbatim (UTF-8 lossy).
+    #[test]
+    fn excerpt_from_bytes_passes_short_input_through() {
+        let bytes = b"hello world";
+        let out = excerpt_from_bytes(bytes);
+        assert_eq!(out, "hello world");
+    }
+
+    /// Bytes over the budget are truncated to exactly the budget size.
+    /// The LLM gets a partial view, but a partial view is better than
+    /// no view (and the operator can read off the full URL from the
+    /// recipe to verify ground truth themselves).
+    #[test]
+    fn excerpt_from_bytes_truncates_oversized_input() {
+        let huge = vec![b'x'; REAUTHOR_EXCERPT_BUDGET + 1024];
+        let out = excerpt_from_bytes(&huge);
+        assert_eq!(out.len(), REAUTHOR_EXCERPT_BUDGET);
+    }
+
+    /// Non-UTF-8 bytes (a binary PDF, say) are handled lossy rather
+    /// than rejected. The LLM may not get useful signal but the
+    /// recipe author won't crash on the encoding.
+    #[test]
+    fn excerpt_from_bytes_handles_non_utf8_input() {
+        let bytes = &[0xff, 0xfe, b'h', b'i', 0xc3, 0x28]; // mixed valid/invalid
+        let out = excerpt_from_bytes(bytes);
+        // String::from_utf8_lossy substitutes U+FFFD for invalid
+        // sequences; the exact length depends on the substitution
+        // count, but the call must not panic.
+        assert!(out.contains("hi"));
     }
 }

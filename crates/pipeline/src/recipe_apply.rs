@@ -706,6 +706,8 @@ mod tests {
             // ADR 0014: recipe_apply tests don't exercise authoring;
             // FetchedBytes is the optimistic-case default.
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
         }
     }
 
