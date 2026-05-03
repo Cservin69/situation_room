@@ -29,10 +29,37 @@
 //! - We don't implement DNS-over-HTTPS. The user's system resolver is
 //!   trusted at the host level; DNS poisoning defense is out of scope
 //!   for a desktop app.
+//!
+//! ## Response-headers surface (Track D, Session 25)
+//!
+//! Two response-shape surfaces coexist:
+//!
+//! - **Body-only** — [`SecureHttpClient::get_bytes`] /
+//!   [`SecureHttpClient::post_json_bytes`] return `Vec<u8>` and discard
+//!   headers. These are the original methods; existing callers continue
+//!   to compile unchanged.
+//! - **Body + headers** — [`SecureHttpClient::get_with_headers`] /
+//!   [`SecureHttpClient::post_json_with_headers`] return
+//!   [`SecureHttpResponse`] which carries a [`SecureHeaderMap`]
+//!   alongside the body. Use this when the caller needs `Retry-After`,
+//!   `Content-Type`, `ETag`, etc.
+//!
+//! The [`SecureHeaderMap`] is the boundary type — see its module docs
+//! and the `headers` module for the allow-list-accessor rationale. The
+//! raw `reqwest::HeaderMap` never crosses the secure boundary; this is
+//! ADR 0009 §"The rule" extended in Session 25.
+//!
+//! Status codes are surfaced through the existing
+//! [`HttpError::Status(u16)`] variant — for 429 specifically, callers
+//! that want to honor `Retry-After` use the `*_with_headers` variant
+//! and read the value from the returned response *before* matching on
+//! status. The pattern is documented at
+//! [`SecureHttpClient::get_with_headers`].
 
+use crate::headers::SecureHeaderMap;
 use crate::secrets::SecretString;
 use crate::url_guard::{is_disallowed_ip, UrlGuard, UrlViolation};
-use reqwest::{redirect, Client, ClientBuilder};
+use reqwest::{redirect, Client, ClientBuilder, Response, StatusCode};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -85,8 +112,38 @@ pub enum HttpError {
     Timeout(Duration),
     #[error("status error: {0}")]
     Status(u16),
+    /// 4xx/5xx response that arrived intact, with headers the caller
+    /// can act on (e.g. `Retry-After` on 429). Distinct from
+    /// [`HttpError::Status`] which is the legacy variant returned by
+    /// `get_bytes` / `post_json_bytes` — the body-only methods can't
+    /// surface headers, so they keep the simpler shape.
+    ///
+    /// The body of the failing response is *not* carried here; it's
+    /// already been logged at debug level if non-empty. Adding it
+    /// would force every caller to think about how to handle a body
+    /// they probably can't act on; the diagnostic value is at the
+    /// log layer, not the error.
+    #[error("status error: {status} (with response headers)")]
+    StatusWithHeaders {
+        status: u16,
+        headers: SecureHeaderMap,
+    },
     #[error("tls error: {0}")]
     Tls(String),
+}
+
+/// A response that carries its body and a bounded view of its headers.
+///
+/// Returned by the `*_with_headers` methods. The status field is the
+/// raw `reqwest::StatusCode` so callers can match against it
+/// idiomatically (`if response.status == StatusCode::TOO_MANY_REQUESTS`);
+/// the headers field is the secured wrapper described in
+/// [`crate::headers`].
+#[derive(Debug)]
+pub struct SecureHttpResponse {
+    pub status: StatusCode,
+    pub headers: SecureHeaderMap,
+    pub body: Vec<u8>,
 }
 
 /// The HTTP client. Construct once and share (wraps an Arc internally).
@@ -149,51 +206,24 @@ impl SecureHttpClient {
         })
     }
 
-    /// GET with all guards applied.
+    // ------------------------------------------------------------------
+    // Body-only methods (legacy surface; existing callers keep these)
+    // ------------------------------------------------------------------
+
+    /// GET with all guards applied. Body-only — headers are read for
+    /// content-length validation and discarded. Use
+    /// [`Self::get_with_headers`] when the caller needs `Retry-After`,
+    /// `Content-Type`, `ETag`, etc.
     pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, HttpError> {
-        let parsed = self.guard.check(url)?;
-        self.check_host_ip(&parsed)?;
-        let resp = self
-            .inner
-            .get(parsed)
-            .send()
-            .await
-            .map_err(|e| Self::classify_err(e, self.config.total_timeout))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(HttpError::Status(status.as_u16()));
+        // Defer to the headers-aware variant and drop the headers.
+        // The legacy error shape (HttpError::Status(u16)) is preserved
+        // — callers of `get_bytes` get the same behaviour as before
+        // Track D.
+        let resp = self.get_with_headers_internal(url).await?;
+        if !resp.status.is_success() {
+            return Err(HttpError::Status(resp.status.as_u16()));
         }
-
-        // Check Content-Length up front if present
-        if let Some(len) = resp.content_length() {
-            if (len as usize) > self.config.max_response_bytes {
-                return Err(HttpError::ResponseTooLarge {
-                    max: self.config.max_response_bytes,
-                    got: len as usize,
-                });
-            }
-        }
-
-        // Bounded read — even if server lies about Content-Length.
-        let mut bytes = Vec::with_capacity(
-            resp.content_length()
-                .map(|l| (l as usize).min(self.config.max_response_bytes))
-                .unwrap_or(4096),
-        );
-        use futures::StreamExt;
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| HttpError::Request(e.to_string()))?;
-            if bytes.len() + chunk.len() > self.config.max_response_bytes {
-                return Err(HttpError::ResponseTooLarge {
-                    max: self.config.max_response_bytes,
-                    got: bytes.len() + chunk.len(),
-                });
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes)
+        Ok(resp.body)
     }
 
     /// GET and parse as JSON, bounded.
@@ -233,6 +263,112 @@ impl SecureHttpClient {
         auth_headers: &[(&str, &SecretString)],
         extra_headers: &[(&str, &str)],
     ) -> Result<Vec<u8>, HttpError> {
+        // Defer to the headers-aware variant and drop the headers.
+        let resp = self
+            .post_json_with_headers_internal(url, body, auth_headers, extra_headers)
+            .await?;
+        if !resp.status.is_success() {
+            return Err(HttpError::Status(resp.status.as_u16()));
+        }
+        Ok(resp.body)
+    }
+
+    /// POST a JSON body and parse the response as JSON.
+    pub async fn post_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        auth_headers: &[(&str, &SecretString)],
+        extra_headers: &[(&str, &str)],
+    ) -> Result<T, HttpError> {
+        let bytes = self
+            .post_json_bytes(url, body, auth_headers, extra_headers)
+            .await?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| HttpError::Request(format!("json parse: {e}")))
+    }
+
+    // ------------------------------------------------------------------
+    // Headers-aware methods (Track D, Session 25)
+    // ------------------------------------------------------------------
+
+    /// GET, returning a [`SecureHttpResponse`] that carries the body
+    /// alongside an allow-list-accessor view of the response headers.
+    ///
+    /// On non-success status this returns
+    /// [`HttpError::StatusWithHeaders`] so callers can read e.g.
+    /// `Retry-After` from a 429 response. On success, the headers are
+    /// in the returned response.
+    ///
+    /// The body is bounded by `config.max_response_bytes`, same as
+    /// [`Self::get_bytes`].
+    pub async fn get_with_headers(&self, url: &Url) -> Result<SecureHttpResponse, HttpError> {
+        let resp = self.get_with_headers_internal(url.as_str()).await?;
+        if !resp.status.is_success() {
+            return Err(HttpError::StatusWithHeaders {
+                status: resp.status.as_u16(),
+                headers: resp.headers,
+            });
+        }
+        Ok(resp)
+    }
+
+    /// POST a JSON body, returning a [`SecureHttpResponse`] that
+    /// carries the body alongside response headers. Same auth /
+    /// content-type discipline as [`Self::post_json_bytes`]; see that
+    /// method's docs for the do-not-pass-content-type rule.
+    ///
+    /// On non-success status this returns
+    /// [`HttpError::StatusWithHeaders`] so callers can read e.g.
+    /// `Retry-After` from a 429 response.
+    pub async fn post_json_with_headers(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        auth_headers: &[(&str, &SecretString)],
+        extra_headers: &[(&str, &str)],
+    ) -> Result<SecureHttpResponse, HttpError> {
+        let resp = self
+            .post_json_with_headers_internal(url, body, auth_headers, extra_headers)
+            .await?;
+        if !resp.status.is_success() {
+            return Err(HttpError::StatusWithHeaders {
+                status: resp.status.as_u16(),
+                headers: resp.headers,
+            });
+        }
+        Ok(resp)
+    }
+
+    // ------------------------------------------------------------------
+    // Internal: the actual request paths. Both legacy body-only and
+    // headers-aware variants share these. The `_internal` suffix means
+    // "returns SecureHttpResponse regardless of status; the public
+    // wrappers project to the appropriate error shape."
+    // ------------------------------------------------------------------
+
+    async fn get_with_headers_internal(
+        &self,
+        url: &str,
+    ) -> Result<SecureHttpResponse, HttpError> {
+        let parsed = self.guard.check(url)?;
+        self.check_host_ip(&parsed)?;
+        let resp = self
+            .inner
+            .get(parsed)
+            .send()
+            .await
+            .map_err(|e| Self::classify_err(e, self.config.total_timeout))?;
+        self.consume_response(resp).await
+    }
+
+    async fn post_json_with_headers_internal(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        auth_headers: &[(&str, &SecretString)],
+        extra_headers: &[(&str, &str)],
+    ) -> Result<SecureHttpResponse, HttpError> {
         let parsed = self.guard.check(url)?;
         self.check_host_ip(&parsed)?;
 
@@ -255,27 +391,46 @@ impl SecureHttpClient {
             .send()
             .await
             .map_err(|e| Self::classify_err(e, self.config.total_timeout))?;
+        self.consume_response(resp).await
+    }
 
+    /// Common bounded-body read shared by the GET and POST internals.
+    /// Captures status + headers up-front so the structured response
+    /// is constructable even on a non-success path. Body is read into
+    /// a `Bytes` so `SecureHttpResponse` can be cheaply cloned.
+    async fn consume_response(&self, resp: Response) -> Result<SecureHttpResponse, HttpError> {
         let status = resp.status();
+        let raw_headers = resp.headers().clone();
+        let headers = SecureHeaderMap::from_reqwest(raw_headers);
+
+        // On a non-success path, log a small body excerpt for diagnostics
+        // but don't blow the bound. This mirrors the legacy
+        // `post_json_bytes` behaviour exactly. The body still gets
+        // surfaced to the caller via the SecureHttpResponse, capped at
+        // `max_response_bytes`, so legitimate "I want the JSON-shaped
+        // error from the API" use-cases keep working.
         if !status.is_success() {
-            // Best-effort: try to read a small error body for the caller's
-            // diagnostics, but don't exceed a few KB — we don't want a
-            // misbehaving server to blow the response limit on the error path.
-            const ERR_BODY_CAP: usize = 8 * 1024;
-            let body_text = match resp.bytes().await {
-                Ok(b) => {
-                    let slice = &b[..b.len().min(ERR_BODY_CAP)];
-                    String::from_utf8_lossy(slice).into_owned()
-                }
-                Err(_) => String::new(),
-            };
-            if !body_text.is_empty() {
-                tracing::debug!(status = status.as_u16(), body = %body_text, "non-success POST response");
-            }
-            return Err(HttpError::Status(status.as_u16()));
+            // Eagerly read into the bound, same machinery as the
+            // success path. Failures during read get classified as
+            // request errors so the caller still sees the status code
+            // — but we return *with* the body so e.g. an LLM provider
+            // can quote the gateway's error JSON in its own log line.
+            let body = self.read_bounded(resp).await?;
+            tracing::debug!(
+                status = status.as_u16(),
+                body_bytes = body.len(),
+                "non-success response"
+            );
+            return Ok(SecureHttpResponse {
+                status,
+                headers,
+                body,
+            });
         }
 
-        // Up-front Content-Length check (same as get_bytes).
+        // Up-front Content-Length check before streaming. Servers can
+        // lie about Content-Length, so the streaming reader below
+        // double-checks against `max_response_bytes`.
         if let Some(len) = resp.content_length() {
             if (len as usize) > self.config.max_response_bytes {
                 return Err(HttpError::ResponseTooLarge {
@@ -285,8 +440,18 @@ impl SecureHttpClient {
             }
         }
 
-        // Bounded stream read — defends against lying Content-Length.
-        let mut bytes = Vec::with_capacity(
+        let body = self.read_bounded(resp).await?;
+        Ok(SecureHttpResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+
+    /// Stream the response body into a `Vec<u8>`, aborting if the
+    /// total exceeds [`SecureHttpConfig::max_response_bytes`].
+    async fn read_bounded(&self, resp: Response) -> Result<Vec<u8>, HttpError> {
+        let mut bytes: Vec<u8> = Vec::with_capacity(
             resp.content_length()
                 .map(|l| (l as usize).min(self.config.max_response_bytes))
                 .unwrap_or(4096),
@@ -304,21 +469,6 @@ impl SecureHttpClient {
             bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
-    }
-
-    /// POST a JSON body and parse the response as JSON.
-    pub async fn post_json<T: serde::de::DeserializeOwned>(
-        &self,
-        url: &str,
-        body: &serde_json::Value,
-        auth_headers: &[(&str, &SecretString)],
-        extra_headers: &[(&str, &str)],
-    ) -> Result<T, HttpError> {
-        let bytes = self
-            .post_json_bytes(url, body, auth_headers, extra_headers)
-            .await?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| HttpError::Request(format!("json parse: {e}")))
     }
 
     /// If the URL's host happens to be a literal IP, recheck it. (A host

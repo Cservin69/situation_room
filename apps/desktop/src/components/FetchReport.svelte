@@ -270,6 +270,16 @@
     border-left-color: var(--signal-negative);
     background: var(--bg-panel-alt);
   }
+  /* Track D, Session 25 — `rate_limited` outcomes get warning amber.
+     The visual distinction from `fail` is load-bearing: red signals
+     "the recipe is broken; re-running won't help"; amber signals
+     "the source asked us to wait; re-running later is the
+     remediation." Same border-treatment otherwise so the outcomes
+     list reads as a uniform vertical scan. */
+  .outcome[data-tone="limited"] {
+    border-left-color: var(--signal-warning);
+    background: var(--bg-panel-alt);
+  }
   /* Defensive: outcomeTone returns 'none' when the outcome is
      undefined, which can't happen for items inside the outcomes
      list (each list item is by construction a defined outcome).

@@ -100,6 +100,7 @@ use situation_room_storage::{
     fetch_runs::FetchRunRow, research_plans::PlanStatus, Store,
 };
 
+use crate::fetch_backoff::{fetch_with_backoff, format_retry_after, BackoffOutcome};
 use crate::http_fetcher::{FetchError as HttpFetchError, HttpFetcher};
 use crate::recipe_apply::{apply, ApplyContext, ApplyError};
 use crate::recipe_author::{author_recipe, AuthoringContext, AuthoringError};
@@ -162,6 +163,25 @@ pub enum RecipeOutcome {
         source_id: String,
         stage: FailureStage,
         message: String,
+    },
+    /// The source returned HTTP 429 with a `Retry-After` value the
+    /// executor's inline backoff (see [`crate::fetch_backoff`]) chose
+    /// not to wait through — either because the wait exceeded the
+    /// short-backoff ceiling, or because no `Retry-After` header was
+    /// provided at all (`retry_after_seconds: None`).
+    ///
+    /// Distinct from [`RecipeOutcome::Failed`] because the operator
+    /// surface should render rate-limits differently from "the
+    /// extraction broke" — re-running with no other change is
+    /// reasonable for a rate-limit but pointless for an apply
+    /// failure. The frontend's outcome-tone helper renders these in
+    /// warning amber rather than error red.
+    ///
+    /// Track D, Session 25.
+    RateLimited {
+        recipe_id: Uuid,
+        source_id: String,
+        retry_after_seconds: Option<u64>,
     },
 }
 
@@ -304,6 +324,23 @@ pub async fn run_fetch_for_plan(
             RecipeOutcome::Skipped { .. } => {}
             RecipeOutcome::Failed { stage, message, .. } => {
                 warn!(plan_id = %plan_id, run_id = %run_id, ?stage, %message, "recipe failed");
+            }
+            RecipeOutcome::RateLimited {
+                retry_after_seconds,
+                ..
+            } => {
+                // Track D: rate-limit is its own outcome category.
+                // It does NOT count as `recipes_succeeded` (no
+                // records produced) and it is not a `Failed`-style
+                // stage error. The warn line names it specifically
+                // so the operator's run log distinguishes "transient
+                // throttling" from "the recipe is broken."
+                warn!(
+                    plan_id = %plan_id,
+                    run_id = %run_id,
+                    retry_after_seconds = ?retry_after_seconds,
+                    "recipe rate-limited"
+                );
             }
         }
         outcomes.push(outcome);
@@ -720,9 +757,26 @@ async fn prefetch_excerpt(
         url = %url,
         "pre-fetching endpoint hint"
     );
-    let bytes = match ctx.http.fetch_bytes(url.as_str()).await {
-        Ok(b) => b,
-        Err(e) => {
+    // Track D: pre-fetch goes through the same backoff helper as
+    // runtime fetches. Pre-fetch isn't latency-critical (it's part
+    // of one-time authoring), but the rate-limit signal is just as
+    // important here as it is at runtime — otherwise the operator
+    // sees "authoring failed" with no hint that the cause was
+    // throttling rather than a malformed source.
+    let bytes = match fetch_with_backoff(ctx.http, url.as_str(), "prefetch").await {
+        BackoffOutcome::Bytes(b) => b,
+        BackoffOutcome::RateLimited {
+            retry_after_seconds,
+        } => {
+            warn!(
+                source_id = %source_id,
+                url = %url,
+                summary = %format_retry_after(retry_after_seconds),
+                "endpoint_hint pre-fetch rate-limited; authoring will fall back to stub excerpt"
+            );
+            return None;
+        }
+        BackoffOutcome::Failed(e) => {
             warn!(
                 source_id = %source_id,
                 url = %url,
@@ -786,6 +840,70 @@ fn stub_excerpt(plan: &ResearchPlan, source_id: &str, real_url: Option<&str>) ->
     out
 }
 
+/// Fetch the bytes a recipe's apply step needs, honoring static
+/// payloads and Track-D backoff.
+///
+/// Returns `Ok(bytes)` on success, or one of three pre-built
+/// `RecipeOutcome` variants the caller `return`s directly:
+/// `Failed { stage: Fetch, ... }` for ordinary network errors,
+/// `RateLimited { ... }` for 429 responses the backoff helper chose
+/// to surface (above-ceiling waits, no `Retry-After`, or two 429s
+/// in a row), and the no-fixture variant of `Failed` for tests.
+///
+/// Lifted out of the four `run_X_recipe` paths so the policy lives
+/// in one place. Each path retains its own visible call site, which
+/// preserves the duplication-with-comments discipline Session 9
+/// chose for the apply/insert tail of those functions — only the
+/// fetch arm is consolidated here.
+async fn fetch_recipe_bytes(
+    ctx: &ExecutorContext<'_>,
+    recipe: &FetchRecipe,
+) -> Result<Vec<u8>, RecipeOutcome> {
+    if let Some(payload) = recipe.static_payload.as_ref() {
+        // ADR 0007 Amendment 3: bytes' provenance is orthogonal to
+        // the extraction mode. A baked payload short-circuits the
+        // network entirely; rate-limiting can't apply.
+        return Ok(payload.as_bytes().to_vec());
+    }
+
+    match fetch_with_backoff(ctx.http, recipe.source_url.as_str(), "runtime").await {
+        BackoffOutcome::Bytes(b) => Ok(b),
+        BackoffOutcome::RateLimited {
+            retry_after_seconds,
+        } => Err(RecipeOutcome::RateLimited {
+            recipe_id: recipe.id,
+            source_id: recipe.source_id.clone(),
+            retry_after_seconds,
+        }),
+        BackoffOutcome::Failed(HttpFetchError::Http(msg)) => Err(RecipeOutcome::Failed {
+            recipe_id: recipe.id,
+            source_id: recipe.source_id.clone(),
+            stage: FailureStage::Fetch,
+            message: msg,
+        }),
+        BackoffOutcome::Failed(HttpFetchError::NoFixture(url)) => Err(RecipeOutcome::Failed {
+            recipe_id: recipe.id,
+            source_id: recipe.source_id.clone(),
+            stage: FailureStage::Fetch,
+            message: format!("no fixture configured for url: {url}"),
+        }),
+        BackoffOutcome::Failed(HttpFetchError::RateLimited {
+            retry_after_seconds,
+        }) => {
+            // Defensive — `fetch_with_backoff` collapses RateLimited
+            // into `BackoffOutcome::RateLimited`, never `Failed`.
+            // If a future refactor breaks that invariant the
+            // operator still sees a sensible outcome rather than a
+            // generic Failed-with-debug-string.
+            Err(RecipeOutcome::RateLimited {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                retry_after_seconds,
+            })
+        }
+    }
+}
+
 /// Run one recipe end-to-end. Pure dispatch on the extraction mode
 /// — Session 8 wired CSV; Session 9 added JSON; Session 12 added
 /// CssSelect; Session 13 added RegexCapture. The only remaining
@@ -817,35 +935,14 @@ async fn run_csv_recipe(
     plan: &ResearchPlan,
     recipe: &FetchRecipe,
 ) -> RecipeOutcome {
-    // Fetch — or, if the recipe carries a baked `static_payload`,
-    // skip the HTTP fetch and feed the baked bytes to apply().
-    // ADR 0007 Amendment 3: the bytes' provenance is orthogonal to
-    // the extraction mode. This short-circuit is duplicated at all
-    // four run_X_recipe sites rather than extracted, preserving the
-    // dispatch-contract readability per Session 9's
-    // "duplication-with-comments over premature unification" rule.
-    let bytes = if let Some(payload) = recipe.static_payload.as_ref() {
-        payload.as_bytes().to_vec()
-    } else {
-        match ctx.http.fetch_bytes(recipe.source_url.as_str()).await {
-            Ok(b) => b,
-            Err(HttpFetchError::Http(msg)) => {
-                return RecipeOutcome::Failed {
-                    recipe_id: recipe.id,
-                    source_id: recipe.source_id.clone(),
-                    stage: FailureStage::Fetch,
-                    message: msg,
-                }
-            }
-            Err(HttpFetchError::NoFixture(url)) => {
-                return RecipeOutcome::Failed {
-                    recipe_id: recipe.id,
-                    source_id: recipe.source_id.clone(),
-                    stage: FailureStage::Fetch,
-                    message: format!("no fixture configured for url: {url}"),
-                }
-            }
-        }
+    // Fetch — or short-circuit on baked `static_payload`. Track D:
+    // 429 responses with a parseable `Retry-After` are now distinct
+    // from generic fetch errors, surfaced as RateLimited rather than
+    // collapsed into `Failed { stage: Fetch }`. See
+    // `fetch_recipe_bytes` for the policy.
+    let bytes = match fetch_recipe_bytes(ctx, recipe).await {
+        Ok(b) => b,
+        Err(outcome) => return outcome,
     };
 
     // Apply.
@@ -912,32 +1009,11 @@ async fn run_json_recipe(
     plan: &ResearchPlan,
     recipe: &FetchRecipe,
 ) -> RecipeOutcome {
-    // Fetch — or short-circuit on baked `static_payload`. See the
-    // comment in `run_csv_recipe` for the full ADR 0007 Amendment 3
-    // reasoning. Inlined here rather than extracted per Session 9's
-    // duplication-with-comments rule.
-    let bytes = if let Some(payload) = recipe.static_payload.as_ref() {
-        payload.as_bytes().to_vec()
-    } else {
-        match ctx.http.fetch_bytes(recipe.source_url.as_str()).await {
-            Ok(b) => b,
-            Err(HttpFetchError::Http(msg)) => {
-                return RecipeOutcome::Failed {
-                    recipe_id: recipe.id,
-                    source_id: recipe.source_id.clone(),
-                    stage: FailureStage::Fetch,
-                    message: msg,
-                }
-            }
-            Err(HttpFetchError::NoFixture(url)) => {
-                return RecipeOutcome::Failed {
-                    recipe_id: recipe.id,
-                    source_id: recipe.source_id.clone(),
-                    stage: FailureStage::Fetch,
-                    message: format!("no fixture configured for url: {url}"),
-                }
-            }
-        }
+    // Fetch — see `fetch_recipe_bytes` for the static-payload
+    // short-circuit and Track-D rate-limit handling.
+    let bytes = match fetch_recipe_bytes(ctx, recipe).await {
+        Ok(b) => b,
+        Err(outcome) => return outcome,
     };
 
     // Apply.
@@ -998,32 +1074,11 @@ async fn run_css_recipe(
     plan: &ResearchPlan,
     recipe: &FetchRecipe,
 ) -> RecipeOutcome {
-    // Fetch — or short-circuit on baked `static_payload`. See the
-    // comment in `run_csv_recipe` for the full ADR 0007 Amendment 3
-    // reasoning. Inlined here rather than extracted per Session 9's
-    // duplication-with-comments rule.
-    let bytes = if let Some(payload) = recipe.static_payload.as_ref() {
-        payload.as_bytes().to_vec()
-    } else {
-        match ctx.http.fetch_bytes(recipe.source_url.as_str()).await {
-            Ok(b) => b,
-            Err(HttpFetchError::Http(msg)) => {
-                return RecipeOutcome::Failed {
-                    recipe_id: recipe.id,
-                    source_id: recipe.source_id.clone(),
-                    stage: FailureStage::Fetch,
-                    message: msg,
-                }
-            }
-            Err(HttpFetchError::NoFixture(url)) => {
-                return RecipeOutcome::Failed {
-                    recipe_id: recipe.id,
-                    source_id: recipe.source_id.clone(),
-                    stage: FailureStage::Fetch,
-                    message: format!("no fixture configured for url: {url}"),
-                }
-            }
-        }
+    // Fetch — see `fetch_recipe_bytes` for the static-payload
+    // short-circuit and Track-D rate-limit handling.
+    let bytes = match fetch_recipe_bytes(ctx, recipe).await {
+        Ok(b) => b,
+        Err(outcome) => return outcome,
     };
 
     // Apply.
@@ -1090,32 +1145,11 @@ async fn run_regex_recipe(
     plan: &ResearchPlan,
     recipe: &FetchRecipe,
 ) -> RecipeOutcome {
-    // Fetch — or short-circuit on baked `static_payload`. See the
-    // comment in `run_csv_recipe` for the full ADR 0007 Amendment 3
-    // reasoning. Inlined here rather than extracted per Session 9's
-    // duplication-with-comments rule.
-    let bytes = if let Some(payload) = recipe.static_payload.as_ref() {
-        payload.as_bytes().to_vec()
-    } else {
-        match ctx.http.fetch_bytes(recipe.source_url.as_str()).await {
-            Ok(b) => b,
-            Err(HttpFetchError::Http(msg)) => {
-                return RecipeOutcome::Failed {
-                    recipe_id: recipe.id,
-                    source_id: recipe.source_id.clone(),
-                    stage: FailureStage::Fetch,
-                    message: msg,
-                }
-            }
-            Err(HttpFetchError::NoFixture(url)) => {
-                return RecipeOutcome::Failed {
-                    recipe_id: recipe.id,
-                    source_id: recipe.source_id.clone(),
-                    stage: FailureStage::Fetch,
-                    message: format!("no fixture configured for url: {url}"),
-                }
-            }
-        }
+    // Fetch — see `fetch_recipe_bytes` for the static-payload
+    // short-circuit and Track-D rate-limit handling.
+    let bytes = match fetch_recipe_bytes(ctx, recipe).await {
+        Ok(b) => b,
+        Err(outcome) => return outcome,
     };
 
     // Apply.
@@ -1681,6 +1715,15 @@ mod tests {
                     failed += 1;
                 }
                 RecipeOutcome::Skipped { .. } => panic!("no skips expected here"),
+                // Track D, Session 25: this test exercises a fixture
+                // that returns a 404 ("status error: 404"), which the
+                // backoff helper passes through as Failed — no 429
+                // path here. Surface as a panic if it ever fires so
+                // a future change to the backoff policy doesn't
+                // silently turn a Failed assertion into a no-op.
+                RecipeOutcome::RateLimited { .. } => {
+                    panic!("no rate-limit expected here")
+                }
             }
         }
         assert_eq!(succeeded, 1);

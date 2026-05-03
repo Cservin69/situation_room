@@ -304,12 +304,26 @@ fn map_http_err(e: HttpError) -> LlmError {
     match e {
         HttpError::Status(401) | HttpError::Status(403) => LlmError::Auth,
         HttpError::Status(429) => LlmError::RateLimited {
-            // xAI returns retry-after in headers; SecureHttpClient doesn't
-            // surface response headers today. Report 0 as "unknown" — the
-            // router can apply its own backoff.
+            // xAI returns retry-after in headers; the legacy
+            // `Status(u16)` shape arrives via the body-only path
+            // that drops them. Report 0 as "unknown" so the router
+            // applies its own backoff. The `StatusWithHeaders` arm
+            // below carries the real value when present.
             retry_after_seconds: 0,
         },
         HttpError::Status(code) => LlmError::Api(format!("http {code}")),
+        // Track D, Session 25: when the LLM provider's HTTP call
+        // surfaces with headers (e.g. 429 from the gateway), thread
+        // the parsed `Retry-After` value through to the router so
+        // its backoff is informed rather than guessed. Other status
+        // codes collapse to the same shape as the body-only path.
+        HttpError::StatusWithHeaders { status, headers } => match status {
+            401 | 403 => LlmError::Auth,
+            429 => LlmError::RateLimited {
+                retry_after_seconds: headers.retry_after_seconds().unwrap_or(0),
+            },
+            code => LlmError::Api(format!("http {code}")),
+        },
         HttpError::Timeout(d) => LlmError::Network(format!("timeout after {d:?}")),
         HttpError::ResponseTooLarge { max, got } => {
             LlmError::Api(format!("response exceeded bound: {got} > {max}"))

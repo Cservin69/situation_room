@@ -34,6 +34,7 @@
 pub mod ingest;
 pub mod normalize;
 pub mod extract;
+pub mod fetch_backoff;
 pub mod fetch_executor;
 pub mod http_fetcher;
 pub mod promote;

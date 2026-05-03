@@ -4464,6 +4464,7 @@ dependencies = [
 name = "situation_room-secure"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "futures",
  "reqwest 0.12.28",
  "secrecy",

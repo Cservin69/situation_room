@@ -9,6 +9,10 @@
 //!   zeroizes on drop, and never `Serialize`s by accident.
 //! - [`http`] — the one HTTP client situation_room uses, with SSRF guardrails,
 //!   strict TLS, bounded response sizes, timeouts, and redirect whitelisting.
+//! - [`headers`] — [`headers::SecureHeaderMap`], the boundary type that
+//!   wraps `reqwest::HeaderMap` with an allow-list of accessors. The raw
+//!   header map never crosses the secure boundary; that's ADR 0009
+//!   §"The rule" extended in Session 25.
 //! - [`url_guard`] — URL validation that rejects private IP ranges, localhost,
 //!   cloud metadata endpoints, and non-HTTP(S) schemes.
 //! - [`logging`] — a tracing subscriber wrapper that scrubs known secret
@@ -28,13 +32,15 @@
 
 pub mod secrets;
 pub mod http;
+pub mod headers;
 pub mod url_guard;
 pub mod logging;
 pub mod bounds;
 pub mod fs_guard;
 
 pub use secrets::{ApiKey, SecretString};
-pub use http::{SecureHttpClient, SecureHttpConfig};
+pub use http::{SecureHttpClient, SecureHttpConfig, SecureHttpResponse};
+pub use headers::SecureHeaderMap;
 pub use url_guard::{UrlGuard, UrlViolation};
 pub use bounds::{Bounds, BoundsViolation};
 pub use fs_guard::{FsGuard, FsViolation};

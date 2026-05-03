@@ -290,3 +290,66 @@ review. The non-commitments (no cert pinning, no DoH, no keychain)
 were reaffirmed as appropriate for the current threat model and
 deployment context; all three are explicitly revisitable if the
 product context shifts.
+
+## Updates
+
+### 2026-05-03 — `SecureHeaderMap` newtype and the response-headers boundary (Track D, Session 25)
+
+The original ADR text said "no fresh `reqwest::Client::new()` anywhere"
+and locked the request-side primitives. It did not name the
+*response-side* posture explicitly. Track D, Session 25, surfaced
+why that gap was load-bearing: the executor needed to read
+`Retry-After` from a 429 response to honor server-supplied backoff
+hints, but every existing accessor in `SecureHttpClient` discarded
+headers before returning bytes to the caller. The naive fix —
+return `reqwest::HeaderMap` — would have re-opened every
+log-the-Authorization-header failure mode that the request side
+goes to such trouble to prevent.
+
+The fix is the `SecureHeaderMap` newtype in
+`crates/secure/src/headers.rs`. It wraps `reqwest::HeaderMap` with a
+closed allow-list of accessors (`retry_after_seconds`,
+`content_type`, `content_length`, `etag`, `last_modified`).
+Construction is `pub(crate)`, so the only legitimate source is the
+secure HTTP client itself. The `Debug` impl prints header *names*
+but never values, so a `tracing` macro that interpolates `?headers`
+cannot accidentally leak `Authorization` or `Set-Cookie`.
+
+**The rule extended.** Not just "no fresh `reqwest::Client::new()`"
+but **"no path by which `reqwest`'s primitives leak past the secure
+boundary."** That covers:
+
+- Request side: `reqwest::Client` is private to `SecureHttpClient`.
+  Has been since Phase 1.
+- Response side: `reqwest::HeaderMap` is wrapped by
+  `SecureHeaderMap` before crossing the crate boundary. New in
+  Session 25.
+- Body side: `reqwest::Response::bytes_stream` is consumed inside
+  the bounded reader; the raw stream isn't exposed.
+
+Adding a new accessor to `SecureHeaderMap` is a deliberate review
+step. A future contributor who needs `X-RateLimit-Remaining` adds
+`fn rate_limit_remaining()` here, with the test in
+`headers::tests::forbidden_header_values_never_appear_in_any_accessor_output`
+guarding against the slip of accidentally exposing
+`Authorization` along the way. The point isn't a complete
+allow-list — no allow-list is — it's that the leak path goes
+through PR review every time.
+
+**Compatibility.** The body-only methods (`get_bytes`,
+`post_json_bytes`) keep their signatures unchanged; every existing
+caller continues to compile and behave identically. The new
+`get_with_headers` / `post_json_with_headers` methods are opt-in.
+The `HttpFetcher` trait used by the executor is rewired internally
+to use the headers-aware path so that 429 responses surface as
+`FetchError::RateLimited { retry_after_seconds }` rather than
+collapsing into a bare `Status(429)`; the trait method signature
+itself is unchanged.
+
+**Code references** (added to the list above):
+- `crates/secure/src/headers.rs` — `SecureHeaderMap`.
+- `crates/secure/src/http.rs` — `SecureHttpResponse`,
+  `*_with_headers` methods, `HttpError::StatusWithHeaders`.
+- `crates/pipeline/src/http_fetcher.rs::FetchError::RateLimited`
+  — executor's view of the rate-limit signal.
+- `crates/pipeline/src/fetch_backoff.rs` — backoff policy.

@@ -10,5 +10,27 @@ import type { FailureStageDto } from "./FailureStageDto";
  * convention (see `CommandErrorDto`). Adding a new outcome variant
  * is an additive change; the frontend's `kind` switch must add the
  * new arm or the type-checker will flag the missing case.
+ *
+ * ## Variants
+ *
+ * - `succeeded` — the recipe ran end-to-end and produced records.
+ * - `skipped` — the executor declined to run the recipe (e.g.
+ *   extraction mode not yet enabled in the runtime).
+ * - `failed` — the recipe ran and broke at a named stage. The
+ *   `stage` discriminator lets the UI render per-stage hints.
+ * - `rate_limited` — Track D, Session 25. The source returned 429
+ *   in a way the executor's inline backoff didn't wait through:
+ *   either `Retry-After` exceeded the short-backoff ceiling, or no
+ *   `Retry-After` was provided. The frontend renders this in
+ *   warning amber to distinguish it from `failed` red — re-running
+ *   later is meaningful for a rate-limit, pointless for a broken
+ *   recipe.
  */
-export type RecipeOutcomeDto = { "kind": "succeeded", recipe_id: string, source_id: string, records_produced: number, } | { "kind": "skipped", recipe_id: string, source_id: string, reason: string, } | { "kind": "failed", recipe_id: string, source_id: string, stage: FailureStageDto, message: string, };
+export type RecipeOutcomeDto = { "kind": "succeeded", recipe_id: string, source_id: string, records_produced: number, } | { "kind": "skipped", recipe_id: string, source_id: string, reason: string, } | { "kind": "failed", recipe_id: string, source_id: string, stage: FailureStageDto, message: string, } | { "kind": "rate_limited", recipe_id: string, source_id: string, 
+/**
+ * Parsed `Retry-After` value in seconds, when the server
+ * supplied one (per RFC 9110 §10.2.3). `None` means the
+ * server returned 429 with no machine-readable hint. The
+ * frontend formats both cases via `outcomes.ts`.
+ */
+retry_after_seconds: bigint | null, };

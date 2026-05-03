@@ -512,6 +512,21 @@ pub struct FetchReportDto {
 /// convention (see `CommandErrorDto`). Adding a new outcome variant
 /// is an additive change; the frontend's `kind` switch must add the
 /// new arm or the type-checker will flag the missing case.
+///
+/// ## Variants
+///
+/// - `succeeded` — the recipe ran end-to-end and produced records.
+/// - `skipped` — the executor declined to run the recipe (e.g.
+///   extraction mode not yet enabled in the runtime).
+/// - `failed` — the recipe ran and broke at a named stage. The
+///   `stage` discriminator lets the UI render per-stage hints.
+/// - `rate_limited` — Track D, Session 25. The source returned 429
+///   in a way the executor's inline backoff didn't wait through:
+///   either `Retry-After` exceeded the short-backoff ceiling, or no
+///   `Retry-After` was provided. The frontend renders this in
+///   warning amber to distinguish it from `failed` red — re-running
+///   later is meaningful for a rate-limit, pointless for a broken
+///   recipe.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -531,6 +546,15 @@ pub enum RecipeOutcomeDto {
         source_id: String,
         stage: FailureStageDto,
         message: String,
+    },
+    RateLimited {
+        recipe_id: String,
+        source_id: String,
+        /// Parsed `Retry-After` value in seconds, when the server
+        /// supplied one (per RFC 9110 §10.2.3). `None` means the
+        /// server returned 429 with no machine-readable hint. The
+        /// frontend formats both cases via `outcomes.ts`.
+        retry_after_seconds: Option<u64>,
     },
 }
 
@@ -613,6 +637,15 @@ impl From<situation_room_pipeline::fetch_executor::RecipeOutcome> for RecipeOutc
                 source_id,
                 stage: stage.into(),
                 message,
+            },
+            O::RateLimited {
+                recipe_id,
+                source_id,
+                retry_after_seconds,
+            } => RecipeOutcomeDto::RateLimited {
+                recipe_id: recipe_id.to_string(),
+                source_id,
+                retry_after_seconds,
             },
         }
     }
@@ -1216,6 +1249,29 @@ mod tests {
         let json = serde_json::to_string(&failed).unwrap();
         assert!(json.contains(r#""kind":"failed""#), "got {json}");
         assert!(json.contains(r#""stage":"fetch""#), "got {json}");
+
+        // Track D, Session 25 — rate-limited variant. Tagged with
+        // `kind: "rate_limited"` (snake_case via the serde rename).
+        // The retry_after_seconds round-trips both as a number and
+        // as null; the frontend reads `null` as "no Retry-After
+        // provided" (see outcomes.ts).
+        let limited_with_value = RecipeOutcomeDto::RateLimited {
+            recipe_id: "id".into(),
+            source_id: "gdelt".into(),
+            retry_after_seconds: Some(120),
+        };
+        let json = serde_json::to_string(&limited_with_value).unwrap();
+        assert!(json.contains(r#""kind":"rate_limited""#), "got {json}");
+        assert!(json.contains(r#""retry_after_seconds":120"#), "got {json}");
+
+        let limited_no_value = RecipeOutcomeDto::RateLimited {
+            recipe_id: "id".into(),
+            source_id: "gdelt".into(),
+            retry_after_seconds: None,
+        };
+        let json = serde_json::to_string(&limited_no_value).unwrap();
+        assert!(json.contains(r#""kind":"rate_limited""#), "got {json}");
+        assert!(json.contains(r#""retry_after_seconds":null"#), "got {json}");
     }
 
     #[test]

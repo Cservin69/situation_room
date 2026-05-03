@@ -23,3 +23,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
+# chrono — needed by the headers module's `Retry-After` parser
+# (RFC 9110 §10.2.3 supports both delta-seconds and HTTP-date forms).
+# Workspace already pins the version + features.
+chrono = { workspace = true }
