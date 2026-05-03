@@ -151,7 +151,17 @@ fn main() -> Result<()> {
             situation_room_api::commands::list_fetch_runs,
             situation_room_api::commands::list_recipes_for_plan,
             situation_room_api::commands::set_recipe_feedback,
-            situation_room_api::commands::list_recipe_feedback_for_plan
+            situation_room_api::commands::list_recipe_feedback_for_plan,
+            // Session 22 added the records-rendering join (storage
+            // query + DTO + #[tauri::command] function), but the
+            // command wasn't added to this macro list — so Tauri
+            // rejected every frontend call with "Command
+            // records_for_plan not found". Session 23.1 amendment:
+            // register it. The function lives in `commands_records`
+            // (a sibling module to `commands`), so the path differs
+            // from the rest of this list — `commands_records::`,
+            // not `commands::`.
+            situation_room_api::commands_records::records_for_plan
         ])
         .run(tauri::generate_context!())
         .context("running tauri")?;
