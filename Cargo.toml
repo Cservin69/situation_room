@@ -7,6 +7,15 @@ members = [
     "crates/pipeline",
     "crates/api",
     "crates/secure",
+    # Session 24: lifted the SourcesFile/SourceEntry loader and the
+    # `load_source_descriptors` function out of both binaries' main.rs
+    # files. ADR 0001 anticipates this kind of lift ("if we later
+    # need a non-Tauri entry point … duplicating whatever wiring is
+    # shared at that point") — the duplication arrived with the CLI
+    # in Session 5 and got more visible alongside the deliberately
+    # duplicated `pick_provider` helper in Session 23. The lift was
+    # the Session 23 followup item; this is it.
+    "crates/apps_common",
     "apps/desktop/src-tauri",
     "apps/situation_room",
 ]
@@ -111,6 +120,10 @@ situation_room-llm = { path = "crates/llm" }
 situation_room-pipeline = { path = "crates/pipeline" }
 situation_room-api = { path = "crates/api" }
 situation_room-secure = { path = "crates/secure" }
+# Session 24: shared composition-root helpers (currently the
+# source-descriptor TOML loader). See `crates/apps_common/src/lib.rs`
+# for the contract on what does and does not belong here.
+situation_room-apps-common = { path = "crates/apps_common" }
 
 [profile.release]
 opt-level = 3

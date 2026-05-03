@@ -16,6 +16,12 @@ situation_room-storage = { workspace = true }
 situation_room-llm = { workspace = true }
 situation_room-pipeline = { workspace = true }
 situation_room-secure = { workspace = true }
+# Session 24: shared source-descriptor TOML loader (was duplicated
+# verbatim in this binary and the desktop main). See ADR 0001 §"Why
+# no separate `app` crate" — the deferred case ("if we later need …
+# duplicating whatever wiring is shared at that point") is now
+# active because the duplication arrived.
+situation_room-apps-common = { workspace = true }
 
 # CLI
 clap = { workspace = true }

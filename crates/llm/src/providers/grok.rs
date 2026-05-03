@@ -101,9 +101,9 @@ impl Default for XaiConfig {
         // distinct mid-tier model is named; do not guess at one.
         // See https://docs.x.ai/api for the live catalog.
         Self {
-            frontier_model: "grok-4.20-0309-reasoning".to_string(),
-            workhorse_model: "grok-4-1-fast-reasoning".to_string(),
-            cheap_model: "grok-4-1-fast-reasoning".to_string(),
+            frontier_model: "grok-4.3".to_string(),
+            workhorse_model: "grok-4.3".to_string(),
+            cheap_model: "grok-4.3".to_string(),
         }
     }
 }

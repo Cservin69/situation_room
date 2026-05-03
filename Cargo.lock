@@ -4373,6 +4373,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "situation_room-apps-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "situation_room-pipeline",
+ "toml 0.8.23",
+ "tracing",
+]
+
+[[package]]
 name = "situation_room-core"
 version = "0.1.0"
 dependencies = [
@@ -4393,6 +4404,7 @@ dependencies = [
  "serde",
  "serde_json",
  "situation_room-api",
+ "situation_room-apps-common",
  "situation_room-core",
  "situation_room-llm",
  "situation_room-pipeline",
@@ -4475,6 +4487,7 @@ dependencies = [
  "dotenvy",
  "serde",
  "serde_json",
+ "situation_room-apps-common",
  "situation_room-core",
  "situation_room-llm",
  "situation_room-pipeline",

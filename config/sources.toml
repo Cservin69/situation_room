@@ -32,8 +32,19 @@
 # falls back to a synthetic placeholder URL — which the Session 9
 # production run revealed the LLM tends to echo back into the
 # recipe, producing `example.invalid` fetches that fail at runtime.
-# Set it for any source whose URL pattern the LLM would otherwise
-# have to guess.
+#
+# Session 23's verification run produced empirical evidence that
+# `endpoint_hint` coverage is *the* highest-leverage configuration
+# concern: a source without a hint gets a stub-authored recipe (ADR
+# 0014 chip), which the operator must triage manually. A source with
+# a hint — even one whose precise field structure has shifted —
+# anchors the LLM in real bytes and produces a fetched-bytes recipe.
+#
+# Set `endpoint_hint` for every source where a stable, public URL
+# exists. When no such URL is reachable (e.g. a paywalled subscription
+# data source whose public face is a marketing page), document the
+# omission in the description so the next operator and the next prompt
+# revision know it is deliberate, not forgotten.
 #
 # Keep entries ordered roughly by priority tier (authoritative
 # primary first). The LLM reads them in order.
@@ -51,6 +62,21 @@ mineral production figures and the global rankings published in each
 chapter.
 """
 authoritative_for = ["mineral_production", "mineral_reserves"]
+# USGS National Minerals Information Center MCS landing page. Stable
+# for years; lists every annual edition with per-commodity chapter
+# links. The LLM uses this excerpt to learn the publication's chapter
+# layout (each commodity gets a two-page PDF synopsis with a "World
+# Mine Production" table) and authors a recipe targeting either the
+# yearly index page or a specific commodity chapter PDF.
+#
+# PDF table extraction itself is deferred (ADR 0007 §"PdfTable
+# deferral") — the recipe author may pick `static_payload` for the
+# observation when the chapter has only a handful of values, or the
+# author may produce a `pdf_table` recipe and surface the
+# `NotImplemented` outcome at fetch time so the operator sees the
+# gap. Either is honest; the chip mechanic from ADR 0014 keeps both
+# legible.
+endpoint_hint = "https://www.usgs.gov/centers/national-minerals-information-center/mineral-commodity-summaries"
 
 [[source]]
 id = "sec_edgar"
@@ -63,6 +89,20 @@ Authoritative for company-stated financials, risk factors, executive
 compensation, and material events.
 """
 authoritative_for = ["corporate_filings", "company_financials"]
+# EDGAR Full-Text Search (EFTS) endpoint. The path is the public
+# search-index, which returns JSON listing every filing matching a
+# keyword query plus optional date and form-type filters. Stable
+# since EDGAR's full-text search rolled out and documented at
+# https://www.sec.gov/edgar/search-and-access. No API key, but the
+# SEC requires a descriptive `User-Agent` header (already enforced
+# by SecureHttpClient via `SecureHttpConfig::user_agent`).
+#
+# The LLM authors a recipe that selects a filing list (each entry
+# carries `cik`, `accession_no`, `form`, `file_date`, `display_name`)
+# and either extracts metadata directly (`json_path`) or follows the
+# accession URL to an individual filing for `static_payload`-style
+# capture.
+endpoint_hint = "https://efts.sec.gov/LATEST/search-index?q=&forms=10-K&dateRange=custom&startdt=2024-01-01&enddt=2024-12-31"
 
 [[source]]
 id = "eur_lex"
@@ -71,6 +111,26 @@ description = """
 The European Union's legal database — directives, regulations,
 decisions, and treaties. Authoritative for the text of EU law and
 the official journal entries that bring acts into force.
+
+EXTRACTION GUIDANCE (Session 24 patch B): prefer HTML over PDF
+for this source. EUR-Lex publishes each act both as an HTML
+metadata page (stable CELEX numbers, dates, document types,
+ELI/PE codes in CSS-targetable result lists) and as PDF
+translations in every EU official language (24 languages —
+English, French, German, …, Maltese). The HTML surface is the
+right target for "what acts exist about X" queries via
+`css_select`. The PDF surface is content-rich but format-
+fragile: layout varies by act, columns and footnotes shift
+between language editions, and *picking one of 24 translations
+is itself a decision the recipe author cannot make on the
+user's behalf*. Reserve PDF recipes for cases where the user
+explicitly wants an act's full text in a known language; do
+**not** use `pdf_table` here at all (the language-selection
+problem makes any single translation arbitrary, and `pdf_table`
+extraction is itself deferred per ADR 0007's 2026-04-22 review
+note pending its own focused implementation session). When PDF
+content extraction is genuinely required, `static_payload` is
+the architecturally sanctioned alternative.
 """
 authoritative_for = ["eu_legislation"]
 # EUR-Lex search index page. HTML; the LLM should pick a
@@ -88,6 +148,15 @@ individuals, companies, vessels, and aircraft subject to U.S.
 sanctions. Authoritative for U.S. sanction designations.
 """
 authoritative_for = ["us_sanctions"]
+# Canonical CSV of the SDN list. Stable URL pattern since the
+# 2020 HTTPS migration (see Treasury technical announcement of
+# Aug 2020). Comma-delimited; primary file is `sdn.csv` with a main
+# table of entries; companion files `add.csv` (addresses) and
+# `alt.csv` (alternate names) link via `ent_num`. The LLM picks a
+# `csv_cell` recipe targeting `sdn.csv` for the primary listing,
+# usually filtered by program code (e.g. `RUSSIA-EO14024`,
+# `IRAN-EO13871`) which appears in the third column.
+endpoint_hint = "https://www.treasury.gov/ofac/downloads/sdn.csv"
 
 [[source]]
 id = "world_bank_indicators"
@@ -114,6 +183,18 @@ indicators (GDP, inflation, current account, fiscal balance). Carries
 both historical series and forward-looking forecasts.
 """
 authoritative_for = ["country_macro_forecasts"]
+# IMF Data Portal landing page for the WEO dataset. The actual
+# WEO database releases ship as zipped Tab-Delimited bundles via
+# the per-vintage download endpoint (e.g.
+# /external/Pubs/ft/weo/2025/01/weodata/WEOApr2025all.ashx) which
+# the LLM will frequently want to use as the recipe's fetch URL,
+# but those URLs change every six months. The data-portal landing
+# page is stable, links each vintage, and gives the LLM enough of
+# the schema (indicator codes like `NGDP_RPCH`, country tables,
+# subject-group taxonomy) to author a `csv_cell` recipe pointing
+# at the vintage-specific URL the operator can refresh as the
+# next release lands.
+endpoint_hint = "https://data.imf.org/en/datasets/IMF.RES:WEO"
 
 # ---- Authoritative secondary --------------------------------------------
 
@@ -124,6 +205,19 @@ description = """
 Spot, three-month, and warehouse stock data for industrial metals
 (aluminium, copper, zinc, lead, nickel, tin). The reference exchange
 for non-ferrous metals pricing.
+
+NOTE on `endpoint_hint` (Session 24 audit): LME's primary data
+products (the Official Settlement Prices, the LMEselect tick stream,
+and the warehouse stock report) are commercial subscription products
+behind a paywall and do not have a stable public URL the LLM can
+pre-fetch. The public-facing site (lme.com) is mostly a marketing
+surface whose HTML structure is fluid and whose data tables are
+session-protected. Until either (a) LME re-opens a public daily
+summary or (b) the operator wires a vendor relay (Refinitiv,
+Bloomberg, FastMarkets feed) into config/sources.toml as a
+distinct entry, this source intentionally has no `endpoint_hint`
+and recipes against it will be stub-authored. ADR 0014's chip will
+surface the provenance honestly.
 """
 authoritative_for = ["industrial_metals_prices", "industrial_metals_stocks"]
 
@@ -136,6 +230,23 @@ trade flows by HS code, country, and year. Reported by importers and
 exporters; figures often disagree between the two reporting sides.
 """
 authoritative_for = ["bilateral_trade_flows"]
+# UN Comtrade Plus public landing page for trade-flow query. The
+# data API itself (`comtradeapi.un.org/data/v1/...`) requires a
+# free `Ocp-Apim-Subscription-Key` header which situation_room does
+# not currently provision; without that key the data endpoints
+# return 401, which the executor surfaces as a pre-fetch failure
+# (and ADR 0014 stamps `StubExcerpt`). The landing page on
+# comtradeplus.un.org is stable and exposes the query parameters
+# (typeCode, freqCode, classification, period, reporterCode,
+# partnerCode, cmdCode, flowCode), giving the LLM enough structure
+# to author a recipe whose `endpoint_url` points at the per-call
+# data API once a subscription key is in scope.
+#
+# Followup on the operator side: when a UN Comtrade subscription
+# key gets wired into the secrets surface, swap this hint for a
+# small data-API call so the recipe author sees real JSON shape
+# instead of marketing-page HTML.
+endpoint_hint = "https://comtradeplus.un.org/TradeFlow"
 
 # ---- Industry / trade press --------------------------------------------
 
@@ -153,6 +264,14 @@ authoritative_for = []
 # query parameters; the LLM reads the doc shape and constructs a
 # JSON-mode query URL for the recipe (DOC API supports `format=json`
 # query parameter and `query=` for keyword filtering).
+#
+# KNOWN: this endpoint rate-limits with HTTP 429 from individual
+# IPs that have made several DOC API calls recently (Session 23
+# verification observed this). When the pre-fetch is rate-limited,
+# ADR 0014 stamps `StubExcerpt` on the resulting recipe and the
+# chip surfaces it for human review. This is not a defect of either
+# the hint or the executor; GDELT's rate limit is part of the
+# source's contract.
 endpoint_hint = "https://api.gdeltproject.org/api/v2/doc/doc?query=domain:reuters.com&mode=ArtList&format=json&maxrecords=10"
 
 # ---- General news (lowest authority) ------------------------------------
@@ -164,9 +283,34 @@ description = """
 Generic RSS/Atom feed reader for monitoring named publications. Use
 for outlets where the publication itself is the only reasonable
 source for the topic (specialist trade press, regulator press
-rooms, etc.). Specific feed URLs are configured separately.
+rooms, etc.). Specific feed URLs are configured per session — a
+recipe targeting this source nominates a publisher-specific feed
+URL inside the recipe body, not in this descriptor.
+
+This entry is a *category* descriptor, not a specific source. The
+Session 23 verification surfaced its limitation: when the LLM
+nominates `rss_feeds` for a topic, it must invent the publisher's
+feed URL itself, and the inventions tend to be plausible-but-wrong
+(`https://www.yna.co.kr/rss` for Yonhap, which 400'd at fetch
+time). The `endpoint_hint` below points at a representative,
+long-stable RSS XML document so the recipe author has *something*
+real to pattern-match against — at the cost of teaching the LLM
+to prefer this specific publisher when no other anchor is given.
+That tradeoff is acceptable for now; the longer-term fix is to
+split this entry into specific publisher entries (e.g. `bbc_rss`,
+`reuters_rss`, `yna_rss`) once a session has empirical evidence
+about which publishers actually carry the operator's recurring
+topics.
 """
 authoritative_for = []
+# BBC News top-stories Atom feed. Stable since the early 2010s
+# under feeds.bbci.co.uk; valid Atom 1.0; small enough that the
+# pre-fetch's body-size guard won't trip. Used here as a structure
+# anchor — the LLM reads the channel/item shape (title, link,
+# description, pubDate, guid) and authors a `css_select` or
+# `json_path` recipe (after the executor parses XML to JSON) whose
+# `endpoint_url` is the *target* publisher's actual feed.
+endpoint_hint = "http://feeds.bbci.co.uk/news/rss.xml"
 
 # ---- Demo / smoke-test source (Session 8) ------------------------------
 #

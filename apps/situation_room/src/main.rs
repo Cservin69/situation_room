@@ -33,12 +33,12 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+use situation_room_apps_common::sources::load_source_descriptors;
 use situation_room_llm::{AnthropicProvider, LlmProvider, ModelTier, XaiProvider};
 use situation_room_pipeline::research_classifier::{
-    classify_topic, ClassificationContext, SourceDescriptor, TopicUsage as ClassifierTopicUsage,
+    classify_topic, ClassificationContext, TopicUsage as ClassifierTopicUsage,
 };
 use situation_room_pipeline::research_plans_store::save_research_plan;
 use situation_room_secure::http::{SecureHttpClient, SecureHttpConfig};
@@ -285,240 +285,28 @@ fn pick_provider(
 // ---------------------------------------------------------------------------
 // Source descriptor loading
 // ---------------------------------------------------------------------------
-
-/// On-disk shape of `config/sources.toml`. Mirrors
-/// [`SourceDescriptor`] one-for-one but keeps `authoritative_for`
-/// optional so simple entries don't need to declare it.
-#[derive(Debug, Deserialize)]
-struct SourcesFile {
-    #[serde(default)]
-    source: Vec<SourceEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SourceEntry {
-    id: String,
-    display_name: String,
-    description: String,
-    #[serde(default)]
-    authoritative_for: Vec<String>,
-    /// Optional URL the fetch executor pre-fetches at recipe-authoring
-    /// time (Session 10, Option F). The CLI doesn't run the executor
-    /// itself today — it stops at Level-1 classification — but it
-    /// loads the same TOML the desktop binary does, so the field is
-    /// parsed here for shape parity. `None` is legal.
-    #[serde(default)]
-    endpoint_hint: Option<String>,
-}
-
-fn load_source_descriptors(path: &Path, limit: usize) -> Result<Vec<SourceDescriptor>> {
-    if !path.exists() {
-        // Missing file is not an error — the classifier handles an
-        // empty list by telling the LLM to nominate by description
-        // only. We log a warning so users notice if they expected it
-        // to load.
-        tracing::warn!(
-            path = %path.display(),
-            "sources file not found; classifier will see no registered sources"
-        );
-        return Ok(Vec::new());
-    }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let file: SourcesFile = toml::from_str(&raw)
-        .with_context(|| format!("parsing TOML in {}", path.display()))?;
-
-    let descriptors: Vec<SourceDescriptor> = file
-        .source
-        .into_iter()
-        .take(limit)
-        .map(|e| SourceDescriptor {
-            id: e.id,
-            display_name: e.display_name,
-            description: e.description.trim().to_string(),
-            authoritative_for: e.authoritative_for,
-            endpoint_hint: e
-                .endpoint_hint
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
-        })
-        .collect();
-
-    Ok(descriptors)
-}
+//
+// Session 24: this used to be a local copy of the loader, word-for-
+// word identical to the desktop binary's. Both copies now call into
+// `situation_room_apps_common::sources::load_source_descriptors`. See
+// `crates/apps_common/src/lib.rs` for the contract on what does and
+// does not belong in that crate.
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+//
+// Session 24: the seven `load_source_descriptors_*` tests that lived
+// here moved alongside the loader into
+// `crates/apps_common/src/sources.rs::tests` (where the new
+// `parses_entry_without_endpoint_hint_documents_omission` test
+// joined them). Only the binary-specific prompt-shape sanity check
+// remains here, because it asserts on this binary's `CLASSIFIER_PROMPT`
+// const and would not be a meaningful test in a shared crate.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn load_source_descriptors_reads_real_config_file() {
-        // The real config file should always parse — if this fails,
-        // someone broke the schema or removed a required field.
-        let path = Path::new("../../config/sources.toml");
-        if !path.exists() {
-            // Tests may be run from various CWDs; skip cleanly rather
-            // than fail when the relative path doesn't resolve.
-            return;
-        }
-        let out = load_source_descriptors(path, 100).expect("real config should parse");
-        assert!(!out.is_empty(), "real config should have at least one source");
-    }
-
-    #[test]
-    fn load_source_descriptors_returns_empty_for_missing_file() {
-        let out = load_source_descriptors(Path::new("/nonexistent/path/sources.toml"), 10).unwrap();
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn load_source_descriptors_respects_limit() {
-        let dir = tempdir();
-        let p = dir.join("sources.toml");
-        let toml = r#"
-[[source]]
-id = "a"
-display_name = "A"
-description = "first"
-
-[[source]]
-id = "b"
-display_name = "B"
-description = "second"
-
-[[source]]
-id = "c"
-display_name = "C"
-description = "third"
-"#;
-        std::fs::write(&p, toml).unwrap();
-
-        let out = load_source_descriptors(&p, 2).unwrap();
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].id, "a");
-        assert_eq!(out[1].id, "b");
-    }
-
-    #[test]
-    fn load_source_descriptors_handles_empty_authoritative_for() {
-        let dir = tempdir();
-        let p = dir.join("sources.toml");
-        let toml = r#"
-[[source]]
-id = "x"
-display_name = "X"
-description = "no authority field"
-"#;
-        std::fs::write(&p, toml).unwrap();
-
-        let out = load_source_descriptors(&p, 10).unwrap();
-        assert_eq!(out.len(), 1);
-        assert!(out[0].authoritative_for.is_empty());
-    }
-
-    #[test]
-    fn load_source_descriptors_trims_description_whitespace() {
-        let dir = tempdir();
-        let p = dir.join("sources.toml");
-        let toml = r#"
-[[source]]
-id = "y"
-display_name = "Y"
-description = """
-
-  Indented description.
-
-"""
-"#;
-        std::fs::write(&p, toml).unwrap();
-
-        let out = load_source_descriptors(&p, 10).unwrap();
-        assert_eq!(out[0].description, "Indented description.");
-    }
-
-    #[test]
-    fn load_source_descriptors_parses_endpoint_hint_when_present() {
-        // Session 10, Option F: an `endpoint_hint` survives TOML
-        // parsing and lands on the descriptor. Whitespace is trimmed
-        // (TOML allows multi-line strings; descriptions use them and
-        // we want endpoint_hints to behave consistently).
-        let dir = tempdir();
-        let p = dir.join("sources.toml");
-        let toml = r#"
-[[source]]
-id = "wb"
-display_name = "World Bank"
-description = "indicators"
-endpoint_hint = "https://api.worldbank.org/v2/indicator?format=json"
-"#;
-        std::fs::write(&p, toml).unwrap();
-
-        let out = load_source_descriptors(&p, 10).unwrap();
-        assert_eq!(out[0].id, "wb");
-        assert_eq!(
-            out[0].endpoint_hint.as_deref(),
-            Some("https://api.worldbank.org/v2/indicator?format=json")
-        );
-    }
-
-    #[test]
-    fn load_source_descriptors_treats_empty_endpoint_hint_as_absent() {
-        // Empty / whitespace-only endpoint_hint normalizes to None so
-        // the executor's lookup path doesn't see a useless empty string.
-        let dir = tempdir();
-        let p = dir.join("sources.toml");
-        let toml = r#"
-[[source]]
-id = "blank"
-display_name = "Blank"
-description = "no useful hint"
-endpoint_hint = "   "
-"#;
-        std::fs::write(&p, toml).unwrap();
-
-        let out = load_source_descriptors(&p, 10).unwrap();
-        assert!(out[0].endpoint_hint.is_none());
-    }
-
-    #[test]
-    fn load_source_descriptors_defaults_endpoint_hint_to_none() {
-        // Carry-over: existing TOML entries without an `endpoint_hint`
-        // line stay parseable. Guards against accidentally making the
-        // field required.
-        let dir = tempdir();
-        let p = dir.join("sources.toml");
-        let toml = r#"
-[[source]]
-id = "minimal"
-display_name = "Minimal"
-description = "nothing else set"
-"#;
-        std::fs::write(&p, toml).unwrap();
-
-        let out = load_source_descriptors(&p, 10).unwrap();
-        assert!(out[0].endpoint_hint.is_none());
-    }
-
-    /// Tiny in-process tempdir helper. We don't pull in `tempfile`
-    /// for one test fixture; this is enough.
-    fn tempdir() -> PathBuf {
-        let mut p = std::env::temp_dir();
-        let nonce: u64 = {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64
-        };
-        p.push(format!("situation_room_situation_room_test_{nonce}"));
-        std::fs::create_dir_all(&p).unwrap();
-        // The dir leaks on test crash; acceptable for now.
-        p
-    }
 
     /// Sanity check: the production prompt is non-trivially long and
     /// contains the placeholders the classifier expects. This is a

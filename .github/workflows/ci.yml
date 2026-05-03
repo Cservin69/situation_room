@@ -30,6 +30,19 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
+      - name: Tauri command registration guard
+        # Session 23.1 added scripts/check_tauri_commands_registered.sh
+        # after a missed `generate_handler!` registration shipped twice
+        # (records_for_plan landed in Session 22, was caught only when
+        # the operator clicked the records pane in Session 23). The
+        # bug is invisible to both Rust and TypeScript compilers; this
+        # guard surfaces it deterministically and sub-second. Wired
+        # into CI in Session 24 per its handoff §"P4 — Wire
+        # check_tauri_commands_registered.sh into CI". Run before
+        # cargo check so a registration miss fails the workflow at
+        # ~1s rather than ~minutes.
+        run: bash scripts/check_tauri_commands_registered.sh
+
       - name: cargo check
         run: cargo check --workspace --all-targets
 

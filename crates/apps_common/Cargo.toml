@@ -1,0 +1,23 @@
+[package]
+name = "situation_room-apps-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared composition-root helpers reused by the desktop and CLI binaries (no app-specific decisions)."
+
+[lib]
+name = "situation_room_apps_common"
+path = "src/lib.rs"
+
+[dependencies]
+situation_room-pipeline = { workspace = true }
+
+# Same shape as either binary used directly. The loader was lifted
+# from two word-for-word identical copies in `apps/desktop/...` and
+# `apps/situation_room/...`; the dependency set matches the union of
+# what those two used (which is the intersection — both used these).
+anyhow = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }

@@ -19,16 +19,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use situation_room_api::commands::AppState;
+use situation_room_apps_common::sources::load_source_descriptors;
 use situation_room_llm::{AnthropicProvider, LlmProvider, XaiProvider};
-use situation_room_pipeline::research_classifier::SourceDescriptor;
 use situation_room_secure::{
     http::{SecureHttpClient, SecureHttpConfig},
     logging,
 };
 use situation_room_storage::Store;
-use tracing::{info, warn};
+use tracing::info;
 
 /// The production classifier prompt, embedded at compile time. The CLI
 /// embeds the same file via `include_str!` from the same path; keeping
@@ -311,56 +310,11 @@ fn apply_dotenv(path: &Path) {
 }
 
 // ---------------------------------------------------------------------------
-// Source-descriptor loader (mirrors the CLI's logic verbatim)
+// Source-descriptor loader
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct SourcesFile {
-    #[serde(default)]
-    source: Vec<SourceEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SourceEntry {
-    id: String,
-    display_name: String,
-    description: String,
-    #[serde(default)]
-    authoritative_for: Vec<String>,
-    /// Optional URL the fetch executor pre-fetches at recipe-authoring
-    /// time. See Session 10 handoff §"Top: F" — without this, the
-    /// LLM tends to keep `https://example.invalid/{id}` placeholders.
-    /// `None` is legal; the executor falls back to a placeholder URL
-    /// and a stub excerpt and continues.
-    #[serde(default)]
-    endpoint_hint: Option<String>,
-}
-
-fn load_source_descriptors(path: &Path, limit: usize) -> Result<Vec<SourceDescriptor>> {
-    if !path.exists() {
-        warn!(
-            path = %path.display(),
-            "sources file not found; classifier will see no registered sources"
-        );
-        return Ok(Vec::new());
-    }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let file: SourcesFile = toml::from_str(&raw)
-        .with_context(|| format!("parsing TOML in {}", path.display()))?;
-
-    let descriptors = file
-        .source
-        .into_iter()
-        .take(limit)
-        .map(|e| SourceDescriptor {
-            id: e.id,
-            display_name: e.display_name,
-            description: e.description.trim().to_string(),
-            authoritative_for: e.authoritative_for,
-            endpoint_hint: e.endpoint_hint.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
-        })
-        .collect();
-
-    Ok(descriptors)
-}
+//
+// Session 24: this used to be a local copy of the loader, word-for-
+// word identical to the CLI's. Both copies now call into
+// `situation_room_apps_common::sources::load_source_descriptors`. See
+// `crates/apps_common/src/lib.rs` for the contract on what does and
+// does not belong in that crate.
