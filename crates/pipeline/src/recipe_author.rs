@@ -2576,4 +2576,146 @@ mod tests {
         // count, but the call must not panic.
         assert!(out.contains("hi"));
     }
+
+    // -----------------------------------------------------------------------
+    // Session 30 — live xAI decline-path test (Track B.1 + C.1 from
+    // Sessions 28/29). Sibling of
+    // `live_author_recipe_against_xai_produces_valid_recipe`; calls the
+    // real xAI provider but with a context engineered to look like a
+    // genuinely-undoable source (a JS-rendered SPA whose HTTP body
+    // carries no extractable data). The expected outcome is
+    // `AuthoringError::Declined`, surfacing prompt v1.9's decline-path
+    // discipline working against a real model.
+    //
+    // Since the LLM is non-deterministic, "expected" is a hypothesis
+    // about the prompt, not a guarantee. The assertion deliberately
+    // distinguishes the three reachable shapes and emits a useful
+    // message when the LLM does not decline:
+    //
+    //   * `Err(AuthoringError::Declined { reason })` — happy path.
+    //     Prompt + model agree the source admits no recipe; the
+    //     reason should reference the SPA shape evident from the
+    //     excerpt.
+    //   * `Ok(recipe)` — the LLM authored a recipe anyway. This is
+    //     evidence the prompt's decline-path section is too weak for
+    //     this model on this excerpt; the test fails noisily with
+    //     the recipe shape so the operator can adjust v1.10.
+    //   * `Err(other)` — a different authoring error (URL guard
+    //     rejection, schema-deser failure, etc). Surface the variant
+    //     so the operator can debug; this is not a decline-path
+    //     concern but does indicate the test fixture itself has
+    //     drifted.
+    //
+    // The excerpt is hand-crafted to maximize decline likelihood: an
+    // empty `<div id="root">` skeleton with no rendered content is
+    // the canonical SPA-as-empty-body shape the prompt's "no recipe
+    // is honestly possible" section was written against.
+    //
+    // No `FETCH_LIVE_DECLINE_*` env-overrides today; the fixture is
+    // chosen specifically to exercise the decline path. If a future
+    // session wants to test against a different SPA, edit the
+    // test directly — it's a 5-minute change.
+    #[tokio::test]
+    #[ignore]
+    async fn live_author_against_jsspa_excerpt_produces_decline() {
+        use situation_room_llm::XaiProvider;
+        use situation_room_secure::http::{SecureHttpClient, SecureHttpConfig};
+
+        let _ = dotenvy::dotenv();
+        let http = SecureHttpClient::new(SecureHttpConfig::default()).unwrap();
+        let Some(provider) = XaiProvider::from_env(http) else {
+            panic!("XAI_API_KEY not set in environment or .env — cannot run live test");
+        };
+
+        // Minimal prompt template that mirrors the production v1.9
+        // template's placeholders (the same shape
+        // `live_author_recipe_against_xai_produces_valid_recipe` uses,
+        // extended with the v1.9-only placeholders). Crucially this
+        // does *not* include the v1.9 decline-path prose section —
+        // the test exercises whether the model declines on its own
+        // given an obviously-undoable excerpt, without prompt-side
+        // hand-holding. If the model declines here, the production
+        // prompt (which DOES include the decline-path section) will
+        // certainly decline; if the model authors anyway, the
+        // production prompt may still rescue the case via its prose,
+        // and the test result is informational rather than
+        // definitive.
+        //
+        // The `decline_reason` field is part of the
+        // `RecipeAuthoringOutput` schema regardless of prompt; the
+        // model can populate it via structured output even without
+        // explicit instruction, because the schema documents it as
+        // the honest-exit field. That's the architectural choice
+        // ADR 0007 amendment 4 made.
+        let template = "\
+            You are a recipe author. Produce a FetchRecipe for:\n\
+            PLAN: {{PLAN_JSON}}\n\
+            SOURCE: {{SOURCE_ID}} at {{SOURCE_URL}}\n\
+            EXCERPT:\n{{DOCUMENT_EXCERPT}}\n\
+            Return JSON matching the schema. If no recipe is honestly \
+            possible against this source under the closed extraction \
+            vocabulary, populate `decline_reason` with a verbatim \
+            explanation.\
+        ";
+
+        let plan = sample_plan();
+
+        // Hand-crafted JS-SPA excerpt: an empty SPA skeleton with no
+        // rendered content. Any extraction mode would address an
+        // empty cell; the LLM should recognize that and decline.
+        let ctx = AuthoringContext {
+            source_id: "jsspa_demo".into(),
+            sample_url: Url::parse(
+                "https://www.bloomberg.com/markets/commodities/futures/metals",
+            )
+            .unwrap(),
+            document_excerpt: "<!DOCTYPE html><html><head><title>Bloomberg \
+                — Commodity Futures</title><script \
+                src=\"/bundle.js\"></script></head><body>\
+                <div id=\"root\"></div></body></html>"
+                .into(),
+            recipe_feedback: None,
+            previous_failure_reason: None,
+            operator_guidance: None,
+        };
+
+        let result =
+            author_recipe(&provider, ModelTier::Workhorse, template, &plan, &ctx).await;
+
+        match result {
+            Err(AuthoringError::Declined { reason }) => {
+                // Happy path. Reason is the LLM's verbatim
+                // explanation; we don't assert on its content beyond
+                // "non-empty," because the wording varies across runs.
+                assert!(
+                    !reason.trim().is_empty(),
+                    "decline reason should not be empty"
+                );
+                eprintln!(
+                    "live decline path verified — reason: {reason}"
+                );
+            }
+            Ok(recipe) => {
+                // The LLM authored anyway. This is informational —
+                // the decline-path discipline isn't strong enough on
+                // this excerpt for this model. The production prompt
+                // v1.9's decline-path section may still rescue the
+                // case in the actual fetch flow.
+                panic!(
+                    "expected decline; got recipe with extraction={:?} \
+                     produces={} — prompt may need refinement against \
+                     this model. Recipe id={}",
+                    recipe.extraction,
+                    recipe.produces.len(),
+                    recipe.id,
+                );
+            }
+            Err(other) => {
+                // Some other authoring error. Likely a schema /
+                // network drift; surface the variant so the operator
+                // can debug.
+                panic!("expected decline or recipe; got error: {other:?}");
+            }
+        }
+    }
 }

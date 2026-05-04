@@ -51,11 +51,50 @@
   `--signal-negative`) and embedded hex literals in component CSS,
   both of which the handoff hard rules forbid. This file now uses the
   canonical vars throughout. ADR 0006.
+
+  Session 30 — flag-from-decline (ADR 0013, Session 28/29 follow-up)
+  ------------------------------------------------------------------
+
+  Declined outcomes were the only failure shape the operator could
+  *see* but couldn't *flag*: failed-apply outcomes had a recipe row in
+  RecipesPanel where the existing flag button lived, but declines
+  produce no recipe (Track B, ADR 0007 amendment 4) so there was no
+  surface to attach feedback. That made the recipe-feedback channel
+  invisible for exactly the case where it matters most — the LLM said
+  "I cannot," the operator wants to say "actually you can, here's how,"
+  and the next authoring run sees the note via `{{RECIPE_FEEDBACK}}`.
+
+  This component now mounts the same `RecipeFlagDialog` used by
+  RecipesPanel (single source of truth — both panels write through
+  `flagRecipe` in the runes store, both read from
+  `plans.recipeFeedback`). For a declined outcome row we render either:
+
+    - a `flag` button (fresh: no note exists for this source/plan), or
+    - a `FLAGGED` indicator chip (a note already exists; clicking
+      reopens the dialog to edit, an empty submit clears).
+
+  Both paths route into the same `openFlagDialog(source_id)` helper.
+  `authoredFrom` is fixed at `'unknown'` for declines because no recipe
+  was ever authored — the dialog's stub-hint banner (ADR 0014) is only
+  meaningful when a stub-authored recipe exists, which this case
+  doesn't.
+
+  Two dialogs in the same app are fine: `position: fixed; z-index: 100`
+  on `.backdrop` is set in RecipeFlagDialog itself, and only one
+  instance is ever non-null at a time per panel — RecipesPanel and
+  FetchReport each track their own `flagDialogSourceId`. A user could
+  in principle open one, then open the other before submitting; the
+  modals would stack visually but each would write through the same
+  store helper, so the worst case is a confusing UX, not a state bug.
+  Lifting the dialog state into the runes store would be the cleaner
+  next-step refactor when a third panel needs it; the local pattern
+  matches RecipesPanel's existing shape and keeps this patch surgical.
 -->
 <script lang="ts">
-  import { plans } from '$stores/plans.svelte';
+  import { plans, flagRecipe } from '$stores/plans.svelte';
   import type { FetchRunSummaryDto } from '$lib/api/types/FetchRunSummaryDto';
   import { outcomeTone, outcomeLabel, outcomeDetail, outcomeKey } from '$lib/outcomes';
+  import RecipeFlagDialog from '$components/dialogs/RecipeFlagDialog.svelte';
 
   function shortId(id: string): string {
     // UUIDv7s are too long for inline display; first 8 chars are
@@ -78,6 +117,35 @@
     if (r.recipes_succeeded === r.recipes_attempted && r.recipes_attempted > 0) return 'ok';
     if (r.recipes_succeeded > 0) return 'partial';
     return 'fail';
+  }
+
+  // Session 30 — flag-from-decline (ADR 0013). Local state mirrors
+  // the pattern in RecipesPanel: one source-id at a time, a transient
+  // submitting flag, fresh-mount-per-open. The store's `flagRecipe`
+  // helper does the actual write and reflects into
+  // `plans.recipeFeedback` so the FLAGGED indicator updates without
+  // a separate refresh roundtrip.
+  let flagDialogSourceId: string | null = $state(null);
+  let flagSubmitting = $state(false);
+
+  function openFlagDialog(sourceId: string) {
+    flagDialogSourceId = sourceId;
+  }
+  function closeFlagDialog() {
+    flagDialogSourceId = null;
+  }
+  async function onFlagSubmit(note: string) {
+    if (!flagDialogSourceId) return;
+    flagSubmitting = true;
+    try {
+      const ok = await flagRecipe(flagDialogSourceId, note);
+      if (ok) flagDialogSourceId = null;
+      // On failure, leave the dialog open. The store sets
+      // plans.error which the parent surfaces; the user can edit
+      // the note and resubmit, or cancel.
+    } finally {
+      flagSubmitting = false;
+    }
   }
 </script>
 
@@ -147,6 +215,52 @@
             {#if outcomeDetail(o)}
               <span class="detail">{outcomeDetail(o)}</span>
             {/if}
+            {#if o.kind === 'declined'}
+              {@const feedback = plans.recipeFeedback[o.source_id]}
+              <!--
+                Session 30 (ADR 0013 follow-up) — flag-from-decline.
+                Declined outcomes have no recipe row in RecipesPanel,
+                so this is the only surface for attaching a feedback
+                note. The note flows into `{{RECIPE_FEEDBACK}}` on
+                the next authoring run for this (plan, source) pair
+                — the operator's "I disagree the source is undoable;
+                here's how to extract from it" lives here.
+
+                We render exactly one of two affordances per row:
+                  * `flag` button when no note exists yet,
+                  * `FLAGGED` chip when a note already exists; the
+                    chip's title attribute exposes the note's full
+                    text on hover, mirroring the chip in
+                    RecipesPanel for visual continuity.
+
+                Both call `openFlagDialog(o.source_id)`; the dialog
+                pre-fills with the existing note via the `initial`
+                prop when one exists.
+
+                The `@const feedback = ...` binding is for type-
+                narrowing — accessing `plans.recipeFeedback[id]`
+                twice would re-look-up via the proxy and TypeScript
+                wouldn't carry the narrowed type across the two
+                accesses. Same pattern RecipesPanel uses.
+              -->
+              <span class="actions">
+                {#if feedback}
+                  <button
+                    type="button"
+                    class="flagged-chip"
+                    title={feedback.note}
+                    onclick={() => openFlagDialog(o.source_id)}
+                  >FLAGGED</button>
+                {:else}
+                  <button
+                    type="button"
+                    class="flag-button"
+                    title="Tell the recipe author why this source admits a recipe — your note feeds into the next authoring attempt."
+                    onclick={() => openFlagDialog(o.source_id)}
+                  >flag</button>
+                {/if}
+              </span>
+            {/if}
           </li>
         {/each}
       </ul>
@@ -174,6 +288,37 @@
     </div>
   {/if}
 </section>
+
+{#if flagDialogSourceId !== null}
+  <!--
+    Session 30 — flag dialog mount for the FetchReport panel. Same
+    component as RecipesPanel uses; both panels write through the
+    same `flagRecipe` runes-store helper, both read the same
+    `plans.recipeFeedback` map, so the indicator stays in sync
+    regardless of which panel opened the dialog.
+
+    `authoredFrom` is hard-coded to `'unknown'` for declines: no
+    recipe was authored, so the `'stub_excerpt'` hint banner (ADR
+    0014) doesn't apply. The dialog's default-prop fallback of
+    `'unknown'` would also work; we pass it explicitly so future
+    contributors don't wonder if the omission was intentional.
+
+    `initial` reads from the live store map so an open-then-close-
+    then-reopen cycle picks up any update made meanwhile (which is
+    not currently reachable, but the cost of the live read is zero
+    and the failure mode of an eager-captured initial would be a
+    silent stale value — not the kind of bug that surfaces in
+    review).
+  -->
+  <RecipeFlagDialog
+    sourceId={flagDialogSourceId}
+    initial={plans.recipeFeedback[flagDialogSourceId]?.note ?? ''}
+    authoredFrom={'unknown'}
+    submitting={flagSubmitting}
+    onSubmit={onFlagSubmit}
+    onCancel={closeFlagDialog}
+  />
+{/if}
 
 <style>
   .fetch-report {
@@ -336,6 +481,65 @@
     color: var(--fg-tertiary);
     white-space: pre-wrap;
     word-break: break-word;
+  }
+  /* Session 30 — flag-from-decline (ADR 0013). The action row sits
+     under .detail (or directly under the row-1 columns when there's
+     no detail) and right-aligns the single flag affordance. The
+     grid-column span keeps it independent of the three-column row-1
+     layout; only the declined variant renders this row, so the
+     other outcome shapes are unchanged.
+
+     Sized matched to the chrome in RecipesPanel — same .flag-button
+     and .flagged-chip rules below — so an operator who has used the
+     RecipesPanel flag affordance recognizes the same control here. */
+  .actions {
+    grid-column: 1 / -1;
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-top: 2px;
+  }
+  /* Mirrors RecipesPanel .flagged-chip (ADR 0013). Same sizing,
+     hue, and hover behaviour so the indicator reads identically
+     across both panels. */
+  .flagged-chip {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    padding: 2px 6px;
+    border-radius: 2px;
+    color: var(--signal-info, var(--fg-secondary));
+    border: 1px solid var(--signal-info, var(--border-subtle));
+    background: var(--bg-canvas);
+    cursor: pointer;
+    align-self: center;
+    transition: filter var(--duration-ui) var(--ease);
+  }
+  .flagged-chip:hover {
+    filter: brightness(1.15);
+  }
+  /* Mirrors RecipesPanel .flag-button. Subordinate chrome — the
+     declined status text is the primary affordance; the flag is
+     the "add context" follow-on. */
+  .flag-button {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+    padding: 2px 8px;
+    border-radius: 2px;
+    color: var(--fg-tertiary);
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    cursor: pointer;
+    align-self: center;
+    transition: border-color var(--duration-ui) var(--ease),
+                color var(--duration-ui) var(--ease);
+  }
+  .flag-button:hover {
+    border-color: var(--signal-info, var(--border-accent));
+    color: var(--fg-primary);
   }
 
   .history {

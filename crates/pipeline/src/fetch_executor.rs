@@ -3493,4 +3493,170 @@ mod tests {
         // Still no recipes persisted.
         assert!(store.recipes_for_plan(plan.id).unwrap().is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Session 30 — live PDF runtime test (Track C.1 from the Session 29
+    // handoff). Sibling of `live_fetch_against_real_csv_*` and
+    // `live_fetch_against_real_json_*`; pre-authors a `pdf_table`
+    // recipe pinned to a known coordinate, fetches a real PDF over
+    // the public internet, and asserts the runtime produced a record
+    // (or at least closed the run cleanly with a typed failure).
+    //
+    // The recipe is pre-authored so the executor *must not* call the
+    // LLM here — `UnreachableProvider` enforces that, mirroring the
+    // CSV / JSON live tests' Position-A discipline.
+    //
+    // The default URL points at a USGS Mineral Commodity Summaries
+    // chapter (lithium 2024). USGS PDFs are public domain, stable
+    // across the year of publication, and have a clear single-table
+    // layout on page 2 ("World mine production and reserves") — the
+    // shape `pdf_table`'s layout heuristic was designed for. The
+    // hard-coded coordinate (`page=2`, `table_index=0`, `row=2`,
+    // `col=1`) targets one of the country rows of that table; the
+    // operator running the test against a different USGS chapter
+    // will likely need to adjust via env vars (see below).
+    //
+    // Override the URL with `FETCH_LIVE_PDF_URL`; override the
+    // address with `FETCH_LIVE_PDF_PAGE`, `FETCH_LIVE_PDF_TABLE_INDEX`,
+    // `FETCH_LIVE_PDF_ROW`, `FETCH_LIVE_PDF_COL`. Like the CSV / JSON
+    // live tests this asserts only on the wiring (recipe was
+    // attempted, outcome is not `Skipped`, audit row closed) — not
+    // on the extracted value, which depends on the real document.
+    //
+    // pdf-extract's text-extraction order is not guaranteed to match
+    // reading order on every PDF (Session 29 handoff §"Known gaps").
+    // If the test surfaces `Failed @ Apply` against a real USGS PDF
+    // with the default coordinate, that's evidence to file under
+    // `docs/failure_cases/` (Class B if the heuristic could in
+    // principle have addressed it; informational otherwise). The
+    // structural assertions below let the test pass on a typed
+    // apply-failure too — what fails the test is `Skipped` (which
+    // would mean the executor took an unwired branch) or a missing
+    // audit row (which would mean run cleanup broke).
+    #[tokio::test]
+    #[ignore]
+    async fn live_fetch_against_real_pdf_produces_observation_and_closes_run() {
+        use situation_room_secure::http::{SecureHttpClient, SecureHttpConfig};
+
+        let _ = dotenvy::dotenv();
+
+        let url = std::env::var("FETCH_LIVE_PDF_URL").unwrap_or_else(|_| {
+            "https://pubs.usgs.gov/periodicals/mcs2024/mcs2024-lithium.pdf".to_string()
+        });
+        let page: u32 = std::env::var("FETCH_LIVE_PDF_PAGE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2);
+        let table_index: u32 = std::env::var("FETCH_LIVE_PDF_TABLE_INDEX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let row: u32 = std::env::var("FETCH_LIVE_PDF_ROW")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2);
+        let col: u32 = std::env::var("FETCH_LIVE_PDF_COL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+
+        let http = SecureHttpClient::new(SecureHttpConfig::default()).unwrap();
+
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let recipe = FetchRecipe {
+            id: Uuid::now_v7(),
+            dedup_key: Some(format!("{}:pdf_demo:live", plan.id)),
+            plan_id: plan.id,
+            source_id: "pdf_demo".into(),
+            source_url: Url::parse(&url).expect("FETCH_LIVE_PDF_URL must be a valid URL"),
+            extraction: ExtractionSpec::PdfTable {
+                page,
+                table_index,
+                row,
+                col,
+            },
+            produces: vec![ProductionBinding {
+                record_type: RecordType::Observation,
+                expectation: ExpectationRef::ObservationMetric { index: 0 },
+                field_mappings: vec![
+                    FieldMap {
+                        path: "value".into(),
+                        // Same pattern as live_fetch_against_real_csv:
+                        // the addressed cell is non-numeric in the
+                        // default fixture (a country code or country
+                        // name), so we side-step f64 coercion by
+                        // literal-binding `value`. The test asserts
+                        // wiring, not extracted values; override the
+                        // env vars to exercise the numeric path
+                        // against a different coordinate.
+                        source: FieldValueSource::Literal {
+                            value: serde_json::json!(0.0),
+                        },
+                    },
+                    FieldMap {
+                        path: "unit".into(),
+                        source: FieldValueSource::Literal {
+                            value: serde_json::json!("t"),
+                        },
+                    },
+                    FieldMap {
+                        path: "metric".into(),
+                        source: FieldValueSource::FromPlan {
+                            pointer: "expectations.observation_metrics.0.name".into(),
+                        },
+                    },
+                    FieldMap {
+                        path: "period".into(),
+                        source: FieldValueSource::Literal {
+                            value: serde_json::json!("annual"),
+                        },
+                    },
+                ],
+            }],
+            authored_at: Utc::now(),
+            authored_by: "live_test".into(),
+            version: 1,
+            static_payload: None,
+            // ADR 0014: test fixture; provenance not exercised here.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
+        };
+        save_recipe(&store, &recipe).unwrap();
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &http,
+            provider: &provider,
+            recipe_author_prompt: "unused — recipe pre-authored",
+            sources: &[],
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        // Structural: recipe was attempted; either it succeeded or
+        // surfaced a typed failure stage (Fetch / Apply / Insert).
+        // A Skipped here would mean we accidentally went through a
+        // non-PDF branch — that's a regression. A `Declined` would
+        // be impossible because the recipe is pre-authored.
+        assert_eq!(report.recipes_attempted, 1);
+        assert!(
+            !matches!(report.outcomes[0], RecipeOutcome::Skipped { .. }),
+            "live test should not skip — got: {:?}",
+            report.outcomes[0]
+        );
+        assert!(
+            !matches!(report.outcomes[0], RecipeOutcome::Declined { .. }),
+            "live test should not decline (recipe pre-authored) — got: {:?}",
+            report.outcomes[0]
+        );
+
+        // Audit row exists and was closed.
+        let runs = store.recent_fetch_runs_for_plan(plan.id, 5).unwrap();
+        assert!(!runs.is_empty());
+        assert!(runs[0].finished_at.is_some(), "fetch_run must be closed");
+    }
 }
