@@ -29,6 +29,13 @@ regex = { workspace = true }
 csv = { workspace = true }
 scraper = { workspace = true }
 jsonpath-rust = { workspace = true }
+# Session 29 (Track C): pdf_table extraction. The crate has been a
+# workspace dependency since Session 1 (USGS adapter scaffolding) but
+# was unconsumed until the recipe-apply runtime gained its layout-
+# heuristic PDF table reader. ADR 0007 amendment 5 documents the
+# approach and the closed-enum invariant (we wired the fifth-of-five,
+# we did not add a sixth mode).
+pdf-extract = { workspace = true }
 
 [dev-dependencies]
 dotenvy = { workspace = true }

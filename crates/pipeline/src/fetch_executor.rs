@@ -56,20 +56,22 @@
 //! [`ExtractionSpec::CssSelect`], and [`ExtractionSpec::RegexCapture`]
 //! are wired through to apply + insert. The remaining mode
 //! ([`ExtractionSpec::PdfTable`]) gets authored normally (Level-2
-//! picks whatever fits the source) and is surfaced in the report as
-//! `Skipped { reason }` rather than a failure — not a bug, a
-//! deliberate phasing of work. This is the cheapest discipline that
-//! keeps the executor honest about what it can and can't do without
-//! conflating "didn't try" with "tried and broke".
+//! recipe author has been told `pdf_table` is fine for stable annual
+//! reports) and runs through `recipe_apply::apply` like every other
+//! mode. Session 29 (Track C, ADR 0007 amendment 5) wired the
+//! runtime arm — what was `Skipped { reason: "pdf_table not
+//! implemented" }` is now a real fetch → apply → insert path. With
+//! pdf_table in, every variant of the closed extraction-mode enum is
+//! a first-class wired runtime path.
 //!
-//! CssSelect was promoted in Session 12; RegexCapture in Session 13.
-//! The recipe_apply runtime has supported every mode since Session 3
-//! (via `csv`, `jsonpath_lib`, `scraper`, and `regex` respectively);
-//! what was missing each time was the executor-level dispatch + the
-//! apply-and-insert plumbing. The wiring is structurally identical
-//! to the CSV and JSON paths because all of them go through the same
-//! `apply()` boundary, which dispatches internally on the recipe's
-//! `ExtractionSpec`.
+//! CssSelect was promoted in Session 12; RegexCapture in Session 13;
+//! PdfTable in Session 29. The recipe_apply runtime has supported
+//! every mode (via `csv`, `jsonpath_lib`, `scraper`, `regex`, and
+//! `pdf-extract` respectively); what was missing each time was the
+//! executor-level dispatch + the apply-and-insert plumbing. The
+//! wiring is structurally identical to the CSV and JSON paths because
+//! all of them go through the same `apply()` boundary, which
+//! dispatches internally on the recipe's `ExtractionSpec`.
 //!
 //! RegexCapture's promotion was prompted by a real Session-13
 //! production run: a "EU AI Act enforcement" plan authored a
@@ -192,11 +194,12 @@ pub enum RecipeOutcome {
     ///
     /// Distinct from [`RecipeOutcome::Failed`] (a recipe ran and
     /// broke), [`RecipeOutcome::Skipped`] (the executor itself chose
-    /// not to run a recipe — pdf_table not yet wired), and
-    /// [`RecipeOutcome::RateLimited`] (the source threw 429): a
-    /// `Declined` outcome means **no recipe was created at all**, on
-    /// the LLM's honest assessment that the source doesn't admit one
-    /// under the closed extraction vocabulary.
+    /// not to run a recipe — historically pdf_table before Session 29,
+    /// today reserved for any future not-yet-wired mode added to the
+    /// closed enum), and [`RecipeOutcome::RateLimited`] (the source
+    /// threw 429): a `Declined` outcome means **no recipe was created
+    /// at all**, on the LLM's honest assessment that the source
+    /// doesn't admit one under the closed extraction vocabulary.
     ///
     /// Carries `source_id` and `reason` only — there is no
     /// `recipe_id` because no recipe exists. The frontend renders
@@ -1039,11 +1042,10 @@ async fn fetch_recipe_bytes(
 
 /// Run one recipe end-to-end. Pure dispatch on the extraction mode
 /// — Session 8 wired CSV; Session 9 added JSON; Session 12 added
-/// CssSelect; Session 13 added RegexCapture. The only remaining
-/// unwired mode (PdfTable) is reported as `Skipped` until it lands
-/// in its own session — it carries enough complexity (PDF table
-/// detection libraries, page rasterization, positional addressing)
-/// to deserve careful design.
+/// CssSelect; Session 13 added RegexCapture; Session 29 (Track C,
+/// ADR 0007 amendment 5) added PdfTable. With PdfTable in, every
+/// variant of the closed extraction-mode enum is a first-class wired
+/// runtime path. Adding a sixth mode is an ADR-level decision.
 async fn run_one_recipe(
     ctx: &ExecutorContext<'_>,
     plan: &ResearchPlan,
@@ -1055,11 +1057,7 @@ async fn run_one_recipe(
         ExtractionSpec::JsonPath { .. } => run_json_recipe(ctx, plan, recipe, run_id).await,
         ExtractionSpec::CssSelect { .. } => run_css_recipe(ctx, plan, recipe, run_id).await,
         ExtractionSpec::RegexCapture { .. } => run_regex_recipe(ctx, plan, recipe, run_id).await,
-        ExtractionSpec::PdfTable { .. } => RecipeOutcome::Skipped {
-            recipe_id: recipe.id,
-            source_id: recipe.source_id.clone(),
-            reason: "pdf_table: extraction mode not implemented (ADR 0007 Session-3 review note)".into(),
-        },
+        ExtractionSpec::PdfTable { .. } => run_pdf_recipe(ctx, plan, recipe, run_id).await,
     }
 }
 
@@ -1370,6 +1368,75 @@ async fn run_regex_recipe(
     // Insert. A failure to insert any one record fails the recipe —
     // we don't half-write a recipe's batch. Same discipline as the
     // CSV, JSON, and CSS paths.
+    for record in &records {
+        if let Err(e) = ctx.store.insert_record(record) {
+            return RecipeOutcome::Failed {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                stage: FailureStage::Insert,
+                message: e.to_string(),
+            };
+        }
+    }
+
+    RecipeOutcome::Succeeded {
+        recipe_id: recipe.id,
+        source_id: recipe.source_id.clone(),
+        records_produced: records.len() as u32,
+    }
+}
+
+/// PDF runtime path: fetch → apply → insert.
+///
+/// Structurally identical to [`run_regex_recipe`] (and [`run_csv_recipe`],
+/// [`run_json_recipe`], [`run_css_recipe`]) — every wired path goes
+/// through the same `apply()` boundary, which dispatches internally on
+/// the recipe's `ExtractionSpec`. The dispatch arms exist as separate
+/// functions because (a) it keeps `run_one_recipe` honest about which
+/// modes are wired, and (b) when modes start to diverge in behaviour
+/// (e.g. PDF gaining a streamed page-walk for very large reports),
+/// the split lets each path evolve without flag-soup.
+///
+/// Session 29 (Track C, ADR 0007 amendment 5) added this. The
+/// `Skipped { reason: "pdf_table not implemented" }` arm is gone;
+/// `pdf_table` recipes now fetch, extract, normalize, and insert
+/// like every other mode.
+async fn run_pdf_recipe(
+    ctx: &ExecutorContext<'_>,
+    plan: &ResearchPlan,
+    recipe: &FetchRecipe,
+    run_id: Uuid,
+) -> RecipeOutcome {
+    let bytes = match fetch_recipe_bytes(ctx, recipe).await {
+        Ok(b) => b,
+        Err(outcome) => return outcome,
+    };
+
+    let fetched_at = Utc::now();
+    let apply_ctx = ApplyContext {
+        recipe,
+        plan,
+        bytes: &bytes,
+        fetched_at,
+    };
+    let records = match apply(apply_ctx) {
+        Ok(rs) => rs,
+        Err(e) => {
+            // Track A: capture the bytes + failure message so the
+            // manual re-author command later sees ground truth. PDFs
+            // are typically large; the existing capture path's size
+            // discipline applies (see `record_apply_failure_attempt`).
+            let message = describe_apply_error(&e);
+            record_apply_failure_attempt(ctx.store, run_id, recipe.id, &bytes, &message);
+            return RecipeOutcome::Failed {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                stage: FailureStage::Apply,
+                message,
+            };
+        }
+    };
+
     for record in &records {
         if let Err(e) = ctx.store.insert_record(record) {
             return RecipeOutcome::Failed {
@@ -2287,46 +2354,111 @@ mod tests {
         );
     }
 
+    /// Synthetic 2-page PDF used for the executor's PDF happy-path
+    /// and apply-failure tests. Same fixture the `recipe_apply` tests
+    /// use; see `tests/fixtures/pdf/README.md` for provenance.
+    const LITHIUM_PDF: &[u8] = include_bytes!(
+        "../tests/fixtures/pdf/lithium_production.pdf"
+    );
+
+    /// Build a working PDF recipe pinned to the lithium fixture's
+    /// (page=2, row=2 [Chile data row], col=1) coordinate. Mirrors
+    /// `working_csv_recipe`, `working_json_recipe`, etc.
+    fn working_pdf_recipe(plan: &ResearchPlan, url: &str) -> FetchRecipe {
+        let mut r = working_csv_recipe(plan, url);
+        r.id = Uuid::now_v7();
+        r.dedup_key = Some(format!("{}:lithium_pdf", plan.id));
+        r.extraction = ExtractionSpec::PdfTable {
+            page: 2,
+            table_index: 0,
+            row: 2,
+            col: 1,
+        };
+        r
+    }
+
     #[tokio::test]
-    async fn run_fetch_for_plan_skips_unwired_extraction_modes() {
-        // Coverage regression: confirms the dispatch arm for the only
-        // remaining unwired mode (PdfTable) still emits Skipped rather
-        // than silently going through a wired path. The canary's
-        // history walks the project's extraction-mode promotion
-        // sequence:
+    async fn run_fetch_for_plan_succeeds_against_pdf_recipe_without_calling_llm() {
+        // Session 29 (Track C) happy-path: PdfTable promoted from
+        // Skipped to a first-class wired mode. Mirrors the CSV / JSON
+        // / CSS / regex success tests structurally; the only
+        // meaningful difference is the recipe's `extraction` variant
+        // and the body bytes (a real PDF instead of CSV/JSON/HTML).
         //
+        // History of the canary that lived here:
         //   - Sessions 8–11: CssSelect was the canary (CSV, JSON wired).
         //   - Session 12: CssSelect promoted; RegexCapture took over.
-        //   - Session 13: RegexCapture promoted; PdfTable is now it.
+        //   - Session 13: RegexCapture promoted; PdfTable was the last.
+        //   - Session 29: PdfTable promoted; canary role retires.
         //
-        // PdfTable is the last unwired mode and will probably stay
-        // that way for several sessions — it carries enough complexity
-        // (PDF table-detection libraries, page rasterization,
-        // positional addressing) to deserve careful design. When
-        // PdfTable lands, this test goes away or becomes a happy-path
-        // test for PdfTable with the canary role retiring entirely
-        // (the closed extraction-mode enum has only the five we have
-        // today; ADR 0007).
+        // The closed extraction-mode enum (ADR 0007) has five variants
+        // and all five are now wired. A new not-yet-wired mode would
+        // only appear via an ADR that grows the enum to six.
         let plan = sample_plan();
         let store = make_store_with_accepted_plan(&plan);
 
-        let url = "https://example.test/page.pdf";
-        let mut pdf_recipe = working_csv_recipe(&plan, url);
-        pdf_recipe.id = Uuid::now_v7();
-        pdf_recipe.dedup_key = Some(format!("{}:demo_pdf", plan.id));
-        pdf_recipe.extraction = ExtractionSpec::PdfTable {
+        let url = "https://example.test/lithium.pdf";
+        let recipe = working_pdf_recipe(&plan, url);
+        save_recipe(&store, &recipe).unwrap();
+
+        let fetcher = StaticFetcher::new().with(url, LITHIUM_PDF);
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: "unused — recipes already authored",
+            sources: &[],
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        assert_eq!(report.plan_id, plan.id);
+        assert_eq!(report.recipes_attempted, 1);
+        assert_eq!(report.recipes_succeeded, 1);
+        assert_eq!(report.records_produced, 1);
+        assert_eq!(report.outcomes.len(), 1);
+        match &report.outcomes[0] {
+            RecipeOutcome::Succeeded {
+                records_produced, ..
+            } => assert_eq!(*records_produced, 1),
+            other => panic!("expected Succeeded, got {other:?}"),
+        }
+
+        // The fetch_runs row was opened and closed cleanly — same
+        // discipline as the CSV / JSON / CSS / regex paths.
+        let runs = store.recent_fetch_runs_for_plan(plan.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, report.run_id);
+        assert_eq!(runs[0].recipes_attempted, 1);
+        assert_eq!(runs[0].recipes_succeeded, 1);
+        assert_eq!(runs[0].records_produced, 1);
+        assert!(runs[0].finished_at.is_some());
+        assert!(runs[0].error_summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_fetch_for_plan_reports_apply_failure_on_pdf_with_out_of_range_address() {
+        // Failure-shape coverage for the new PdfTable arm: a recipe
+        // pointing at row 99 of a 4-row table fails at the apply
+        // stage with `ApplyError::Extraction { mode: "pdf_table" }`,
+        // which the executor maps to `FailureStage::Apply`. Mirrors
+        // the CSV / JSON / CSS / regex apply-failure tests.
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let url = "https://example.test/lithium.pdf";
+        let mut recipe = working_pdf_recipe(&plan, url);
+        recipe.extraction = ExtractionSpec::PdfTable {
             page: 2,
             table_index: 0,
-            row: 3,
-            col: 1,
+            row: 99,
+            col: 0,
         };
-        save_recipe(&store, &pdf_recipe).unwrap();
+        save_recipe(&store, &recipe).unwrap();
 
-        // Fixture not strictly necessary — Skipped is decided before
-        // fetch — but include it so a regression that *did* attempt
-        // fetch wouldn't trip on a missing fixture and look like a
-        // test setup bug.
-        let fetcher = StaticFetcher::new().with(url, b"%PDF-1.4 stub");
+        let fetcher = StaticFetcher::new().with(url, LITHIUM_PDF);
 
         let provider = UnreachableProvider;
         let ctx = ExecutorContext {
@@ -2338,13 +2470,19 @@ mod tests {
         };
 
         let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
-        assert_eq!(report.recipes_attempted, 1);
         assert_eq!(report.recipes_succeeded, 0);
-        assert_eq!(report.records_produced, 0);
-        assert!(matches!(
-            report.outcomes[0],
-            RecipeOutcome::Skipped { .. }
-        ));
+        match &report.outcomes[0] {
+            RecipeOutcome::Failed { stage, .. } => assert_eq!(*stage, FailureStage::Apply),
+            other => panic!("expected Failed(Apply), got {other:?}"),
+        }
+        // Track A: the apply-failure attempt was recorded so a manual
+        // re-author command later sees the bytes that triggered it.
+        let attempt = store
+            .latest_attempt_for_recipe(recipe.id)
+            .unwrap()
+            .expect("an attempt row must exist after an apply failure");
+        assert!(attempt.failure_message.is_some());
+        assert!(!attempt.succeeded);
     }
 
     #[tokio::test]

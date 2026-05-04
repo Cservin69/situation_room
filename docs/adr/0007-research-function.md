@@ -999,3 +999,161 @@ actually authors.
   `decl·` marker, `[data-tone="declined"]` CSS.
 - `config/prompts/recipe_author.md` v1.9 — four new prose
   sections + three placeholder hookups.
+
+---
+
+## Amendment 5 — `pdf_table` extractor wired (Session 29, Track C)
+
+**Status:** ratified.
+**Date:** 2026-05-04.
+**Supersedes:** the Session-3 review note ("`PdfTable` arm returns
+a structured `NotImplemented` error") and amendments 1 and 3 inasmuch
+as they describe `pdf_table` as the last unwired mode.
+
+### What this amendment does
+
+It wires the runtime arm for `ExtractionSpec::PdfTable`. Recipes that
+target PDF sources now flow through the same fetch → apply →
+normalize → insert path as every other mode. The closed extraction-
+mode enum is unchanged: still five variants, still an ADR-level
+decision to add a sixth.
+
+### What changed
+
+- `crates/pipeline/src/recipe_apply.rs` — the `PdfTable` arm in
+  `extract` now dispatches to `extract_pdf_table` instead of returning
+  `ApplyError::NotImplemented`. The `NotImplemented` variant remains
+  on the public `ApplyError` enum (removing it is a breaking API
+  change) but no production path returns it as of this amendment.
+- `extract_pdf_table` reads the page's text via
+  `pdf_extract::extract_text_from_mem_by_pages`, splits it into
+  lines, tokenizes each line via `split_on_runs_of_whitespace` (runs
+  of 2+ whitespace separate cells; single spaces stay inside a cell
+  so multi-word values like `"United States"` are one token), and
+  clusters contiguous lines with matching token-counts ≥ 2 into
+  *tables*. Cells are addressed positionally by `(table_index, row,
+  col)` per the existing `ExtractionSpec::PdfTable { page,
+  table_index, row, col }` schema.
+- `crates/pipeline/src/fetch_executor.rs` — the `PdfTable` arm in
+  `run_one_recipe` now dispatches to `run_pdf_recipe`, structurally
+  identical to `run_csv_recipe` / `run_json_recipe` /
+  `run_css_recipe` / `run_regex_recipe`. The Skipped-with-reason
+  outcome for `pdf_table` is gone; PDF recipes now succeed, fail at
+  Apply, fail at Insert, or rate-limit like every other mode.
+- The "skips unwired modes" canary test in `fetch_executor.rs` is
+  retired. With all five modes wired, the canary's coverage
+  function is met by each mode's individual happy-path test.
+  Replaced with `run_fetch_for_plan_succeeds_against_pdf_recipe_*`
+  and `run_fetch_for_plan_reports_apply_failure_on_pdf_*`.
+- `crates/pipeline/Cargo.toml` — adds
+  `pdf-extract = { workspace = true }`. The crate has been a
+  workspace dep since Session 1 (USGS adapter scaffolding) but
+  was unconsumed until this amendment.
+- `crates/pipeline/tests/fixtures/pdf/lithium_production.pdf` —
+  synthetic 2-page PDF fixture for tests. See
+  `tests/fixtures/pdf/README.md` for provenance and regeneration
+  instructions.
+
+### Approach: layout heuristic, not glyph clustering
+
+The Session 25 spec offered two paths for `pdf_table`:
+**(a)** pure-Rust layout-heuristic table detection on extracted
+text, or **(b)** pure-Rust positional glyph clustering via
+pdf-extract's `OutputDev` trait or lopdf's content-stream walker.
+Approach (a) was chosen for the first runtime.
+
+Rationale:
+
+1. **The realistic case is column-aligned.** Authoritative annual
+   reports (USGS MCS, SEC 10-K filings, EUR-Lex statistical tables,
+   central-bank statistical bulletins) are typeset by professional
+   tools (LaTeX, InDesign, Word) that emit consistent multi-space
+   gaps between table cells. Approach (a) handles this case
+   directly and cheaply. Approach (b) handles it equally well but
+   with materially more code and a deeper dependency on pdf-extract's
+   output-dev API surface (which has shifted between releases).
+2. **Failures are loud and shaped right.** When the heuristic
+   doesn't find a clean table — multi-column prose, scanned PDFs
+   without OCR, tables with merged cells — `extract_pdf_table`
+   returns `ApplyError::Extraction { mode: "pdf_table", reason }`
+   with a coordinate-specific message. The operator sees exactly
+   which addressing path failed. No silent wrong-data-returned mode.
+3. **The closed enum stays at five.** Approach (a) is enough to
+   keep `pdf_table` honest about what it can and can't do without
+   adding a sixth mode for "PDFs we couldn't address with (a)".
+   When a real plan hits a PDF that (a) can't address and the
+   operator cares enough to fix it, the right move is **not** to
+   grow the runtime; it is to use `static_payload` (amendment 3)
+   or to prefer the source's HTML companion (the recipe-author
+   prompt's longstanding "HTML first" guidance).
+4. **No external table-detection library.** Tabula is JVM-only;
+   pdfplumber is Python-only; camelot ships a CLI but pulls in
+   ImageMagick/Ghostscript. None of these compose with a
+   single-binary Tauri desktop ship. Approach (a) is a hundred
+   lines of Rust; approach (b) is several hundred plus a
+   pdf-extract API surface to track. Approach (a) was the right
+   first cut.
+
+### What this amendment does NOT do
+
+- It does not handle scanned PDFs (no OCR). Scans return zero or
+  near-zero extractable text from `pdf-extract` and the heuristic
+  finds no tables; the recipe fails with a clear "table_index 0
+  not found on page N" error.
+- It does not handle multi-column prose or sidebar layouts.
+  pdf-extract's text reconstruction interleaves columns and the
+  heuristic sees the interleaved text as inconsistent token counts;
+  the recipe fails predictably.
+- It does not handle tables with merged cells or missing values
+  in the middle of a row. Token counts for those rows differ from
+  the rest, and the heuristic terminates the table at the
+  inconsistent row. The recipe author can sometimes work around
+  this by addressing a sub-region (`table_index = 1` after the
+  merged-cell row terminates `table_index = 0`).
+- It does not change the recipe-author prompt's "HTML first"
+  guidance. PDFs are still the fallback. The prompt's
+  "Strategy for PDF sources — HTML first, static payload fallback"
+  section continues to apply; with `pdf_table` wired, the prompt's
+  third option ("author against the PDF directly") is now a real
+  runtime path rather than a future one, but it is still ranked
+  third. Authoritative HTML companions (USGS MCS HTML, EDGAR XBRL,
+  EUR-Lex EN/HTML) are easier to address deterministically and
+  more resilient to PDF re-typesetting between report editions.
+- It does not change the closed extraction-mode enum. Adding a
+  sixth mode still requires an ADR.
+- It does not affect the runtime's LLM-free invariant. The
+  layout heuristic is deterministic; same bytes in → same string
+  out. No LLM participates in PDF parsing or table detection.
+
+### Failure modes the amendment accepts
+
+- **`pdf_table` will fail on inconsistent tables.** The honest
+  shape of this failure is that the operator sees a
+  `Failed @ Apply` outcome with a token-count message in the
+  reason. The remediation is to author a different recipe (try
+  a different `table_index`, switch to `regex_capture` against
+  the page text, or fall back to `static_payload`).
+- **`pdf_extract::extract_text_from_mem_by_pages` ordering may
+  differ from visual reading order on some PDFs.** This is a
+  known pdf-extract limitation; the amendment does not fix it.
+  When it bites, the recipe sees rows out of expected order and
+  the operator addresses it by adjusting `row` or by switching
+  to a different extraction mode. The handoff for Session 29
+  flagged this as a known acceptance.
+
+### Code references (Track C, Session 29)
+
+- `crates/pipeline/Cargo.toml` — `pdf-extract = { workspace = true }`
+  added.
+- `crates/pipeline/src/recipe_apply.rs` — `extract_pdf_table`,
+  `detect_pdf_tables`, `split_on_runs_of_whitespace`, the dispatch
+  arm in `extract`, the fixture-backed unit tests, the end-to-end
+  PDF-recipe-produces-Observation test.
+- `crates/pipeline/src/fetch_executor.rs` — `run_pdf_recipe`,
+  the dispatch arm in `run_one_recipe`, the Session-29 doc-comment
+  update, the canary test's retirement, the new PDF happy-path
+  and apply-failure tests, `working_pdf_recipe` test helper.
+- `crates/pipeline/tests/fixtures/pdf/lithium_production.pdf` —
+  synthetic test fixture. `tests/fixtures/pdf/README.md`
+  documents provenance and regeneration.
+

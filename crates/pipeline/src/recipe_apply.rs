@@ -15,11 +15,9 @@
 //! inline fixtures and keeps all network-facing defences (SSRF,
 //! bounded size, TLS) in one place.
 //!
-//! Four of the five extraction modes are implemented. `PdfTable`
-//! returns a structured `NotImplemented` error — see the arm for the
-//! full rationale. The demo binary exercises the end-to-end path
-//! using a non-PDF source; USGS / PDF sources unblock when positional
-//! PDF table extraction lands as its own session.
+//! All five extraction modes are implemented as of Session 29.
+//! `PdfTable` was the last to land — see ADR 0007 amendment 5 for the
+//! layout-heuristic rationale.
 //!
 //! ## Flow
 //!
@@ -93,6 +91,12 @@ pub enum ApplyError {
     #[error("extraction [{mode}]: {reason}")]
     Extraction { mode: &'static str, reason: String },
 
+    /// Reserved for a future extraction mode that ships its enum
+    /// variant before its runtime. As of Session 29 (Track C) all five
+    /// modes in [`ExtractionSpec`] are wired, so no production path
+    /// returns this. Kept in the enum because removing it is a
+    /// breaking API change and adding a sixth mode (ADR-level) is the
+    /// only legitimate way to need it again.
     #[error("extraction mode not implemented: {mode} ({reason})")]
     NotImplemented { mode: &'static str, reason: String },
 
@@ -149,15 +153,12 @@ fn extract(spec: &ExtractionSpec, bytes: &[u8]) -> Result<String, ApplyError> {
         ExtractionSpec::CsvCell { column, row_filter } => {
             extract_csv_cell(bytes, column, row_filter.as_ref())
         }
-        ExtractionSpec::PdfTable { .. } => Err(ApplyError::NotImplemented {
-            mode: "pdf_table",
-            reason: "positional PDF table extraction is not yet implemented; \
-                     pure-rust positional cell access is a known hard problem \
-                     that will land as its own focused session. Recipes for PDF \
-                     sources are authored and stored correctly but currently \
-                     fail at apply time."
-                .into(),
-        }),
+        ExtractionSpec::PdfTable {
+            page,
+            table_index,
+            row,
+            col,
+        } => extract_pdf_table(bytes, *page, *table_index, *row, *col),
         ExtractionSpec::RegexCapture { pattern, group } => {
             extract_regex(bytes, pattern, *group)
         }
@@ -347,6 +348,249 @@ fn extract_regex(bytes: &[u8], pattern: &str, group: u32) -> Result<String, Appl
             reason: format!("capture group {group} not present in match"),
         })?;
     Ok(m.as_str().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// PdfTable extractor — Session 29 (ADR 0007 amendment 5).
+//
+// The runtime previously returned `ApplyError::NotImplemented` for
+// `pdf_table` per the Session-3 review note. The handoff for Session 29
+// chose a pure-Rust layout-heuristic approach over an external Tabula
+// or JBIG2 dependency: read the page's text via pdf-extract's
+// `extract_text_from_mem_by_pages` (which preserves whitespace between
+// text fragments), cluster contiguous lines with matching token-counts
+// into "tables", and address cells positionally.
+//
+// **Whitespace note (Session-29 fix-1).** pdf-extract's
+// `PlainTextOutput` normalizes horizontal gaps to single spaces — a
+// PDF that visually has thirteen spaces between "Country" and
+// "Production" comes out as `"Country Production"`. The first
+// Session-29 implementation tried to require 2+ whitespace as the
+// cell-boundary signal and found zero tables on every real PDF. The
+// fix is to tokenize on any whitespace run (`tokenize_line`) and
+// accept the multi-word-cell limitation as a known one. See
+// `tokenize_line`'s docstring and ADR 0007 amendment 5 for the
+// remediation paths when a recipe needs to address a multi-word
+// cell value.
+//
+// What this *is*:
+//
+// - A working `pdf_table` extractor for the realistic case of an
+//   authoritative annual report (USGS MCS, SEC 10-K filing, EUR-Lex
+//   statistical table) whose tables are column-aligned and whose
+//   cells are single-word.
+// - Deterministic. Same bytes in → same string out. No glyph-cluster
+//   heuristics that could drift across rustc versions; the only
+//   non-determinism would come from pdf-extract itself.
+//
+// What this *is not*:
+//
+// - A general-purpose PDF table parser. Multi-word cell values
+//   tokenize as multiple tokens and terminate the table at the
+//   ragged-token-count row. Scanned PDFs without OCR produce no
+//   extractable text. Tables with merged cells produce ragged token
+//   counts that fail detection.
+// - A replacement for HTML-first authoring. The recipe-author prompt
+//   continues to teach "if the source has an HTML companion, author
+//   against the HTML." `pdf_table` is the fallback when there
+//   genuinely is no HTML.
+//
+// Failures are loud and structurally specific (page out of range,
+// table not found, row/col out of range, empty cell), not silent.
+// Each error reason names the addressing path so the operator sees
+// exactly which coordinate failed.
+// ---------------------------------------------------------------------------
+
+fn extract_pdf_table(
+    bytes: &[u8],
+    page: u32,
+    table_index: u32,
+    row: u32,
+    col: u32,
+) -> Result<String, ApplyError> {
+    // pdf-extract's per-page text reader returns a `Vec<String>`
+    // where each entry is one page's text. The library does its own
+    // line-reconstruction; we trust that and do the table detection
+    // on top.
+    let pages = pdf_extract::extract_text_from_mem_by_pages(bytes).map_err(|e| {
+        ApplyError::Extraction {
+            mode: "pdf_table",
+            reason: format!("pdf parse failed: {e}"),
+        }
+    })?;
+
+    // `page` is 1-indexed in the recipe schema (matching how PDFs are
+    // referenced in publications). `0` is structurally invalid; reject
+    // it explicitly so a recipe with a typo doesn't silently address
+    // page 1.
+    if page == 0 {
+        return Err(ApplyError::Extraction {
+            mode: "pdf_table",
+            reason: "page must be 1-indexed; 0 is not a valid PDF page".into(),
+        });
+    }
+    let page_idx = (page as usize) - 1;
+    let page_text = pages.get(page_idx).ok_or_else(|| ApplyError::Extraction {
+        mode: "pdf_table",
+        reason: format!(
+            "page {page} out of range (PDF has {} pages)",
+            pages.len()
+        ),
+    })?;
+
+    let tables = detect_pdf_tables(page_text);
+    let table = tables
+        .get(table_index as usize)
+        .ok_or_else(|| ApplyError::Extraction {
+            mode: "pdf_table",
+            reason: format!(
+                "table_index {table_index} not found on page {page} \
+                 ({} tables detected; use table_index 0..{})",
+                tables.len(),
+                tables.len().saturating_sub(1)
+            ),
+        })?;
+
+    let row_data = table.get(row as usize).ok_or_else(|| ApplyError::Extraction {
+        mode: "pdf_table",
+        reason: format!(
+            "row {row} out of range on page {page}, table {table_index} \
+             (table has {} rows)",
+            table.len()
+        ),
+    })?;
+
+    let cell = row_data.get(col as usize).ok_or_else(|| ApplyError::Extraction {
+        mode: "pdf_table",
+        reason: format!(
+            "col {col} out of range at page {page}, table {table_index}, row {row} \
+             (row has {} cells)",
+            row_data.len()
+        ),
+    })?;
+
+    let trimmed = cell.trim();
+    if trimmed.is_empty() {
+        return Err(ApplyError::Extraction {
+            mode: "pdf_table",
+            reason: format!(
+                "cell at page {page}, table {table_index}, row {row}, col {col} \
+                 is empty after trimming"
+            ),
+        });
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Detect tabular regions in a single page's text.
+///
+/// Algorithm (deliberately simple, deliberately explicit):
+///
+/// 1. Split the page text into lines.
+/// 2. Tokenize each non-blank line with [`tokenize_line`] — any run
+///    of whitespace separates cells. (See `tokenize_line`'s docstring
+///    for why any-whitespace and not 2+-whitespace.)
+/// 3. **Blank lines are skipped**, not table-terminators. pdf-extract's
+///    `PlainTextOutput` is known to emit `\n\n` between adjacent text
+///    objects in some PDFs (one `\n` from `end_line`, another from
+///    `end_word`/`begin_word`); treating every blank line as a flush
+///    would split single tables into N one-row clusters that all get
+///    dropped by the min-2-rows rule. The Session-29 fix-1 lesson:
+///    pdf-extract's emit-spacing is not stable enough to use blanks
+///    as a structural signal.
+/// 4. A *table* is a maximal run of non-blank lines whose token counts
+///    are all equal and ≥ 2. Token-count change terminates the
+///    current table and starts a new one. Single-token lines also
+///    terminate (they're typically prose / footers / section headings).
+/// 5. A run of fewer than 2 lines does not become a table.
+///
+/// The minimum-2-rows rule prevents stray prose lines from being
+/// mistaken for tables. The minimum-2-tokens rule rejects single-
+/// column "tables" which are usually paragraphs.
+///
+/// The returned shape is `tables[i][row][col]`. `tables` is in
+/// page-reading order; `row` is in line order; `col` is in
+/// left-to-right order.
+fn detect_pdf_tables(page_text: &str) -> Vec<Vec<Vec<String>>> {
+    let mut tables: Vec<Vec<Vec<String>>> = Vec::new();
+    let mut current_table: Vec<Vec<String>> = Vec::new();
+    let mut current_token_count: Option<usize> = None;
+
+    let flush = |current_table: &mut Vec<Vec<String>>, tables: &mut Vec<Vec<Vec<String>>>| {
+        if current_table.len() >= 2 {
+            tables.push(std::mem::take(current_table));
+        } else {
+            current_table.clear();
+        }
+    };
+
+    for line in page_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            // Blank lines are skipped, not terminators. See the
+            // docstring above for the rationale.
+            continue;
+        }
+
+        let tokens = tokenize_line(trimmed);
+        if tokens.len() < 2 {
+            // Single-token lines DO terminate the current table —
+            // they're typically section headings, footnote markers,
+            // or single-column footers, never legitimate table rows.
+            flush(&mut current_table, &mut tables);
+            current_token_count = None;
+            continue;
+        }
+
+        match current_token_count {
+            Some(n) if n == tokens.len() => {
+                current_table.push(tokens);
+            }
+            Some(_) => {
+                // Token-count mismatch: close the current table and
+                // start a new one with this line.
+                flush(&mut current_table, &mut tables);
+                current_table.push(tokens.clone());
+                current_token_count = Some(tokens.len());
+            }
+            None => {
+                current_token_count = Some(tokens.len());
+                current_table.push(tokens);
+            }
+        }
+    }
+    flush(&mut current_table, &mut tables);
+    tables
+}
+
+/// Split a single line into tokens by any run of whitespace.
+///
+/// **Why any whitespace, not 2+ whitespace.** pdf-extract's
+/// `PlainTextOutput` normalizes whitespace at extraction time: it
+/// emits one space for a horizontal gap regardless of how many spaces
+/// were in the original Tj operand. So a PDF that *visually* has
+/// thirteen spaces between "Country" and "Production" comes out of
+/// pdf-extract as `"Country Production"` (single space). The Session-29
+/// initial implementation tried to require 2+ whitespace as the
+/// cell-boundary signal; against real pdf-extract output it found
+/// zero tables on every PDF and every test failed. Splitting on any
+/// whitespace run is the one signal pdf-extract reliably preserves.
+///
+/// Tabs count as whitespace. Empty/whitespace-only input returns
+/// an empty Vec (the caller's table detector treats that as a
+/// single-token line, which terminates the current table).
+///
+/// **Known limitation: multi-word cell values.** A cell value with
+/// internal whitespace (e.g. `"United States"`) gets tokenized as
+/// two tokens. When the LLM authors a recipe targeting such a PDF,
+/// the row's token count will differ from rows with single-word
+/// cells, terminating the table at that row. The remediation is
+/// editorial: address the cleaner sub-region with a different
+/// `table_index`, switch to `regex_capture`, or fall back to
+/// `static_payload` with a transcribed CSV. Documented in ADR 0007
+/// amendment 5 under "What this amendment does NOT do."
+fn tokenize_line(s: &str) -> Vec<String> {
+    s.split_whitespace().map(|t| t.to_string()).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -861,24 +1105,296 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PdfTable extractor — must fail loudly and predictably
+    // PdfTable extractor — Session 29 (ADR 0007 amendment 5)
     // -----------------------------------------------------------------------
 
+    /// Synthetic 2-page PDF used for PDF-table extractor tests.
+    ///
+    /// Page 1: filler prose (no table; exercises the "page 1's loose
+    /// prose isn't mis-detected as a table" guarantee — a recipe for
+    /// `page=1, table_index=0` should fail with "table_index 0 not
+    /// found", not silently return prose).
+    /// Page 2: a clean 4-row × 2-column table:
+    ///
+    /// ```text
+    ///   Country     Production
+    ///   Australia   88000
+    ///   Chile       49000
+    ///   Argentina   6200
+    /// ```
+    ///
+    /// See `tests/fixtures/pdf/README.md` for how this fixture was
+    /// generated and how to swap in a real USGS MCS PDF when network
+    /// access is available.
+    const LITHIUM_PDF: &[u8] = include_bytes!(
+        "../tests/fixtures/pdf/lithium_production.pdf"
+    );
+
     #[test]
-    fn pdf_table_returns_not_implemented_with_clear_reason() {
-        let spec = ExtractionSpec::PdfTable {
-            page: 2,
-            table_index: 0,
-            row: 3,
-            col: 1,
-        };
-        let err = extract(&spec, b"%PDF-1.4...").unwrap_err();
+    fn tokenize_line_splits_on_any_whitespace_run() {
+        // Single space, multi-space, and tab all separate cells.
+        // pdf-extract collapses gaps to single spaces in its
+        // PlainTextOutput, so the splitter must work on single-space
+        // input (the common case in practice).
+        assert_eq!(
+            tokenize_line("Country Production"),
+            vec!["Country".to_string(), "Production".to_string()]
+        );
+        assert_eq!(
+            tokenize_line("Country     Production"),
+            vec!["Country".to_string(), "Production".to_string()]
+        );
+        assert_eq!(
+            tokenize_line("a\tb"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn tokenize_line_treats_multi_word_cells_as_separate_tokens() {
+        // Known limitation (ADR 0007 amendment 5): pdf-extract collapses
+        // multi-space gaps so the splitter cannot distinguish "a cell
+        // value with internal whitespace" from "two cells separated by
+        // whitespace." Multi-word cells become multiple tokens; the
+        // table detector handles this by terminating the table at the
+        // ragged-token-count row.
+        let v = tokenize_line("United States 1234");
+        assert_eq!(
+            v,
+            vec!["United".to_string(), "States".to_string(), "1234".to_string()]
+        );
+    }
+
+    #[test]
+    fn tokenize_line_returns_empty_for_blank() {
+        assert!(tokenize_line("   ").is_empty());
+        assert!(tokenize_line("").is_empty());
+        assert!(tokenize_line("\t\n").is_empty());
+    }
+
+    #[test]
+    fn detect_pdf_tables_finds_one_clean_table() {
+        // Input shaped like what pdf-extract emits: single spaces
+        // between cells (the multi-space PDF gaps got normalized at
+        // extraction time).
+        let txt = "\
+Country Production
+Australia 88000
+Chile 49000
+Argentina 6200
+";
+        let tables = detect_pdf_tables(txt);
+        assert_eq!(tables.len(), 1, "got {tables:?}");
+        assert_eq!(tables[0].len(), 4);
+        assert_eq!(tables[0][0], vec!["Country".to_string(), "Production".to_string()]);
+        assert_eq!(tables[0][2], vec!["Chile".to_string(), "49000".to_string()]);
+    }
+
+    #[test]
+    fn detect_pdf_tables_treats_blank_lines_as_skipped_not_terminators() {
+        // Per the Session-29 fix-1 lesson: pdf-extract is known to
+        // emit `\n\n` between rows on some PDFs (one `\n` from
+        // `end_line`, another from text-object boundaries). Treating
+        // every blank line as a flush would split single tables into
+        // many one-row clusters that all get dropped. The algorithm
+        // skips blanks instead.
+        let txt = "\
+A 1
+B 2
+
+C 3
+D 4
+";
+        let tables = detect_pdf_tables(txt);
+        // Pre-fix-1 expectation was 2 tables; with skip-blanks
+        // semantics it's one continuous 4-row table.
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].len(), 4);
+        assert_eq!(tables[0][0], vec!["A".to_string(), "1".to_string()]);
+        assert_eq!(tables[0][3], vec!["D".to_string(), "4".to_string()]);
+    }
+
+    #[test]
+    fn detect_pdf_tables_terminates_on_token_count_change_even_across_blanks() {
+        // A blank line on its own is not a terminator, but a
+        // post-blank line with a different token count IS — the
+        // mismatch is what closes the current table.
+        let txt = "\
+A 1
+B 2
+
+X y z
+P q r
+";
+        let tables = detect_pdf_tables(txt);
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0][0].len(), 2);
+        assert_eq!(tables[1][0].len(), 3);
+    }
+
+    #[test]
+    fn detect_pdf_tables_breaks_on_token_count_change() {
+        // A two-cell table followed by a three-cell table — the change
+        // in token count terminates the first and starts the second.
+        let txt = "\
+A 1
+B 2
+X y z
+P q r
+";
+        let tables = detect_pdf_tables(txt);
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0][0].len(), 2);
+        assert_eq!(tables[1][0].len(), 3);
+    }
+
+    #[test]
+    fn detect_pdf_tables_rejects_single_row_clusters() {
+        // Two prose lines with mismatched token counts — each forms a
+        // 1-row "cluster" which is rejected by the min-2-rows rule.
+        // This is the failure mode for stray prose, footnotes, etc.
+        let txt = "\
+Just one line here
+And then nothing.
+";
+        let tables = detect_pdf_tables(txt);
+        // "Just one line here" → 4 tokens; "And then nothing." → 3
+        // tokens; mismatch → flushes the 1-row cluster, starts a new
+        // 1-row cluster, end-of-input flush drops that too.
+        assert_eq!(tables.len(), 0, "got {tables:?}");
+    }
+
+    #[test]
+    fn detect_pdf_tables_rejects_single_column_lines() {
+        let txt = "\
+just_one_token
+another
+third
+";
+        let tables = detect_pdf_tables(txt);
+        assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn detect_pdf_tables_terminates_at_multi_word_cell_row() {
+        // ADR 0007 amendment 5 known limitation, with a regression
+        // test pinning the behaviour: a row with a multi-word cell
+        // (e.g. "United States") tokenizes to one extra token and
+        // mismatches the surrounding rows, terminating the table at
+        // that row. The remediation is editorial (different
+        // table_index, regex_capture, or static_payload).
+        let txt = "\
+A 1
+B 2
+United States 3
+C 4
+";
+        let tables = detect_pdf_tables(txt);
+        // "A 1" + "B 2" form the first 2-token table.
+        // "United States 3" mismatches (3 tokens) → flush, start new.
+        // "C 4" mismatches the 3-token current → flush 1-row "United
+        //   States 3" cluster (dropped), start new 2-token cluster.
+        // End: flush the 1-row "C 4" cluster (dropped).
+        // Result: just the first {A 1, B 2} table.
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].len(), 2);
+        assert_eq!(tables[0][0], vec!["A".to_string(), "1".to_string()]);
+    }
+
+    #[test]
+    fn extract_pdf_table_happy_path_against_fixture() {
+        // Page 2, table 0, row 2 (Chile data row), col 1 (production
+        // value): "49000". This mirrors the recipe a USGS-authored
+        // PDF recipe would use.
+        let out = extract_pdf_table(LITHIUM_PDF, 2, 0, 2, 1).unwrap();
+        assert_eq!(out, "49000");
+    }
+
+    #[test]
+    fn extract_pdf_table_addresses_header_row() {
+        // row 0 = header. col 0 = "Country", col 1 = "Production".
+        let header_country = extract_pdf_table(LITHIUM_PDF, 2, 0, 0, 0).unwrap();
+        let header_prod = extract_pdf_table(LITHIUM_PDF, 2, 0, 0, 1).unwrap();
+        assert_eq!(header_country, "Country");
+        assert_eq!(header_prod, "Production");
+    }
+
+    #[test]
+    fn extract_pdf_table_errors_on_zero_page() {
+        let err = extract_pdf_table(LITHIUM_PDF, 0, 0, 0, 0).unwrap_err();
         match err {
-            ApplyError::NotImplemented { mode, reason } => {
+            ApplyError::Extraction { mode, reason } => {
                 assert_eq!(mode, "pdf_table");
-                assert!(reason.contains("positional"), "got reason {reason}");
+                assert!(reason.contains("1-indexed"), "got {reason}");
             }
-            other => panic!("expected NotImplemented, got {other:?}"),
+            other => panic!("expected Extraction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_pdf_table_errors_on_page_out_of_range() {
+        // The fixture has 2 pages; asking for page 99 fails predictably.
+        let err = extract_pdf_table(LITHIUM_PDF, 99, 0, 0, 0).unwrap_err();
+        match err {
+            ApplyError::Extraction { mode, reason } => {
+                assert_eq!(mode, "pdf_table");
+                assert!(reason.contains("out of range"), "got {reason}");
+            }
+            other => panic!("expected Extraction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_pdf_table_errors_on_table_not_found() {
+        // Page 1 of the fixture is loose prose; no table is detected.
+        // Recipes addressing page=1, table_index=0 fail predictably
+        // rather than silently returning prose tokens.
+        let err = extract_pdf_table(LITHIUM_PDF, 1, 0, 0, 0).unwrap_err();
+        match err {
+            ApplyError::Extraction { mode, reason } => {
+                assert_eq!(mode, "pdf_table");
+                assert!(reason.contains("table_index"), "got {reason}");
+            }
+            other => panic!("expected Extraction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_pdf_table_errors_on_row_out_of_range() {
+        // Page 2's table has 4 rows (header + 3 data); asking for row
+        // 99 fails predictably.
+        let err = extract_pdf_table(LITHIUM_PDF, 2, 0, 99, 0).unwrap_err();
+        match err {
+            ApplyError::Extraction { mode, reason } => {
+                assert_eq!(mode, "pdf_table");
+                assert!(reason.contains("row 99"), "got {reason}");
+            }
+            other => panic!("expected Extraction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_pdf_table_errors_on_col_out_of_range() {
+        // Page 2's table has 2 columns; asking for col 99 fails.
+        let err = extract_pdf_table(LITHIUM_PDF, 2, 0, 1, 99).unwrap_err();
+        match err {
+            ApplyError::Extraction { mode, reason } => {
+                assert_eq!(mode, "pdf_table");
+                assert!(reason.contains("col 99"), "got {reason}");
+            }
+            other => panic!("expected Extraction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_pdf_table_errors_on_invalid_pdf_bytes() {
+        let err = extract_pdf_table(b"not a pdf at all", 1, 0, 0, 0).unwrap_err();
+        match err {
+            ApplyError::Extraction { mode, reason } => {
+                assert_eq!(mode, "pdf_table");
+                assert!(reason.contains("pdf parse failed"), "got {reason}");
+            }
+            other => panic!("expected Extraction, got {other:?}"),
         }
     }
 
@@ -1016,22 +1532,65 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_pdf_recipe_fails_cleanly_with_not_implemented() {
+    fn end_to_end_pdf_recipe_produces_observation() {
+        // Session 29: pdf_table is wired. A recipe that addresses
+        // (page=2, table_index=0, row=2, col=1) on the lithium fixture
+        // extracts "49000", which `parse_extracted_scalar` parses as
+        // f64 and which flows into the Observation's `value` field —
+        // identical end-state to the CSV / JSON / CSS / regex paths.
         let recipe = recipe_with(ExtractionSpec::PdfTable {
-            page: 1,
+            page: 2,
             table_index: 0,
             row: 2,
-            col: 3,
+            col: 1,
         });
         let p = plan();
         let ctx = ApplyContext {
             recipe: &recipe,
             plan: &p,
-            bytes: b"%PDF-1.4 fake",
+            bytes: LITHIUM_PDF,
+            fetched_at: fetched_at(),
+        };
+        let records = apply(ctx).unwrap();
+        assert_eq!(records.len(), 1);
+        let obs = match &records[0] {
+            Record::Observation(o) => o,
+            other => panic!("expected Observation, got {other:?}"),
+        };
+        assert_eq!(obs.content.metric, "production");
+        assert_eq!(obs.content.value, 49000.0);
+        assert_eq!(obs.content.unit.as_str(), "t");
+        // Provenance carries the recipe id + version like the other
+        // wired modes.
+        let src = &obs.envelope.provenance.source_id;
+        assert!(src.starts_with("usgs_mcs#recipe:"), "got {src}");
+        assert!(src.contains("@v1"), "got {src}");
+    }
+
+    #[test]
+    fn end_to_end_pdf_recipe_fails_cleanly_when_address_is_out_of_range() {
+        // A recipe addressing a non-existent row surfaces as
+        // ApplyError::Extraction at the apply boundary, not
+        // ApplyError::NotImplemented. Replaces the pre-Session-29
+        // canary that asserted NotImplemented.
+        let recipe = recipe_with(ExtractionSpec::PdfTable {
+            page: 2,
+            table_index: 0,
+            row: 99,
+            col: 0,
+        });
+        let p = plan();
+        let ctx = ApplyContext {
+            recipe: &recipe,
+            plan: &p,
+            bytes: LITHIUM_PDF,
             fetched_at: fetched_at(),
         };
         let err = apply(ctx).unwrap_err();
-        assert!(matches!(err, ApplyError::NotImplemented { mode: "pdf_table", .. }));
+        assert!(
+            matches!(err, ApplyError::Extraction { mode: "pdf_table", .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
