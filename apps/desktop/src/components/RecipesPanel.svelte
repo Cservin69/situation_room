@@ -125,6 +125,66 @@
   When the parent plan has no selection at all, this component also
   renders nothing — it never appears as a leaked artefact across
   selection boundaries because plans.recipes is reset on selectPlan.
+
+  RESPONSE BYTES inline (Session 31)
+  -----------------------------------
+
+  Track A (ADR 0012 amendment 1) made the executor capture the bytes
+  the runtime saw at the moment a recipe failed at apply, into the
+  `recipe_fetch_attempts` table. Until Session 31 those bytes were
+  reachable only through the manual re-author dialog — the operator
+  had to click `re-author` to even see what came back. The Session 31
+  test run made the gap visible: a `comtrade` recipe failed at apply
+  with `bytes did not parse as JSON: expected value at line 1 column 1`
+  against `https://comtradeplus.un.org/TradeFlow`. Diagnosing this
+  required the operator to either click re-author (heavy) or query
+  DuckDB by hand. Both punish the developer for using the app.
+
+  This section adds an inline `response bytes` expander on every
+  failed-apply recipe row. Click → fetches the latest captured
+  attempt for the recipe (same `latest_attempt_for_recipe` command
+  the re-author dialog uses; no new wire surface, no new storage
+  read), then renders:
+
+    - a content-type chip (JSON / HTML / XML / TEXT / EMPTY),
+      derived heuristically from the first non-whitespace byte; and
+    - the byte count; and
+    - a `<pre>` of the captured excerpt (capped at 64 KiB at
+      capture time per `MAX_EXCERPT_BYTES`).
+
+  The chip is the load-bearing diagnostic. For the comtrade case
+  above the chip would read `HTML` while the failure message says
+  `did not parse as JSON` — the operator sees the mismatch in two
+  glances and writes a flag note ("source returns HTML, not JSON;
+  check for a separate JSON API") in five seconds.
+
+  We render only on failed-apply outcomes (mirrors the re-author
+  button's gate). For other failure stages — Failed @ fetch (no
+  body was read) or Failed @ insert (storage-side, the bytes
+  parsed) — the bytes either don't exist or wouldn't help, so we
+  hide the affordance rather than surface a misleading "no bytes
+  captured" placeholder on every row in those states.
+
+  State is held in `attemptByRecipeId` with a five-state alphabet:
+  `undefined` (not loaded), `'loading'`, `'error'` (load failed),
+  `null` (no attempt row exists), or the attempt DTO. The button
+  → loading → resolved transition is one-shot per recipe id. The
+  state map is component-scoped: it survives across re-runs of
+  fetch on the same plan (so a previously-loaded attempt stays
+  visible) and is reset only when the user navigates away from the
+  plan (the parent's `selectPlan` flow re-mounts the panel by
+  changing `plans.recipes`). The known staleness window is "user
+  loaded bytes for recipe X, then ran fetch again which produced a
+  new attempt row for X, and the panel still shows the previous
+  load" — fine for diagnosis, since the new attempt's outcome
+  surfaces in the outcome strip and the re-author dialog has its
+  own always-fresh load. If empirical use shows the staleness
+  bites, the runes store can clear the map on fetch-run completion;
+  defer until then.
+
+  No new ADR. ADR 0012 amendment 1 already authorized capture; this
+  is a second consumer of the same capture, alongside the re-author
+  dialog. ts-rs DTOs unchanged. No regenerated TS files in this patch.
 -->
 <script lang="ts">
   import { plans, flagRecipe, reauthorRecipe } from '$stores/plans.svelte';
@@ -205,6 +265,114 @@
     reauthorDialogRecipe = null;
     reauthorAttempt = null;
     reauthorLoadingAttempt = false;
+  }
+
+  // Session 31: inline response-bytes affordance on failed-apply
+  // recipe rows. The map's value alphabet is:
+  //   - undefined → not loaded yet (button is shown)
+  //   - 'loading' → fetch in flight
+  //   - 'error'   → fetch threw; banner shows the error
+  //   - null      → no attempt row exists in storage (rare —
+  //                 fetch failed before the body was read, or
+  //                 the row predates Track A's capture)
+  //   - DTO       → resolved; render bytes
+  // Keyed by recipe.id (not source_id) because attempts are
+  // per-recipe-latest in storage and a (plan, source) can have
+  // multiple recipe rows in its lineage.
+  type AttemptCellState =
+    | undefined
+    | 'loading'
+    | 'error'
+    | null
+    | RecipeFetchAttemptDto;
+  let attemptByRecipeId: Record<string, AttemptCellState> = $state({});
+
+  async function loadRecipeAttempt(recipeId: string) {
+    // Idempotent: if we've already started or finished a load for
+    // this recipe, do nothing. The button that calls this is hidden
+    // once the state advances out of `undefined`, so this is a
+    // belt-and-suspenders guard against double-clicks during the
+    // small window before the loading state renders.
+    if (attemptByRecipeId[recipeId] !== undefined) return;
+    attemptByRecipeId[recipeId] = 'loading';
+    try {
+      const attempt = await latestAttemptForRecipe(recipeId);
+      attemptByRecipeId[recipeId] = attempt; // DTO or null
+    } catch (e) {
+      // Store the error sentinel so the row shows a stable "could
+      // not load" message instead of reverting to the button (which
+      // would invite an infinite click → fail loop). The error
+      // banner via plans.error gives the operator the diagnostic.
+      attemptByRecipeId[recipeId] = 'error';
+      plans.error = asCommandError(e);
+    }
+  }
+
+  /**
+   * Heuristic content-type detection from the first non-whitespace
+   * byte. Not authoritative — the actual response Content-Type
+   * header is not currently surfaced through the wire (`SecureHttpClient`
+   * doesn't expose it on success bodies — see Session 30 known
+   * imperfection #6 carry-over). For diagnostic purposes the first
+   * byte is enough: the comtrade case is "starts with `<` while the
+   * recipe expected JSON," and the chip surfaces that mismatch
+   * immediately. The world_bank_indicators case is "starts with `[`
+   * (so JSON), but it's the indicator catalog endpoint's response,
+   * not a country/indicator data response" — the chip says JSON
+   * correctly and the operator opens the bytes to see the wrong
+   * shape.
+   *
+   * `'empty'` covers both null and effectively-blank bodies. XML
+   * detection covers RSS / Atom in addition to bare XML, since the
+   * project's recipes hit RSS feeds frequently (EUR-Lex, BBC).
+   */
+  function responseShape(
+    bytes: string | null | undefined,
+  ): 'json' | 'html' | 'xml' | 'text' | 'empty' {
+    if (bytes === null || bytes === undefined) return 'empty';
+    const trimmed = bytes.trimStart();
+    if (trimmed.length === 0) return 'empty';
+    const first = trimmed[0];
+    if (first === '{' || first === '[') return 'json';
+    if (first === '<') {
+      const head = trimmed.slice(0, 200).toLowerCase();
+      if (
+        head.startsWith('<?xml') ||
+        head.startsWith('<rss') ||
+        head.startsWith('<feed') ||
+        head.startsWith('<atom')
+      ) {
+        return 'xml';
+      }
+      return 'html';
+    }
+    return 'text';
+  }
+
+  function responseShapeLabel(
+    bytes: string | null | undefined,
+  ): string {
+    return responseShape(bytes).toUpperCase();
+  }
+
+  /**
+   * Format byte count with a friendly suffix. Operates on the
+   * decoded string's `.length` (UTF-16 code units), which is
+   * approximately byte-equivalent for typical API responses
+   * (mostly ASCII) and a slight under-count for prose-heavy
+   * non-ASCII. The exact byte count from storage's
+   * `MAX_EXCERPT_BYTES` truncation isn't surfaced separately;
+   * a 64 KiB excerpt is the wire-side cap so any value reading
+   * "64.0 KB" is plausibly truncated.
+   */
+  function responseLengthLabel(
+    bytes: string | null | undefined,
+  ): string {
+    if (!bytes) return '0 B';
+    const len = bytes.length;
+    if (len < 1024) return `${len} B`;
+    if (len < 1024 * 1024) return `${(len / 1024).toFixed(1)} KB`;
+    return `${(len / (1024 * 1024)).toFixed(1)} MB`;
   }
 
   async function onReauthorSubmit(note: string | null) {
@@ -437,6 +605,77 @@
       <summary>produces</summary>
       <pre>{prettyJson(recipe.produces)}</pre>
     </details>
+
+    <!--
+      Session 31: inline response-bytes affordance.
+
+      Visible only when the latest fetch outcome is Failed @ apply
+      — same gate as the re-author button, same justification: the
+      bytes only exist for that failure stage (Track A, ADR 0012
+      amendment 1). Fetch failures have no body to capture; insert
+      failures had a parsed body that landed records (we'd be
+      surfacing bytes that aren't the diagnostic).
+
+      The state machine (button → loading → resolved | error | null)
+      is described in the script's `attemptByRecipeId` block. The
+      content-type chip in the resolved branch's summary is the
+      load-bearing diagnostic — when it disagrees with what the
+      recipe's extraction mode expected (e.g. `HTML` while the
+      recipe is `json_path`), the operator sees the mismatch
+      without reading any bytes.
+    -->
+    {#if outcome && outcome.kind === 'failed' && outcome.stage === 'apply'}
+      {@const attemptState = attemptByRecipeId[recipe.id]}
+      <div class="block response-bytes-block">
+        {#if attemptState === undefined}
+          <button
+            type="button"
+            class="response-bytes-toggle"
+            title="Show the response bytes the runtime saw at apply time. Captured at fetch time per Track A / ADR 0012 amendment 1."
+            onclick={() => loadRecipeAttempt(recipe.id)}
+          >▸ show response bytes</button>
+        {:else if attemptState === 'loading'}
+          <div class="response-bytes-status">loading response bytes…</div>
+        {:else if attemptState === 'error'}
+          <div class="response-bytes-status response-bytes-error">
+            could not load response bytes — see error banner above
+          </div>
+        {:else if attemptState === null}
+          <!--
+            null means the storage call returned None — no attempt
+            row exists. Two reasons this can happen for a
+            failed-apply outcome: (a) the row predates Track A's
+            capture (migration 0013, Session 25); (b) the runtime
+            was patched in a way that bypassed the capture path.
+            Both are diagnostic dead-ends from the UI; we surface
+            the gap honestly rather than hide the affordance.
+          -->
+          <div class="response-bytes-status">
+            no response bytes were captured for this attempt
+          </div>
+        {:else}
+          {@const shape = responseShape(attemptState.bytes_excerpt)}
+          <details class="response-bytes-details" open>
+            <summary>
+              <span class="response-summary-label">response bytes</span>
+              <span class="response-shape-chip" data-shape={shape}>
+                {responseShapeLabel(attemptState.bytes_excerpt)}
+              </span>
+              <span class="response-length">
+                {responseLengthLabel(attemptState.bytes_excerpt)}
+              </span>
+            </summary>
+            {#if attemptState.bytes_excerpt}
+              <pre class="response-bytes-pre">{attemptState.bytes_excerpt}</pre>
+            {:else}
+              <div class="response-bytes-empty">
+                (response body was empty or non-UTF-8)
+              </div>
+            {/if}
+          </details>
+        {/if}
+      </div>
+    {/if}
 
     {#if recipe.static_payload !== null}
       <!--
@@ -986,5 +1225,161 @@
     color: var(--fg-quaternary);
     padding-top: 4px;
     border-top: 1px solid var(--border-subtle);
+  }
+
+  /*
+   * Response-bytes affordance — Session 31. Surfaces the bytes the
+   * runtime saw at apply time, alongside a content-type chip for
+   * fast diagnosis.
+   *
+   * The collapsed state is the button (`response-bytes-toggle`); the
+   * expanded state is a `<details open>` with the bytes inside. Both
+   * sit inside the same `.block.response-bytes-block` container so the
+   * row's vertical rhythm matches the extraction / produces blocks
+   * around it.
+   *
+   * The block shares chrome with the failed-outcome treatment in the
+   * outcome strip — same `--signal-negative` left edge — so the eye
+   * groups "this recipe failed" with "here is what came back" without
+   * needing a separate header.
+   */
+  .response-bytes-block {
+    border-left: 2px solid var(--signal-negative, var(--border-subtle));
+  }
+
+  .response-bytes-toggle {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+    padding: 0;
+    color: var(--fg-tertiary);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    transition: color var(--duration-ui) var(--ease);
+  }
+  .response-bytes-toggle:hover {
+    color: var(--fg-primary);
+  }
+
+  .response-bytes-status {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--fg-tertiary);
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+  }
+  .response-bytes-error {
+    color: var(--signal-negative, var(--fg-secondary));
+  }
+
+  .response-bytes-details summary {
+    /* Mirrors `.block summary` but with extra inline children for
+       the chip + length, so we override the layout to flex. */
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-tertiary);
+    cursor: pointer;
+    user-select: none;
+  }
+  .response-bytes-details summary:hover {
+    color: var(--fg-secondary);
+  }
+  /*
+   * `.response-summary-label` (the "response bytes" prefix span)
+   * deliberately has no rules of its own — it inherits from
+   * `.response-bytes-details summary`'s flex layout above. The class
+   * is kept as a hook for future per-element tuning, but an empty
+   * ruleset trips svelte-check's `Do not use empty rulesets` lint
+   * (Session 31 follow-up), so the prior empty `.response-summary-label`
+   * block is removed. If a future session needs to tune the label,
+   * re-add the rule with content.
+   */
+
+  /*
+   * Content-type chip. The hue tells the operator at a glance what
+   * the response actually is, so a JSON-expecting recipe failing
+   * against an HTML body reads in the chip alone.
+   *
+   *   JSON  → --signal-info     (most recipes target JSON; neutral-positive)
+   *   HTML  → --signal-warning  (almost always a wrong-endpoint diagnosis)
+   *   XML   → --signal-info     (RSS / Atom / EUR-Lex; expected for some recipes)
+   *   TEXT  → --fg-tertiary     (neutral; could be CSV, plain text, etc.)
+   *   EMPTY → --fg-quaternary   (no body or stripped to whitespace)
+   *
+   * No --signal-negative variant: the chip describes what came back,
+   * not whether what came back was right. The outcome strip already
+   * carries the verdict; this chip is descriptive, not evaluative.
+   */
+  .response-shape-chip {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    padding: 1px 5px;
+    border-radius: 2px;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-canvas);
+  }
+  .response-shape-chip[data-shape="json"] {
+    color: var(--signal-info, var(--fg-secondary));
+    border-color: var(--signal-info, var(--border-subtle));
+  }
+  .response-shape-chip[data-shape="html"] {
+    color: var(--signal-warning, var(--fg-secondary));
+    border-color: var(--signal-warning, var(--border-subtle));
+  }
+  .response-shape-chip[data-shape="xml"] {
+    color: var(--signal-info, var(--fg-secondary));
+    border-color: var(--signal-info, var(--border-subtle));
+  }
+  .response-shape-chip[data-shape="text"] {
+    color: var(--fg-tertiary);
+  }
+  .response-shape-chip[data-shape="empty"] {
+    color: var(--fg-quaternary);
+  }
+
+  .response-length {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--fg-tertiary);
+    /* sits flush with the chip, no transform — read as a numeric
+       literal, not a uppercase label */
+    text-transform: none;
+    letter-spacing: 0;
+  }
+
+  .response-bytes-pre {
+    margin: 6px 0 0 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--fg-primary);
+    background: var(--bg-inset);
+    padding: 8px;
+    border-radius: 2px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    /* Bytes can be up to 64 KiB; cap the visible height so the
+       expanded affordance doesn't push other recipes off-screen.
+       Operators who need more open the re-author dialog (which
+       has its own scroll region tuned for diagnosis). */
+    max-height: 280px;
+    overflow-y: auto;
+  }
+
+  .response-bytes-empty {
+    margin: 6px 0 0 0;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--fg-quaternary);
+    font-style: italic;
   }
 </style>
