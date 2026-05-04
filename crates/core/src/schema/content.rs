@@ -21,6 +21,7 @@
 use crate::schema::geometry::Geometry;
 use crate::vocab::{CountryCode, Currency, EntityId, EventType, Topic, Unit};
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -28,7 +29,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// The content of an observation: a measurement of a metric.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct ObservationContent {
     /// What is being measured. Examples: "price", "production",
     /// "warehouse_stock", "capex", "fab_utilization". Lowercase snake_case.
@@ -61,7 +62,7 @@ pub struct ObservationContent {
     pub geometry: Option<Geometry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationPeriod {
     /// Point-in-time measurement (prices, inventory levels).
@@ -81,7 +82,7 @@ pub enum ObservationPeriod {
 // ---------------------------------------------------------------------------
 
 /// The content of a discrete dated event.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct EventContent {
     /// Controlled event type from `config/vocab/event_types.toml`.
     pub event_type: EventType,
@@ -113,7 +114,7 @@ pub struct EventContent {
     pub geometry: Option<Geometry>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventDirection {
     SupplyPositive,
@@ -130,7 +131,7 @@ pub enum EventDirection {
 /// The content of a directed edge between two entities.
 /// Examples: "A owns 49% of B", "country X exports 140kt to country Y",
 /// "company C has a supply contract with company D."
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct RelationContent {
     /// Kind of relation. Lowercase snake_case, extensible vocabulary.
     /// Examples: `ownership`, `trade_flow`, `supply_contract`,
@@ -273,5 +274,53 @@ mod tests {
         assert!(json.contains("country"));
         let back: AttributeValue = serde_json::from_str(&json).unwrap();
         assert_eq!(v, back);
+    }
+
+    // ---------------------------------------------------------------
+    // Track B (Session 28, ADR 0007 amendment 4)
+    //
+    // The recipe-author prompt now embeds JSON Schemas for the three
+    // authorable record types (Observation, Event, Relation) via the
+    // `{{TARGET_RECORD_SCHEMA}}` placeholder. The schemars-derived
+    // schema is the wire-truth the LLM is authoring against; the
+    // prompt no longer relies on prose alone for type expectations.
+    //
+    // These tests pin the derive: if `schema_for!` ever fails to
+    // compile or returns garbage, recipe authoring loses its
+    // schema-aware framing. They are deliberately structural (no
+    // exact-shape assertions on the schemars output, which can
+    // change between minor versions) — we only assert that the
+    // schema is non-empty and serializes to valid JSON.
+    //
+    // The pipeline crate's `target_record_schemas()` helper is the
+    // production consumer; see
+    // `crates/pipeline/src/recipe_author.rs::tests::
+    // target_record_schemas_emits_all_three_record_types`.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn observation_content_emits_json_schema() {
+        let schema = schemars::schema_for!(ObservationContent);
+        let s = serde_json::to_string(&schema).unwrap();
+        assert!(s.contains("metric"));
+        assert!(s.contains("value"));
+        assert!(s.contains("unit"));
+    }
+
+    #[test]
+    fn event_content_emits_json_schema() {
+        let schema = schemars::schema_for!(EventContent);
+        let s = serde_json::to_string(&schema).unwrap();
+        assert!(s.contains("event_type"));
+        assert!(s.contains("headline"));
+    }
+
+    #[test]
+    fn relation_content_emits_json_schema() {
+        let schema = schemars::schema_for!(RelationContent);
+        let s = serde_json::to_string(&schema).unwrap();
+        assert!(s.contains("kind"));
+        assert!(s.contains("from"));
+        assert!(s.contains("to"));
     }
 }

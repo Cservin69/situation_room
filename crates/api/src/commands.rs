@@ -1370,6 +1370,45 @@ pub async fn reauthor_recipe(
                     message: e.to_string(),
                 });
             }
+            // Track B (Session 28, ADR 0007 amendment 4): the LLM
+            // exercised the decline channel during re-author. The
+            // operator clicked "re-author" on a previously-failed
+            // recipe and the LLM responded "I cannot author a recipe
+            // for this source." Architecturally this is *not* a
+            // re-author failure (the LLM call worked, the schema
+            // validated, the answer was honest); architecturally it
+            // is a *new authoring outcome* on a path the frontend
+            // doesn't yet know about — `ReauthorDeclined` would be
+            // the disciplined wire shape but introducing it requires
+            // a frontend arm we're not adding in this fix-up.
+            //
+            // The pragmatic choice here is to surface the decline
+            // through the existing `ReauthorFailed` channel with a
+            // `[declined]` prefix on the message, so the operator
+            // sees the LLM's explanation in the dialog without a
+            // crashing UI. The follow-up — a real
+            // `CommandError::ReauthorDeclined { prior_recipe_id,
+            // reason }` variant + frontend handling — is documented
+            // in the Session 29 handoff as a Track B follow-up.
+            //
+            // The `[declined]` prefix is load-bearing: it is the
+            // only wire-distinguishable signal the frontend has
+            // today between "the gateway 500'd" and "the LLM read
+            // the source and said no recipe is possible." A future
+            // session must NOT remove this prefix without adding
+            // the dedicated wire variant first.
+            AuthoringError::Declined { reason } => {
+                warn!(
+                    prior_recipe_id = %parsed_recipe_id,
+                    decline_reason = %reason,
+                    "reauthor_recipe declined by LLM; surfacing through \
+                     ReauthorFailed channel pending dedicated wire variant"
+                );
+                return Err(CommandError::ReauthorFailed {
+                    prior_recipe_id: parsed_recipe_id.to_string(),
+                    message: format!("[declined] {reason}"),
+                });
+            }
         },
     };
 

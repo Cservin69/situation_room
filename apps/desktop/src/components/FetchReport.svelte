@@ -55,7 +55,7 @@
 <script lang="ts">
   import { plans } from '$stores/plans.svelte';
   import type { FetchRunSummaryDto } from '$lib/api/types/FetchRunSummaryDto';
-  import { outcomeTone, outcomeLabel, outcomeDetail } from '$lib/outcomes';
+  import { outcomeTone, outcomeLabel, outcomeDetail, outcomeKey } from '$lib/outcomes';
 
   function shortId(id: string): string {
     // UUIDv7s are too long for inline display; first 8 chars are
@@ -125,9 +125,23 @@
       <p class="empty">no outcomes were recorded — this is unexpected; check the logs.</p>
     {:else}
       <ul class="outcomes">
-        {#each report.outcomes as o (o.recipe_id)}
+        {#each report.outcomes as o (outcomeKey(o))}
           <li class="outcome" data-tone={outcomeTone(o)}>
-            <span class="recipe-id">{shortId(o.recipe_id)}</span>
+            {#if o.kind === 'declined'}
+              <!--
+                Track B (Session 28, ADR 0007 amendment 4): a declined
+                outcome carries no recipe_id (no recipe was created).
+                The first column shows a literal `decl·` marker so
+                the operator scan-reading the list sees the column
+                slot is intentionally blank, not "the recipe id is
+                missing." source-id and label sit in their normal
+                columns; the LLM's verbatim reason flows into the
+                detail row beneath.
+              -->
+              <span class="recipe-id decl-marker">decl·</span>
+            {:else}
+              <span class="recipe-id">{shortId(o.recipe_id)}</span>
+            {/if}
             <span class="source-id">{o.source_id}</span>
             <span class="status">{outcomeLabel(o)}</span>
             {#if outcomeDetail(o)}
@@ -280,6 +294,22 @@
     border-left-color: var(--signal-warning);
     background: var(--bg-panel-alt);
   }
+  /* Track B (Session 28, ADR 0007 amendment 4) — `declined`
+     outcomes get their own border treatment. The semantic
+     distinction from `failed` (red) and `rate_limited` (amber) is
+     load-bearing: a decline means no recipe was ever created. The
+     remediation is editorial (drop the source, escalate the model
+     tier, find an alternative) — re-running with no other change
+     gets the same decline. We render in `--fg-tertiary` (the same
+     dimmed neutral as `skip`) with the panel-alt background of
+     `fail`/`limited` to mark it as "outcome that needs attention,
+     but not red-alarm." Distinct from `skip` (no background) so
+     the LLM-decided cases stand apart from executor-decided
+     skips. */
+  .outcome[data-tone="declined"] {
+    border-left-color: var(--fg-tertiary);
+    background: var(--bg-panel-alt);
+  }
   /* Defensive: outcomeTone returns 'none' when the outcome is
      undefined, which can't happen for items inside the outcomes
      list (each list item is by construction a defined outcome).
@@ -288,6 +318,16 @@
   .outcome[data-tone="none"] { border-left-color: var(--border-subtle); }
 
   .recipe-id { color: var(--fg-quaternary); }
+  /* Track B (Session 28): declined rows have no recipe_id; we put
+     a literal "decl·" marker in the slot so the column doesn't go
+     blank (which would visually misalign the row) and so the
+     operator sees that the absence is intentional rather than
+     missing data. Italic + slightly dimmed to distinguish from a
+     real id without grabbing focus. */
+  .recipe-id.decl-marker {
+    color: var(--fg-quaternary);
+    font-style: italic;
+  }
   .source-id { color: var(--fg-secondary); }
   .status    { color: var(--fg-primary); justify-self: end; }
   .detail {

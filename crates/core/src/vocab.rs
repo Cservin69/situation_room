@@ -36,6 +36,7 @@
 //! (commodity seed list, event type taxonomy) live in `config/vocab/`
 //! as plain data, not as code.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -75,7 +76,7 @@ pub enum VocabError {
 /// session, not schema-enforced. The research planner is instructed via
 /// prompt to reuse existing strings when possible; synonym drift is managed
 /// there, not in the type system.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct Topic(String);
 
@@ -107,7 +108,7 @@ impl std::fmt::Display for Topic {
 // ---------------------------------------------------------------------------
 
 /// ISO 3166-1 alpha-2 country code. Always two uppercase ASCII letters.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct CountryCode(String);
 
@@ -142,7 +143,7 @@ impl std::fmt::Display for CountryCode {
 /// Validation: non-empty, ≤128 chars, ASCII-printable minus whitespace.
 /// Deliberately more permissive than other vocabs because entity naming
 /// is messy in practice.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct EntityId(String);
 
@@ -181,7 +182,7 @@ impl std::fmt::Display for EntityId {
 /// Like [`Topic`], the event type namespace is open — the research planner
 /// introduces new types as needed. The config file is a seed and a naming
 /// suggestion, not a hard allowlist.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct EventType(String);
 
@@ -219,7 +220,7 @@ impl std::fmt::Display for EventType {
 /// Common units in situation_room: "t" (metric ton), "kt" (kiloton),
 /// "USD/t" (price), "%" (percent), "1" (dimensionless),
 /// "USD" (raw currency amount), "units/month", "MWh".
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct Unit(String);
 
@@ -251,7 +252,7 @@ impl std::fmt::Display for Unit {
 // ---------------------------------------------------------------------------
 
 /// ISO 4217 alpha currency code. Always three uppercase ASCII letters.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct Currency(String);
 

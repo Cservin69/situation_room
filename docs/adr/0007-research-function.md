@@ -794,3 +794,208 @@ Amendment 3 also does **not** affect the runtime's LLM-free
 invariant (ADR 0007 §"runtime path"). The bytes are baked at
 *authoring* time by the LLM and stored verbatim; the *runtime*
 serves stored bytes deterministically. The two-level split holds.
+
+---
+
+## Amendment 4 (Session 28) — Decline path + schema-aware authoring
+
+**Status**: Accepted, in effect.
+**Scope**: Adds an honest exit on the LLM's authoring output for
+sources that don't admit a recipe under the closed extraction
+vocabulary; adds three prompt placeholders that give the LLM
+better grounding (the actual JSON Schemas of the target record
+types, the prior recipe's failure message when re-authoring, the
+operator's transient one-off note from the re-author dialog).
+The closed extraction-mode enum is unchanged. The two-level LLM
+architecture is unchanged. The runtime stays LLM-free.
+
+### What this amendment adds
+
+- **`decline_reason: String` on `RecipeAuthoringOutput`.** Empty-
+  string-as-absent (matches the existing `static_payload` /
+  `unit_hint` / `display` idiom; xAI's structured-output schema
+  rejects top-level `Option<String>` for some shapes). When non-
+  empty after trim, `build_validated_recipe` returns
+  `AuthoringError::Declined { reason }` **before** any URL,
+  extraction, or binding validation — a declined output isn't
+  required to populate those fields meaningfully, and applying
+  the secondary validators would surface a confusing "your URL
+  is invalid" error subordinate to the actual decline.
+- **`AuthoringError::Declined { reason }`** error variant. Length-
+  bounded by `Bounds::DECLINE_REASON` (2 000 chars; over-bounded
+  output surfaces as `InvalidRecipe`, not `Declined` — we got a
+  decline, but we can't accept its size).
+- **`RecipeOutcome::Declined { source_id, reason }`** outcome
+  variant on the executor's per-recipe outcome enum. **No
+  `recipe_id`** because no recipe was ever created. Surfaces in
+  `FetchReport.outcomes` so the operator sees the LLM's
+  explanation in the UI alongside any subsequently-run recipes.
+- **`load_or_author_recipes` now returns
+  `(Vec<FetchRecipe>, Vec<RecipeOutcome>)`.** Decline outcomes
+  from the per-source authoring loop are lifted into the second
+  Vec; the executor's `run_fetch_for_plan` prepends them to
+  `outcomes` before iterating recipes. They do **not** count
+  toward `recipes_attempted` (no recipe was attempted) or
+  `recipes_succeeded`. Declined sources never produce a recipe
+  to attempt, by design.
+- **Three new prompt placeholders.**
+  - `{{TARGET_RECORD_SCHEMA}}` — the schemars-derived JSON
+    Schemas for the three authorable record-content types
+    (`ObservationContent`, `EventContent`, `RelationContent`),
+    wrapped as a single object keyed by snake_case record-type
+    name. Computed at every call by
+    `pipeline::recipe_author::target_record_schemas`. Adds a few
+    KiB to the prompt's final size; well within
+    `Bounds::LLM_PROMPT_BODY` (256 KiB). Gives the LLM the wire
+    truth of the records it's authoring against rather than
+    relying on prompt-side prose for type expectations.
+  - `{{PREVIOUS_FAILURE_REASON}}` — the verbatim apply-stage
+    error message from the prior recipe, populated from
+    `AuthoringContext::previous_failure_reason` (set by
+    `reauthor_recipe`). Plain prose framing, **no fence** — the
+    failure message is the executor's own error chain, not
+    operator-supplied text, so there is no injection vector to
+    defend against. Empty string when fresh-authoring.
+  - `{{OPERATOR_GUIDANCE}}` — the transient one-off note the
+    operator typed in the re-author dialog (Session 27's Track
+    A surface). Fenced with the same per-call UUID nonce
+    treatment as `{{RECIPE_FEEDBACK}}` (the channel is
+    operator-supplied free text, so the byte-walk-with-nonce
+    discipline applies). Empty string when no guidance was
+    given.
+- **Schemars derives on the core content types.** `JsonSchema`
+  added to `vocab::{Topic, CountryCode, EntityId, EventType,
+  Unit, Currency}`, `schema::geometry::{Position, Geometry,
+  PointGeom, LineStringGeom, PolygonGeom, MultiPolygonGeom}`,
+  and `schema::content::{ObservationContent, EventContent,
+  RelationContent, ObservationPeriod, EventDirection}`. These
+  are the types `target_record_schemas` exposes; the derive
+  ripples through their dependencies but stops at the content
+  layer. Envelope, full record types, and assertion shapes do
+  NOT derive `JsonSchema` — they are not in the LLM's authoring
+  surface, and adding the derive would expand the schema the
+  LLM sees with metadata it has no business populating.
+- **`Bounds::DECLINE_REASON = 2 000`.** Sized to match
+  `RECIPE_FEEDBACK` and `REJECTION_REASON`: long enough for the
+  LLM to explain itself in a sentence or two, short enough to
+  keep the channel from drifting into narrative invention.
+- **Recipe-author prompt v1.9.** Four new prose sections:
+  - "When no recipe is honestly possible — the decline path"
+    teaches the LLM the four recurring decline shapes (JS SPA,
+    paywall, dead endpoint, structurally-inappropriate source)
+    and the framing that decline is not failure, but also not
+    the easy way out.
+  - "What the records you produce look like" introduces
+    `{{TARGET_RECORD_SCHEMA}}` and tells the LLM the schemas
+    are wire-truth, not prompt prose.
+  - "Type honesty" names the two recurring runtime-caught
+    failure modes (null-where-number, numeric-string-where-
+    number) and tells the LLM that when the source's type
+    can't be cleanly translated, decline is the right move.
+  - "Zero records is a valid outcome" acknowledges legitimate
+    empty-result-set cases so the LLM doesn't fabricate
+    placeholder records.
+  - "Defensive variants" surfaces the BBC CDATA case from
+    Session 13 and the JSON-key-presence-may-vary case as
+    examples of the structural-variant problem the single-shot
+    author can't see from one excerpt.
+
+### Why a flat `decline_reason` field, not a discriminated output
+
+The natural alternative was a top-level discriminated union:
+`Result<RecipeAuthoringOutput, DeclineOutput>` with `kind:
+"declined"` vs `kind: "authored"`. We chose the flat field
+deliberately:
+
+- xAI's structured-output schema gateway has historically
+  rejected top-level discriminated unions for nontrivial inner
+  shapes; the empty-string-as-absent idiom is the existing
+  workaround the codebase uses (see `static_payload`,
+  `unit_hint`, `display`).
+- A discriminated union forces the LLM to choose between two
+  top-level shapes *before* knowing which path applies, which
+  in practice yields more "I will try anyway" outputs (the LLM
+  picks `authored` because that is the longer / more detailed
+  branch and feels like the "main" output).
+- The flat shape lets the LLM author normally and only set
+  `decline_reason` when the obstacle is genuine — the schema
+  shows decline as a sibling field, not a competing top-level
+  alternative.
+
+A future session that finds the flat shape produces too many
+"declined for trivial reasons" outputs may revisit this; the
+test scaffold (`DecliningProvider` in `fetch_executor::tests`)
+makes the alternative cheap to A/B.
+
+### Why `JsonSchema` only on content types, not on full records
+
+The LLM's `field_mappings` populate fields **inside** the bare
+content types — `metric`, `value`, `headline`, `event_type`,
+`from`, `to`. The full record types
+(`Observation`, `Event`, `Relation`) wrap the content with an
+`Envelope` (subjects, time scope, provenance, confidence) that
+the runtime stamps server-side from the plan's `topic_tags` and
+the recipe's `provenance` field. The LLM never authors envelope
+fields; surfacing the envelope schema would invite the LLM to
+populate fields that the runtime overwrites, producing
+confusing-to-the-operator schemas that don't reflect what the
+recipe actually controls. Stopping the derive at the content
+layer keeps the schema the LLM sees focused on what the LLM
+actually authors.
+
+### What this amendment does NOT do
+
+- It does not wire `pdf_table` extraction (still
+  `RecipeOutcome::Skipped { reason: "...not implemented" }`;
+  Track C in the Session 25 spec, deferred).
+- It does not implement the automated re-author retry loop
+  (ADR 0012 §"When to automate"; the gate count remains 2/10).
+  The new `decline_reason` channel is operator-visible but the
+  decision to re-run, re-author, or drop the source is still
+  manual.
+- It does not change the closed extraction-mode enum. Adding a
+  sixth mode still requires an ADR update.
+- It does not affect the runtime's LLM-free invariant. The
+  decline check runs at *authoring* time; once a recipe is
+  persisted, no LLM call participates in fetching or applying
+  it.
+- It does not change the wire shape of any existing
+  `RecipeOutcome` variant. The `Declined` variant is purely
+  additive; existing frontend consumers that don't yet know
+  about it will fall through to their default-case rendering
+  (the TypeScript discriminated union check will flag the
+  missing arm at compile time once the regenerated DTO lands).
+
+### Code references (Track B, Session 28)
+
+- `crates/core/src/vocab.rs` — `JsonSchema` on the six newtype
+  vocab identifiers.
+- `crates/core/src/schema/geometry.rs` — `JsonSchema` on the
+  geometry shapes.
+- `crates/core/src/schema/content.rs` — `JsonSchema` on the
+  three authorable content types and their enum dependencies.
+- `crates/secure/src/bounds.rs` — `Bounds::DECLINE_REASON`.
+- `crates/pipeline/src/recipe_author.rs` — `decline_reason`
+  field on `RecipeAuthoringOutput`, `AuthoringError::Declined`
+  variant, `target_record_schemas` helper,
+  `render_previous_failure_reason` and `render_operator_guidance`
+  helpers, parametric `sanitize_for_fence_named` refactor, the
+  three new placeholder substitutions in
+  `build_prompt_with_fence_id`, the step-0 decline check in
+  `build_validated_recipe`.
+- `crates/pipeline/src/fetch_executor.rs` —
+  `RecipeOutcome::Declined`, the new return type on
+  `load_or_author_recipes`, the decline-prepending behaviour
+  in `run_fetch_for_plan`, the `DecliningProvider` test
+  scaffold.
+- `crates/api/src/types_export.rs` —
+  `RecipeOutcomeDto::Declined` variant + `From` arm.
+- `apps/desktop/src/lib/api/types/RecipeOutcomeDto.ts` —
+  regenerated to include the `declined` branch.
+- `apps/desktop/src/lib/outcomes.ts` — `'declined'` tone,
+  `outcomeKey` helper, `outcomeForRecipe` narrowing fix.
+- `apps/desktop/src/components/FetchReport.svelte` — keyed-each
+  switched to `outcomeKey`, declined-row rendering with the
+  `decl·` marker, `[data-tone="declined"]` CSS.
+- `config/prompts/recipe_author.md` v1.9 — four new prose
+  sections + three placeholder hookups.

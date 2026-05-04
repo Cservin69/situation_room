@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.8
+# Recipe Author Prompt — v1.9
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -76,6 +76,140 @@ Use `pdf_table` for authoritative annual reports (USGS MCS, SEC
 filings) where the structure is stable year-over-year. Use
 `regex_capture` only when no structured mode works.
 
+## When no recipe is honestly possible — the decline path
+
+The closed vocabulary above does not address every source. Some
+real failure shapes you will encounter:
+
+- **JS-rendered SPAs.** The static HTTP response carries no
+  extractable data; the actual content arrives via XHR/fetch after
+  page load. CSS selectors will match nothing because there is
+  nothing in the HTML to match.
+- **Authenticated / paywalled endpoints.** The body is a login
+  page, a 401 stub, or a subscription wall — never the data the
+  plan asks for.
+- **Dead or moved endpoints.** The `Sample URL` returns 404 or
+  redirects to a parking page; no replacement is identifiable from
+  the excerpt or from the source's well-known documentation.
+- **Structurally inappropriate sources for the plan's asks.** The
+  source covers a topic adjacent to the plan but doesn't carry the
+  fields the plan's expectations need (e.g. a press-release
+  archive when the plan asks for time-series numeric metrics).
+
+When you face one of these, **set the `decline_reason` field** in
+your output to a one-sentence explanation of what you saw and why
+the closed vocabulary cannot address it. Leave `source_url`,
+`extraction`, and `produces` populated with stub-shaped values
+(any well-formed contents that pass schema validation; they will
+not be used). The runtime will surface your decline to the
+operator as a distinct outcome, separate from runtime failures —
+the operator then decides whether to drop the source, find an
+alternative, or escalate the model tier.
+
+**Decline is not failure.** Authoring a plausible-shaped recipe
+against a JS SPA produces a recipe that will fail at every fetch,
+forever, until someone notices. Honest decline saves the operator
+time and preserves the trust contract that says: every recipe in
+the panel is one the LLM committed to.
+
+**Decline is not the easy way out.** If a source admits *any*
+reasonable extraction — even partial coverage of the plan's
+asks — write the recipe. Decline only when the closed vocabulary
+genuinely cannot address the source.
+
+## What the records you produce look like
+
+The runtime takes your recipe's `produces` bindings and stamps the
+extracted values into typed records of the bound `record_type`
+(observation, event, or relation). The record types' actual JSON
+shapes are reproduced below — **read them**. Field names, optional
+vs required fields, and the closed enums for `period` and
+`direction` are wire-truth, not prompt prose.
+
+```json
+{{TARGET_RECORD_SCHEMA}}
+```
+
+Use these schemas to ground your `field_mappings`: the `path` of
+each mapping must name a field that actually exists on the target
+record. If the schema says `period` is one of `instant`, `daily`,
+`weekly`, `monthly`, `quarterly`, `annual`, your literal value
+must be one of those exact strings — guessing "yearly" or
+"per_year" produces a record that fails to deserialize at apply
+time.
+
+## Type honesty
+
+The schemas above name field types (`f64`, `String`, optional
+arrays of `EntityId`, etc.). Honor them. Two recurring failure
+modes the runtime catches at apply time:
+
+- **Null where a number was expected.** A source's API returns
+  `"value": null` for a missing data point. Do not author against
+  the field as if it were a number — the deserializer rejects
+  `null` for `f64`. Either the binding belongs on a different
+  field that is non-null, or the recipe is honestly producing zero
+  records for the period (see "Zero records is a valid outcome"
+  below). Don't paper over it with a `literal` 0; that fabricates
+  data.
+- **Numeric strings where a number was expected.** A CSV column
+  reports `"1,234.5"` — the comma-thousands form. Most extractors
+  return the raw string; `f64` deserialization rejects the comma.
+  Pick a `field_mapping` `path` that targets the field's actual
+  type, or pick an extraction mode that returns the cleaned form
+  (some JSON APIs offer both string and numeric variants of the
+  same field — prefer the numeric one).
+
+When the source's type doesn't match the record's type and there
+is no clean translation, the right move is `decline_reason` —
+not a recipe that lies about types.
+
+## Zero records is a valid outcome
+
+A recipe that finds nothing on a given fetch is **not** broken.
+Some sources legitimately return empty result sets:
+
+- A press-release feed for a quiet week.
+- A regulatory filing search with no matches in the rolling
+  window.
+- An RSS feed pruned to the most recent N items, where N happens
+  to be empty between updates.
+
+Author the recipe so it produces records when records exist, and
+nothing when they don't. The runtime distinguishes "extractor
+matched nothing" (which is fine on its own; the outcome is
+`Succeeded { records_produced: 0 }`) from "extractor errored"
+(which surfaces as `Failed`). Don't add fallback logic that
+fabricates a placeholder record when the source is empty — that
+poisons downstream analytics.
+
+## Defensive variants — what to do when your first attempt may not match
+
+Sources that look uniform often have minor structural variants the
+single-shot author cannot see from one excerpt. Two recurring
+patterns from prior runs:
+
+- **CDATA-wrapped XML/RSS.** A feed shows `<title>Story title</title>`
+  in the excerpt; in production some items wrap the title in
+  `<![CDATA[ Story title ]]>` to preserve special characters. A
+  `regex_capture` against `<title>([^<]+)</title>` matches the
+  bare form but fails on the CDATA form. Where you can choose,
+  prefer `xpath`-style structural extractors (`css_select` on a
+  child element) over regex against tag pairs — the structural
+  form sees through CDATA wrappers.
+- **Optional fields appearing/disappearing.** A JSON API returns
+  `"price": 12.5` most of the time, `"price": null` occasionally,
+  and on rare days omits the key entirely. The three shapes
+  deserialize differently. If you must target this field, pick
+  the most permissive of the available variants, or accept that
+  some fetches will produce zero records (see above).
+
+When the source's variability is large enough that no single
+recipe works across all observed shapes, **`decline_reason`** is
+the honest answer. The runtime's re-author path will see the
+operator's diagnosis next time and you can author against a
+narrower, more honest target.
+
 ## The plan you are authoring for
 
 ```json
@@ -89,6 +223,10 @@ be attached automatically to every produced record — do not include
 them in your mappings.
 
 {{RECIPE_FEEDBACK}}
+
+{{PREVIOUS_FAILURE_REASON}}
+
+{{OPERATOR_GUIDANCE}}
 
 ## The source context
 
@@ -651,6 +789,33 @@ you pick.
 
 ### Changelog
 
+- **v1.9** (2026-05-04) — Track B (Session 28, ADR 0007 amendment 4).
+  Output contract changes: `decline_reason: String` is now an
+  expected field on `RecipeAuthoringOutput` (empty-string-as-absent
+  per the `static_payload` idiom; `build_validated_recipe` short-
+  circuits to `AuthoringError::Declined` when non-empty, before any
+  URL or binding validation, and the executor surfaces the result as
+  `RecipeOutcome::Declined` distinct from `Failed @ Apply`).
+  Three new placeholders: `{{TARGET_RECORD_SCHEMA}}` (the
+  schemars-derived JSON Schemas for ObservationContent /
+  EventContent / RelationContent — gives the LLM the actual wire
+  shape it's authoring against rather than relying on prompt-side
+  prose for type expectations); `{{PREVIOUS_FAILURE_REASON}}` (the
+  verbatim apply-stage error message from the prior recipe, plain
+  prose, no fence — the executor's own error chain has no injection
+  vector); `{{OPERATOR_GUIDANCE}}` (the transient one-off note the
+  operator typed in the re-author dialog, fenced with the same
+  per-call UUID nonce treatment as `{{RECIPE_FEEDBACK}}`). Four
+  new prose sections: "When no recipe is honestly possible" (the
+  decline path), "What the records you produce look like" (the
+  schema-aware framing), "Type honesty" (null-vs-numeric and
+  string-vs-numeric failure modes the runtime catches at apply
+  time), "Zero records is a valid outcome" (acknowledges legitimate
+  empty-result-set cases so the LLM doesn't fabricate placeholder
+  records), "Defensive variants" (the BBC CDATA case from Session 13
+  and the JSON-key-presence-may-vary case). Existing recipes lacking
+  `decline_reason` deserialize cleanly via serde defaults; no
+  re-authoring required for already-authored recipes.
 - **v1.8** (2026-05-02) — Added "Operator feedback on prior
   authoring" section, surfaced via the new `{{RECIPE_FEEDBACK}}`
   placeholder, between `## The plan you are authoring for` and

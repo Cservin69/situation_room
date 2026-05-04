@@ -25,6 +25,14 @@ import type { FailureStageDto } from "./FailureStageDto";
  *   warning amber to distinguish it from `failed` red — re-running
  *   later is meaningful for a rate-limit, pointless for a broken
  *   recipe.
+ * - `declined` — Track B, Session 28, ADR 0007 amendment 4. The
+ *   recipe-author LLM declined to write a recipe for this source
+ *   and explained why. **No `recipe_id`** — no recipe was created.
+ *   The frontend renders this in a distinct tone (`'declined'`) so
+ *   the operator sees an authoring-stage decision, not a runtime
+ *   failure. Remediation is editorial: drop the source, find an
+ *   alternative, escalate the model tier — re-running the same
+ *   inputs gets the same decline.
  */
 export type RecipeOutcomeDto = { "kind": "succeeded", recipe_id: string, source_id: string, records_produced: number, } | { "kind": "skipped", recipe_id: string, source_id: string, reason: string, } | { "kind": "failed", recipe_id: string, source_id: string, stage: FailureStageDto, message: string, } | { "kind": "rate_limited", recipe_id: string, source_id: string, 
 /**
@@ -33,4 +41,4 @@ export type RecipeOutcomeDto = { "kind": "succeeded", recipe_id: string, source_
  * server returned 429 with no machine-readable hint. The
  * frontend formats both cases via `outcomes.ts`.
  */
-retry_after_seconds: bigint | null, };
+retry_after_seconds: bigint | null, } | { "kind": "declined", source_id: string, reason: string, };

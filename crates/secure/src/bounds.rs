@@ -76,6 +76,23 @@ impl Bounds {
     /// See `crates/pipeline/src/recipe_author.rs::AuthoringContext`.
     pub const RECIPE_FEEDBACK: usize = 2_000;
 
+    /// LLM-authored decline reason on `RecipeAuthoringOutput`. Track B
+    /// (Session 28, ADR 0007 amendment 4): the recipe-author prompt
+    /// gives the LLM a `decline_reason` field for sources that don't
+    /// admit a recipe under the closed extraction vocabulary. The
+    /// LLM's explanation should be a sentence or two — long enough
+    /// to be useful in the operator UI, short enough to keep the
+    /// channel from drifting into a narrative explanation that
+    /// invites the LLM to invent context.
+    ///
+    /// 2 000 chars matches `RECIPE_FEEDBACK` and `REJECTION_REASON`
+    /// for the same reason: "this is wrong because X" sized for a
+    /// sentence or two. The named constant is distinct so the limit
+    /// can diverge if a future session learns the LLM benefits from
+    /// more or less room. See
+    /// `crates/pipeline/src/recipe_author.rs::build_validated_recipe`.
+    pub const DECLINE_REASON: usize = 2_000;
+
     /// A single URL.
     pub const URL: usize = 2_048;
 

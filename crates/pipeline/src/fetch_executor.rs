@@ -185,6 +185,38 @@ pub enum RecipeOutcome {
         source_id: String,
         retry_after_seconds: Option<u64>,
     },
+    /// The recipe-author LLM declined to write a recipe for this
+    /// source and explained why through the `decline_reason` field of
+    /// [`crate::recipe_author::RecipeAuthoringOutput`]. Track B
+    /// (Session 28, ADR 0007 amendment 4).
+    ///
+    /// Distinct from [`RecipeOutcome::Failed`] (a recipe ran and
+    /// broke), [`RecipeOutcome::Skipped`] (the executor itself chose
+    /// not to run a recipe — pdf_table not yet wired), and
+    /// [`RecipeOutcome::RateLimited`] (the source threw 429): a
+    /// `Declined` outcome means **no recipe was created at all**, on
+    /// the LLM's honest assessment that the source doesn't admit one
+    /// under the closed extraction vocabulary.
+    ///
+    /// Carries `source_id` and `reason` only — there is no
+    /// `recipe_id` because no recipe exists. The frontend renders
+    /// this in a distinct tone so the operator sees an authoring-
+    /// stage decision rather than a runtime failure; the appropriate
+    /// remediation is editorial (drop the source, find an
+    /// alternative, escalate the model tier) rather than retrying
+    /// the same recipe.
+    ///
+    /// Declined outcomes are produced by the executor's
+    /// `load_or_author_recipes` step on first authoring; once a plan
+    /// has any persisted recipes, that step short-circuits and no
+    /// new authoring runs, so subsequent fetch runs against the same
+    /// plan never produce `Declined` outcomes for already-authored
+    /// sources. The previous decline lives in the operator's
+    /// memory of the prior run's report.
+    Declined {
+        source_id: String,
+        reason: String,
+    },
 }
 
 /// Stage at which a recipe's run failed. Closed enum so the UI's
@@ -289,9 +321,15 @@ pub async fn run_fetch_for_plan(
         }
     };
 
-    // 3. Load-or-author recipes for the plan.
-    let recipes = match load_or_author_recipes(ctx, &plan).await {
-        Ok(r) => r,
+    // 3. Load-or-author recipes for the plan. Track B (Session 28):
+    //    `load_or_author_recipes` now also returns any
+    //    `RecipeOutcome::Declined` entries from the LLM declining
+    //    via `decline_reason`. Declines are surfaced to the operator
+    //    in the report's `outcomes` (prepended before any per-recipe
+    //    outcomes) and do NOT count toward `recipes_attempted` —
+    //    declined sources never produced a recipe to attempt.
+    let (recipes, decline_outcomes) = match load_or_author_recipes(ctx, &plan).await {
+        Ok(pair) => pair,
         Err(e) => {
             close_run_with_error(ctx.store, &mut run_row, &e.to_string());
             return Err(e);
@@ -302,6 +340,7 @@ pub async fn run_fetch_for_plan(
         plan_id = %plan_id,
         run_id = %run_id,
         recipe_count = recipes.len(),
+        declined_count = decline_outcomes.len(),
         "recipes prepared, executing"
     );
 
@@ -309,7 +348,26 @@ pub async fn run_fetch_for_plan(
     //    they get reported and we move on. This is what "deterministic
     //    runtime" feels like to the user: a partial failure leaves a
     //    partial result with a precise account of what worked.
-    let mut outcomes = Vec::with_capacity(recipes.len());
+    //
+    //    Track B (Session 28): start the outcomes Vec with any
+    //    declines from the authoring step. They appear first in the
+    //    UI list because they happened first in time (authoring
+    //    precedes per-recipe execution). Their order within the list
+    //    matches `load_or_author_recipes`'s source-iteration order,
+    //    which itself reflects Level-1's source-priority hierarchy.
+    let mut outcomes: Vec<RecipeOutcome> = Vec::with_capacity(decline_outcomes.len() + recipes.len());
+    for declined in &decline_outcomes {
+        if let RecipeOutcome::Declined { source_id, reason } = declined {
+            warn!(
+                plan_id = %plan_id,
+                run_id = %run_id,
+                source_id = %source_id,
+                decline_reason = %reason,
+                "recipe author declined this source; surfacing in report"
+            );
+        }
+    }
+    outcomes.extend(decline_outcomes);
     let mut records_produced_total: u32 = 0;
     let mut recipes_succeeded: u32 = 0;
     let recipes_attempted: u32 = recipes.len() as u32;
@@ -342,6 +400,26 @@ pub async fn run_fetch_for_plan(
                     run_id = %run_id,
                     retry_after_seconds = ?retry_after_seconds,
                     "recipe rate-limited"
+                );
+            }
+            // Track B: a `Declined` outcome cannot reach this match
+            // arm — declines are produced by `load_or_author_recipes`
+            // (and prepended to `outcomes` above) before this loop
+            // ever runs, and `run_one_recipe` itself never returns
+            // `Declined`. The arm exists to keep the match
+            // exhaustive and to flag the invariant: if a future
+            // session ever extends `run_one_recipe` to return
+            // `Declined`, the run-counter logic above needs
+            // revisiting (today, Declined doesn't bump
+            // `recipes_attempted` or `recipes_succeeded`).
+            RecipeOutcome::Declined { source_id, reason } => {
+                warn!(
+                    plan_id = %plan_id,
+                    run_id = %run_id,
+                    source_id = %source_id,
+                    decline_reason = %reason,
+                    "unexpected: run_one_recipe returned Declined; \
+                     declines should originate in load_or_author_recipes"
                 );
             }
         }
@@ -419,13 +497,36 @@ async fn prepare_plan(
 /// matching belongs to the source registry (Phase 3) and isn't in
 /// this session's scope. Treating empty `preferred_source_ids` as
 /// "no binding to author against here" is the honest, narrow scope.
+///
+/// Returns `(recipes, decline_outcomes)`:
+/// - `recipes` is the Vec of successfully authored (or pre-existing)
+///   `FetchRecipe`s for the run loop to iterate.
+/// - `decline_outcomes` carries `RecipeOutcome::Declined` entries for
+///   sources where the LLM declined via Track B's `decline_reason`
+///   channel. The run loop prepends these to the report's `outcomes`
+///   so the operator sees the LLM's explanation alongside any
+///   subsequently-run recipes.
+///
+/// Per-source authoring failures *other than* `Declined` (LLM call
+/// errors, schema parse errors, structural validation rejects) keep
+/// the prior session's behaviour: log loudly and continue. They do
+/// not surface as outcomes — the warn log is the audit trail. The
+/// rationale is the same as before Track B: a transient provider
+/// error or a single malformed output shouldn't poison the run loop,
+/// and the operator can read the logs / re-run if needed. A `Declined`
+/// outcome is structurally different: the LLM's signal is "no, this
+/// won't work," which deserves to surface visibly because the
+/// remediation is editorial rather than transient.
 async fn load_or_author_recipes(
     ctx: &ExecutorContext<'_>,
     plan: &ResearchPlan,
-) -> Result<Vec<FetchRecipe>, FetchExecutorError> {
+) -> Result<(Vec<FetchRecipe>, Vec<RecipeOutcome>), FetchExecutorError> {
     let existing = load_recipes_for_plan(ctx.store, plan.id)?;
     if !existing.is_empty() {
-        return Ok(existing);
+        // Recipes already authored — no fresh LLM call, no decline
+        // path to surface. Return whatever already lives in storage
+        // and an empty declines vec.
+        return Ok((existing, Vec::new()));
     }
 
     // Flatten the (hint, source_id) pairs into a single Vec so we
@@ -460,6 +561,7 @@ async fn load_or_author_recipes(
     );
 
     let mut authored = Vec::new();
+    let mut declines: Vec<RecipeOutcome> = Vec::new();
     for (idx, source_id) in sources.iter().enumerate() {
         let position = idx + 1;
         info!(
@@ -473,6 +575,29 @@ async fn load_or_author_recipes(
             Ok(recipe) => {
                 save_recipe(ctx.store, &recipe)?;
                 authored.push(recipe);
+            }
+            // Track B (Session 28): the LLM exercised the decline
+            // channel. This is structurally different from other
+            // authoring errors — it is the LLM's deliberate "I have
+            // looked at this source and the closed extraction
+            // vocabulary cannot address it" signal. Surface it as a
+            // `RecipeOutcome::Declined` so the operator sees the
+            // explanation in the fetch report, distinct from "this
+            // source is broken" or "the recipe failed at apply
+            // time." No `recipe_id` because no recipe exists.
+            Err(FetchExecutorError::Authoring(AuthoringError::Declined { reason })) => {
+                info!(
+                    plan_id = %plan.id,
+                    source_id = %source_id,
+                    position,
+                    total,
+                    decline_reason = %reason,
+                    "recipe author declined for this source; surfacing as RecipeOutcome::Declined"
+                );
+                declines.push(RecipeOutcome::Declined {
+                    source_id: source_id.clone(),
+                    reason,
+                });
             }
             Err(e) => {
                 // Per-source authoring failures shouldn't abort
@@ -504,10 +629,11 @@ async fn load_or_author_recipes(
         plan_id = %plan.id,
         total_sources = total,
         succeeded = authored.len(),
+        declined = declines.len(),
         "authoring recipes for plan: complete"
     );
 
-    Ok(authored)
+    Ok((authored, declines))
 }
 
 /// Sources to author recipes against, derived from a single
@@ -1801,6 +1927,16 @@ mod tests {
                 RecipeOutcome::RateLimited { .. } => {
                     panic!("no rate-limit expected here")
                 }
+                // Track B, Session 28: this test pre-saves recipes
+                // before running the executor, so the
+                // `load_or_author_recipes` step short-circuits and
+                // no LLM authoring runs — no path to a Declined
+                // outcome. If one ever materialises here, the
+                // executor's outcome shape has drifted in a way the
+                // test should surface, not absorb.
+                RecipeOutcome::Declined { .. } => {
+                    panic!("no decline expected here (pre-saved recipes)")
+                }
             }
         }
         assert_eq!(succeeded, 1);
@@ -3057,5 +3193,166 @@ mod tests {
             AuthoredFrom::StubExcerpt,
             "missing descriptor must stamp StubExcerpt"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Track B (Session 28, ADR 0007 amendment 4): the decline path.
+    //
+    // When the recipe-author LLM returns a `RecipeAuthoringOutput`
+    // with a non-empty `decline_reason`, `build_validated_recipe`
+    // surfaces it as `AuthoringError::Declined`, and
+    // `load_or_author_recipes` lifts that into a
+    // `RecipeOutcome::Declined` carried in the executor's outcomes
+    // list. The recipe is NEVER persisted (no `recipe_id` exists),
+    // and the run's `recipes_attempted` counter is NOT bumped — the
+    // declined source did not contribute a recipe to attempt.
+    //
+    // The provider below is a `DecliningProvider`: a sibling of
+    // `RecordingProvider` that returns a structured output with a
+    // populated `decline_reason`. This is the only test scaffold in
+    // the executor that exercises the decline channel end-to-end;
+    // unit-level coverage of `build_validated_recipe`'s decline
+    // checks lives in `recipe_author::tests`.
+    // -----------------------------------------------------------------------
+
+    /// Test provider that always returns a declined authoring output.
+    /// Used by the executor's decline-path tests below.
+    struct DecliningProvider {
+        reason: String,
+    }
+
+    impl DecliningProvider {
+        fn new(reason: impl Into<String>) -> Self {
+            Self {
+                reason: reason.into(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for DecliningProvider {
+        fn id(&self) -> &'static str {
+            "declining"
+        }
+        fn supported_tiers(&self) -> &[ModelTier] {
+            &[ModelTier::Workhorse]
+        }
+        async fn complete(
+            &self,
+            _tier: ModelTier,
+            _req: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            // The schema requires `source_url`, `extraction`, and
+            // `produces` to be present (they're not `Option`); the
+            // decline contract says they may be stubbed when
+            // `decline_reason` is set. Stub them with values that
+            // would fail downstream validation if the decline-check
+            // didn't short-circuit — that's how we know the decline
+            // path runs first.
+            let canned = serde_json::json!({
+                "source_url": "https://example.invalid/declined",
+                "extraction": {
+                    "mode": "csv_cell",
+                    "column": "ignored",
+                    "row_filter": null
+                },
+                "produces": [{
+                    "record_type": "observation",
+                    "expectation": { "list": "observation_metric", "index": 0 },
+                    "field_mappings": [
+                        { "path": "value", "source": { "kind": "extracted" } }
+                    ]
+                }],
+                "static_payload": "",
+                "decline_reason": self.reason,
+            });
+            Ok(CompletionResponse {
+                text: serde_json::to_string(&canned).unwrap(),
+                structured: Some(canned),
+                provider: "declining".into(),
+                model: "declining-test".into(),
+                input_tokens: None,
+                output_tokens: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn declined_source_surfaces_as_declined_outcome() {
+        let plan = sample_plan(); // one bound source: "demo_csv"
+        let store = make_store_with_accepted_plan(&plan);
+
+        // Empty fetcher: no recipe will ever be applied. If the
+        // decline path doesn't short-circuit authoring, the test
+        // would surface a different failure (missing fixture).
+        let fetcher = StaticFetcher::new();
+        let provider = DecliningProvider::new(
+            "this source is a JS-rendered SPA; the static HTTP \
+             response carries no extractable data",
+        );
+        let sources: Vec<SourceDescriptor> = vec![];
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            sources: &sources,
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        // No recipe was authored (the LLM declined).
+        assert_eq!(
+            report.recipes_attempted, 0,
+            "declined sources don't contribute to recipes_attempted"
+        );
+        assert_eq!(report.recipes_succeeded, 0);
+        assert_eq!(report.records_produced, 0);
+        // No recipe was persisted.
+        assert!(store.recipes_for_plan(plan.id).unwrap().is_empty());
+        // The decline surfaces as exactly one outcome.
+        assert_eq!(report.outcomes.len(), 1);
+        match &report.outcomes[0] {
+            RecipeOutcome::Declined { source_id, reason } => {
+                assert_eq!(source_id, "demo_csv");
+                assert!(
+                    reason.contains("JS-rendered SPA"),
+                    "decline reason verbatim: {reason}"
+                );
+            }
+            other => panic!("expected Declined, got: {other:?}"),
+        }
+    }
+
+    /// A re-run after a decline does NOT replay the decline. The
+    /// previous run produced no persisted recipes, so the next call
+    /// to `load_or_author_recipes` will *also* go through the
+    /// authoring branch — but this is a behaviour of "no recipes
+    /// persisted yet" rather than a memoization of the decline
+    /// itself. We assert it explicitly so future sessions reading
+    /// the test understand the invariant.
+    #[tokio::test]
+    async fn second_run_after_decline_re_attempts_authoring() {
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let fetcher = StaticFetcher::new();
+        let provider = DecliningProvider::new("declined again");
+        let sources: Vec<SourceDescriptor> = vec![];
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            sources: &sources,
+        };
+
+        let _r1 = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+        let r2 = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+        // Same shape on the second run.
+        assert_eq!(r2.outcomes.len(), 1);
+        assert!(matches!(r2.outcomes[0], RecipeOutcome::Declined { .. }));
+        // Still no recipes persisted.
+        assert!(store.recipes_for_plan(plan.id).unwrap().is_empty());
     }
 }

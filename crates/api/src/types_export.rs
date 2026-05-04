@@ -538,6 +538,14 @@ pub struct FetchReportDto {
 ///   warning amber to distinguish it from `failed` red — re-running
 ///   later is meaningful for a rate-limit, pointless for a broken
 ///   recipe.
+/// - `declined` — Track B, Session 28, ADR 0007 amendment 4. The
+///   recipe-author LLM declined to write a recipe for this source
+///   and explained why. **No `recipe_id`** — no recipe was created.
+///   The frontend renders this in a distinct tone (`'declined'`) so
+///   the operator sees an authoring-stage decision, not a runtime
+///   failure. Remediation is editorial: drop the source, find an
+///   alternative, escalate the model tier — re-running the same
+///   inputs gets the same decline.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -566,6 +574,16 @@ pub enum RecipeOutcomeDto {
         /// server returned 429 with no machine-readable hint. The
         /// frontend formats both cases via `outcomes.ts`.
         retry_after_seconds: Option<u64>,
+    },
+    /// Track B (Session 28, ADR 0007 amendment 4): the LLM declined
+    /// to author a recipe and explained why. No `recipe_id` because
+    /// no recipe was created. `source_id` carries the source the
+    /// decline applied to; `reason` is the LLM's verbatim
+    /// explanation (bounded by `Bounds::DECLINE_REASON` at authoring
+    /// time, ~2 000 chars).
+    Declined {
+        source_id: String,
+        reason: String,
     },
 }
 
@@ -657,6 +675,14 @@ impl From<situation_room_pipeline::fetch_executor::RecipeOutcome> for RecipeOutc
                 recipe_id: recipe_id.to_string(),
                 source_id,
                 retry_after_seconds,
+            },
+            // Track B (Session 28, ADR 0007 amendment 4): the LLM
+            // declined to author a recipe. No recipe_id because no
+            // recipe exists; only the source the decline applied to
+            // and the LLM's verbatim explanation cross the wire.
+            O::Declined { source_id, reason } => RecipeOutcomeDto::Declined {
+                source_id,
+                reason,
             },
         }
     }
@@ -1381,6 +1407,48 @@ mod tests {
         let json = serde_json::to_string(&limited_no_value).unwrap();
         assert!(json.contains(r#""kind":"rate_limited""#), "got {json}");
         assert!(json.contains(r#""retry_after_seconds":null"#), "got {json}");
+
+        // Track B, Session 28 — declined variant. Tagged with
+        // `kind: "declined"` (snake_case via the serde rename).
+        // Distinguishing wire-shape feature: there is **no
+        // `recipe_id` field** because no recipe was created. The
+        // frontend's discriminated-union handling must therefore
+        // accept that key as absent on the `declined` arm — this
+        // test pins it.
+        let declined = RecipeOutcomeDto::Declined {
+            source_id: "demo_spa".into(),
+            reason: "this source is a JS-rendered SPA; the static \
+                     HTTP response carries no extractable data"
+                .into(),
+        };
+        let json = serde_json::to_string(&declined).unwrap();
+        assert!(json.contains(r#""kind":"declined""#), "got {json}");
+        assert!(json.contains(r#""source_id":"demo_spa""#), "got {json}");
+        assert!(json.contains("JS-rendered SPA"), "got {json}");
+        assert!(
+            !json.contains("recipe_id"),
+            "declined must not carry a recipe_id field; got {json}"
+        );
+    }
+
+    /// Track B (Session 28): a `Declined` outcome from the typed
+    /// `RecipeOutcome` enum lifts cleanly into the DTO via the
+    /// `From` impl. Pins the wire shape against accidental drift.
+    #[test]
+    fn recipe_outcome_dto_lifts_declined_from_typed() {
+        use situation_room_pipeline::fetch_executor::RecipeOutcome;
+        let typed = RecipeOutcome::Declined {
+            source_id: "demo_spa".into(),
+            reason: "no static payload available".into(),
+        };
+        let dto: RecipeOutcomeDto = typed.into();
+        match dto {
+            RecipeOutcomeDto::Declined { source_id, reason } => {
+                assert_eq!(source_id, "demo_spa");
+                assert_eq!(reason, "no static payload available");
+            }
+            other => panic!("expected Declined, got: {other:?}"),
+        }
     }
 
     #[test]

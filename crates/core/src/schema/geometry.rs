@@ -8,10 +8,11 @@
 //! make it explicit, use [`Position::new(lon, lat)`] and fields
 //! [`Position::lon`]/[`Position::lat`] rather than tuple access.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// A geographic position in WGS84, longitude first (GeoJSON convention).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct Position {
     pub lon: f64,
     pub lat: f64,
@@ -31,7 +32,7 @@ impl Position {
 }
 
 /// Geometry — attached as an optional field to Entity, Event, Observation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(tag = "type", rename_all = "PascalCase")]
 pub enum Geometry {
     Point(PointGeom),
@@ -40,12 +41,12 @@ pub enum Geometry {
     MultiPolygon(MultiPolygonGeom),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct PointGeom {
     pub coordinates: Position,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct LineStringGeom {
     pub coordinates: Vec<Position>,
 }
@@ -54,13 +55,13 @@ pub struct LineStringGeom {
 /// is a closed ring of positions (last == first). We don't enforce
 /// closure here — consumers that need topology (point-in-polygon) can
 /// close rings themselves.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct PolygonGeom {
     /// `rings[0]` is the outer ring. `rings[1..]` are holes.
     pub coordinates: Vec<Vec<Position>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct MultiPolygonGeom {
     pub coordinates: Vec<Vec<Vec<Position>>>,
 }
