@@ -1,0 +1,68 @@
+-- situation_room schema, version 0014.
+--
+-- Surface the response Content-Type header alongside the captured
+-- bytes-excerpt for failed-apply attempts. Session 32 (P2 from
+-- Session 31's handoff). Promotes the response-bytes chip in
+-- `RecipesPanel.svelte` from a heuristic byte-sniffer to an
+-- authoritative reading of what the server claimed it returned.
+--
+-- ## Why a column rather than a sibling table
+--
+-- The Content-Type belongs to the same lifecycle event the bytes
+-- excerpt does — it is *what the server said about those bytes*.
+-- Splitting it into a separate `recipe_fetch_attempt_headers` table
+-- would force a 1:1 join for every read and pay nothing back: there
+-- is no use case for headers without their bytes, or for headers
+-- across attempts. Same shape, same row.
+--
+-- A future "all response headers" surface (see ADR 0009 Amendment in
+-- Session 25 — `SecureHeaderMap`'s closed allow-list) would still
+-- live as additional columns on this table, not as a sibling. The
+-- allow-list is short by design.
+--
+-- ## Why nullable, no DEFAULT, no constraint
+--
+-- Three reasons:
+--
+--   1. Existing rows from migration 0013 have no header capture.
+--      NULL is the honest representation of "we never recorded this
+--      for this row" — distinct from "we recorded it as empty," which
+--      doesn't happen in practice (servers either send Content-Type
+--      or omit it entirely).
+--   2. The DuckDB ALTER trap from Session 5/8 (`ADD COLUMN ... NOT
+--      NULL DEFAULT ...` rejected; split-and-SET-NOT-NULL blocked by
+--      indexes on the table). The
+--      `recipe_fetch_attempts_recipe_id_attempted_at_idx` and
+--      `recipe_fetch_attempts_run_id_idx` indexes from migration 0013
+--      both bite. A nullable column with no default sidesteps both
+--      paths cleanly.
+--   3. The Rust write path in `Store::insert_recipe_fetch_attempt`
+--      always sets the column on new rows (the runtime always knows
+--      whether the server sent the header), so the typed invariant
+--      lives in Rust where it can carry a useful error message —
+--      same discipline as the `status` column on `research_plans`.
+--
+-- ## Header-value handling
+--
+-- The wire value is whatever `SecureHeaderMap::content_type()`
+-- returns: the raw header value as the server sent it, e.g.
+-- `application/json; charset=utf-8` or `text/html; charset=UTF-8`.
+-- The MIME-parameter parsing happens at presentation time (the
+-- Svelte chip splits on `;`, takes the type/subtype, and maps to
+-- the chip's enum). Storing the raw value preserves the source-of-
+-- truth header for any future analyzer that wants the parameters
+-- (charset, boundary, etc.) without a re-fetch.
+--
+-- ## Privacy posture (ADR 0009)
+--
+-- Content-Type is request-side metadata about the response body.
+-- It carries no auth material, no user identifier, no session
+-- token. It is the most innocuous response header in the closed
+-- allow-list and is safe to store at rest in the single-user
+-- desktop database.
+
+ALTER TABLE recipe_fetch_attempts ADD COLUMN response_content_type TEXT;
+
+-- Record this migration.
+INSERT INTO schema_migrations (version, description)
+    VALUES (14, 'recipe_fetch_attempts.response_content_type column');

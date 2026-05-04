@@ -971,6 +971,14 @@ impl RecipeFeedbackDto {
 /// practice every captured row from Track A has both populated, but
 /// the wire shape doesn't pin that and shouldn't (storage can carry
 /// looser shapes than the runtime emits).
+///
+/// `response_content_type` (Session 32) carries the raw response
+/// `Content-Type` header value when the underlying transport
+/// surfaced one, else `None`. The frontend's response-bytes chip
+/// (`RecipesPanel.svelte`) prefers this value when present and
+/// falls back to the heuristic byte-sniffer when absent. `None`
+/// means one of: row predates migration 0014, server omitted the
+/// header, or the bytes came from a `static_payload` (no transport).
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
 pub struct RecipeFetchAttemptDto {
@@ -981,6 +989,7 @@ pub struct RecipeFetchAttemptDto {
     pub succeeded: bool,
     pub failure_message: Option<String>,
     pub bytes_excerpt: Option<String>,
+    pub response_content_type: Option<String>,
 }
 
 impl RecipeFetchAttemptDto {
@@ -995,6 +1004,7 @@ impl RecipeFetchAttemptDto {
             succeeded: r.succeeded,
             failure_message: r.failure_message,
             bytes_excerpt: r.bytes_excerpt,
+            response_content_type: r.response_content_type,
         }
     }
 }
@@ -1500,6 +1510,56 @@ mod tests {
         assert_eq!(dto.id, stored.id.to_string());
         assert_eq!(dto.recipes_attempted, 2);
         assert!(dto.finished_at.is_some());
+    }
+
+    /// Session 32: the response Content-Type round-trips from
+    /// `StoredRecipeFetchAttempt` into the wire DTO. The chip in
+    /// `RecipesPanel.svelte` consumes this field directly; the
+    /// from_stored path is the only place the wire shape can
+    /// silently drop the value.
+    #[test]
+    fn recipe_fetch_attempt_dto_round_trips_response_content_type() {
+        use chrono::TimeZone;
+        let stored = situation_room_storage::StoredRecipeFetchAttempt {
+            id: uuid::Uuid::now_v7(),
+            recipe_id: uuid::Uuid::now_v7(),
+            run_id: uuid::Uuid::now_v7(),
+            attempted_at: chrono::Utc.with_ymd_and_hms(2026, 5, 4, 12, 0, 0).unwrap(),
+            succeeded: false,
+            failure_message: Some("apply: jsonpath did not match".into()),
+            bytes_excerpt: Some("{\"hello\":\"world\"}".into()),
+            response_content_type: Some("application/json; charset=utf-8".into()),
+        };
+        let dto = RecipeFetchAttemptDto::from_stored(stored.clone());
+        assert_eq!(dto.id, stored.id.to_string());
+        assert_eq!(dto.recipe_id, stored.recipe_id.to_string());
+        assert!(!dto.succeeded);
+        assert_eq!(
+            dto.response_content_type.as_deref(),
+            Some("application/json; charset=utf-8")
+        );
+    }
+
+    /// Mirror of the round-trip test for the absent-header case:
+    /// pre-migration rows and rows whose server omitted the header
+    /// must surface as `None` on the wire, not as the empty string.
+    /// The frontend chip's fallback-to-heuristic branch keys on
+    /// `null`.
+    #[test]
+    fn recipe_fetch_attempt_dto_carries_none_when_header_absent() {
+        use chrono::TimeZone;
+        let stored = situation_room_storage::StoredRecipeFetchAttempt {
+            id: uuid::Uuid::now_v7(),
+            recipe_id: uuid::Uuid::now_v7(),
+            run_id: uuid::Uuid::now_v7(),
+            attempted_at: chrono::Utc.with_ymd_and_hms(2026, 5, 4, 12, 0, 0).unwrap(),
+            succeeded: false,
+            failure_message: Some("apply: regex pattern did not match".into()),
+            bytes_excerpt: Some("plain text body".into()),
+            response_content_type: None,
+        };
+        let dto = RecipeFetchAttemptDto::from_stored(stored);
+        assert_eq!(dto.response_content_type, None);
     }
 
     #[test]

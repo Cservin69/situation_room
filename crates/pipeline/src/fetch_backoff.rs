@@ -53,7 +53,7 @@
 use std::time::Duration;
 use tracing::{info, warn};
 
-use crate::http_fetcher::{FetchError, HttpFetcher};
+use crate::http_fetcher::{FetchError, FetchedBytes, HttpFetcher};
 
 /// Maximum `Retry-After` value (in seconds) for which we sleep
 /// inline and retry. Larger values surface to the operator without
@@ -62,9 +62,11 @@ const SHORT_BACKOFF_CEILING_SECS: u64 = 60;
 
 /// Result of a backoff-aware fetch. Three shapes:
 ///
-/// - `Bytes(...)` — the body, as if we'd never hit a rate limit
-///   (either because we weren't, or because the inline retry
-///   succeeded).
+/// - `Bytes { body, content_type }` — the body, as if we'd never hit
+///   a rate limit (either because we weren't, or because the inline
+///   retry succeeded). Carries the response `Content-Type` header
+///   value when the underlying fetcher surfaced one (Session 32);
+///   `None` when it didn't.
 /// - `RateLimited { ... }` — the server returned 429 in a way
 ///   that's the operator's call, not the executor's: either no
 ///   `Retry-After` (no signal what to do) or a value above the
@@ -73,7 +75,16 @@ const SHORT_BACKOFF_CEILING_SECS: u64 = 60;
 ///   [`FetchError`] minus the `RateLimited` variant.
 #[derive(Debug)]
 pub enum BackoffOutcome {
-    Bytes(Vec<u8>),
+    /// Session 32: the body and the response Content-Type travel
+    /// together. The struct-variant shape (rather than two-tuple)
+    /// keeps callers honest about which field is which when
+    /// destructuring; the chip-authority work in
+    /// `recipe_fetch_attempts` depends on the header reaching the
+    /// storage write site without being silently dropped.
+    Bytes {
+        body: Vec<u8>,
+        content_type: Option<String>,
+    },
     RateLimited {
         retry_after_seconds: Option<u64>,
     },
@@ -92,8 +103,13 @@ pub async fn fetch_with_backoff(
     url: &str,
     context: &str,
 ) -> BackoffOutcome {
-    match http.fetch_bytes(url).await {
-        Ok(bytes) => BackoffOutcome::Bytes(bytes),
+    // Session 32: route through the meta-aware path so the response
+    // Content-Type travels with the body. Implementations that don't
+    // override `fetch_bytes_with_meta` get the trait's default impl,
+    // which calls `fetch_bytes` and returns `content_type: None` —
+    // backward-compat is byte-for-byte for those callers.
+    match http.fetch_bytes_with_meta(url).await {
+        Ok(FetchedBytes { body, content_type }) => BackoffOutcome::Bytes { body, content_type },
         Err(FetchError::RateLimited { retry_after_seconds }) => {
             handle_rate_limit(http, url, context, retry_after_seconds).await
         }
@@ -120,15 +136,18 @@ async fn handle_rate_limit(
                 "rate-limited; sleeping for short Retry-After then retrying once"
             );
             tokio::time::sleep(Duration::from_secs(secs)).await;
-            match http.fetch_bytes(url).await {
-                Ok(bytes) => {
+            // Session 32: the inline retry also goes through
+            // `fetch_bytes_with_meta` so a recovered fetch carries
+            // the same Content-Type discipline as the first-try path.
+            match http.fetch_bytes_with_meta(url).await {
+                Ok(FetchedBytes { body, content_type }) => {
                     info!(
                         context = %context,
                         url = %url,
-                        retried_bytes = bytes.len(),
+                        retried_bytes = body.len(),
                         "rate-limit retry succeeded"
                     );
-                    BackoffOutcome::Bytes(bytes)
+                    BackoffOutcome::Bytes { body, content_type }
                 }
                 Err(FetchError::RateLimited {
                     retry_after_seconds: second_value,
@@ -259,7 +278,29 @@ mod tests {
         let f = StaticFetcher::new().with("https://example.com/x", b"hello");
         let out = fetch_with_backoff(&f, "https://example.com/x", "test").await;
         match out {
-            BackoffOutcome::Bytes(b) => assert_eq!(b, b"hello"),
+            BackoffOutcome::Bytes { body, content_type } => {
+                assert_eq!(body, b"hello");
+                // No content-type configured on the fetcher → None.
+                assert_eq!(content_type, None);
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn happy_path_threads_content_type_when_configured() {
+        // Session 32: the StaticFetcher's `with_content_type` builder
+        // is the test surface for the per-URL Content-Type override.
+        // The backoff helper must thread the value through unchanged.
+        let f = StaticFetcher::new()
+            .with("https://example.com/api.json", b"{\"k\": 1}")
+            .with_content_type("https://example.com/api.json", "application/json");
+        let out = fetch_with_backoff(&f, "https://example.com/api.json", "test").await;
+        match out {
+            BackoffOutcome::Bytes { body, content_type } => {
+                assert_eq!(body, b"{\"k\": 1}");
+                assert_eq!(content_type.as_deref(), Some("application/json"));
+            }
             other => panic!("expected Bytes, got {other:?}"),
         }
     }

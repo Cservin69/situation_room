@@ -167,12 +167,28 @@ demographics, governance) sourced from national statistical offices
 and standardized by the World Bank. Long historical series.
 """
 authoritative_for = ["country_macro_indicators"]
-# JSON API root for the indicators catalog. Stable for years; returns
-# a paginated indicator list. The LLM uses this excerpt to pick a
-# specific indicator endpoint (e.g.
-# https://api.worldbank.org/v2/country/HUN/indicator/NY.GDP.MKTP.CD?format=json
-# ) for the recipe.
-endpoint_hint = "https://api.worldbank.org/v2/indicator?format=json&per_page=20"
+# Real country-indicator JSON response, not the indicator catalog.
+#
+# Session 32 (P1, audit followup to Session 31's screenshot): the
+# previous hint pointed at `https://api.worldbank.org/v2/indicator?...`
+# which returns the *catalog* of indicator definitions (a list of
+# `{id, name, unit, source, ...}` rows describing what indicators
+# exist). The recipe author saw the catalog shape and authored
+# `json_path` recipes assuming the data response had the same shape;
+# at runtime the catalog endpoint of course never carries
+# country/year/value data, so apply blew up with the
+# `1.0.HCount.1.90usd` mismatch from the Session 30 screenshot.
+#
+# This URL returns the actual data shape: a two-element JSON array
+# `[paginationmeta, [datapoints]]` where each datapoint carries
+# `country.value`, `indicator.value`, `value`, `date`. The LLM now
+# learns the real envelope and authors recipes whose extraction
+# paths land on real values. The country code (`all`) and indicator
+# (`NY.GDP.MKTP.CD` — GDP in current US$) are illustrative; the LLM
+# substitutes per-plan values into the URL pattern when authoring.
+# `per_page=5` keeps the excerpt small enough to fit the
+# `PREFETCH_EXCERPT_BUDGET` while still showing multiple datapoints.
+endpoint_hint = "https://api.worldbank.org/v2/country/all/indicator/NY.GDP.MKTP.CD?format=json&per_page=5"
 
 [[source]]
 id = "imf_weo"

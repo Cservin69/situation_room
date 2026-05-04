@@ -19,5 +19,13 @@
  * practice every captured row from Track A has both populated, but
  * the wire shape doesn't pin that and shouldn't (storage can carry
  * looser shapes than the runtime emits).
+ *
+ * `response_content_type` (Session 32) carries the raw response
+ * `Content-Type` header value when the underlying transport
+ * surfaced one, else `None`. The frontend's response-bytes chip
+ * (`RecipesPanel.svelte`) prefers this value when present and
+ * falls back to the heuristic byte-sniffer when absent. `None`
+ * means one of: row predates migration 0014, server omitted the
+ * header, or the bytes came from a `static_payload` (no transport).
  */
-export type RecipeFetchAttemptDto = { id: string, recipe_id: string, run_id: string, attempted_at: string, succeeded: boolean, failure_message: string | null, bytes_excerpt: string | null, };
+export type RecipeFetchAttemptDto = { id: string, recipe_id: string, run_id: string, attempted_at: string, succeeded: boolean, failure_message: string | null, bytes_excerpt: string | null, response_content_type: string | null, };

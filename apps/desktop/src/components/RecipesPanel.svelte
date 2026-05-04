@@ -126,8 +126,8 @@
   renders nothing — it never appears as a leaked artefact across
   selection boundaries because plans.recipes is reset on selectPlan.
 
-  RESPONSE BYTES inline (Session 31)
-  -----------------------------------
+  RESPONSE BYTES inline (Session 31, upgraded Session 32)
+  --------------------------------------------------------
 
   Track A (ADR 0012 amendment 1) made the executor capture the bytes
   the runtime saw at the moment a recipe failed at apply, into the
@@ -146,17 +146,46 @@
   the re-author dialog uses; no new wire surface, no new storage
   read), then renders:
 
-    - a content-type chip (JSON / HTML / XML / TEXT / EMPTY),
-      derived heuristically from the first non-whitespace byte; and
+    - a content-type chip (JSON / HTML / XML / CSV / TEXT / EMPTY); and
     - the byte count; and
     - a `<pre>` of the captured excerpt (capped at 64 KiB at
       capture time per `MAX_EXCERPT_BYTES`).
 
   The chip is the load-bearing diagnostic. For the comtrade case
-  above the chip would read `HTML` while the failure message says
+  above the chip reads `HTML` while the failure message says
   `did not parse as JSON` — the operator sees the mismatch in two
   glances and writes a flag note ("source returns HTML, not JSON;
   check for a separate JSON API") in five seconds.
+
+  Session 32 — chip is now header-authoritative
+  ----------------------------------------------
+
+  The Session-31 chip was heuristic: it inspected the first
+  non-whitespace byte of the captured excerpt and guessed. Honest
+  about the limitation but lossy in two specific ways: it couldn't
+  tell `text/csv` from arbitrary text (a CSV row is just commas),
+  and it couldn't surface what the server actually claimed when the
+  bytes alone were ambiguous (`application/javascript` vs
+  `application/json` both start with `{`).
+
+  Session 32 threads the response `Content-Type` header from
+  `SecureHttpClient::get_with_headers` through
+  `HttpFetcher::fetch_bytes_with_meta` and `BackoffOutcome::Bytes`
+  into the `recipe_fetch_attempts.response_content_type` column
+  (migration 0014), and out through `RecipeFetchAttemptDto` to
+  this component. The chip now reads the header when present and
+  recognized — solid border, no `?` glyph, tooltip showing the raw
+  header value — and falls back to the heuristic when the header
+  is absent or unrecognized — dashed border with a `?` glyph and a
+  tooltip explaining the fallback. CSV joins the chip's enum as a
+  first-class shape; `text/csv` against a `csv_cell` recipe is now
+  legible at a glance.
+
+  The fallback path matters: pre-migration-0014 attempt rows have
+  no header captured, `static_payload` recipes never had a
+  transport, and some servers omit the header entirely. The chip
+  stays useful in all three cases — just with a dashed border so
+  the operator knows the reading is best-effort.
 
   We render only on failed-apply outcomes (mirrors the re-author
   button's gate). For other failure stages — Failed @ fetch (no
@@ -182,9 +211,11 @@
   bites, the runes store can clear the map on fetch-run completion;
   defer until then.
 
-  No new ADR. ADR 0012 amendment 1 already authorized capture; this
-  is a second consumer of the same capture, alongside the re-author
-  dialog. ts-rs DTOs unchanged. No regenerated TS files in this patch.
+  No new ADR. ADR 0012 amendment 1 already authorized capture; the
+  Session-32 upgrade adds one nullable column to the same table and
+  one field to the same DTO. ts-rs regenerates `RecipeFetchAttemptDto.ts`
+  on `cargo test --package situation_room-api`; the patch ships the
+  regenerated file so `npm run check` passes immediately.
 -->
 <script lang="ts">
   import { plans, flagRecipe, reauthorRecipe } from '$stores/plans.svelte';
@@ -309,26 +340,106 @@
   }
 
   /**
-   * Heuristic content-type detection from the first non-whitespace
-   * byte. Not authoritative — the actual response Content-Type
-   * header is not currently surfaced through the wire (`SecureHttpClient`
-   * doesn't expose it on success bodies — see Session 30 known
-   * imperfection #6 carry-over). For diagnostic purposes the first
-   * byte is enough: the comtrade case is "starts with `<` while the
-   * recipe expected JSON," and the chip surfaces that mismatch
-   * immediately. The world_bank_indicators case is "starts with `[`
-   * (so JSON), but it's the indicator catalog endpoint's response,
-   * not a country/indicator data response" — the chip says JSON
-   * correctly and the operator opens the bytes to see the wrong
-   * shape.
+   * Shape categories surfaced by the response-bytes chip. The set
+   * is closed and aligned with the extraction-mode enum on the
+   * recipe side: a `JSON` chip across from a `json_path` recipe is
+   * a shape match; a `HTML` chip across from a `json_path` recipe
+   * is the diagnostic the operator wants to see.
    *
-   * `'empty'` covers both null and effectively-blank bodies. XML
-   * detection covers RSS / Atom in addition to bare XML, since the
-   * project's recipes hit RSS feeds frequently (EUR-Lex, BBC).
+   * Session 32: `csv` joined the set when the chip became
+   * header-aware. A `text/csv` response against a `csv_cell`
+   * recipe is a shape match, even when the bytes start with a
+   * comma or quote and the older heuristic byte-sniffer would
+   * have called it `text`. Adding the variant when the underlying
+   * authority arrived was cheaper than carrying a "the heuristic
+   * doesn't recognize CSV" caveat for every operator who hits a
+   * CSV apply failure.
    */
-  function responseShape(
+  type Shape = 'json' | 'html' | 'xml' | 'csv' | 'text' | 'empty';
+
+  /**
+   * The chip's value plus whether it came from the server's claim
+   * (the response Content-Type header) or from a heuristic
+   * inspection of the bytes themselves. Surfacing the source lets
+   * the operator know whether a surprising chip ("HTML on a
+   * json_path recipe") is the server telling the truth or a guess
+   * the chip made when the header was absent.
+   */
+  type ShapeReading = {
+    label: Shape;
+    source: 'header' | 'heuristic';
+    /**
+     * The raw `Content-Type` header value when source === 'header'.
+     * `null` when source === 'heuristic'. Surfaced in the chip's
+     * tooltip so the operator can see what the server claimed
+     * verbatim — `application/json; charset=utf-8` is more
+     * diagnostic than just `JSON`.
+     */
+    rawContentType: string | null;
+  };
+
+  /**
+   * Map a raw `Content-Type` header value to a `Shape`. Strips
+   * parameters (`; charset=...`, `; boundary=...`), lowercases the
+   * type/subtype, and matches against the closed set of MIME
+   * shapes the chip recognizes.
+   *
+   * Returns `null` when the value doesn't match anything we have
+   * a chip for — the caller falls back to the heuristic sniffer.
+   * `text/plain` maps to `text` (chip = TEXT) rather than `null`
+   * because the operator should see "server told us text/plain"
+   * as a real reading, not as "we don't know."
+   */
+  function shapeFromContentType(value: string): Shape | null {
+    // Strip parameters and whitespace, lowercase.
+    const head = value.split(';')[0].trim().toLowerCase();
+    if (head === '') return null;
+    // JSON: standard + the half-dozen +json suffixes commonly seen
+    // (application/ld+json, application/vnd.api+json, etc.).
+    if (head === 'application/json' || head === 'text/json' || head.endsWith('+json')) {
+      return 'json';
+    }
+    if (head === 'text/html' || head === 'application/xhtml+xml') {
+      return 'html';
+    }
+    // XML covers bare XML, RSS, Atom, and the +xml suffix family
+    // (application/rss+xml, application/atom+xml, etc.).
+    if (
+      head === 'application/xml' ||
+      head === 'text/xml' ||
+      head.endsWith('+xml')
+    ) {
+      return 'xml';
+    }
+    if (head === 'text/csv' || head === 'application/csv') {
+      return 'csv';
+    }
+    if (head === 'text/plain') {
+      return 'text';
+    }
+    return null;
+  }
+
+  /**
+   * Heuristic content-type detection from the first non-whitespace
+   * byte. Pre-Session-32 fallback for when the response Content-Type
+   * header isn't present (legacy attempts predating migration 0014,
+   * servers that omit the header, or `static_payload` recipes that
+   * have no transport).
+   *
+   * The heuristic is structural: starts-with `{` or `[` → JSON;
+   * starts-with `<?xml` / `<rss` / `<feed` / `<atom` → XML; bare
+   * `<` → HTML; null/whitespace → EMPTY; anything else → TEXT.
+   * It does NOT detect CSV: distinguishing CSV from arbitrary text
+   * by byte-sniffing alone is unreliable (a CSV row is just
+   * comma-separated text), and the chip's authority for CSV comes
+   * from the `text/csv` header path. When the heuristic is invoked
+   * on actual CSV bytes, the chip reads TEXT — honest about the
+   * limitation.
+   */
+  function shapeFromBytes(
     bytes: string | null | undefined,
-  ): 'json' | 'html' | 'xml' | 'text' | 'empty' {
+  ): Shape {
     if (bytes === null || bytes === undefined) return 'empty';
     const trimmed = bytes.trimStart();
     if (trimmed.length === 0) return 'empty';
@@ -349,10 +460,47 @@
     return 'text';
   }
 
-  function responseShapeLabel(
-    bytes: string | null | undefined,
-  ): string {
-    return responseShape(bytes).toUpperCase();
+  /**
+   * The chip's full reading: prefer the server's Content-Type when
+   * present and recognized, fall back to the byte-sniffer otherwise.
+   * Session 32. Documented as the load-bearing authority elevation
+   * over Session 31's heuristic-only chip.
+   */
+  function classifyShape(attempt: RecipeFetchAttemptDto): ShapeReading {
+    const ct = attempt.response_content_type;
+    if (ct !== null && ct !== undefined && ct.trim() !== '') {
+      const fromHeader = shapeFromContentType(ct);
+      if (fromHeader !== null) {
+        return { label: fromHeader, source: 'header', rawContentType: ct };
+      }
+      // Header was present but we don't recognize the MIME type
+      // (e.g. `application/octet-stream`, vendor-specific shapes).
+      // Fall through to the heuristic so the operator still gets a
+      // best-effort label, but tooltip-surface the raw header value
+      // so the unrecognized MIME is visible.
+      const fromBytes = shapeFromBytes(attempt.bytes_excerpt);
+      return { label: fromBytes, source: 'heuristic', rawContentType: ct };
+    }
+    return {
+      label: shapeFromBytes(attempt.bytes_excerpt),
+      source: 'heuristic',
+      rawContentType: null,
+    };
+  }
+
+  /**
+   * Tooltip text for the response-shape chip. Distinguishes the
+   * three cases the operator cares about: header-authoritative,
+   * heuristic-with-unknown-header, heuristic-with-no-header.
+   */
+  function shapeTooltip(reading: ShapeReading): string {
+    if (reading.source === 'header' && reading.rawContentType !== null) {
+      return `from response header: ${reading.rawContentType}`;
+    }
+    if (reading.source === 'heuristic' && reading.rawContentType !== null) {
+      return `heuristic from first byte; server returned unrecognized Content-Type: ${reading.rawContentType}`;
+    }
+    return 'heuristic from first byte; no Content-Type header was captured';
   }
 
   /**
@@ -654,12 +802,17 @@
             no response bytes were captured for this attempt
           </div>
         {:else}
-          {@const shape = responseShape(attemptState.bytes_excerpt)}
+          {@const reading = classifyShape(attemptState)}
           <details class="response-bytes-details" open>
             <summary>
               <span class="response-summary-label">response bytes</span>
-              <span class="response-shape-chip" data-shape={shape}>
-                {responseShapeLabel(attemptState.bytes_excerpt)}
+              <span
+                class="response-shape-chip"
+                data-shape={reading.label}
+                data-source={reading.source}
+                title={shapeTooltip(reading)}
+              >
+                {reading.label.toUpperCase()}{reading.source === 'heuristic' ? '?' : ''}
               </span>
               <span class="response-length">
                 {responseLengthLabel(attemptState.bytes_excerpt)}
@@ -1310,12 +1463,20 @@
    *   JSON  → --signal-info     (most recipes target JSON; neutral-positive)
    *   HTML  → --signal-warning  (almost always a wrong-endpoint diagnosis)
    *   XML   → --signal-info     (RSS / Atom / EUR-Lex; expected for some recipes)
-   *   TEXT  → --fg-tertiary     (neutral; could be CSV, plain text, etc.)
+   *   CSV   → --signal-info     (Session 32; first-class extraction mode)
+   *   TEXT  → --fg-tertiary     (neutral; could be plain text, unknown shape)
    *   EMPTY → --fg-quaternary   (no body or stripped to whitespace)
    *
    * No --signal-negative variant: the chip describes what came back,
    * not whether what came back was right. The outcome strip already
    * carries the verdict; this chip is descriptive, not evaluative.
+   *
+   * Session 32 adds `data-source` (`header` | `heuristic`). The
+   * header-source chip is solid; the heuristic-source chip carries
+   * a `?` glyph after the label and a slightly muted border to
+   * mark its lower confidence. Tooltip on hover spells out which
+   * source produced the reading and (when present) what the raw
+   * Content-Type header value was.
    */
   .response-shape-chip {
     font-family: var(--font-mono);
@@ -1339,11 +1500,25 @@
     color: var(--signal-info, var(--fg-secondary));
     border-color: var(--signal-info, var(--border-subtle));
   }
+  .response-shape-chip[data-shape="csv"] {
+    color: var(--signal-info, var(--fg-secondary));
+    border-color: var(--signal-info, var(--border-subtle));
+  }
   .response-shape-chip[data-shape="text"] {
     color: var(--fg-tertiary);
   }
   .response-shape-chip[data-shape="empty"] {
     color: var(--fg-quaternary);
+  }
+  /*
+   * Heuristic-source chips: muted border to mark them as lower
+   * confidence than header-source chips. The shape-specific color
+   * still applies; only the border softens. Tooltip via the
+   * `title` attribute carries the diagnostic detail.
+   */
+  .response-shape-chip[data-source="heuristic"] {
+    border-style: dashed;
+    opacity: 0.85;
   }
 
   .response-length {

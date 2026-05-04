@@ -91,6 +91,13 @@ const MIGRATIONS: &[Migration] = &[
         description: "recipe_fetch_attempts table",
         sql: include_str!("../../../migrations/0013_recipe_fetch_attempts.sql"),
     },
+    Migration {
+        version: 14,
+        description: "recipe_fetch_attempts.response_content_type column",
+        sql: include_str!(
+            "../../../migrations/0014_recipe_fetch_attempts_content_type.sql"
+        ),
+    },
 ];
 
 /// Apply every migration whose version is not yet in

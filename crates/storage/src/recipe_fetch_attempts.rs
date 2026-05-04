@@ -75,6 +75,18 @@ pub struct RecipeFetchAttemptRow {
     /// the excerpt so the operator can correlate the failure with the
     /// actual response shape.
     pub bytes_excerpt: Option<String>,
+    /// Raw `Content-Type` header value the server returned, when the
+    /// transport surfaced one. Session 32 (P2). The runtime captures
+    /// this verbatim — `application/json; charset=utf-8`,
+    /// `text/html; charset=UTF-8`, etc. — and the presentation layer
+    /// (the response-bytes chip in `RecipesPanel.svelte`) parses out
+    /// the type/subtype to decide the chip's enum value.
+    ///
+    /// `None` for two reasons: (a) the row predates migration 0014;
+    /// (b) the server omitted the header. Distinct meanings, but
+    /// indistinguishable at this layer — the consumer falls back to
+    /// the heuristic byte-sniffer in either case.
+    pub response_content_type: Option<String>,
 }
 
 /// An attempt row as it comes back out of storage. Same shape as
@@ -88,6 +100,9 @@ pub struct StoredRecipeFetchAttempt {
     pub succeeded: bool,
     pub failure_message: Option<String>,
     pub bytes_excerpt: Option<String>,
+    /// Mirror of [`RecipeFetchAttemptRow::response_content_type`].
+    /// `None` for rows written before migration 0014.
+    pub response_content_type: Option<String>,
 }
 
 impl Store {
@@ -102,8 +117,9 @@ impl Store {
         conn.execute(
             "INSERT INTO recipe_fetch_attempts (
                 id, recipe_id, run_id, attempted_at,
-                succeeded, failure_message, bytes_excerpt
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                succeeded, failure_message, bytes_excerpt,
+                response_content_type
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 r.id,
                 r.recipe_id,
@@ -112,6 +128,7 @@ impl Store {
                 r.succeeded,
                 r.failure_message,
                 r.bytes_excerpt,
+                r.response_content_type,
             ],
         )
         .map_err(StorageError::DuckDb)?;
@@ -139,7 +156,8 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id, recipe_id, run_id, attempted_at,
-                        succeeded, failure_message, bytes_excerpt
+                        succeeded, failure_message, bytes_excerpt,
+                        response_content_type
                  FROM recipe_fetch_attempts
                  WHERE recipe_id = ?
                  ORDER BY attempted_at DESC
@@ -199,6 +217,7 @@ fn row_to_stored(row: &duckdb::Row<'_>) -> Result<StoredRecipeFetchAttempt> {
         succeeded: row.get(4).map_err(StorageError::DuckDb)?,
         failure_message: row.get(5).map_err(StorageError::DuckDb)?,
         bytes_excerpt: row.get(6).map_err(StorageError::DuckDb)?,
+        response_content_type: row.get(7).map_err(StorageError::DuckDb)?,
     })
 }
 
@@ -219,6 +238,7 @@ mod tests {
                 "<rss><channel><title>BBC News</title><item><title>example</title></item></channel></rss>"
                     .into(),
             ),
+            response_content_type: Some("application/rss+xml; charset=utf-8".into()),
         }
     }
 
@@ -245,6 +265,35 @@ mod tests {
             Some("extraction [regex_capture]: pattern matched nothing")
         );
         assert!(got.bytes_excerpt.as_ref().unwrap().contains("BBC News"));
+        // Session 32: the Content-Type round-trips. The chip in
+        // RecipesPanel.svelte parses out the type/subtype.
+        assert_eq!(
+            got.response_content_type.as_deref(),
+            Some("application/rss+xml; charset=utf-8")
+        );
+    }
+
+    #[test]
+    fn attempt_round_trips_with_null_content_type() {
+        // Pre-migration-0014 rows, and rows where the server omitted
+        // the Content-Type header, both land here. The load path must
+        // surface NULL as None rather than failing.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let recipe_id = Uuid::now_v7();
+        let run_id = Uuid::now_v7();
+        let mut row = sample_attempt(recipe_id, run_id);
+        row.response_content_type = None;
+        store.insert_recipe_fetch_attempt(&row).unwrap();
+
+        let got = store
+            .latest_attempt_for_recipe(recipe_id)
+            .unwrap()
+            .expect("attempt should exist");
+        assert_eq!(got.response_content_type, None);
+        // The bytes excerpt is independent of the header.
+        assert!(got.bytes_excerpt.is_some());
     }
 
     #[test]

@@ -900,7 +900,11 @@ async fn prefetch_excerpt(
     // sees "authoring failed" with no hint that the cause was
     // throttling rather than a malformed source.
     let bytes = match fetch_with_backoff(ctx.http, url.as_str(), "prefetch").await {
-        BackoffOutcome::Bytes(b) => b,
+        // Session 32: prefetch builds an excerpt for the LLM author;
+        // the response Content-Type isn't part of that excerpt's
+        // shape (the recipe author infers structure from the bytes
+        // themselves). Discard the meta here.
+        BackoffOutcome::Bytes { body, .. } => body,
         BackoffOutcome::RateLimited {
             retry_after_seconds,
         } => {
@@ -979,12 +983,24 @@ fn stub_excerpt(plan: &ResearchPlan, source_id: &str, real_url: Option<&str>) ->
 /// Fetch the bytes a recipe's apply step needs, honoring static
 /// payloads and Track-D backoff.
 ///
-/// Returns `Ok(bytes)` on success, or one of three pre-built
-/// `RecipeOutcome` variants the caller `return`s directly:
+/// Returns `Ok((bytes, content_type))` on success, or one of three
+/// pre-built `RecipeOutcome` variants the caller `return`s directly:
 /// `Failed { stage: Fetch, ... }` for ordinary network errors,
 /// `RateLimited { ... }` for 429 responses the backoff helper chose
 /// to surface (above-ceiling waits, no `Retry-After`, or two 429s
 /// in a row), and the no-fixture variant of `Failed` for tests.
+///
+/// `content_type` is the raw response `Content-Type` header value
+/// when the underlying transport surfaced one, else `None`. Session
+/// 32: the value is threaded into `record_apply_failure_attempt`
+/// when an apply-stage failure happens, so the response-bytes chip
+/// in `RecipesPanel.svelte` can render the server's claim
+/// authoritatively rather than guessing from the first byte.
+///
+/// For the `static_payload` short-circuit, `content_type` is
+/// returned as `None` — baked bytes have no transport, so there is
+/// no header. The chip falls back to the heuristic byte-sniffer
+/// for those, same as before.
 ///
 /// Lifted out of the four `run_X_recipe` paths so the policy lives
 /// in one place. Each path retains its own visible call site, which
@@ -994,16 +1010,17 @@ fn stub_excerpt(plan: &ResearchPlan, source_id: &str, real_url: Option<&str>) ->
 async fn fetch_recipe_bytes(
     ctx: &ExecutorContext<'_>,
     recipe: &FetchRecipe,
-) -> Result<Vec<u8>, RecipeOutcome> {
+) -> Result<(Vec<u8>, Option<String>), RecipeOutcome> {
     if let Some(payload) = recipe.static_payload.as_ref() {
         // ADR 0007 Amendment 3: bytes' provenance is orthogonal to
         // the extraction mode. A baked payload short-circuits the
-        // network entirely; rate-limiting can't apply.
-        return Ok(payload.as_bytes().to_vec());
+        // network entirely; rate-limiting can't apply, and there is
+        // no Content-Type because there is no response.
+        return Ok((payload.as_bytes().to_vec(), None));
     }
 
     match fetch_with_backoff(ctx.http, recipe.source_url.as_str(), "runtime").await {
-        BackoffOutcome::Bytes(b) => Ok(b),
+        BackoffOutcome::Bytes { body, content_type } => Ok((body, content_type)),
         BackoffOutcome::RateLimited {
             retry_after_seconds,
         } => Err(RecipeOutcome::RateLimited {
@@ -1069,6 +1086,14 @@ async fn run_one_recipe(
 /// the ground truth the manual `reauthor_recipe` Tauri command reads
 /// from when the operator triggers a re-author.
 ///
+/// `response_content_type` (Session 32) is the raw `Content-Type`
+/// header value the runtime saw when fetching, captured into the
+/// same row as the bytes excerpt. The response-bytes chip in
+/// `RecipesPanel.svelte` reads it to render an authoritative shape
+/// label rather than a heuristic guess. `None` for static-payload
+/// recipes (no transport, no header) and for any future fetcher
+/// that doesn't surface headers.
+///
 /// Storage failure here is non-fatal — the outcome is still returned
 /// to the caller, the run continues, and we log the lost capture at
 /// `warn` level. The audit trail loses a row but the user-facing
@@ -1080,6 +1105,7 @@ fn record_apply_failure_attempt(
     run_id: Uuid,
     recipe_id: Uuid,
     bytes: &[u8],
+    response_content_type: Option<&str>,
     failure_message: &str,
 ) {
     let row = situation_room_storage::recipe_fetch_attempts::RecipeFetchAttemptRow {
@@ -1090,6 +1116,7 @@ fn record_apply_failure_attempt(
         succeeded: false,
         failure_message: Some(failure_message.to_string()),
         bytes_excerpt: Some(situation_room_storage::truncate_excerpt(bytes)),
+        response_content_type: response_content_type.map(|s| s.to_string()),
     };
     if let Err(e) = store.insert_recipe_fetch_attempt(&row) {
         warn!(
@@ -1114,8 +1141,15 @@ async fn run_csv_recipe(
     // from generic fetch errors, surfaced as RateLimited rather than
     // collapsed into `Failed { stage: Fetch }`. See
     // `fetch_recipe_bytes` for the policy.
-    let bytes = match fetch_recipe_bytes(ctx, recipe).await {
-        Ok(b) => b,
+    // Session 32: `fetch_recipe_bytes` now returns the response
+    // Content-Type alongside the body (None for static-payload
+    // recipes and for fetchers that don't surface headers). The
+    // value is threaded into `record_apply_failure_attempt` so the
+    // response-bytes chip in `RecipesPanel.svelte` can read the
+    // server's claim authoritatively rather than guess from the
+    // first byte.
+    let (bytes, response_content_type) = match fetch_recipe_bytes(ctx, recipe).await {
+        Ok((b, ct)) => (b, ct),
         Err(outcome) => return outcome,
     };
 
@@ -1133,7 +1167,14 @@ async fn run_csv_recipe(
             // Track A: capture the bytes + failure message so the
             // manual re-author command later sees ground truth.
             let message = describe_apply_error(&e);
-            record_apply_failure_attempt(ctx.store, run_id, recipe.id, &bytes, &message);
+            record_apply_failure_attempt(
+                ctx.store,
+                run_id,
+                recipe.id,
+                &bytes,
+                response_content_type.as_deref(),
+                &message,
+            );
             return RecipeOutcome::Failed {
                 recipe_id: recipe.id,
                 source_id: recipe.source_id.clone(),
@@ -1190,8 +1231,15 @@ async fn run_json_recipe(
 ) -> RecipeOutcome {
     // Fetch — see `fetch_recipe_bytes` for the static-payload
     // short-circuit and Track-D rate-limit handling.
-    let bytes = match fetch_recipe_bytes(ctx, recipe).await {
-        Ok(b) => b,
+    // Session 32: `fetch_recipe_bytes` now returns the response
+    // Content-Type alongside the body (None for static-payload
+    // recipes and for fetchers that don't surface headers). The
+    // value is threaded into `record_apply_failure_attempt` so the
+    // response-bytes chip in `RecipesPanel.svelte` can read the
+    // server's claim authoritatively rather than guess from the
+    // first byte.
+    let (bytes, response_content_type) = match fetch_recipe_bytes(ctx, recipe).await {
+        Ok((b, ct)) => (b, ct),
         Err(outcome) => return outcome,
     };
 
@@ -1209,7 +1257,14 @@ async fn run_json_recipe(
             // Track A: capture the bytes + failure message so the
             // manual re-author command later sees ground truth.
             let message = describe_apply_error(&e);
-            record_apply_failure_attempt(ctx.store, run_id, recipe.id, &bytes, &message);
+            record_apply_failure_attempt(
+                ctx.store,
+                run_id,
+                recipe.id,
+                &bytes,
+                response_content_type.as_deref(),
+                &message,
+            );
             return RecipeOutcome::Failed {
                 recipe_id: recipe.id,
                 source_id: recipe.source_id.clone(),
@@ -1260,8 +1315,15 @@ async fn run_css_recipe(
 ) -> RecipeOutcome {
     // Fetch — see `fetch_recipe_bytes` for the static-payload
     // short-circuit and Track-D rate-limit handling.
-    let bytes = match fetch_recipe_bytes(ctx, recipe).await {
-        Ok(b) => b,
+    // Session 32: `fetch_recipe_bytes` now returns the response
+    // Content-Type alongside the body (None for static-payload
+    // recipes and for fetchers that don't surface headers). The
+    // value is threaded into `record_apply_failure_attempt` so the
+    // response-bytes chip in `RecipesPanel.svelte` can read the
+    // server's claim authoritatively rather than guess from the
+    // first byte.
+    let (bytes, response_content_type) = match fetch_recipe_bytes(ctx, recipe).await {
+        Ok((b, ct)) => (b, ct),
         Err(outcome) => return outcome,
     };
 
@@ -1279,7 +1341,14 @@ async fn run_css_recipe(
             // Track A: capture the bytes + failure message so the
             // manual re-author command later sees ground truth.
             let message = describe_apply_error(&e);
-            record_apply_failure_attempt(ctx.store, run_id, recipe.id, &bytes, &message);
+            record_apply_failure_attempt(
+                ctx.store,
+                run_id,
+                recipe.id,
+                &bytes,
+                response_content_type.as_deref(),
+                &message,
+            );
             return RecipeOutcome::Failed {
                 recipe_id: recipe.id,
                 source_id: recipe.source_id.clone(),
@@ -1336,8 +1405,15 @@ async fn run_regex_recipe(
 ) -> RecipeOutcome {
     // Fetch — see `fetch_recipe_bytes` for the static-payload
     // short-circuit and Track-D rate-limit handling.
-    let bytes = match fetch_recipe_bytes(ctx, recipe).await {
-        Ok(b) => b,
+    // Session 32: `fetch_recipe_bytes` now returns the response
+    // Content-Type alongside the body (None for static-payload
+    // recipes and for fetchers that don't surface headers). The
+    // value is threaded into `record_apply_failure_attempt` so the
+    // response-bytes chip in `RecipesPanel.svelte` can read the
+    // server's claim authoritatively rather than guess from the
+    // first byte.
+    let (bytes, response_content_type) = match fetch_recipe_bytes(ctx, recipe).await {
+        Ok((b, ct)) => (b, ct),
         Err(outcome) => return outcome,
     };
 
@@ -1355,7 +1431,14 @@ async fn run_regex_recipe(
             // Track A: capture the bytes + failure message so the
             // manual re-author command later sees ground truth.
             let message = describe_apply_error(&e);
-            record_apply_failure_attempt(ctx.store, run_id, recipe.id, &bytes, &message);
+            record_apply_failure_attempt(
+                ctx.store,
+                run_id,
+                recipe.id,
+                &bytes,
+                response_content_type.as_deref(),
+                &message,
+            );
             return RecipeOutcome::Failed {
                 recipe_id: recipe.id,
                 source_id: recipe.source_id.clone(),
@@ -1407,8 +1490,15 @@ async fn run_pdf_recipe(
     recipe: &FetchRecipe,
     run_id: Uuid,
 ) -> RecipeOutcome {
-    let bytes = match fetch_recipe_bytes(ctx, recipe).await {
-        Ok(b) => b,
+    // Session 32: `fetch_recipe_bytes` now returns the response
+    // Content-Type alongside the body (None for static-payload
+    // recipes and for fetchers that don't surface headers). The
+    // value is threaded into `record_apply_failure_attempt` so the
+    // response-bytes chip in `RecipesPanel.svelte` can read the
+    // server's claim authoritatively rather than guess from the
+    // first byte.
+    let (bytes, response_content_type) = match fetch_recipe_bytes(ctx, recipe).await {
+        Ok((b, ct)) => (b, ct),
         Err(outcome) => return outcome,
     };
 
@@ -1427,7 +1517,14 @@ async fn run_pdf_recipe(
             // are typically large; the existing capture path's size
             // discipline applies (see `record_apply_failure_attempt`).
             let message = describe_apply_error(&e);
-            record_apply_failure_attempt(ctx.store, run_id, recipe.id, &bytes, &message);
+            record_apply_failure_attempt(
+                ctx.store,
+                run_id,
+                recipe.id,
+                &bytes,
+                response_content_type.as_deref(),
+                &message,
+            );
             return RecipeOutcome::Failed {
                 recipe_id: recipe.id,
                 source_id: recipe.source_id.clone(),
@@ -2351,6 +2448,71 @@ mod tests {
             excerpt,
             std::str::from_utf8(bytes).unwrap(),
             "excerpt must carry the runtime bytes verbatim under the cap"
+        );
+        // Session 32: the StaticFetcher in this test doesn't have a
+        // content-type configured, so the captured value is None.
+        // The next test exercises the populated path.
+        assert_eq!(
+            attempt.response_content_type, None,
+            "no content-type configured on the fetcher must round-trip as None"
+        );
+    }
+
+    /// Session 32: the response Content-Type travels from
+    /// `HttpFetcher::fetch_bytes_with_meta` through
+    /// `BackoffOutcome::Bytes` and `fetch_recipe_bytes` into the
+    /// `recipe_fetch_attempts.response_content_type` column. This
+    /// is the wire that makes the `RecipesPanel.svelte` chip
+    /// authoritative rather than heuristic.
+    ///
+    /// Pattern mirrors `apply_stage_failure_persists_a_recipe_fetch_attempt_row`
+    /// — same fixture shape, same regex recipe, same apply failure;
+    /// the only delta is that the fetcher carries a configured
+    /// content-type and the assertion checks it lands in the row.
+    #[tokio::test]
+    async fn apply_stage_failure_captures_response_content_type() {
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let url = "https://example.test/spa-shell.html";
+        let recipe = working_regex_recipe(&plan, url);
+        let recipe_id = recipe.id;
+        save_recipe(&store, &recipe).unwrap();
+
+        // The classic Session 30 / Session 31 case: the recipe was
+        // authored expecting a structured payload, but the URL the
+        // executor fetches returns the SPA landing page. Heuristic
+        // alone (the chip Session 31 shipped) reads `<` → HTML;
+        // the header-aware path here proves the chip can be
+        // authoritative when the server told the truth.
+        let bytes = b"<!DOCTYPE html><html><body>SPA shell</body></html>";
+        let fetcher = StaticFetcher::new()
+            .with(url, bytes)
+            .with_content_type(url, "text/html; charset=UTF-8");
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: "",
+            sources: &[],
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+        match &report.outcomes[0] {
+            RecipeOutcome::Failed { stage, .. } => assert_eq!(*stage, FailureStage::Apply),
+            other => panic!("expected Failed(Apply), got {other:?}"),
+        }
+
+        let attempt = store
+            .latest_attempt_for_recipe(recipe_id)
+            .unwrap()
+            .expect("apply-stage failure must record a fetch attempt");
+        assert_eq!(
+            attempt.response_content_type.as_deref(),
+            Some("text/html; charset=UTF-8"),
+            "the configured Content-Type must round-trip into storage"
         );
     }
 

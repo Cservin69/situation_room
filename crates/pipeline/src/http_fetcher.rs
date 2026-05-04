@@ -46,6 +46,38 @@
 //! header via the new [`SecureHttpClient::get_with_headers`] surface.
 //! Other status errors keep the legacy `FetchError::Http` shape so
 //! existing match-arms continue to compile unchanged.
+//!
+//! ## Session 32 — Content-Type surfacing
+//!
+//! The Session-31 response-bytes affordance in `RecipesPanel.svelte`
+//! had to fall back to a heuristic byte-sniffer because the runtime
+//! discarded the `Content-Type` header on its way through this trait
+//! (the only method was `fetch_bytes -> Vec<u8>`). The chip read
+//! `JSON` for any body starting with `{` or `[` even when the server
+//! claimed `application/javascript`; conversely an HTML SPA shell
+//! reading `text/html` was correctly heuristically classified, but
+//! the operator had no way to know whether the chip was authoritative
+//! or guessed.
+//!
+//! Session 32 adds [`HttpFetcher::fetch_bytes_with_meta`], returning
+//! [`FetchedBytes`] which carries the raw `Content-Type` value
+//! alongside the body. The trait method has a default impl that
+//! delegates to `fetch_bytes` and returns `content_type: None` — so
+//! every existing test mock (the `StaticFetcher` in particular)
+//! continues to compile unchanged. The production
+//! `SecureHttpClient` impl overrides to pull the header via the
+//! `SecureHeaderMap::content_type()` accessor that already exists
+//! in the secure crate's allow-list.
+//!
+//! Callers that don't need the header (the LLM-side `post_json`
+//! provider, the prefetch excerpt builder when it doesn't care
+//! about the type) keep using `fetch_bytes` and pay nothing. The
+//! one caller that needs it — the apply-failure capture path in
+//! `fetch_executor::record_apply_failure_attempt` — routes through
+//! `fetch_with_backoff`, which threads the header into
+//! `BackoffOutcome::Bytes` so it lands in the
+//! `recipe_fetch_attempts.response_content_type` column for the
+//! chip to consume.
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -97,6 +129,34 @@ impl From<HttpError> for FetchError {
     }
 }
 
+/// A fetched response body, plus the response `Content-Type` header
+/// when the underlying transport surfaced it.
+///
+/// Returned by [`HttpFetcher::fetch_bytes_with_meta`]. Session 32:
+/// see the module docs for why the meta lives alongside the body
+/// rather than in a parallel call. `content_type` is the raw header
+/// value (e.g. `application/json; charset=utf-8`) — the consumer
+/// parses out the type/subtype if it cares.
+///
+/// `content_type` is `None` for two indistinguishable reasons:
+///
+///   - The transport didn't surface a header (the test
+///     [`testing::StaticFetcher`] never does; the default trait impl
+///     of `fetch_bytes_with_meta` in terms of `fetch_bytes` doesn't
+///     either).
+///   - The server returned no `Content-Type` header (some legacy
+///     CSV endpoints, some misconfigured proxies).
+///
+/// The presentation layer that consumes this (the response-bytes
+/// chip in `RecipesPanel.svelte`) treats `None` as "fall back to
+/// the heuristic byte-sniffer." Honest about the absence rather
+/// than papering over it.
+#[derive(Debug, Clone)]
+pub struct FetchedBytes {
+    pub body: Vec<u8>,
+    pub content_type: Option<String>,
+}
+
 /// Fetch a URL and return its body bytes. The single capability the
 /// fetch executor needs from "the network".
 ///
@@ -106,6 +166,28 @@ impl From<HttpError> for FetchError {
 #[async_trait]
 pub trait HttpFetcher: Send + Sync {
     async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, FetchError>;
+
+    /// Fetch bytes plus the response `Content-Type` header value, when
+    /// the underlying transport surfaces it. Session 32.
+    ///
+    /// Default impl wraps [`Self::fetch_bytes`] and returns
+    /// `content_type: None` so every existing implementation —
+    /// including the test [`testing::StaticFetcher`] — compiles
+    /// unchanged. Implementations with header access (the production
+    /// [`SecureHttpClient`] impl) override to populate.
+    ///
+    /// Why a sibling method rather than replacing `fetch_bytes`'s
+    /// return type: the LLM-side caller (`crates/llm`) doesn't care
+    /// about content-type and doesn't want to allocate/destructure a
+    /// wrapper struct on every call. Adding a method preserves the
+    /// happy-path call shape for callers that don't need the meta.
+    async fn fetch_bytes_with_meta(&self, url: &str) -> Result<FetchedBytes, FetchError> {
+        let body = self.fetch_bytes(url).await?;
+        Ok(FetchedBytes {
+            body,
+            content_type: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -117,12 +199,43 @@ impl HttpFetcher for SecureHttpClient {
         // The body-only `get_bytes` would discard the header before
         // we could read it; the executor's backoff logic depends on
         // the parsed value being available.
+        //
+        // Session 32: callers that also need the response Content-Type
+        // go through `fetch_bytes_with_meta` below; this method stays
+        // body-only for the existing happy-path callers (the LLM
+        // provider, the static-payload short-circuit verifier, and
+        // any new caller that explicitly doesn't care).
         let parsed = match Url::parse(url) {
             Ok(u) => u,
             Err(e) => return Err(FetchError::Http(format!("invalid url: {e}"))),
         };
         match self.get_with_headers(&parsed).await {
             Ok(resp) => Ok(resp.body),
+            Err(e) => Err(FetchError::from(e)),
+        }
+    }
+
+    /// Override of the trait's default impl to populate
+    /// `content_type` from the real response header. The header
+    /// passes through `SecureHeaderMap::content_type()` — the closed
+    /// allow-list accessor from the secure crate (ADR 0009 amendment
+    /// in Session 25). The raw string is returned verbatim so the
+    /// presentation layer can parse out parameters (`charset=`,
+    /// `boundary=`) if it needs them; today only the type/subtype is
+    /// consumed by the chip in `RecipesPanel.svelte`.
+    async fn fetch_bytes_with_meta(&self, url: &str) -> Result<FetchedBytes, FetchError> {
+        let parsed = match Url::parse(url) {
+            Ok(u) => u,
+            Err(e) => return Err(FetchError::Http(format!("invalid url: {e}"))),
+        };
+        match self.get_with_headers(&parsed).await {
+            Ok(resp) => {
+                let content_type = resp.headers.content_type().map(|s| s.to_string());
+                Ok(FetchedBytes {
+                    body: resp.body,
+                    content_type,
+                })
+            }
             Err(e) => Err(FetchError::from(e)),
         }
     }
@@ -145,6 +258,15 @@ pub mod testing {
     pub struct StaticFetcher {
         fixtures: Mutex<HashMap<String, Vec<u8>>>,
         rate_limited_urls: Mutex<HashMap<String, Option<u64>>>,
+        /// Per-URL Content-Type override for the
+        /// `fetch_bytes_with_meta` path (Session 32). When unset for
+        /// a URL, the override returns `None` — matching the trait's
+        /// default impl behaviour. When set, `fetch_bytes_with_meta`
+        /// returns the override; `fetch_bytes` is unaffected. Tests
+        /// exercising the apply-failure capture path use this to
+        /// simulate "server told us text/html when the recipe
+        /// expected JSON."
+        content_types: Mutex<HashMap<String, String>>,
     }
 
     impl Default for StaticFetcher {
@@ -158,6 +280,7 @@ pub mod testing {
             Self {
                 fixtures: Mutex::new(HashMap::new()),
                 rate_limited_urls: Mutex::new(HashMap::new()),
+                content_types: Mutex::new(HashMap::new()),
             }
         }
 
@@ -166,6 +289,19 @@ pub mod testing {
                 .get_mut()
                 .unwrap()
                 .insert(url.to_string(), bytes.to_vec());
+            self
+        }
+
+        /// Configure the `Content-Type` value
+        /// `fetch_bytes_with_meta` will return for this URL. Used by
+        /// the Session-32 apply-failure capture tests to verify the
+        /// header lands in the storage row.
+        #[allow(dead_code)]
+        pub fn with_content_type(mut self, url: &str, content_type: &str) -> Self {
+            self.content_types
+                .get_mut()
+                .unwrap()
+                .insert(url.to_string(), content_type.to_string());
             self
         }
 
@@ -207,6 +343,23 @@ pub mod testing {
             map.get(url)
                 .cloned()
                 .ok_or_else(|| FetchError::NoFixture(url.to_string()))
+        }
+
+        /// Override of the trait default so a configured
+        /// `with_content_type` value rides through to callers that
+        /// route via `fetch_bytes_with_meta`. Without this override,
+        /// the default impl would drop back to `fetch_bytes` and
+        /// always return `None` — defeating the point of the
+        /// configured value.
+        async fn fetch_bytes_with_meta(&self, url: &str) -> Result<FetchedBytes, FetchError> {
+            let body = self.fetch_bytes(url).await?;
+            let content_type = self
+                .content_types
+                .lock()
+                .map_err(|e| FetchError::Http(format!("test fixture lock poisoned: {e}")))?
+                .get(url)
+                .cloned();
+            Ok(FetchedBytes { body, content_type })
         }
     }
 }
