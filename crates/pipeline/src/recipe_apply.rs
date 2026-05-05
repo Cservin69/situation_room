@@ -178,10 +178,52 @@ fn extract_json_path(bytes: &[u8], path: &str) -> Result<String, ApplyError> {
         reason: format!("path query failed: {e}"),
     })?;
 
-    let first = nodes.into_iter().next().ok_or_else(|| ApplyError::Extraction {
-        mode: "json_path",
-        reason: format!("path {path:?} matched no nodes"),
-    })?;
+    if nodes.is_empty() {
+        return Err(ApplyError::Extraction {
+            mode: "json_path",
+            reason: format!("path {path:?} matched no nodes"),
+        });
+    }
+
+    // Session 32b: skip JSON `null` matches when picking the
+    // first-of-many. Live evidence from the World Bank Open Data
+    // API (`api.worldbank.org/v2/country/.../indicator/...`): the
+    // most-recent rows in any indicator series carry `"value":
+    // null` for years where data hasn't been published yet, so a
+    // path like `$[1][*].value` legitimately matches a sequence of
+    // nulls before the first real value. The previous code stringified
+    // the leading null to the literal four-character string `"null"`,
+    // which then failed downstream content assembly with
+    // `invalid type: string "null", expected f64` (Session 32a live
+    // run, hungarian barley production).
+    //
+    // The new behaviour: if the first non-null match exists, return
+    // it. If every matched node is null, return a clear error that
+    // names the pattern and suggests the standard fix (a JSONPath
+    // filter expression that excludes nulls). This preserves the
+    // first-match contract for non-null sources unchanged.
+    //
+    // We do NOT do the same for empty strings, zeros, or other
+    // "falsy" values — those are real data and the source is
+    // entitled to publish them. Only JSON `null` is treated as
+    // "this slot has no value here, look further down."
+    let first_non_null = nodes.iter().find(|n| !matches!(n, Value::Null));
+    let first = match first_non_null {
+        Some(n) => *n,
+        None => {
+            return Err(ApplyError::Extraction {
+                mode: "json_path",
+                reason: format!(
+                    "path {path:?} matched {} node(s), all JSON null. \
+                     The source publishes nulls for unavailable data; \
+                     refine the path with a filter expression \
+                     (e.g. `$[1][?(@.value)].value`) to skip nulls \
+                     and select real values.",
+                    nodes.len()
+                ),
+            });
+        }
+    };
 
     // Preserve the value's natural JSON representation. Strings come
     // out unquoted; numbers, bools, objects keep their JSON form.
@@ -989,6 +1031,89 @@ mod tests {
         let bytes = b"not json";
         let err = extract_json_path(bytes, "$.a").unwrap_err();
         assert!(matches!(err, ApplyError::Extraction { mode: "json_path", .. }));
+    }
+
+    /// Session 32b: the World Bank Open Data shape has nulls at the
+    /// head of every per-country/indicator series for years where
+    /// data hasn't been published yet. The path must skip the
+    /// leading nulls and return the first real value, not stringify
+    /// the leading null to `"null"` and fail downstream content
+    /// assembly.
+    ///
+    /// Live evidence: hungarian-barley-production try-out on the
+    /// Session 32a patch returned `invalid type: string "null",
+    /// expected f64`. This test locks in the fix.
+    #[test]
+    fn json_path_skips_leading_nulls_and_returns_first_real_value() {
+        // World Bank shape (simplified): two-element top-level array,
+        // [paginationmeta, [datapoints]]. The datapoints array carries
+        // null `value` for missing years.
+        let bytes = br#"[
+            {"page": 1, "pages": 1, "per_page": 5, "total": 5},
+            [
+                {"date": "2024", "value": null},
+                {"date": "2023", "value": null},
+                {"date": "2022", "value": 178832000000.0},
+                {"date": "2021", "value": 181847000000.0},
+                {"date": "2020", "value": 156800000000.0}
+            ]
+        ]"#;
+        // `$[1][*].value` matches all five `value` fields; the first
+        // two are null, the third is the first real number.
+        let out = extract_json_path(bytes, "$[1][*].value").unwrap();
+        assert_eq!(out, "178832000000.0");
+    }
+
+    /// When every matched node is null, the error message must name
+    /// the pattern (so the operator reading the recipes panel and
+    /// the response-bytes chip can write a useful flag note) and
+    /// suggest the canonical fix (a filter expression).
+    #[test]
+    fn json_path_all_null_returns_actionable_error() {
+        let bytes = br#"[
+            {"date": "2024", "value": null},
+            {"date": "2023", "value": null}
+        ]"#;
+        let err = extract_json_path(bytes, "$[*].value").unwrap_err();
+        let reason = match err {
+            ApplyError::Extraction { mode, reason } => {
+                assert_eq!(mode, "json_path");
+                reason
+            }
+            other => panic!("expected Extraction, got {other:?}"),
+        };
+        // The error must (a) name JSON null as the cause, (b)
+        // suggest a filter-expression fix. Both signals show up in
+        // the chip-and-bytes diagnostic flow Session 31/32 built.
+        assert!(
+            reason.to_lowercase().contains("null"),
+            "error must name null as the cause; got: {reason}"
+        );
+        assert!(
+            reason.contains("filter expression") || reason.contains("?("),
+            "error must point at the filter-expression fix; got: {reason}"
+        );
+    }
+
+    /// A single-node match on JSON null hits the same actionable
+    /// error path as the all-null multi-match case. Without this,
+    /// a path like `$[0].value` against `[{"value": null}]` would
+    /// return the string `"null"` and reproduce the original
+    /// `invalid type: string "null", expected f64` failure.
+    #[test]
+    fn json_path_single_null_match_returns_actionable_error() {
+        let bytes = br#"{"value": null}"#;
+        let err = extract_json_path(bytes, "$.value").unwrap_err();
+        match err {
+            ApplyError::Extraction { mode, reason } => {
+                assert_eq!(mode, "json_path");
+                assert!(
+                    reason.to_lowercase().contains("null"),
+                    "error must name null; got: {reason}"
+                );
+            }
+            other => panic!("expected Extraction, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------

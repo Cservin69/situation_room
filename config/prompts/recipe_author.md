@@ -60,7 +60,17 @@ modes exist. If a source does not fit one of these modes, return an
 error-shaped output (see the schema) rather than inventing a mode.
 
 - `json_path` — for JSON APIs. Field: `path` (JSONPath-like
-  expression).
+  expression). The runtime uses `jsonpath-rust` 1.x — RFC 9535
+  compliant — so filter expressions like `$[1][?(@.value)].value`
+  (select children whose `value` field is truthy) and
+  `$[1][?(@.value > 1000)].value` are supported and often
+  necessary. **For time-series JSON APIs whose most-recent rows
+  carry `null` for unpublished data (World Bank, OECD, Eurostat,
+  many country-stats endpoints), do NOT author a positional
+  index like `$[1][0].value` — index 0 hits the most recent
+  year, which is null every time.** Use a filter expression
+  instead. See "Type honesty" below for the failure shape this
+  avoids.
 - `css_select` — for HTML pages. Fields: `selector` (CSS selector),
   optional `attribute` (pull an attribute rather than text).
 - `csv_cell` — for CSV/TSV. Fields: `column` (header name), optional
@@ -145,13 +155,30 @@ arrays of `EntityId`, etc.). Honor them. Two recurring failure
 modes the runtime catches at apply time:
 
 - **Null where a number was expected.** A source's API returns
-  `"value": null` for a missing data point. Do not author against
-  the field as if it were a number — the deserializer rejects
-  `null` for `f64`. Either the binding belongs on a different
-  field that is non-null, or the recipe is honestly producing zero
-  records for the period (see "Zero records is a valid outcome"
-  below). Don't paper over it with a `literal` 0; that fabricates
-  data.
+  `"value": null` for missing data points. Two distinct shapes,
+  two different responses:
+  - **Per-row null in a series** (the common case for time-series
+    JSON APIs — World Bank, OECD, IMF, Eurostat). The series has
+    real values for some rows and `null` for others, typically
+    with the most-recent rows leading with nulls because data
+    hasn't been published yet. **Fix: filter out nulls in the
+    `path`.** A path like `$[1][0].value` against a World Bank
+    response hits the most recent year, which is null, and the
+    apply runtime fails with `path "$[1][0].value" matched 1
+    node(s), all JSON null` (it tells you the fix verbatim).
+    Author `$[1][?(@.value)].value` instead — the filter
+    expression `[?(@.value)]` selects only entries whose `value`
+    field is truthy, so the path lands on the first real datum.
+    For a numeric threshold, `$[1][?(@.value > 0)].value` works
+    too. Both are jsonpath-rust 1.x supported syntax.
+  - **Systematically null field** (the field is *never* populated
+    on this endpoint — wrong endpoint, deprecated metric, etc.).
+    Fix: the binding belongs on a different field, or the recipe
+    is honestly producing zero records for the topic (see
+    "Zero records is a valid outcome" below). Don't paper over
+    with a `literal` 0; that fabricates data.
+  When the prefetch excerpt shows mixed real-and-null rows, you
+  are in case (a) and a filter expression is the right tool.
 - **Numeric strings where a number was expected.** A CSV column
   reports `"1,234.5"` — the comma-thousands form. Most extractors
   return the raw string; `f64` deserialization rejects the comma.
