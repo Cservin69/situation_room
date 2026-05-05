@@ -67,6 +67,121 @@ use crate::recipes::{
 use crate::research::ResearchPlan;
 
 // ---------------------------------------------------------------------------
+// Runtime bounds on extracted values and error messages
+// ---------------------------------------------------------------------------
+//
+// Session 33: live evidence from a hungarian-barley-production run
+// against `usgs_mcs` produced an apply error whose Display rendered a
+// ~12 KB HTML/JSON blob into the `RecipeOutcome::Failed.message`
+// field. The blob was the rendered text of the USGS MCS landing
+// page (the `<noscript>` block plus a Drupal page-state JSON
+// embedded at the bottom), which the LLM-authored CSS selector had
+// pulled wholesale. `parse_extracted_scalar` kept it as a String,
+// content assembly tried to coerce it to `f64`, and serde_json's
+// error message included the entire offending value. The 12 KB
+// message then propagated through:
+//
+//   - the run log line in `fetch_executor::run_recipes`
+//   - the `recipe_fetch_attempts.error_summary` SQLite column
+//   - the desktop UI's recipe panel
+//
+// rendering each unreadable.
+//
+// The fix has two layers, both narrow:
+//
+//   - At each extractor's exit, reject any scalar above
+//     `EXTRACTED_SCALAR_MAX_BYTES` with a small named error. Recipes
+//     produce records whose largest scalar field — an event title or
+//     a multi-paragraph description — does not legitimately exceed a
+//     couple of kilobytes. A multi-KB extraction is a recipe that
+//     doesn't fit the data; ADR 0007 says the runtime catches that.
+//
+//   - When content assembly does fail despite the upstream bound (a
+//     legitimate-sized non-numeric string mapped to `f64`, say),
+//     truncate the serde_json error message at a generous cap before
+//     wrapping into `ApplyError::ContentAssembly`. The structurally
+//     informative parts of the message — `invalid type: string …,
+//     expected f64` — sit at the head and tail; the middle is the
+//     offending value, which we summarise rather than reproduce.
+//
+// Document records are not producible from recipes (`build_record`
+// rejects them), so no recipe-extracted field legitimately needs the
+// large-body affordance. Bound applies uniformly to every mode.
+
+/// Maximum byte length of an extracted scalar value, across all five
+/// extraction modes. A multi-KB extraction means the recipe targets
+/// a container, not a leaf — refining the recipe is the right
+/// response, and the runtime's job is to surface that cleanly.
+const EXTRACTED_SCALAR_MAX_BYTES: usize = 2048;
+
+/// Maximum char length of an `ApplyError::ContentAssembly` reason
+/// before truncation. The body of an apply error is surfaced in run
+/// logs, in the `recipe_fetch_attempts` table, and in the desktop
+/// UI's recipe panel. A multi-KB blob makes all three illegible.
+const CONTENT_ASSEMBLY_REASON_MAX_CHARS: usize = 600;
+
+/// Reject an extraction whose result exceeds the scalar bound.
+/// Returns the original string unchanged when within bound.
+///
+/// `mode` is the same string used in the extractor's other
+/// `ApplyError::Extraction` returns (`"json_path"`, `"css_select"`,
+/// etc.) so log filters and UI categorisation continue to work.
+fn bound_extracted(out: String, mode: &'static str) -> Result<String, ApplyError> {
+    if out.len() <= EXTRACTED_SCALAR_MAX_BYTES {
+        return Ok(out);
+    }
+    // Preview is short on purpose — it's there to give the operator a
+    // hint at *which* container got selected, not to reproduce its
+    // contents. Char-based truncation keeps the preview UTF-8-safe
+    // even when the extracted bytes are arbitrary text.
+    let preview: String = out.chars().take(120).collect();
+    Err(ApplyError::Extraction {
+        mode,
+        reason: format!(
+            "extraction returned {} bytes; recipes produce single \
+             scalar values and the runtime caps individual field \
+             values at {} bytes. Likely cause: the selector matches a \
+             container element (body, div, table) instead of a leaf, \
+             or the JSON path resolves to an object/array instead of \
+             a scalar. Refine the recipe to target a leaf value. \
+             Preview: {:?}",
+            out.len(),
+            EXTRACTED_SCALAR_MAX_BYTES,
+            preview
+        ),
+    })
+}
+
+/// Truncate a content-assembly reason that grew too long because
+/// serde_json stamped a multi-byte value into its error string.
+///
+/// Strategy: preserve a head and a tail so both the prefix
+/// (`observation content: invalid type: string`) and the suffix
+/// (`, expected f64`) survive. The middle — the offending value —
+/// is replaced by a length marker.
+fn truncate_content_assembly_reason(reason: String) -> String {
+    let total_chars = reason.chars().count();
+    if total_chars <= CONTENT_ASSEMBLY_REASON_MAX_CHARS {
+        return reason;
+    }
+    // Reserve room for the marker. The head + tail share the
+    // remainder roughly 2:1 — the head carries the type description
+    // (more useful) and the tail carries the expected-type hint.
+    let marker_len = 48;
+    let body_budget = CONTENT_ASSEMBLY_REASON_MAX_CHARS.saturating_sub(marker_len);
+    let head_target = (body_budget * 2) / 3;
+    let tail_target = body_budget - head_target;
+
+    let head: String = reason.chars().take(head_target).collect();
+    let tail_rev: Vec<char> = reason.chars().rev().take(tail_target).collect();
+    let tail: String = tail_rev.into_iter().rev().collect();
+
+    format!(
+        "{head} … [value truncated, total {total_chars} chars] … {tail}"
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -227,10 +342,11 @@ fn extract_json_path(bytes: &[u8], path: &str) -> Result<String, ApplyError> {
 
     // Preserve the value's natural JSON representation. Strings come
     // out unquoted; numbers, bools, objects keep their JSON form.
-    Ok(match first {
+    let out = match first {
         Value::String(s) => s.clone(),
         other => other.to_string(),
-    })
+    };
+    bound_extracted(out, "json_path")
 }
 
 fn extract_css_select(
@@ -278,7 +394,7 @@ fn extract_css_select(
             reason: "selection resolved to empty string".into(),
         });
     }
-    Ok(out)
+    bound_extracted(out, "css_select")
 }
 
 fn extract_csv_cell(
@@ -358,7 +474,7 @@ fn extract_csv_cell(
             mode: "csv_cell",
             reason: "no rows matched the filter".into(),
         }),
-        1 => Ok(matching.into_iter().next().unwrap()),
+        1 => bound_extracted(matching.into_iter().next().unwrap(), "csv_cell"),
         n => Err(ApplyError::Extraction {
             mode: "csv_cell",
             reason: format!(
@@ -389,7 +505,7 @@ fn extract_regex(bytes: &[u8], pattern: &str, group: u32) -> Result<String, Appl
             mode: "regex_capture",
             reason: format!("capture group {group} not present in match"),
         })?;
-    Ok(m.as_str().to_string())
+    bound_extracted(m.as_str().to_string(), "regex_capture")
 }
 
 // ---------------------------------------------------------------------------
@@ -521,7 +637,7 @@ fn extract_pdf_table(
             ),
         });
     }
-    Ok(trimmed.to_string())
+    bound_extracted(trimmed.to_string(), "pdf_table")
 }
 
 /// Detect tabular regions in a single page's text.
@@ -699,7 +815,7 @@ fn build_record(
         RecordType::Observation => {
             let content: ObservationContent = serde_json::from_value(content_value)
                 .map_err(|e| ApplyError::ContentAssembly {
-                    reason: format!("observation content: {e}"),
+                    reason: truncate_content_assembly_reason(format!("observation content: {e}")),
                 })?;
             Record::Observation(Observation {
                 id: Uuid::now_v7(),
@@ -711,7 +827,7 @@ fn build_record(
         RecordType::Event => {
             let content: EventContent = serde_json::from_value(content_value)
                 .map_err(|e| ApplyError::ContentAssembly {
-                    reason: format!("event content: {e}"),
+                    reason: truncate_content_assembly_reason(format!("event content: {e}")),
                 })?;
             Record::Event(Event {
                 id: Uuid::now_v7(),
@@ -723,7 +839,7 @@ fn build_record(
         RecordType::Relation => {
             let content: RelationContent = serde_json::from_value(content_value)
                 .map_err(|e| ApplyError::ContentAssembly {
-                    reason: format!("relation content: {e}"),
+                    reason: truncate_content_assembly_reason(format!("relation content: {e}")),
                 })?;
             Record::Relation(Relation {
                 id: Uuid::now_v7(),
@@ -1139,6 +1255,134 @@ mod tests {
         let html = b"<p>hi</p>";
         let err = extract_css_select(html, "table", None).unwrap_err();
         assert!(matches!(err, ApplyError::Extraction { mode: "css_select", .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Session 33: scalar size bound + content-assembly error truncation
+    //
+    // These tests cover the runtime safeguard that catches recipes
+    // whose extraction returns a multi-KB blob — typically because
+    // the LLM authored a CSS selector against a container element
+    // (body, div) on a non-data HTML page. Live evidence: a
+    // hungarian-barley-production run against `usgs_mcs` produced an
+    // apply error whose Display rendered ~12 KB of HTML/JSON page
+    // bytes into the recipe outcome's `message`, polluting logs and
+    // the desktop UI. The bound rejects oversized extractions at the
+    // extractor layer with a small named error; the truncation helper
+    // keeps content-assembly errors readable when they do reach that
+    // stage with a legitimately-sized but type-wrong value.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn css_select_rejects_oversized_extraction() {
+        // A wide selector (`body`) on a real-world-looking HTML page
+        // returns the full rendered text. `bound_extracted` should
+        // turn that into a small actionable error that names the
+        // scalar contract, not a 12 KB blob.
+        let huge = "x".repeat(EXTRACTED_SCALAR_MAX_BYTES + 100);
+        let html = format!("<html><body>{huge}</body></html>");
+        let err = extract_css_select(html.as_bytes(), "body", None).unwrap_err();
+        let ApplyError::Extraction { mode, reason } = err else {
+            panic!("expected Extraction error, got {err:?}");
+        };
+        assert_eq!(mode, "css_select");
+        assert!(
+            reason.contains("scalar"),
+            "reason should explain the scalar contract, got {reason:?}"
+        );
+        assert!(
+            reason.contains(&EXTRACTED_SCALAR_MAX_BYTES.to_string()),
+            "reason should name the bound, got {reason:?}"
+        );
+        assert!(
+            reason.len() < 1024,
+            "reason itself must stay small (got {} bytes); the whole \
+             point of the bound is to keep error messages short",
+            reason.len()
+        );
+    }
+
+    #[test]
+    fn json_path_rejects_oversized_extraction() {
+        // Mirror of the css_select case for the JSON mode: a path
+        // that resolves to a large JSON-stringified object should
+        // not flow into content assembly as an enormous scalar.
+        let huge = "y".repeat(EXTRACTED_SCALAR_MAX_BYTES + 100);
+        let bytes = format!(r#"{{"data":"{huge}"}}"#).into_bytes();
+        let err = extract_json_path(&bytes, "$.data").unwrap_err();
+        assert!(
+            matches!(err, ApplyError::Extraction { mode: "json_path", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn bound_extracted_passes_typical_field_sizes() {
+        // Sanity: a legitimately-sized extraction (a scientific
+        // notation number, a multi-paragraph event description, a
+        // formatted price) must continue to pass through unchanged.
+        for fixture in [
+            "3.14",
+            "1,234,567.89 USD",
+            // ~600 chars: a verbose event description, well within
+            // the 2 KB bound.
+            &"This is a long event description ".repeat(18),
+        ] {
+            let out = bound_extracted(fixture.to_string(), "json_path")
+                .expect("typical sizes must pass the bound");
+            assert_eq!(out, fixture);
+        }
+    }
+
+    #[test]
+    fn truncate_content_assembly_reason_passes_short_messages_unchanged() {
+        let short = "observation content: invalid type: string \"foo\", expected f64";
+        assert_eq!(
+            truncate_content_assembly_reason(short.to_string()),
+            short
+        );
+    }
+
+    #[test]
+    fn truncate_content_assembly_reason_preserves_head_and_tail() {
+        // Construct an error whose middle is a 4 KB value — the
+        // shape serde_json produces when the offending string is
+        // big. The truncated message must:
+        //   1. be bounded (operator-readable in logs and UI)
+        //   2. preserve the head (so the operator sees which content
+        //      type and which type mismatch)
+        //   3. preserve the tail (so the operator sees the expected
+        //      type — `expected f64` etc.)
+        //   4. carry an explicit length marker so the operator knows
+        //      the truncation happened and how much was elided.
+        let middle = "Z".repeat(4_000);
+        let reason = format!(
+            "observation content: invalid type: string \"{middle}\", expected f64"
+        );
+        let truncated = truncate_content_assembly_reason(reason.clone());
+
+        assert!(
+            truncated.chars().count()
+                <= CONTENT_ASSEMBLY_REASON_MAX_CHARS + 32,
+            "truncated message must stay near the cap, got {} chars",
+            truncated.chars().count()
+        );
+        assert!(
+            truncated.starts_with("observation content: invalid type: string"),
+            "head must survive: {truncated}"
+        );
+        assert!(
+            truncated.ends_with("expected f64"),
+            "tail must survive: {truncated}"
+        );
+        assert!(
+            truncated.contains("truncated"),
+            "must signal truncation: {truncated}"
+        );
+        assert!(
+            truncated.contains(&reason.chars().count().to_string()),
+            "must name the original total length: {truncated}"
+        );
     }
 
     // -----------------------------------------------------------------------
