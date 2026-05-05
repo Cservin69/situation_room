@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.9
+# Recipe Author Prompt — v1.10
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -290,6 +290,86 @@ provided, the correct response is to set `source_url` to the most
 plausible documented endpoint you know of for the named
 `source_id` — not to echo a placeholder.
 
+### Plan coherence — the URL must serve the plan's subjects
+
+A URL on the source's documented endpoint shape is necessary but
+not sufficient. The URL must also *be about the plan's subjects*.
+
+The pre-fetch you receive is the runtime issuing one HTTP request
+against the source's registered hint. Hints commonly carry
+**illustrative parameter values** — a default country, a default
+indicator code, a default ticker symbol, a default region — chosen
+by the source maintainer to demonstrate the data envelope without
+committing to any one plan's subjects. The bytes you see are bytes
+about *that illustrative subject*, not about the plan. Treating
+the hint as a target rather than a pattern is the same category of
+mistake as echoing a `https://example.invalid/...` placeholder
+(case 2 above): both are fluent-looking URLs that produce
+structurally-wrong fetches forever.
+
+If your `source_url` keeps the illustrative parameters, the
+runtime will fetch the illustrative subject on every refresh,
+regardless of plan. The recipe's extraction may be perfectly
+valid; the data it produces will be structurally about the wrong
+thing.
+
+**Order of operations.** Before you write `source_url`:
+
+1. Read the plan's `topic`, `geographic_scope`, and the matching
+   expectation bucket. Together these name *what the URL must be
+   about*.
+2. Read the prefetch URL's structure — path segments, query
+   parameters — and identify which parts are **subject placeholders**
+   (likely substituted per plan) versus which parts are **envelope
+   shape** (the API's design, leave alone). Subject placeholders are
+   the components whose value would change if the same source were
+   asked about a different country, a different indicator, a
+   different filing, etc.
+3. Substitute the plan's subjects into the URL's placeholders. The
+   plan's `geographic_scope.code` substitutes into country / region
+   parameters; the plan's metric or topic substitutes into indicator
+   / code / category parameters (typically via the source's catalog,
+   whose codes are documented or discoverable from the same API
+   family).
+4. *Then* refine for tier (instance vs listing — see next subsection)
+   and for completeness (Hunt the URL end-to-end — below that).
+5. *Then* author the extraction. The substituted-URL response shape
+   matches the prefetch envelope by API design, so the extraction
+   path you'd write against the prefetch generally still applies —
+   you are extracting the same envelope's leaf, just from a
+   different subject's data.
+
+**Anti-example** (real failure, Session 33 followup):
+
+> Plan: agricultural production for one specific country.
+> Bucket: three observation expectations
+> (annual production volume, yield per hectare, harvested area).
+> Source: a country-indicator API whose registered hint is
+> `…/country/{country}/indicator/{indicator}?format=json` with
+> `{country}=all` and `{indicator}=` a default macro indicator
+> (the family the source's maintainers picked as their illustrative
+> default).
+> Excerpt: a paginated `[paginationmeta, [datapoints]]` JSON array
+> whose datapoints carry `{country, indicator, value, date}` rows
+> for the default country and the default macro indicator.
+> LLM authored: `source_url` unchanged from the hint; extraction
+> path `$[1][0].value` against the default-indicator series.
+>
+> Why wrong: The hint demonstrated the *data envelope* using a
+> default country and a default macro indicator. The plan asked
+> for a different country *and* a different indicator family
+> (agriculture, not macro). Authoring against the unsubstituted
+> hint produced a recipe whose URL fetched the same illustrative
+> series on every refresh, with a path that landed on whichever
+> year happened to lead the response (often null for unpublished
+> data — see "Type honesty"). Two failures stacked: wrong subject
+> *and* fragile path. The right move was to substitute `{country}`
+> with the plan's `geographic_scope.code` and `{indicator}` with
+> the source-catalog code matching the plan's actual metric, and
+> to author a filter-by-value path (`$[1][?(@.value)].value` or
+> `$[1][?(@.country.value=="…")].value`) instead of a static
+> index. The envelope is the same; the subject is the plan's.
+
 ### Endpoint discipline — instance vs listing
 
 A real-host URL is necessary but not sufficient. The URL must
@@ -408,6 +488,47 @@ P1 verification re-run):
 > a known instance URL is a coverage failure (one event, not
 > N) and a freshness failure (the same regulation forever, no
 > matter what enforcement actions follow).
+
+### Pre-flight checklist
+
+Before you finalize `source_url` and `extraction`, walk this list
+once. Each item points back to the rule it summarizes; treat a
+"no" answer as a signal to refine the recipe before shipping it,
+not a signal to ship and hope.
+
+1. **Subjects.** Does the URL name the plan's geographic scope and
+   the plan's specific metric / topic / entity — *not* the
+   registered hint's illustrative defaults? *(See "Plan coherence —
+   the URL must serve the plan's subjects" above.)*
+2. **Tier.** Is the URL the right tier — listing if the matching
+   bucket holds two or more expectations of the same record type,
+   instance if it holds one? *(See "Endpoint discipline — instance
+   vs listing".)*
+3. **Refinement.** If the prefetch was a search-form skeleton, a
+   locale picker, a format chooser, or a redirect notice, did you
+   refine to the deterministic variant the listing actually lives
+   at? *(See "Hunt the URL end-to-end".)*
+4. **Path shape.** For `json_path` against a time-series API, does
+   the path use a filter expression (`[?(@.value)]`,
+   `[?(@.country.value=="…")]`) targeting the plan's entity rather
+   than a static positional index that lands on whichever row
+   happens to lead the response? *(See "Type honesty — null where
+   a number was expected".)*
+5. **Type fit.** Does each `field_mapping` produce the type the
+   record schema expects (`f64`, `String`, closed enums)? *(See
+   "Type honesty — numeric strings where a number was expected".)*
+
+The checklist exists because the rules above are written as prose,
+in the order the LLM reads them, but the LLM commits to
+`source_url` and `extraction` last — and at that point the rule
+the recipe is about to violate is often the one that lives
+furthest back in the document. Walking the list reorders the
+rules to be adjacent to the moment of decision.
+
+The runtime is deterministic — what you ship runs forever, against
+fresh fetches, until the operator flags it. A few extra seconds
+spent on the checklist now saves the operator a flag-and-reauthor
+round trip later.
 
 ## Strategy for PDF sources — HTML first, static payload fallback
 
@@ -816,6 +937,33 @@ you pick.
 
 ### Changelog
 
+- **v1.10** (2026-05-05) — Added "Plan coherence — the URL must
+  serve the plan's subjects" subsection inside URL discipline
+  (between the case-1/case-2 paragraphs and "Endpoint discipline —
+  instance vs listing"), and a "Pre-flight checklist" subsection
+  at the end of URL discipline. Addresses a Session 33 followup
+  live failure: a country-indicator API hint with
+  `country=all&indicator={default-macro}` placeholder parameters
+  produced a recipe whose `source_url` echoed the hint verbatim
+  and whose `json_path` was a static positional index against the
+  default-indicator response. Two failures stacked: wrong subject
+  *and* fragile path, both visible in the same run. v1.9's URL
+  discipline already gestured at parameter substitution as a
+  sub-clause of case 1 ("swap an indicator code in the path") and
+  v1.9's "Type honesty" already named the null-at-static-index
+  failure shape with the verbatim fix. With those rules buried in
+  prose by the time the LLM commits to `source_url` and
+  `extraction`, the rules adjacent to the prefetch bytes (URL
+  fluency, envelope-reading) outweighed them. v1.10 lifts
+  plan-coherence to its own subsection at the top of URL
+  discipline so substitution is read alongside placeholder-vs-real
+  rather than as a buried sub-clause; the pre-flight checklist
+  reorders the most-violated rules to be adjacent to the moment of
+  decision (subjects → tier → refinement → path shape → type
+  fit). Anti-example anchored in the failure shape, not in the
+  source's identity. Output contract is unchanged — same JSON
+  Schema, same field-source kinds, same binding rules. Recipes
+  already authored remain valid.
 - **v1.9** (2026-05-04) — Track B (Session 28, ADR 0007 amendment 4).
   Output contract changes: `decline_reason: String` is now an
   expected field on `RecipeAuthoringOutput` (empty-string-as-absent
