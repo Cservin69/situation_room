@@ -1020,8 +1020,9 @@ mod tests {
         ProductionBinding, RowFilter,
     };
     use crate::research::{
-        DocumentSourceHint, EntityKindExpectation, EventTypeExpectation, GeoScope,
-        MetricExpectation, RecordExpectations, RelationKindExpectation,
+        DocumentSourceEntry, DocumentSourceNomination, EntityKindExpectation,
+        EventTypeExpectation, GeoScope, MetricExpectation, PriorityTier, RecordExpectations,
+        RelationKindExpectation,
     };
     use chrono::TimeZone;
     use situation_room_core::vocab::{EntityId, EventType, Topic, Unit};
@@ -1054,10 +1055,16 @@ mod tests {
                     kind: "operator_of".into(),
                     rationale: "Asset link".into(),
                 }],
-                document_sources: vec![DocumentSourceHint {
-                    description: "USGS".into(),
-                    preferred_source_ids: vec!["usgs_mcs".into()],
-                }],
+                document_sources: vec![DocumentSourceEntry::Nomination(
+                    DocumentSourceNomination {
+                        description: "USGS".into(),
+                        endpoint_url:
+                            "https://www.usgs.gov/centers/national-minerals-information-center/mineral-commodity-summaries"
+                                .into(),
+                        priority_tier: PriorityTier::AuthoritativePrimary,
+                        known_id: Some("usgs_mcs".into()),
+                    },
+                )],
                 assertion_guidance: None,
             },
             created_at: Utc.with_ymd_and_hms(2026, 4, 22, 0, 0, 0).unwrap(),

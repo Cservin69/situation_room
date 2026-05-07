@@ -171,10 +171,19 @@ pub struct RecordExpectations {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relation_kinds: Vec<RelationKindExpectation>,
 
-    /// Document sources the session wants to monitor. Each hint is
-    /// matched against registered sources by the source-matching step.
+    /// Document sources the session wants to fetch from. Each entry is
+    /// either a [`DocumentSourceNomination`] (the post-ADR-0015 shape
+    /// the LLM emits today, carrying its own `endpoint_url` and
+    /// `priority_tier`) or a legacy [`DocumentSourceHint`] (the pre-ADR
+    /// shape carried by plans persisted before Session 37).
+    ///
+    /// The two are unioned through [`DocumentSourceEntry`] with
+    /// `#[serde(untagged)]` so old `research_plans.plan_json` rows
+    /// deserialize into `Legacy` and new plans deserialize into
+    /// `Nomination`. ADR 0015 §"Backwards-compatible deserialization
+    /// of legacy plans".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub document_sources: Vec<DocumentSourceHint>,
+    pub document_sources: Vec<DocumentSourceEntry>,
 
     /// Notes from the classifier about expected Assertion patterns —
     /// what claims the LLM extraction layer should prioritize extracting
@@ -244,6 +253,104 @@ pub struct DocumentSourceHint {
     /// Empty means "match by description against all sources."
     #[serde(default)]
     pub preferred_source_ids: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// DocumentSourceNomination — the post-ADR-0015 emission shape (Session 37)
+// ---------------------------------------------------------------------------
+
+/// A source the Level-1 classifier nominates for a plan, in the shape
+/// ADR 0015 ratifies. Every nomination carries its own `endpoint_url`
+/// and `priority_tier` directly — no static-registry lookup, no
+/// description-only fallback.
+///
+/// Replaces [`DocumentSourceHint`] for newly classified plans. Plans
+/// classified before Session 37 keep the legacy shape on disk and are
+/// surfaced through [`DocumentSourceEntry::Legacy`]; the executor
+/// produces a per-source `LegacyPlanCannotAuthor` outcome for those
+/// when no recipes have been authored yet (ADR 0015 §"Backwards-
+/// compatible deserialization of legacy plans").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentSourceNomination {
+    /// Why this source fits the plan. Shown in the UI and threaded
+    /// into the recipe author's authoring context as part of the
+    /// source description.
+    pub description: String,
+
+    /// The URL the executor pre-fetches and hands to recipe authoring.
+    /// Required and validated through `UrlGuard::check` at conversion
+    /// time — an unparseable, scheme-blocked, or private-IP URL fails
+    /// classification entirely (ADR 0015 §"Validation discipline").
+    pub endpoint_url: String,
+
+    /// Where this nomination sits in the source-priority hierarchy
+    /// ADR 0007 amendment 6 ratified. Typed enum; not implicit in
+    /// list order.
+    pub priority_tier: PriorityTier,
+
+    /// LLM's recognition that this URL matches a memory entry the
+    /// classifier prompt surfaced. `None` when the LLM emitted a URL
+    /// from training-distribution knowledge alone (the cold-start
+    /// pattern). The executor verifies the match by host normalization
+    /// — a mismatch logs a warning and the URL wins for identity (the
+    /// resulting `recipes.source_id` is host-derived). ADR 0015
+    /// §"`DocumentSourceHint` becomes `DocumentSourceNomination`".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_id: Option<String>,
+}
+
+/// Source-priority tier as ADR 0007 amendment 6 ratified it. Closed
+/// enum; `schemars` serializes the four variants as the snake_case
+/// strings the prompt teaches.
+///
+/// The order is significant: higher priority is "earlier" in this
+/// declaration, and any future tie-breaking (e.g. concurrent-authoring
+/// scheduling) follows the declaration order. The UI groups
+/// nominations by tier in the Plan Review panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorityTier {
+    /// The entity that *creates* the data — the agency publishing the
+    /// statistic, the regulator enacting the rule, the company filing
+    /// its own 10-K. Cited as fact.
+    AuthoritativePrimary,
+    /// Aggregators that compile primaries with attribution (USGS
+    /// aggregating mine-level production into national totals; the
+    /// IEA aggregating energy stats).
+    AuthoritativeSecondary,
+    /// Specialist publications reporting on the topic from inside the
+    /// industry. Useful for context, weaker for facts.
+    IndustryTradePress,
+    /// Broad-audience reporting. Useful for events and timelines,
+    /// weakest for numbers.
+    GeneralNews,
+}
+
+/// Per-plan document-source entry. `#[serde(untagged)]` lets the same
+/// JSON column hold either shape — new plans serialize as `Nomination`,
+/// pre-Session-37 plans round-trip through `Legacy` without touching
+/// disk. ADR 0015 §"Backwards-compatible deserialization of legacy
+/// plans".
+///
+/// The wire DTO that crosses to the desktop frontend (`DocumentSourceEntryDto`
+/// in the `api` crate) is *tagged*, not untagged: the frontend matches
+/// on `kind` to render either the new tile or a "legacy entry — please
+/// re-classify" stub. The asymmetry is deliberate; serde's
+/// untagged-on-disk lets old data load, the tagged-on-wire form makes
+/// the variant explicit at the React/Svelte boundary where
+/// pattern-matching is the natural shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DocumentSourceEntry {
+    /// Post-ADR-0015 emission. `serde(untagged)` matches this variant
+    /// first because nominations carry the required `endpoint_url`
+    /// field and the legacy hint never does.
+    Nomination(DocumentSourceNomination),
+    /// Pre-Session-37 hint. Reached by `serde(untagged)` only when the
+    /// nomination shape fails to deserialize (typically because
+    /// `endpoint_url` is absent). New plans never serialize this
+    /// variant.
+    Legacy(DocumentSourceHint),
 }
 
 // ---------------------------------------------------------------------------
@@ -345,10 +452,15 @@ mod tests {
                     rationale: "Fabs are the atomic unit of capacity".into(),
                 }],
                 relation_kinds: vec![],
-                document_sources: vec![DocumentSourceHint {
-                    description: "SEC filings of listed semi companies".into(),
-                    preferred_source_ids: vec!["sec_edgar".into()],
-                }],
+                document_sources: vec![DocumentSourceEntry::Nomination(
+                    DocumentSourceNomination {
+                        description: "SEC filings of listed semi companies".into(),
+                        endpoint_url: "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany"
+                            .into(),
+                        priority_tier: PriorityTier::AuthoritativePrimary,
+                        known_id: Some("sec_edgar".into()),
+                    },
+                )],
                 assertion_guidance: Some("Prioritize named-official guidance".into()),
             },
             created_at: Utc::now(),
@@ -406,5 +518,87 @@ mod tests {
         let exp = RecordExpectations::default();
         let json = serde_json::to_string(&exp).unwrap();
         assert_eq!(json, "{}");
+    }
+
+    // ----- ADR 0015 / Session 37 ---------------------------------------------
+
+    #[test]
+    fn nomination_round_trips_through_serde() {
+        let n = DocumentSourceNomination {
+            description: "World Bank country indicators".into(),
+            endpoint_url: "https://api.worldbank.org/v2/country/HU/indicator/AG.PRD.CROP.XD?format=json"
+                .into(),
+            priority_tier: PriorityTier::AuthoritativePrimary,
+            known_id: Some("world_bank_indicators".into()),
+        };
+        let entry = DocumentSourceEntry::Nomination(n);
+        let json = serde_json::to_string(&entry).unwrap();
+        // Untagged: the JSON does not carry a discriminator on disk.
+        assert!(!json.contains("\"kind\""));
+        assert!(json.contains("endpoint_url"));
+        assert!(json.contains("priority_tier"));
+        let back: DocumentSourceEntry = serde_json::from_str(&json).unwrap();
+        match back {
+            DocumentSourceEntry::Nomination(b) => {
+                assert_eq!(b.priority_tier, PriorityTier::AuthoritativePrimary);
+                assert_eq!(b.known_id.as_deref(), Some("world_bank_indicators"));
+            }
+            _ => panic!("nomination should round-trip as Nomination"),
+        }
+    }
+
+    #[test]
+    fn legacy_plan_json_deserializes_as_legacy_variant() {
+        // The wire shape pre-Session-37 plans wrote: `description` +
+        // `preferred_source_ids`, no `endpoint_url`, no
+        // `priority_tier`. ADR 0015 §"Backwards-compatible
+        // deserialization" requires this round-trip.
+        let legacy_json = r#"{
+            "description": "OFAC SDN list publication feed",
+            "preferred_source_ids": ["ofac_sdn"]
+        }"#;
+        let entry: DocumentSourceEntry = serde_json::from_str(legacy_json).unwrap();
+        match entry {
+            DocumentSourceEntry::Legacy(h) => {
+                assert_eq!(h.description, "OFAC SDN list publication feed");
+                assert_eq!(h.preferred_source_ids, vec!["ofac_sdn".to_string()]);
+            }
+            DocumentSourceEntry::Nomination(_) => {
+                panic!("legacy hint must deserialize as Legacy, not Nomination");
+            }
+        }
+    }
+
+    #[test]
+    fn priority_tier_serializes_snake_case() {
+        let tiers = [
+            (PriorityTier::AuthoritativePrimary, "authoritative_primary"),
+            (PriorityTier::AuthoritativeSecondary, "authoritative_secondary"),
+            (PriorityTier::IndustryTradePress, "industry_trade_press"),
+            (PriorityTier::GeneralNews, "general_news"),
+        ];
+        for (tier, expected) in tiers {
+            let s = serde_json::to_string(&tier).unwrap();
+            assert_eq!(s, format!("\"{expected}\""));
+            let back: PriorityTier = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, tier);
+        }
+    }
+
+    #[test]
+    fn nomination_without_known_id_round_trips() {
+        // The cold-start case: LLM emits a URL from training-distribution
+        // knowledge alone; no memory match; `known_id` is absent. Both
+        // omission ("no field") and explicit null must deserialize.
+        let json_omitted = r#"{
+            "description": "arXiv quant-ph daily listings",
+            "endpoint_url": "https://arxiv.org/list/quant-ph/recent",
+            "priority_tier": "authoritative_primary"
+        }"#;
+        let entry: DocumentSourceEntry = serde_json::from_str(json_omitted).unwrap();
+        match entry {
+            DocumentSourceEntry::Nomination(n) => assert!(n.known_id.is_none()),
+            _ => panic!("expected Nomination"),
+        }
     }
 }

@@ -102,13 +102,20 @@ fn main() -> Result<()> {
 
     // --- Source descriptors -----------------------------------------
     //
-    // Loaded from `<workspace_root>/config/sources.toml`. A missing
-    // file is non-fatal: classification still runs, just without
-    // registered-source nominations.
+    // Doc-narrowed under ADR 0015 (Session 37). The classifier no
+    // longer reads this file — it consults the in-DB sources memory
+    // (see `Store::sources_memory`). The load survives because the
+    // executor's `#[ignore]` live tests still author hand-crafted
+    // recipes against the surviving `csv_demo` and `json_demo`
+    // entries. A missing file is non-fatal; production classification
+    // proceeds either way.
     let sources_path = workspace_root.join("config").join("sources.toml");
     let sources = load_source_descriptors(&sources_path, 30)
         .with_context(|| format!("loading sources from {}", sources_path.display()))?;
-    info!(count = sources.len(), "registered source descriptors loaded");
+    info!(
+        count = sources.len(),
+        "source descriptors loaded (post-ADR-0015 demo fixtures only)"
+    );
 
     // --- AppState ----------------------------------------------------
     let state = AppState::new(

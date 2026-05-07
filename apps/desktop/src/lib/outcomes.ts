@@ -68,7 +68,7 @@
  */
 import type { RecipeOutcomeDto } from '$lib/api/types/RecipeOutcomeDto';
 
-export type OutcomeTone = 'ok' | 'skip' | 'fail' | 'limited' | 'declined' | 'none';
+export type OutcomeTone = 'ok' | 'skip' | 'fail' | 'limited' | 'declined' | 'legacy' | 'none';
 
 /**
  * Map a wire outcome to its UI tone. The recipes panel uses
@@ -82,6 +82,7 @@ export function outcomeTone(o: RecipeOutcomeDto | undefined): OutcomeTone {
   if (o.kind === 'skipped') return 'skip';
   if (o.kind === 'rate_limited') return 'limited';
   if (o.kind === 'declined') return 'declined';
+  if (o.kind === 'legacy_plan_cannot_author') return 'legacy';
   return 'fail';
 }
 
@@ -112,6 +113,7 @@ export function outcomeLabel(o: RecipeOutcomeDto | undefined): string {
     return `rate-limited; retry after ${formatRetryAfter(secs)}`;
   }
   if (o.kind === 'declined') return 'declined';
+  if (o.kind === 'legacy_plan_cannot_author') return 'legacy plan';
   return `failed @ ${o.stage}`;
 }
 
@@ -136,6 +138,9 @@ export function outcomeDetail(o: RecipeOutcomeDto | undefined): string {
     return `The source asked to wait ${formatRetryAfter(secs)} before retrying. Re-run the fetch after that window.`;
   }
   if (o.kind === 'declined') return o.reason;
+  if (o.kind === 'legacy_plan_cannot_author') {
+    return 'Plan was classified before Session 37. Re-classify to update — the new pass emits source URLs the executor can author against.';
+  }
   return '';
 }
 
@@ -188,7 +193,12 @@ export function outcomeForRecipe(
   outcomes: RecipeOutcomeDto[] | undefined,
 ): RecipeOutcomeDto | undefined {
   if (!outcomes) return undefined;
-  return outcomes.find((o) => o.kind !== 'declined' && o.recipe_id === recipeId);
+  return outcomes.find(
+    (o) =>
+      o.kind !== 'declined' &&
+      o.kind !== 'legacy_plan_cannot_author' &&
+      o.recipe_id === recipeId,
+  );
 }
 
 /**
@@ -215,5 +225,6 @@ export function outcomeForRecipe(
  */
 export function outcomeKey(o: RecipeOutcomeDto): string {
   if (o.kind === 'declined') return `declined:${o.source_id}`;
+  if (o.kind === 'legacy_plan_cannot_author') return `legacy:${o.source_id}`;
   return o.recipe_id;
 }

@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.11
+# Recipe Author Prompt — v1.12
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -1030,6 +1030,33 @@ you pick.
 
 ### Changelog
 
+- **v1.12** (2026-05-07) — ADR 0015 (Session 37). No structural
+  change to the recipe-author prompt; this entry records that the
+  classifier now emits source URLs directly (the
+  `DocumentSourceNomination` shape carries `endpoint_url`,
+  `priority_tier`, optional `known_id`) and that the executor
+  hands the LLM-emitted URL to this prompt's `{{SOURCE_URL}}`
+  placeholder verbatim, no descriptor lookup, no
+  `https://example.invalid/...` placeholder synthesis.
+  In practice this means: (a) URL case 2 of "URL discipline — read
+  this carefully" — the `https://example.invalid/<source_id>`
+  placeholder case — never fires for plans classified after Session
+  37, because the classifier already committed to a real URL.
+  The case-2 paragraph stays in the prompt for the historical
+  re-author path against pre-Session-37 plans whose stored recipes
+  may still carry placeholder URLs. (b) `{{SOURCE_ID}}` is now
+  derived from `known_id` (when present and host-verified) or the
+  URL host, so an `endpoint_url` of
+  `https://api.worldbank.org/v2/country/HU/indicator/...` produces
+  `source_id = "world_bank_indicators"` (when the LLM stamped
+  `known_id`) or `source_id = "api.worldbank.org"` (when it
+  didn't) — both shapes are valid; the recipe fields treat them
+  identically. The PDF-vs-HTML strategy, JS-rendering caveat,
+  rate-limit notes, and paywall caveats — all of which previously
+  lived as source-specific TOML annotations in
+  `config/sources.toml` — are unchanged here because v1.10–v1.11
+  had already absorbed them as principles. Output contract is
+  unchanged.
 - **v1.11** (2026-05-06) — Frame inversion: from source-anchored
   authoring to plan-anchored authoring. Added a new top-level
   section *"The plan is your specification — author from the

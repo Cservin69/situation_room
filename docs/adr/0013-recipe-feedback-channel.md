@@ -408,3 +408,21 @@ The implementation in Session 19 follows this ADR exactly. If
 empirical use surfaces any of the amendment triggers in §"When to
 amend or supersede," the next session writes the amendment before
 the code change.
+
+## Note (Session 37) — `source_id` source under ADR 0015
+
+The schema description in §"Decision" notes that `source_id` is
+"a string id from `config/sources.toml`." That description is
+historically accurate but stale under ADR 0015 (Session 37):
+`config/sources.toml` shrunk to two demo entries; production
+`source_id` values now derive from either the classifier's
+`known_id` stamp or the URL host of the LLM-emitted
+`endpoint_url` (per ADR 0015 §"The executor change").
+
+The `recipe_feedback` table's `source_id` column continues to
+function identically. The keying discipline `(plan_id, source_id)`
+survives the source-emission change because the natural key is the
+same regardless of where the id came from. Operator feedback set
+against a memory-derived `source_id` (e.g. `api.worldbank.org`)
+persists across reauthoring exactly as feedback set against a
+former registry id (e.g. `world_bank_indicators`) did before.

@@ -5,6 +5,16 @@
 > shape unless ADR 0012 §"Documenting observed Class B failures" is
 > amended.
 
+> **Note (Session 37)**: This case log references "Session 24's
+> `config/sources.toml` patch" as a remediation that would not
+> change the case. ADR 0015 (Session 37) replaced
+> `config/sources.toml` with the classifier's LLM-emitted sources;
+> the file shrunk to two demo entries, and the Session-24 patches
+> no longer exist in the production path. The investigative
+> content (null-vs-f64 deserialization failure, the JSON-stat
+> envelope anti-pattern) remains valid as a Class B-adjacent
+> exemplar; only the procedural remediation note is stale.
+
 ## Summary
 
 Operator-machine live verification run on 2026-05-03, against the

@@ -41,4 +41,4 @@ export type RecipeOutcomeDto = { "kind": "succeeded", recipe_id: string, source_
  * server returned 429 with no machine-readable hint. The
  * frontend formats both cases via `outcomes.ts`.
  */
-retry_after_seconds: bigint | null, } | { "kind": "declined", source_id: string, reason: string, };
+retry_after_seconds: bigint | null, } | { "kind": "declined", source_id: string, reason: string, } | { "kind": "legacy_plan_cannot_author", source_id: string, };

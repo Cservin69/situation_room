@@ -25,8 +25,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use situation_room_pipeline::research::{
-    DocumentSourceHint, EntityKindExpectation, EventTypeExpectation, GeoScope,
-    MetricExpectation, RecordExpectations, RelationKindExpectation, ResearchPlan,
+    DocumentSourceEntry, DocumentSourceHint, DocumentSourceNomination, EntityKindExpectation,
+    EventTypeExpectation, GeoScope, MetricExpectation, PriorityTier, RecordExpectations,
+    RelationKindExpectation, ResearchPlan,
 };
 use situation_room_storage::research_plans::{PlanStatus, StoredResearchPlan};
 use ts_rs::TS;
@@ -137,7 +138,7 @@ pub struct RecordExpectationsDto {
     pub event_types: Vec<EventTypeExpectationDto>,
     pub entity_kinds: Vec<EntityKindExpectationDto>,
     pub relation_kinds: Vec<RelationKindExpectationDto>,
-    pub document_sources: Vec<DocumentSourceHintDto>,
+    pub document_sources: Vec<DocumentSourceEntryDto>,
     /// `None` is preserved as `null` on the wire; the frontend renders
     /// the assertion-guidance panel only when present.
     pub assertion_guidance: Option<String>,
@@ -175,11 +176,68 @@ pub struct RelationKindExpectationDto {
     pub rationale: String,
 }
 
+/// Wire shape for the legacy pre-Session-37 document-source hint.
+/// Surfaced under [`DocumentSourceEntryDto::Legacy`] only — newly
+/// classified plans never produce this variant. Kept on the wire so
+/// the frontend can render a "legacy entry — re-classify to update"
+/// stub for plans persisted before ADR 0015.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
 pub struct DocumentSourceHintDto {
     pub description: String,
     pub preferred_source_ids: Vec<String>,
+}
+
+/// Source-priority tier on the wire. ADR 0015 / Session 37: closed
+/// snake_case enum. Mirrors
+/// [`situation_room_pipeline::research::PriorityTier`] one-for-one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+#[serde(rename_all = "snake_case")]
+pub enum PriorityTierDto {
+    AuthoritativePrimary,
+    AuthoritativeSecondary,
+    IndustryTradePress,
+    GeneralNews,
+}
+
+/// Wire shape for a post-ADR-0015 document-source nomination. The
+/// classifier emits the URL directly; the executor authors against
+/// it without any registry lookup.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct DocumentSourceNominationDto {
+    pub description: String,
+    pub endpoint_url: String,
+    pub priority_tier: PriorityTierDto,
+    /// `null` on the wire when the LLM did not stamp a known_id (the
+    /// cold-start case). The frontend uses presence to decide whether
+    /// to show the recognized-source badge.
+    pub known_id: Option<String>,
+}
+
+/// Wire shape for one document-source entry on a plan.
+///
+/// Tagged on the wire (`{"kind": "nomination", ...}` / `{"kind":
+/// "legacy", ...}`) even though the on-disk `DocumentSourceEntry`
+/// is `#[serde(untagged)]`. The asymmetry is deliberate: the
+/// untagged-on-disk form lets old plans round-trip without touching
+/// storage, and the tagged-on-wire form gives the React/Svelte
+/// boundary a clean discriminator to pattern-match on.
+///
+/// The frontend should:
+///
+/// - For `Nomination`: render the new tile with the URL, tier, and
+///   optional known_id badge.
+/// - For `Legacy`: render a "legacy entry — re-classify to update"
+///   stub. The plan was classified before Session 37 / ADR 0015
+///   and its sources cannot be authored against without re-classification.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DocumentSourceEntryDto {
+    Nomination(DocumentSourceNominationDto),
+    Legacy(DocumentSourceHintDto),
 }
 
 // ---------------------------------------------------------------------------
@@ -261,10 +319,12 @@ impl PlanSummary {
 /// Wire shape for a registered source descriptor. Mirrors
 /// [`situation_room_pipeline::research_classifier::SourceDescriptor`].
 ///
-/// Currently the frontend doesn't fetch this directly (the binary
-/// loads `config/sources.toml` and stuffs descriptors into `AppState`),
-/// but the type is exported so a future settings or "sources used
-/// by this plan" view has a stable wire schema to import.
+/// **Doc-narrowed under ADR 0015 (Session 37).** The classifier no
+/// longer reads `config/sources.toml` — it consults the in-DB sources
+/// memory ([`Store::sources_memory`]). The DTO survives because the
+/// wire schema is stable; the frontend never used it for
+/// classification anyway, and a future "demo fixtures" surface might
+/// still want it.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
 pub struct SourceDescriptorDto {
@@ -436,7 +496,7 @@ impl From<RecordExpectations> for RecordExpectationsDto {
             document_sources: e
                 .document_sources
                 .into_iter()
-                .map(DocumentSourceHintDto::from)
+                .map(DocumentSourceEntryDto::from)
                 .collect(),
             assertion_guidance: e.assertion_guidance,
         }
@@ -489,6 +549,41 @@ impl From<DocumentSourceHint> for DocumentSourceHintDto {
         Self {
             description: h.description,
             preferred_source_ids: h.preferred_source_ids,
+        }
+    }
+}
+
+// --- ADR 0015 / Session 37 ------------------------------------------------
+
+impl From<DocumentSourceNomination> for DocumentSourceNominationDto {
+    fn from(n: DocumentSourceNomination) -> Self {
+        Self {
+            description: n.description,
+            endpoint_url: n.endpoint_url,
+            priority_tier: n.priority_tier.into(),
+            known_id: n.known_id,
+        }
+    }
+}
+
+impl From<PriorityTier> for PriorityTierDto {
+    fn from(t: PriorityTier) -> Self {
+        match t {
+            PriorityTier::AuthoritativePrimary => Self::AuthoritativePrimary,
+            PriorityTier::AuthoritativeSecondary => Self::AuthoritativeSecondary,
+            PriorityTier::IndustryTradePress => Self::IndustryTradePress,
+            PriorityTier::GeneralNews => Self::GeneralNews,
+        }
+    }
+}
+
+impl From<DocumentSourceEntry> for DocumentSourceEntryDto {
+    fn from(e: DocumentSourceEntry) -> Self {
+        match e {
+            DocumentSourceEntry::Nomination(n) => {
+                DocumentSourceEntryDto::Nomination(n.into())
+            }
+            DocumentSourceEntry::Legacy(h) => DocumentSourceEntryDto::Legacy(h.into()),
         }
     }
 }
@@ -584,6 +679,18 @@ pub enum RecipeOutcomeDto {
     Declined {
         source_id: String,
         reason: String,
+    },
+    /// ADR 0015 / Session 37: the plan was classified before
+    /// Session 37 and the operator triggered a fetch before any
+    /// recipes had been authored. The pre-Session-37 hint shape
+    /// (description + `preferred_source_ids`) carries no
+    /// `endpoint_url` for the executor to author against; the
+    /// frontend renders this as a "legacy entry — re-classify the
+    /// plan to update" stub. Once the plan is re-classified the
+    /// next run produces normal `Succeeded` / `Failed` / `Declined`
+    /// outcomes.
+    LegacyPlanCannotAuthor {
+        source_id: String,
     },
 }
 
@@ -684,6 +791,13 @@ impl From<situation_room_pipeline::fetch_executor::RecipeOutcome> for RecipeOutc
                 source_id,
                 reason,
             },
+            // ADR 0015 / Session 37: a Legacy entry on a
+            // pre-Session-37 plan cannot be authored against. No
+            // recipe_id, no reason — the cause is structural
+            // (legacy hint) and remediation is fixed (re-classify).
+            O::LegacyPlanCannotAuthor { source_id } => {
+                RecipeOutcomeDto::LegacyPlanCannotAuthor { source_id }
+            }
         }
     }
 }
@@ -1018,10 +1132,10 @@ mod tests {
     use super::*;
     use situation_room_core::vocab::{EntityId, EventType, Topic, Unit};
     use situation_room_pipeline::research::{
-        DocumentSourceHint as P_DSH, EntityKindExpectation as P_EKE,
-        EventTypeExpectation as P_ETE, GeoScope as P_GS, MetricExpectation as P_ME,
-        RecordExpectations as P_RE, RelationKindExpectation as P_RKE,
-        ResearchPlan as P_RP,
+        DocumentSourceEntry as P_DSE, DocumentSourceNomination as P_DSN,
+        EntityKindExpectation as P_EKE, EventTypeExpectation as P_ETE, GeoScope as P_GS,
+        MetricExpectation as P_ME, PriorityTier as P_PT, RecordExpectations as P_RE,
+        RelationKindExpectation as P_RKE, ResearchPlan as P_RP,
     };
 
     fn sample_plan() -> P_RP {
@@ -1060,10 +1174,14 @@ mod tests {
                     kind: "operator_of".into(),
                     rationale: "Asset link".into(),
                 }],
-                document_sources: vec![P_DSH {
+                document_sources: vec![P_DSE::Nomination(P_DSN {
                     description: "USGS MCS".into(),
-                    preferred_source_ids: vec!["usgs_mcs".into()],
-                }],
+                    endpoint_url:
+                        "https://www.usgs.gov/centers/national-minerals-information-center/mineral-commodity-summaries"
+                            .into(),
+                    priority_tier: P_PT::AuthoritativePrimary,
+                    known_id: Some("usgs_mcs".into()),
+                })],
                 assertion_guidance: Some("Prioritize official guidance".into()),
             },
             created_at: chrono::Utc::now(),

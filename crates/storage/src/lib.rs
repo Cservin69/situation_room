@@ -28,6 +28,7 @@ pub mod record_dispatch;
 pub mod recipes;
 pub mod relations;
 pub mod research_plans;
+pub mod sources_memory;
 
 pub use connection::Store;
 pub use fetch_runs::{FetchRunRow, StoredFetchRun};
@@ -38,6 +39,7 @@ pub use recipe_fetch_attempts::{
 };
 pub use recipes::{AuthoredFrom, RecipeRow, StoredRecipe, MAX_RECIPE_LINEAGE_DEPTH};
 pub use research_plans::{PlanStatus, ResearchPlanRow, StoredResearchPlan};
+pub use sources_memory::{MemorySource, SOURCES_MEMORY_LIMIT};
 
 use thiserror::Error;
 

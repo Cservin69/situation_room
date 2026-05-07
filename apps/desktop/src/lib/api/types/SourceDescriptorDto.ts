@@ -4,9 +4,11 @@
  * Wire shape for a registered source descriptor. Mirrors
  * [`situation_room_pipeline::research_classifier::SourceDescriptor`].
  *
- * Currently the frontend doesn't fetch this directly (the binary
- * loads `config/sources.toml` and stuffs descriptors into `AppState`),
- * but the type is exported so a future settings or "sources used
- * by this plan" view has a stable wire schema to import.
+ * **Doc-narrowed under ADR 0015 (Session 37).** The classifier no
+ * longer reads `config/sources.toml` — it consults the in-DB sources
+ * memory ([`Store::sources_memory`]). The DTO survives because the
+ * wire schema is stable; the frontend never used it for
+ * classification anyway, and a future "demo fixtures" surface might
+ * still want it.
  */
 export type SourceDescriptorDto = { id: string, display_name: string, description: string, authoritative_for: Array<string>, };

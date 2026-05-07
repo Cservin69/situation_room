@@ -1,16 +1,18 @@
-# Research Classifier Prompt — v1.5
+# Research Classifier Prompt — v1.6
 
 <!--
     This file is the Level-1 research classifier prompt for situation_room.
     It is loaded by `pipeline::research_classifier::classify_topic` and
     sent to an LLM along with a free-text topic, the existing Topic
-    strings in use, and the registered sources situation_room can fetch
-    from. The LLM returns a structured AuthoredResearchPlan (see
-    `crates/pipeline/src/research_classifier.rs`) which is validated
-    server-side and stored as a ResearchPlan.
+    strings in use, and the sources memory derived from past
+    successful fetches. The LLM returns a structured AuthoredResearchPlan
+    (see `crates/pipeline/src/research_classifier.rs`) which is
+    validated server-side and stored as a ResearchPlan.
 
     See `docs/adr/0007-research-function.md` for the architectural
-    constraint this prompt operates under.
+    constraint this prompt operates under, and ADR 0015 for the
+    Session 37 shift from a static source registry to an LLM-emitted
+    nomination model.
 
     ## Versioning
 
@@ -79,8 +81,10 @@ Use these to decide which `expectations` buckets to populate.
 - **Document** — a fetched artifact (a PDF report, a filing, an RSS
   article, an API response treated as a document). Goes into doc
   viewers, citation panels.
-  Populate `document_sources` with hints about which sources this
-  topic should monitor — see the priority discipline below.
+  Populate `document_sources` with **nominations** — each one
+  carrying its own `endpoint_url`, `priority_tier`, and an optional
+  `known_id` you stamp when the URL matches an entry in your
+  sources-memory injection. See "Source nomination" below.
 
 - **Assertion** — a claim made by some claimant with some stance
   ("the EPA estimates lithium reserves at X"; "the CEO said
@@ -248,39 +252,54 @@ If a topic above survives the substantive test for the user's query,
 include it in `topic_tags`. If no topic survives, invent one — new
 tags cost nothing.
 
-## Registered sources — priority discipline
+## Source nomination — emit URLs, stamp known_id from memory
 
-situation_room can only fetch from sources that have been registered.
-Your `document_sources` hints should reference these by id when
-applicable. Naming a source by description that *isn't* registered
-is allowed (the user may register it later) but lower-priority.
+You nominate sources directly. Each entry in `document_sources` is
+a **nomination** carrying four fields:
 
-Your job in `document_sources` is two things:
+- `description` — a short rationale tying the source to the plan's
+  specific subjects.
+- `endpoint_url` — the URL situation_room should fetch. Required.
+  Pick a real URL on a real host you know, with the right path
+  shape for the resource the plan asks about. The downstream
+  recipe author will refine it (substituting plan-specific
+  parameters, hunting the listing endpoint when the URL you give
+  is a search-form skeleton); your job here is to commit to a
+  concrete starting point, not the final form.
+- `priority_tier` — where this nomination sits in the source-
+  priority hierarchy below. One of `authoritative_primary`,
+  `authoritative_secondary`, `industry_trade_press`, or
+  `general_news`.
+- `known_id` (optional) — set this **only** when the
+  `endpoint_url` you chose corresponds to an entry in the sources-
+  memory injection below. The injected entry's `source_id` is
+  what you stamp here. Stamping `known_id` against an unrelated
+  URL is a recognition error: the runtime will catch the mismatch
+  through host normalization, log a warning, and fall back to the
+  URL host for identity. When in doubt, omit `known_id`.
 
-1. **Nominate sources that fit the topic.** For "lithium supply
-   chain", USGS Mineral Commodity Summaries and SEC filings of
-   listed lithium producers are obvious; for "EU AI Act compliance",
-   EUR-Lex and the European Commission press feed are obvious.
+### The source-priority hierarchy
 
-2. **Prioritize.** Order matters. List the most authoritative
-   primary sources first, then authoritative secondaries, then
-   industry/trade press, then general news. The situation_room UI
-   surfaces this ordering — the first source in the list is the
-   one the user sees as the anchor for that document slot.
+Order matters. List the most authoritative primary sources first,
+then authoritative secondaries, then industry trade press, then
+general news. The situation_room UI surfaces this ordering — the
+first source in the list is the one the user sees as the anchor
+for that document slot.
 
 A rough hierarchy, from highest to lowest priority:
 
-- **Authoritative primary** — the entity that *creates* the data
+- **`authoritative_primary`** — the entity that *creates* the data
   (the agency that publishes the statistic, the regulator that
-  enacts the rule, the company filing its own 10-K). These get
-  cited as fact.
-- **Authoritative secondary** — aggregators that compile primaries
+  enacts the rule, the company filing its own 10-K). Cited as
+  fact.
+- **`authoritative_secondary`** — aggregators that compile primaries
   with attribution (USGS aggregating mine-level production into
   national totals; the IEA aggregating energy stats).
-- **Industry / trade press** — specialist publications that report
-  on the topic from inside the industry (Argus Media for commodities,
-  Lloyd's List for shipping). Useful for context, weaker for facts.
-- **General news** — broad-audience reporting. Useful for events
+- **`industry_trade_press`** — specialist publications that report
+  on the topic from inside the industry (Argus Media for
+  commodities, Lloyd's List for shipping). Useful for context,
+  weaker for facts.
+- **`general_news`** — broad-audience reporting. Useful for events
   and timelines, weakest for numbers.
 
 ### Source breadth — multi-source by default
@@ -337,19 +356,46 @@ nomination's angle. What's *not* fine is reflexively naming one
 or two sources because they came to mind first.
 
 When you nominate more than two sources, order them by priority
-(authoritative primary first) but do not omit lower-tier
-sources just because higher-tier ones exist — the workstation
-benefits from cross-tier triangulation.
+(authoritative primary first) but do not omit lower-tier sources
+just because higher-tier ones exist — the workstation benefits
+from cross-tier triangulation.
 
-Currently registered sources:
+### Sources memory — context, not constraint
 
-{{REGISTERED_SOURCES}}
+The injection below is **what situation_room has successfully
+fetched against in past sessions**, recency-sorted. It is *not* a
+list of approved sources. It is *not* a registry to nominate
+against. It is a hint that says "these URLs have worked before;
+the operator is likely to recognize them; stamping `known_id`
+when your `endpoint_url` matches one of these surfaces the
+recognition in the UI."
 
-When you nominate a registered source, set `preferred_source_ids`
-to the source's id (e.g. `["usgs_mcs"]`) so the runtime can wire
-it without ambiguity. When you nominate an unregistered source,
-leave `preferred_source_ids` empty and put the description in
-`description`.
+When the memory is empty (the operator's first sessions, or a
+topic that doesn't overlap with past research), **emit URLs from
+your training-distribution knowledge alone**. This is the
+cold-start case. You know what the World Bank's indicators API
+looks like (`https://api.worldbank.org/v2/...`); you know that
+arXiv has daily listings per category
+(`https://arxiv.org/list/quant-ph/recent`); you know SEC EDGAR's
+search endpoint (`https://www.sec.gov/cgi-bin/browse-edgar?...`).
+Pick the URL that best fits the plan's subjects and emit it.
+Don't stamp `known_id` on anything when the memory is empty —
+there is nothing to recognize.
+
+When the memory is populated and contains an entry whose URL or
+host matches what you would have emitted anyway, stamp the entry's
+`source_id` as `known_id`. If the memory shows past success
+against `https://api.worldbank.org/v2/foo` with `source_id`
+`world_bank_indicators`, and your nomination for this plan is a
+World Bank indicators URL, stamp `known_id: "world_bank_indicators"`
+on that nomination. If your nomination is a different host
+entirely (say IMF), don't stamp anything — the memory entry isn't
+for IMF.
+
+The injection (recency-sorted; `(empty)` when there is no
+relevant past success):
+
+{{SOURCES_MEMORY}}
 
 ## The user's topic
 
@@ -415,9 +461,23 @@ The top-level shape is:
 - Do not write currency names. `dollars` → `USD`. `euro` → `EUR`.
 - Do not invent metric names that aren't quantifiable (`quality`,
   `success`, `growth` without a denominator).
-- Do not invent registered source ids. If a source isn't in the
-  registered list, nominate it by description with empty
-  `preferred_source_ids`.
+- Do not omit `endpoint_url` on a `document_sources` nomination.
+  Every nomination must commit to a real URL the recipe author can
+  refine. "I want this kind of source but don't know how to reach
+  it" is not a valid nomination shape; pick the URL you would type
+  into a browser if you were the analyst sitting down with this
+  topic.
+- Do not emit synthetic placeholder hosts — `example.invalid`,
+  `example.com`, `example.org`, or any other reserved-for-testing
+  TLD — as `endpoint_url`. The downstream recipe author treated
+  `example.invalid` as a contract bug; the classifier prompt
+  shouldn't perpetuate it.
+- Do not stamp `known_id` against a URL that doesn't appear in the
+  sources-memory injection. The runtime verifies via host
+  normalization and rejects mismatches; the cost of an unverified
+  stamp is a warning log and a fallback to host-derived identity,
+  but the *intent* of `known_id` is "I recognize this URL," and
+  recognition without grounds is dishonest.
 - Do not produce a plan with all expectation buckets empty.
   That's not a thin classification — it's a failed one. If you
   genuinely cannot populate any bucket for the given topic, the
@@ -509,32 +569,41 @@ User topic: `lithium supply chain`
     ],
     "document_sources": [
       {
-        "description": "USGS Mineral Commodity Summaries — annual lithium chapter",
-        "preferred_source_ids": ["usgs_mcs"]
+        "description": "USGS Mineral Commodity Summaries — annual lithium chapter (mine production and reserves by country)",
+        "endpoint_url": "https://www.usgs.gov/centers/national-minerals-information-center/mineral-commodity-summaries",
+        "priority_tier": "authoritative_primary",
+        "known_id": "usgs_mcs"
       },
       {
         "description": "SEC EDGAR filings of listed lithium producers (Albemarle, SQM, Livent, Tianqi via cross-listings)",
-        "preferred_source_ids": ["sec_edgar"]
+        "endpoint_url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&type=10-K",
+        "priority_tier": "authoritative_primary",
+        "known_id": "sec_edgar"
       },
       {
         "description": "World Bank commodity prices statistical bulletin (Pink Sheet) — lithium and battery-metals series",
-        "preferred_source_ids": ["world_bank_indicators"]
+        "endpoint_url": "https://www.worldbank.org/en/research/commodity-markets",
+        "priority_tier": "authoritative_primary"
       },
       {
         "description": "International Energy Agency — Critical Minerals Outlook and Global EV Outlook",
-        "preferred_source_ids": []
-      },
-      {
-        "description": "Argus and Fastmarkets pricing reports (industry trade press)",
-        "preferred_source_ids": []
+        "endpoint_url": "https://www.iea.org/topics/critical-minerals",
+        "priority_tier": "authoritative_secondary"
       },
       {
         "description": "Australian Office of the Chief Economist — Resources and Energy Quarterly (mine-level production data for the largest producing country)",
-        "preferred_source_ids": []
+        "endpoint_url": "https://www.industry.gov.au/publications/resources-and-energy-quarterly",
+        "priority_tier": "authoritative_secondary"
       },
       {
-        "description": "Reuters and Bloomberg commodities desk for events (mine openings, export-control announcements, offtake signings)",
-        "preferred_source_ids": []
+        "description": "Argus and Fastmarkets pricing reports (industry trade press)",
+        "endpoint_url": "https://www.fastmarkets.com/markets/battery-raw-materials/lithium",
+        "priority_tier": "industry_trade_press"
+      },
+      {
+        "description": "Reuters commodities desk for events (mine openings, export-control announcements, offtake signings)",
+        "endpoint_url": "https://www.reuters.com/markets/commodities/",
+        "priority_tier": "general_news"
       }
     ],
     "assertion_guidance": "Prioritize claims by named producers about production guidance, capacity additions, and offtake commitments; claims by named regulators about export controls, royalty changes, and permitting decisions."
@@ -565,10 +634,13 @@ Notice in the example:
   authoritative primary statistical agencies first (USGS, SEC EDGAR,
   World Bank), authoritative secondary aggregators next (IEA,
   Australian Office of the Chief Economist), then industry trade
-  press (Argus, Fastmarkets), then general-news for events
-  (Reuters, Bloomberg). Five to ten nominations is the target band
-  for topics this rich; a single-source plan would be fragile
-  against decline-at-author-time and apply failures.
+  press (Fastmarkets), then general-news for events (Reuters). Each
+  nomination carries its own `endpoint_url` and `priority_tier`;
+  `known_id` is stamped only on the two entries (USGS, SEC) where
+  the URL recognizably matches a memory entry. Five to ten
+  nominations is the target band for topics this rich; a
+  single-source plan would be fragile against decline-at-author-time
+  and apply failures.
 - `assertion_guidance` describes claim patterns, not claims.
 
 ## A second worked example — different shape
@@ -606,7 +678,9 @@ User topic: `OFAC SDN list updates`
     "document_sources": [
       {
         "description": "OFAC SDN List publication feed",
-        "preferred_source_ids": ["ofac_sdn"]
+        "endpoint_url": "https://www.treasury.gov/ofac/downloads/sdn.xml",
+        "priority_tier": "authoritative_primary",
+        "known_id": "ofac_sdn"
       }
     ],
     "assertion_guidance": ""
@@ -637,6 +711,114 @@ case is the *exception*, not the template.
 The contrast with the lithium example is the point: bucket-fill
 should reflect what the topic *is*, not a habit of producing the
 same shape every time.
+
+## A third worked example — cold start, no memory
+
+The two examples above stamp `known_id` on the URLs that
+correspond to memory entries the operator's past sessions wrote.
+But a fresh installation, or a topic that doesn't overlap with
+past research, sees an *empty* sources-memory injection. The
+prompt teaches you to handle this without falling silent: emit
+URLs from your training-distribution knowledge of authoritative
+sources for the topic, and don't stamp `known_id` on anything.
+
+User topic: `quantum computing hardware roadmaps`
+
+```json
+{
+  "interpretation": "Quantum computing hardware development — qubit-count milestones, error-correction thresholds, vendor roadmaps, and the academic and industrial publications announcing them. The workstation will populate a timeline of milestone announcements, an entity panel for the major hardware vendors and academic labs, and a documents panel anchored on arXiv, IEEE Xplore, and the vendors' own technical roadmaps. Scope is global; window is two years.",
+  "topic_tags": ["quantum_computing", "quantum_hardware"],
+  "geographic_scope": [],
+  "historical_window_days": 730,
+  "expectations": {
+    "observation_metrics": [
+      {
+        "name": "qubit_count",
+        "unit_hint": "1",
+        "rationale": "The headline capability metric vendors and labs publish."
+      },
+      {
+        "name": "logical_error_rate",
+        "unit_hint": "pct",
+        "rationale": "Error-correction quality — gates whether qubit-count growth is meaningful."
+      }
+    ],
+    "event_types": [
+      {
+        "event_type": "milestone_announced",
+        "rationale": "Discrete capability claims (first N-qubit chip, first logical-qubit demonstration)."
+      },
+      {
+        "event_type": "roadmap_published",
+        "rationale": "Vendors revising their multi-year plans is a leading indicator."
+      }
+    ],
+    "entity_kinds": [
+      {
+        "kind": "company",
+        "exemplars": ["company:ibm_quantum", "company:google_quantum_ai", "company:ionq", "company:rigetti", "company:psiquantum"],
+        "rationale": "The hardware vendors driving the field."
+      },
+      {
+        "kind": "lab",
+        "exemplars": ["lab:harvard_lukin", "lab:eth_zurich_quantum"],
+        "rationale": "Academic groups whose preprints define the public state of the art."
+      }
+    ],
+    "relation_kinds": [],
+    "document_sources": [
+      {
+        "description": "arXiv quant-ph daily listings — primary preprint feed for the field",
+        "endpoint_url": "https://arxiv.org/list/quant-ph/recent",
+        "priority_tier": "authoritative_primary"
+      },
+      {
+        "description": "IEEE Xplore — peer-reviewed conference and journal proceedings on quantum hardware",
+        "endpoint_url": "https://ieeexplore.ieee.org/search/searchresult.jsp?queryText=quantum+computing+hardware",
+        "priority_tier": "authoritative_primary"
+      },
+      {
+        "description": "USPTO patent database for quantum-hardware filings (vendor-disclosed claims)",
+        "endpoint_url": "https://ppubs.uspto.gov/pubwebapp/external.html",
+        "priority_tier": "authoritative_primary"
+      },
+      {
+        "description": "EU Quantum Flagship newsroom (regional roadmap and funding announcements)",
+        "endpoint_url": "https://qt.eu/news/",
+        "priority_tier": "authoritative_secondary"
+      },
+      {
+        "description": "Nature News quantum-computing beat (selected announcements with editorial context)",
+        "endpoint_url": "https://www.nature.com/subjects/quantum-information",
+        "priority_tier": "industry_trade_press"
+      }
+    ],
+    "assertion_guidance": "Prioritize claims by named vendors about qubit-count milestones, error-correction thresholds, and publicly committed roadmap dates; claims by named academic groups about logical-qubit demonstrations and fault-tolerance crossovers."
+  }
+}
+```
+
+Things to notice in this example, especially in contrast to the
+lithium and OFAC ones:
+
+- **No `known_id` anywhere.** The sources-memory injection for
+  this hypothetical session is empty (or contains entries unrelated
+  to quantum hardware). There is nothing to recognize, so nothing
+  to stamp. This is the honest signal — `known_id: null` tells the
+  downstream UI "I emitted these URLs from training knowledge, not
+  from your past successes."
+- **`endpoint_url` is still required and is still a real URL.**
+  The classifier doesn't get to skip the URL because the topic is
+  novel. It picks the URL it would expect a domain expert to type
+  into a browser when they sit down with the topic for the first
+  time.
+- **`geographic_scope` is empty.** Quantum-hardware progress is
+  globally distributed and there's no single national anchor; an
+  empty scope is correct here. The `interpretation` paragraph
+  says so explicitly.
+- **`relation_kinds` is empty.** This topic surfaces individual
+  vendors and labs, not their typed links to each other. Empty by
+  design, named in the interpretation.
 
 ## When you're tempted to leave buckets empty
 
@@ -680,6 +862,29 @@ honest about what the workstation will surface.
 
 ### Changelog
 
+- **v1.6** (2026-05-07) — ADR 0015. Source nomination shifts from a
+  static-registry model (LLM picks `preferred_source_ids` from a
+  prompt-injected list) to an LLM-emitted model (LLM emits
+  `endpoint_url` directly, with optional `known_id` stamped from a
+  memory-derived recognition). Replaced the
+  `{{REGISTERED_SOURCES}}` placeholder with `{{SOURCES_MEMORY}}`,
+  surfacing past successful fetches recency-sorted; rewrote
+  *"Registered sources — priority discipline"* as *"Source
+  nomination — emit URLs, stamp known_id from memory"* with an
+  explicit cold-start subsection; updated the lithium worked
+  example to carry seven nominations with `endpoint_url` /
+  `priority_tier` / optional `known_id`; updated the OFAC SDN
+  example similarly; added a third worked example
+  (`quantum computing hardware roadmaps`) modelling the cold-start
+  case where the memory injection is empty and `known_id` is
+  absent on every nomination; updated *"What NOT to produce"* to
+  forbid placeholder hosts, missing `endpoint_url`, and unverified
+  `known_id` stamps. Output contract changed: `document_sources`
+  entries no longer carry `preferred_source_ids` and now carry
+  `endpoint_url` + `priority_tier` + optional `known_id`. Plans
+  classified before this version are surfaced through the
+  `LegacyPlanCannotAuthor` runtime outcome and require
+  re-classification to be fetchable.
 - **v1.5** (2026-05-06) — Multi-source as the default. Added a new
   *"Source breadth — multi-source by default"* subsection inside
   "Registered sources — priority discipline" establishing 5–10

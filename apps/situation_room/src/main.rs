@@ -35,7 +35,6 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use situation_room_apps_common::sources::load_source_descriptors;
 use situation_room_llm::{AnthropicProvider, LlmProvider, ModelTier, XaiProvider};
 use situation_room_pipeline::research_classifier::{
     classify_topic, ClassificationContext, TopicUsage as ClassifierTopicUsage,
@@ -56,17 +55,28 @@ struct Cli {
     db: PathBuf,
 
     /// Path to the source descriptors TOML.
+    ///
+    /// Doc-narrowed under ADR 0015 (Session 37). The classifier no
+    /// longer reads sources.toml — it consults the in-DB sources
+    /// memory derived from past successful fetches. This flag is
+    /// kept as a no-op so existing scripts don't break; remove it
+    /// from your CLI invocations at your leisure.
     #[arg(long, default_value = "config/sources.toml")]
+    #[allow(dead_code)]
     sources: PathBuf,
 
     /// How many topics-in-use to surface to the classifier.
     #[arg(long, default_value_t = 30)]
     topics_limit: usize,
 
-    /// Cap on source descriptors surfaced to the classifier (after
-    /// reading sources.toml). Mostly a guard against pathological
-    /// configurations.
+    /// Cap on source descriptors surfaced to the classifier.
+    ///
+    /// Doc-narrowed under ADR 0015 (Session 37). No longer used —
+    /// the new `sources_memory` injection is capped internally by
+    /// `situation_room_storage::SOURCES_MEMORY_LIMIT`. Kept as a
+    /// no-op so existing scripts don't break.
     #[arg(long, default_value_t = 30)]
+    #[allow(dead_code)]
     sources_limit: usize,
 
     /// Subcommand. Omitting it requires a topic argument and runs
@@ -172,13 +182,18 @@ async fn run_classify(store: &Store, cli: &Cli, topic: &str) -> Result<()> {
         })
         .collect();
 
-    // 3. Registered-sources injection — loaded from the TOML file.
-    let registered_sources = load_source_descriptors(&cli.sources, cli.sources_limit)
-        .with_context(|| format!("loading sources from {}", cli.sources.display()))?;
+    // 3. Sources-memory injection (ADR 0015 / Session 37). Replaces
+    //    the pre-Session-37 `registered_sources` injection that loaded
+    //    `config/sources.toml`. The classifier no longer reads that
+    //    file; the file's surviving demo entries (csv_demo, json_demo)
+    //    are read by the executor's `#[ignore]` live tests only.
+    let sources_memory = store
+        .sources_memory(situation_room_storage::SOURCES_MEMORY_LIMIT)
+        .context("querying sources_memory")?;
 
     let ctx = ClassificationContext {
         existing_topics,
-        registered_sources,
+        sources_memory,
         // CLI does not carry a re-classification flow today; the
         // GUI is the (Session 15) home for rejection feedback. This
         // field is kept None so the classifier prompt's
@@ -188,9 +203,9 @@ async fn run_classify(store: &Store, cli: &Cli, topic: &str) -> Result<()> {
     };
 
     eprintln!(
-        "classifying topic ({} existing topics in scope, {} registered sources)…",
+        "classifying topic ({} existing topics in scope, {} memory entries)…",
         ctx.existing_topics.len(),
-        ctx.registered_sources.len()
+        ctx.sources_memory.len()
     );
 
     // 4. Classify. `provider.as_ref()` deref-coerces the
@@ -321,6 +336,6 @@ mod tests {
         );
         assert!(CLASSIFIER_PROMPT.contains("{{TOPIC}}"));
         assert!(CLASSIFIER_PROMPT.contains("{{EXISTING_TOPICS}}"));
-        assert!(CLASSIFIER_PROMPT.contains("{{REGISTERED_SOURCES}}"));
+        assert!(CLASSIFIER_PROMPT.contains("{{SOURCES_MEMORY}}"));
     }
 }

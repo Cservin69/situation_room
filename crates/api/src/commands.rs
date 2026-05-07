@@ -102,8 +102,11 @@ use crate::types_export::{
 /// - the recipe-author prompt template (same loading pattern; used
 ///   by the fetch executor's Level-2 authoring step when a plan has
 ///   no recipes yet),
-/// - the registered source descriptors (loaded from
-///   `config/sources.toml` in the binary).
+/// - the source descriptors loaded from `config/sources.toml`
+///   (post-Session-37 this file holds only two demo fixtures —
+///   `csv_demo` and `json_demo`; the slice is doc-narrowed and used
+///   only by the executor's `#[ignore]` live tests against those
+///   fixtures, see [`pipeline::research_classifier::SourceDescriptor`]).
 ///
 /// Topic-injection limit is a constant here rather than configuration:
 /// the same number the CLI uses (30 topics). If the GUI later needs
@@ -120,6 +123,10 @@ pub struct AppState {
     pub http: Arc<SecureHttpClient>,
     pub classifier_prompt: &'static str,
     pub recipe_author_prompt: &'static str,
+    /// Doc-narrowed under ADR 0015 (Session 37). The classifier no
+    /// longer consults this list; only the executor's `#[ignore]`
+    /// live tests do (against `csv_demo` / `json_demo`). Production
+    /// classification uses [`Store::sources_memory`] instead.
     pub sources: Vec<PipelineSourceDescriptor>,
 }
 
@@ -337,9 +344,19 @@ pub async fn classify(
         })
         .collect();
 
+    // ADR 0015 / Session 37: pull the sources memory from the
+    // recipes ⨝ recipe_fetch_attempts ⨝ research_plans join. The
+    // pre-Session-37 path threaded `state.sources` (the static
+    // `config/sources.toml` registry) here; that registry has been
+    // retired (see ADR 0015 §"Configuration").
+    let sources_memory = state
+        .store
+        .sources_memory(situation_room_storage::SOURCES_MEMORY_LIMIT)
+        .map_err(CommandError::from)?;
+
     let ctx = ClassificationContext {
         existing_topics,
-        registered_sources: state.sources.clone(),
+        sources_memory,
         // Fresh classification: no prior rejection feedback to inject.
         // The re-classify path is `reclassify_plan` (Session 15).
         previous_rejection_reason: None,
@@ -718,9 +735,15 @@ pub async fn reclassify_plan(
         })
         .collect();
 
+    // ADR 0015 / Session 37: same memory-derived context as `classify`.
+    let sources_memory = state
+        .store
+        .sources_memory(situation_room_storage::SOURCES_MEMORY_LIMIT)
+        .map_err(CommandError::from)?;
+
     let ctx = ClassificationContext {
         existing_topics,
-        registered_sources: state.sources.clone(),
+        sources_memory,
         previous_rejection_reason: Some(effective_reason),
     };
 

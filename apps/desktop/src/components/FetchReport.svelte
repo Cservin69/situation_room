@@ -167,21 +167,21 @@
 
     {#if report.recipes_attempted === 0 && report.outcomes.length === 0}
       <!--
-        Case 1 from the empty-state taxonomy above. Distinct from the
-        generic "no outcomes" message: this happens when the plan's
-        document_sources hints didn't bind to any registered source
-        descriptor, so `load_or_author_recipes` had nothing to do.
-        Adjacent to ADR 0007's deferred CoverageReport; the Session
-        13 handoff §P5 chose to address it locally rather than wait
-        for the broader coverage design.
+        Case 1 from the empty-state taxonomy above. After ADR 0015
+        (Session 37) the most common cause of this state is a plan
+        whose document_sources is empty (the classifier produced
+        zero nominations). Pre-ADR-0015 plans land in case 1's
+        sibling — outcomes populated with `legacy_plan_cannot_author`
+        rather than empty — handled below.
       -->
       <div class="empty empty-no-bindings">
         <p class="empty-headline">No recipes were attempted.</p>
         <p class="empty-explainer">
-          The plan's document sources didn't bind to any registered
-          source in <code>config/sources.toml</code>. Either add a
-          matching source descriptor, or re-classify the topic in
-          terms the registry covers.
+          The plan's document_sources didn't surface any nominations
+          for the executor to author against. Re-classify the topic
+          if you expect this plan to populate documents — the
+          classifier emits source URLs from its training-distribution
+          knowledge of authoritative sources for the topic.
         </p>
       </div>
     {:else if report.outcomes.length === 0}
@@ -207,6 +207,15 @@
                 detail row beneath.
               -->
               <span class="recipe-id decl-marker">decl·</span>
+            {:else if o.kind === 'legacy_plan_cannot_author'}
+              <!--
+                ADR 0015 / Session 37: pre-Session-37 plans surface
+                one outcome per `preferred_source_id` they previously
+                carried; no recipe exists, no recipe_id. Same
+                blank-column-with-marker convention as `decl·` so
+                the row stays scannable.
+              -->
+              <span class="recipe-id decl-marker">leg·</span>
             {:else}
               <span class="recipe-id">{shortId(o.recipe_id)}</span>
             {/if}
@@ -393,14 +402,6 @@
     color: var(--fg-secondary);
     font-size: 11px;
     line-height: 1.5;
-  }
-  .empty-explainer code {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    background: var(--bg-inset);
-    padding: 1px 4px;
-    border-radius: 2px;
-    color: var(--fg-primary);
   }
 
   .outcomes {

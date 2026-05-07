@@ -360,13 +360,46 @@
       recordsCount={documentRecords.length}
     >
       {#each plan.expectations.document_sources as s, i (i)}
-        <ExpectationRow label={s.description} rationale={'preferred ids: ' + (s.preferred_source_ids.length > 0 ? s.preferred_source_ids.join(', ') : '(none — match by description)')}>
-          {#snippet aside()}
-            {#each s.preferred_source_ids as id (id)}
-              <Chip label={id} tone="info" />
-            {/each}
-          {/snippet}
-        </ExpectationRow>
+        {#if s.kind === 'nomination'}
+          <!--
+            ADR 0015 / Session 37: post-Session-37 plans carry
+            DocumentSourceEntryDto.Nomination — endpoint_url +
+            priority_tier + optional known_id. Rendered as the
+            primary-line URL with the tier badge and an optional
+            recognition chip.
+          -->
+          <ExpectationRow
+            label={s.description}
+            rationale={s.endpoint_url}
+          >
+            {#snippet aside()}
+              <Chip label={s.priority_tier.replace(/_/g, ' ')} tone="info" />
+              {#if s.known_id}
+                <Chip label={'known: ' + s.known_id} tone="positive" />
+              {/if}
+            {/snippet}
+          </ExpectationRow>
+        {:else if s.kind === 'legacy'}
+          <!--
+            Pre-Session-37 plan persisted with DocumentSourceHintDto
+            on the wire as Legacy. Rendered with a clear
+            re-classify-to-update affordance — the executor will
+            surface RecipeOutcomeDto.LegacyPlanCannotAuthor for each
+            preferred_source_id when the operator hits Run Fetch on
+            this plan.
+          -->
+          <ExpectationRow
+            label={s.description}
+            rationale={'legacy entry — re-classify the plan to update'}
+          >
+            {#snippet aside()}
+              <Chip label="legacy" tone="warning" />
+              {#each s.preferred_source_ids as id (id)}
+                <Chip label={id} tone="info" />
+              {/each}
+            {/snippet}
+          </ExpectationRow>
+        {/if}
       {/each}
       {#if recordsLoaded}
         <div class="records">

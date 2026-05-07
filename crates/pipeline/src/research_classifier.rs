@@ -51,12 +51,15 @@ use serde::{Deserialize, Serialize};
 use situation_room_core::vocab::{EntityId, EventType, Topic, Unit, VocabError};
 use situation_room_llm::{CompletionRequest, LlmError, LlmProvider, ModelTier};
 use situation_room_secure::bounds::{check_string, Bounds};
+use situation_room_secure::url_guard::{UrlGuard, UrlViolation};
+use situation_room_storage::sources_memory::MemorySource;
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::research::{
-    DocumentSourceHint, EntityKindExpectation, EventTypeExpectation, GeoScope,
-    MetricExpectation, RecordExpectations, RelationKindExpectation, ResearchPlan,
+    DocumentSourceEntry, DocumentSourceNomination, EntityKindExpectation, EventTypeExpectation,
+    GeoScope, MetricExpectation, PriorityTier, RecordExpectations, RelationKindExpectation,
+    ResearchPlan,
 };
 
 // ---------------------------------------------------------------------------
@@ -65,11 +68,12 @@ use crate::research::{
 
 /// Context the classifier sees alongside the user's topic.
 ///
-/// The caller assembles this from storage (`existing_topics`) and the
-/// source registry (`registered_sources`). Keeping the assembly in the
-/// caller means the pipeline crate doesn't take a dependency on the
-/// sources crate or on storage internals — the classifier just gets a
-/// flat list of descriptors.
+/// The caller assembles this from storage (`existing_topics`,
+/// `sources_memory`) before calling [`classify_topic`]. After ADR
+/// 0015 (Session 37) the classifier no longer consults a static
+/// `Vec<SourceDescriptor>` — `sources_memory` carries past-success
+/// URLs the operator has actually fetched against, surfaced to the
+/// LLM as **context, not constraint**.
 #[derive(Debug, Clone)]
 pub struct ClassificationContext {
     /// Topics already used in past sessions, sorted by frequency
@@ -77,11 +81,17 @@ pub struct ClassificationContext {
     /// vocabulary cohesive.
     pub existing_topics: Vec<TopicUsage>,
 
-    /// Registered sources situation_room can fetch from. Surfaced to the
-    /// LLM so the plan's `document_sources` hints reference real ids.
-    /// An empty list is legal — the plan will then nominate sources
-    /// only by description, and the user / Level-2 will resolve.
-    pub registered_sources: Vec<SourceDescriptor>,
+    /// URLs the operator has previously fetched against successfully,
+    /// derived from the `recipes ⨝ recipe_fetch_attempts ⨝
+    /// research_plans` join. Surfaced through the prompt's
+    /// `{{SOURCES_MEMORY}}` placeholder so the LLM can stamp
+    /// `known_id` on its emissions when the URL it picks corresponds
+    /// to a memory entry. An empty Vec is legal — first-time
+    /// installations have no memory yet, and the prompt's worked
+    /// examples teach the cold-start pattern (emit URLs from
+    /// training-distribution knowledge alone). ADR 0015 §"Memory
+    /// query".
+    pub sources_memory: Vec<MemorySource>,
 
     /// Free-text feedback the user supplied when rejecting a previous
     /// classification of the same topic. `None` for fresh
@@ -111,30 +121,38 @@ pub struct TopicUsage {
     pub uses: u64,
 }
 
-/// Compact view of a known data source for prompt injection.
+/// Compact view of a known data source.
 ///
-/// situation_room no longer carries hand-coded source adapters; the LLM
-/// nominates sources from the descriptors the caller supplies here.
-/// Callers typically load these from `config/sources.toml` (or
-/// equivalent) at the binary layer — the pipeline crate stays
-/// agnostic of where the list comes from.
+/// **Doc-narrowed under ADR 0015 (Session 37).** Before Session 37
+/// this type was the classifier's source-awareness surface, populated
+/// from `config/sources.toml` and rendered into the
+/// `{{REGISTERED_SOURCES}}` prompt placeholder. ADR 0015 replaced the
+/// classifier's input with a memory-derived view (see
+/// [`MemorySource`]); the classifier no longer consults this type at
+/// all.
 ///
-/// ## `endpoint_hint` — Session 10, Option F
+/// The type survives because two surfaces still load it:
 ///
-/// `endpoint_hint` is consumed by the **fetch executor's** Level-2
-/// authoring step, not by the classifier prompt. It is a stable URL
-/// the executor pre-fetches to obtain a real document excerpt before
-/// asking the LLM to author a recipe. Without it, the executor falls
-/// back to a synthetic placeholder URL — which the Session 9
-/// production run revealed the LLM tends to keep verbatim, producing
-/// recipes that fetch `example.invalid` at runtime and fail.
+/// 1. The fetch executor's [`ExecutorContext::sources`] field (see
+///    `crates/pipeline/src/fetch_executor.rs`) — used **only** by
+///    `#[ignore]` tests that author recipes against the demo CSV /
+///    JSON fixtures in `config/sources.toml`. The production
+///    executor walks `plan.expectations.document_sources` directly
+///    and reads the URL from each `DocumentSourceNomination`, never
+///    consulting this list.
+/// 2. The `apps_common::sources` loader, which still parses the
+///    two-entry `config/sources.toml` for the demo descriptors.
 ///
-/// The classifier itself does not render `endpoint_hint` into its
-/// prompt: the classifier teaches the LLM via descriptions, and a
-/// plan whose `document_sources` reference an id is enough — the
-/// runtime side resolves URLs. Keeping `endpoint_hint` invisible to
-/// the classifier is deliberate and keeps the two prompts' contracts
-/// independent.
+/// New consumers should not reach for this type. It is retained,
+/// not extended.
+///
+/// ## `endpoint_hint` — historical context
+///
+/// `endpoint_hint` was added in Session 10 (Option F) to feed real
+/// URLs into the recipe-author pre-fetch. Under ADR 0015 the LLM-
+/// emitted `endpoint_url` on each [`DocumentSourceNomination`] plays
+/// that role directly — there is no static registry to inject a
+/// hint from. The field stays on the type for the two demo entries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceDescriptor {
     /// Stable id used by recipes (`source_id` in `FetchRecipe`).
@@ -148,18 +166,7 @@ pub struct SourceDescriptor {
     #[serde(default)]
     pub authoritative_for: Vec<String>,
     /// Stable URL the fetch executor pre-fetches at recipe-authoring
-    /// time so the LLM sees a real excerpt of the source's current
-    /// shape. Validated through `UrlGuard` at use-time, not at
-    /// load-time — a bad URL here produces a clean fallback to the
-    /// synthetic-placeholder behaviour, not a hard configuration
-    /// error.
-    ///
-    /// `None` is legal: the executor will synthesize a placeholder
-    /// (`https://example.invalid/{id}`) and emit a warning. Sources
-    /// for which the LLM already knows the URL pattern (e.g.
-    /// well-known APIs documented in the description) can author
-    /// usable recipes from a placeholder; sources whose URL the LLM
-    /// would need to invent will benefit from setting this.
+    /// time. Doc-narrowed: only the two demo entries set this today.
     #[serde(default)]
     pub endpoint_hint: Option<String>,
 }
@@ -189,9 +196,15 @@ pub enum ClassificationError {
 /// Assemble the user-message prompt from a template + runtime inputs.
 ///
 /// The template string must contain `{{TOPIC}}`, `{{EXISTING_TOPICS}}`,
-/// `{{REGISTERED_SOURCES}}`, and `{{USER_FEEDBACK}}` placeholders.
+/// `{{SOURCES_MEMORY}}`, and `{{USER_FEEDBACK}}` placeholders.
 /// Missing placeholders are not errors — they're assumed to be
 /// intentional omissions by the prompt author.
+///
+/// `{{SOURCES_MEMORY}}` substitutes to a sorted list of past-success
+/// URLs from the operator's local DuckDB (recency-descending; see
+/// [`render_sources_memory`]). An empty memory renders explicitly so
+/// the LLM sees the cold-start signal rather than a missing section.
+/// ADR 0015 §"Memory query".
 ///
 /// `{{USER_FEEDBACK}}` substitutes to either the empty string (fresh
 /// classification, `previous_rejection_reason: None`) or a complete
@@ -232,7 +245,7 @@ pub fn build_prompt_with_fence_id(
     fence_id: &str,
 ) -> Result<String, ClassificationError> {
     let existing = render_existing_topics(&ctx.existing_topics);
-    let sources = render_registered_sources(&ctx.registered_sources);
+    let memory = render_sources_memory(&ctx.sources_memory);
     let feedback = render_user_feedback(
         ctx.previous_rejection_reason.as_deref(),
         fence_id,
@@ -241,7 +254,7 @@ pub fn build_prompt_with_fence_id(
     let out = template
         .replace("{{TOPIC}}", topic)
         .replace("{{EXISTING_TOPICS}}", &existing)
-        .replace("{{REGISTERED_SOURCES}}", &sources)
+        .replace("{{SOURCES_MEMORY}}", &memory)
         .replace("{{USER_FEEDBACK}}", &feedback);
 
     check_string("llm_prompt_user", &out, Bounds::LLM_PROMPT_BODY)
@@ -357,7 +370,7 @@ pub struct AuthoredRecordExpectations {
     #[serde(default)]
     pub relation_kinds: Vec<AuthoredRelationKindExpectation>,
     #[serde(default)]
-    pub document_sources: Vec<AuthoredDocumentSourceHint>,
+    pub document_sources: Vec<AuthoredDocumentSourceNomination>,
     #[serde(default)]
     pub assertion_guidance: Option<String>,
 }
@@ -391,10 +404,35 @@ pub struct AuthoredRelationKindExpectation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct AuthoredDocumentSourceHint {
+pub struct AuthoredDocumentSourceNomination {
+    /// Why this source fits the plan. Free-form prose; the post-ADR-
+    /// 0015 prompt asks for a one-line rationale tying the source to
+    /// the plan's specific subjects.
     pub description: String,
+    /// The URL the LLM has chosen for this nomination. Validated
+    /// through `UrlGuard::check` at conversion time. Required —
+    /// emit a real URL or omit the nomination; "I'd like this source
+    /// but don't know how to reach it" is not an option in the
+    /// post-ADR-0015 contract.
+    pub endpoint_url: String,
+    /// Source-priority tier as a snake_case string. The LLM-facing
+    /// layer carries this as `String` to match the existing
+    /// `Authored*` enum-as-string convention; conversion to the
+    /// closed [`PriorityTier`] enum happens in `convert_expectations`,
+    /// where an unknown value produces a clean
+    /// `ClassificationError::InvalidPlan`.
+    ///
+    /// Valid values: `authoritative_primary`,
+    /// `authoritative_secondary`, `industry_trade_press`,
+    /// `general_news`.
+    pub priority_tier: String,
+    /// Optional recognition that this nomination matches a memory
+    /// entry the prompt surfaced. Free-form (the LLM uses the
+    /// `source_id` it saw in the memory bullet); the executor
+    /// verifies via host normalization at recipe-authoring time.
+    /// Empty / whitespace-only normalizes to `None` at conversion.
     #[serde(default)]
-    pub preferred_source_ids: Vec<String>,
+    pub known_id: Option<String>,
 }
 
 /// LLM-facing form of a geographic scope entry. Mirrors
@@ -596,11 +634,8 @@ fn convert_expectations(
     let document_sources = raw
         .document_sources
         .into_iter()
-        .map(|d| DocumentSourceHint {
-            description: d.description,
-            preferred_source_ids: d.preferred_source_ids,
-        })
-        .collect();
+        .map(convert_one_nomination)
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(RecordExpectations {
         observation_metrics,
@@ -610,6 +645,90 @@ fn convert_expectations(
         document_sources,
         assertion_guidance: raw.assertion_guidance,
     })
+}
+
+// ---------------------------------------------------------------------------
+// DocumentSourceNomination conversion (ADR 0015, Session 37)
+// ---------------------------------------------------------------------------
+
+/// Convert one [`AuthoredDocumentSourceNomination`] into a typed
+/// [`DocumentSourceEntry::Nomination`]. Runs the full ADR-0015
+/// validation discipline:
+///
+/// - `endpoint_url` must be non-empty after trim.
+/// - `endpoint_url` must pass [`UrlGuard::check`] (scheme,
+///   private-IP, port allowlist, length, embedded-credentials checks).
+///   `UrlGuard` is the single point of URL discipline; ADR 0015
+///   §"Validation discipline" explicitly forbids a parallel
+///   `Bounds::ENDPOINT_URL` length check.
+/// - `priority_tier` must parse to a [`PriorityTier`] variant. The
+///   `schemars`-generated JSON Schema does not enumerate the four
+///   strings (we keep the LLM-facing layer as `String` to match the
+///   existing `Authored*` convention), so this parse is the
+///   structural enforcement.
+///
+/// One invalid nomination fails the whole plan — partial validation
+/// would dilute the trust property that an accepted plan is wholly
+/// trustable. ADR 0015 §"Validation discipline".
+fn convert_one_nomination(
+    raw: AuthoredDocumentSourceNomination,
+) -> Result<DocumentSourceEntry, ClassificationError> {
+    let endpoint_url = raw.endpoint_url.trim();
+    if endpoint_url.is_empty() {
+        return Err(ClassificationError::InvalidPlan(
+            "document_sources nomination has empty endpoint_url".into(),
+        ));
+    }
+
+    // Single-point URL discipline. UrlGuard handles scheme,
+    // private-IP, embedded-credentials, port allowlist, AND the
+    // 2048-byte length cap.
+    let guard = UrlGuard::new();
+    guard
+        .check(endpoint_url)
+        .map_err(|v: UrlViolation| {
+            ClassificationError::InvalidPlan(format!(
+                "document_sources nomination endpoint_url failed UrlGuard: {v}"
+            ))
+        })?;
+
+    let priority_tier = parse_priority_tier(&raw.priority_tier)?;
+
+    let known_id = match raw.known_id {
+        Some(s) => {
+            let trimmed = s.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }
+        None => None,
+    };
+
+    Ok(DocumentSourceEntry::Nomination(DocumentSourceNomination {
+        description: raw.description,
+        endpoint_url: endpoint_url.to_string(),
+        priority_tier,
+        known_id,
+    }))
+}
+
+/// Parse the LLM's priority-tier string into the closed
+/// [`PriorityTier`] enum. Mirrors the snake_case wire form
+/// `serde(rename_all = "snake_case")` produces.
+fn parse_priority_tier(s: &str) -> Result<PriorityTier, ClassificationError> {
+    match s.trim() {
+        "authoritative_primary" => Ok(PriorityTier::AuthoritativePrimary),
+        "authoritative_secondary" => Ok(PriorityTier::AuthoritativeSecondary),
+        "industry_trade_press" => Ok(PriorityTier::IndustryTradePress),
+        "general_news" => Ok(PriorityTier::GeneralNews),
+        other => Err(ClassificationError::InvalidPlan(format!(
+            "document_sources nomination has unknown priority_tier {other:?} \
+             (expected authoritative_primary | authoritative_secondary | \
+             industry_trade_press | general_news)"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -629,18 +748,37 @@ fn render_existing_topics(topics: &[TopicUsage]) -> String {
     out.trim_end().to_string()
 }
 
-fn render_registered_sources(sources: &[SourceDescriptor]) -> String {
-    if sources.is_empty() {
-        return "(no sources currently registered — nominate by description only)".to_string();
+/// Render the `{{SOURCES_MEMORY}}` substitution.
+///
+/// The classifier's view of "what URLs have I successfully fetched
+/// against in past sessions". One bullet per memory entry, with the
+/// `source_id` and the `endpoint_url` so the LLM can stamp `known_id`
+/// when its emitted URL corresponds to a memory entry.
+///
+/// Empty memory renders as an explicit cold-start signal — not a
+/// missing section. The prompt's worked examples teach the LLM how
+/// to handle that signal (emit URLs from training-distribution
+/// knowledge alone). ADR 0015 §"Memory query" §cold-start mitigation.
+fn render_sources_memory(memory: &[MemorySource]) -> String {
+    if memory.is_empty() {
+        return "(no past successful fetches yet — this is a cold start. Emit URLs from your \
+                training-distribution knowledge of authoritative sources for the topic. Do not \
+                stamp `known_id` on any nomination — there are no memory entries to recognize.)"
+            .to_string();
     }
     let mut out = String::new();
-    for s in sources {
-        out.push_str(&format!("- `{}` — {}\n", s.id, s.display_name));
-        out.push_str(&format!("  {}\n", s.description.trim()));
-        if !s.authoritative_for.is_empty() {
+    for m in memory {
+        out.push_str(&format!(
+            "- `{}` — {}\n  successful fetches: {}; last fetched: {}\n",
+            m.source_id,
+            m.endpoint_url,
+            m.successful_attempts,
+            m.last_attempted_at.format("%Y-%m-%d"),
+        ));
+        if !m.associated_topics.is_empty() {
             out.push_str(&format!(
-                "  authoritative on: {}\n",
-                s.authoritative_for.join(", ")
+                "  used on plans tagged: {}\n",
+                m.associated_topics.join(", ")
             ));
         }
     }
@@ -821,6 +959,7 @@ fn sanitize_for_fence(s: &str, fence_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn good_output() -> AuthoredResearchPlan {
         AuthoredResearchPlan {
@@ -862,9 +1001,11 @@ mod tests {
                     kind: "operator_of".into(),
                     rationale: "Operator-asset link".into(),
                 }],
-                document_sources: vec![AuthoredDocumentSourceHint {
+                document_sources: vec![AuthoredDocumentSourceNomination {
                     description: "USGS Mineral Commodity Summaries".into(),
-                    preferred_source_ids: vec!["usgs_mcs".into()],
+                    endpoint_url: "https://www.usgs.gov/centers/national-minerals-information-center/mineral-commodity-summaries".into(),
+                    priority_tier: "authoritative_primary".into(),
+                    known_id: Some("usgs_mcs".into()),
                 }],
                 assertion_guidance: None,
             },
@@ -883,14 +1024,13 @@ mod tests {
                     uses: 5,
                 },
             ],
-            registered_sources: vec![SourceDescriptor {
-                id: "usgs_mcs".into(),
-                display_name: "USGS Mineral Commodity Summaries".into(),
-                description: "Annual US Geological Survey reports on mineral \
-                              production, reserves, and trade."
+            sources_memory: vec![MemorySource {
+                endpoint_url: "https://www.usgs.gov/centers/national-minerals-information-center/mineral-commodity-summaries"
                     .into(),
-                authoritative_for: vec!["production".into(), "reserves".into()],
-                endpoint_hint: None,
+                source_id: "usgs_mcs".into(),
+                successful_attempts: 3,
+                last_attempted_at: chrono::Utc::now(),
+                associated_topics: vec!["lithium".into(), "critical_minerals".into()],
             }],
             previous_rejection_reason: None,
         }
@@ -924,28 +1064,46 @@ mod tests {
     }
 
     #[test]
-    fn render_registered_sources_renders_each() {
-        let s = render_registered_sources(&[SourceDescriptor {
-            id: "usgs_mcs".into(),
-            display_name: "USGS MCS".into(),
-            description: "Annual reports.".into(),
-            authoritative_for: vec!["production".into()],
-            endpoint_hint: None,
+    fn render_sources_memory_renders_each_entry() {
+        let s = render_sources_memory(&[MemorySource {
+            endpoint_url: "https://api.worldbank.org/v2/foo".into(),
+            source_id: "world_bank_indicators".into(),
+            successful_attempts: 4,
+            last_attempted_at: chrono::Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).single().unwrap(),
+            associated_topics: vec!["lithium".into(), "battery_supply_chain".into()],
         }]);
-        assert!(s.contains("usgs_mcs"));
-        assert!(s.contains("USGS MCS"));
-        assert!(s.contains("production"));
+        assert!(s.contains("world_bank_indicators"));
+        assert!(s.contains("api.worldbank.org"));
+        assert!(s.contains("4"));
+        assert!(s.contains("lithium"));
+        assert!(s.contains("battery_supply_chain"));
+    }
+
+    #[test]
+    fn render_sources_memory_handles_empty_with_cold_start_signal() {
+        let s = render_sources_memory(&[]);
+        // The empty-memory rendering must surface the cold-start
+        // signal so the LLM behaves the way the prompt's worked
+        // examples teach. ADR 0015 §"Memory query" — explicit cold
+        // start, not a missing section.
+        assert!(
+            s.to_lowercase().contains("cold start")
+                || s.to_lowercase().contains("no past successful fetches"),
+            "empty memory must render an explicit cold-start signal; got: {s}"
+        );
     }
 
     #[test]
     fn build_prompt_substitutes_all_placeholders() {
-        let template = "TOPIC: {{TOPIC}}\nKNOWN: {{EXISTING_TOPICS}}\nSOURCES: {{REGISTERED_SOURCES}}";
+        let template =
+            "TOPIC: {{TOPIC}}\nKNOWN: {{EXISTING_TOPICS}}\nMEMORY: {{SOURCES_MEMORY}}";
         let out = build_prompt(template, "lithium supply chain", &sample_ctx()).unwrap();
         assert!(out.contains("lithium supply chain"));
         assert!(out.contains("usgs_mcs"));
+        assert!(out.contains("api.worldbank.org") || out.contains("usgs.gov"));
         assert!(!out.contains("{{TOPIC}}"));
         assert!(!out.contains("{{EXISTING_TOPICS}}"));
-        assert!(!out.contains("{{REGISTERED_SOURCES}}"));
+        assert!(!out.contains("{{SOURCES_MEMORY}}"));
     }
 
     // -----------------------------------------------------------------------
@@ -1172,15 +1330,122 @@ mod tests {
         // legitimate classification — only `document_sources` filled.
         let mut out = good_output();
         out.expectations = AuthoredRecordExpectations {
-            document_sources: vec![AuthoredDocumentSourceHint {
+            document_sources: vec![AuthoredDocumentSourceNomination {
                 description: "OFAC SDN list".into(),
-                preferred_source_ids: vec!["ofac_sdn".into()],
+                endpoint_url:
+                    "https://www.treasury.gov/ofac/downloads/sdn.xml"
+                        .into(),
+                priority_tier: "authoritative_primary".into(),
+                known_id: None,
             }],
             ..Default::default()
         };
         let plan = build_validated_plan(out, "OFAC SDN list updates").unwrap();
         assert_eq!(plan.expectations.observation_metrics.len(), 0);
         assert_eq!(plan.expectations.document_sources.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR 0015 / Session 37 — nomination validation discipline.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_validated_plan_accepts_nomination_with_valid_url_and_tier() {
+        let plan = build_validated_plan(good_output(), "lithium supply chain").unwrap();
+        assert_eq!(plan.expectations.document_sources.len(), 1);
+        match &plan.expectations.document_sources[0] {
+            DocumentSourceEntry::Nomination(n) => {
+                assert_eq!(n.priority_tier, PriorityTier::AuthoritativePrimary);
+                assert_eq!(n.known_id.as_deref(), Some("usgs_mcs"));
+                assert!(n.endpoint_url.starts_with("https://"));
+            }
+            DocumentSourceEntry::Legacy(_) => {
+                panic!("freshly classified plan must produce Nomination, not Legacy");
+            }
+        }
+    }
+
+    #[test]
+    fn build_validated_plan_rejects_empty_endpoint_url() {
+        let mut out = good_output();
+        out.expectations.document_sources[0].endpoint_url = "  ".into();
+        let err = build_validated_plan(out, "x").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("empty endpoint_url"), "got {msg}");
+    }
+
+    #[test]
+    fn build_validated_plan_rejects_url_blocked_by_url_guard() {
+        // file:// is rejected by UrlGuard's scheme allowlist. The
+        // classifier must surface this as InvalidPlan, not let it
+        // through.
+        let mut out = good_output();
+        out.expectations.document_sources[0].endpoint_url =
+            "file:///etc/passwd".into();
+        let err = build_validated_plan(out, "x").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("UrlGuard"), "got {msg}");
+    }
+
+    #[test]
+    fn build_validated_plan_rejects_private_ip_url() {
+        // Cloud metadata endpoint — UrlGuard refuses, classifier
+        // surfaces.
+        let mut out = good_output();
+        out.expectations.document_sources[0].endpoint_url =
+            "http://169.254.169.254/latest/meta-data/".into();
+        let err = build_validated_plan(out, "x").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("UrlGuard"), "got {msg}");
+    }
+
+    #[test]
+    fn build_validated_plan_rejects_unknown_priority_tier() {
+        let mut out = good_output();
+        out.expectations.document_sources[0].priority_tier = "tier_zero".into();
+        let err = build_validated_plan(out, "x").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("priority_tier"), "got {msg}");
+        assert!(msg.contains("tier_zero"), "got {msg}");
+    }
+
+    #[test]
+    fn build_validated_plan_normalizes_empty_known_id_to_none() {
+        let mut out = good_output();
+        out.expectations.document_sources[0].known_id = Some("   ".into());
+        let plan = build_validated_plan(out, "x").unwrap();
+        match &plan.expectations.document_sources[0] {
+            DocumentSourceEntry::Nomination(n) => assert!(n.known_id.is_none()),
+            _ => panic!("expected Nomination"),
+        }
+    }
+
+    #[test]
+    fn parse_priority_tier_accepts_all_four_variants() {
+        assert_eq!(
+            parse_priority_tier("authoritative_primary").unwrap(),
+            PriorityTier::AuthoritativePrimary
+        );
+        assert_eq!(
+            parse_priority_tier("authoritative_secondary").unwrap(),
+            PriorityTier::AuthoritativeSecondary
+        );
+        assert_eq!(
+            parse_priority_tier("industry_trade_press").unwrap(),
+            PriorityTier::IndustryTradePress
+        );
+        assert_eq!(
+            parse_priority_tier("general_news").unwrap(),
+            PriorityTier::GeneralNews
+        );
+    }
+
+    #[test]
+    fn parse_priority_tier_trims_whitespace() {
+        assert_eq!(
+            parse_priority_tier("  authoritative_primary  ").unwrap(),
+            PriorityTier::AuthoritativePrimary
+        );
     }
 
     #[test]
@@ -1532,12 +1797,15 @@ mod tests {
             You are the research classifier for situation_room.\n\
             TOPIC: {{TOPIC}}\n\
             EXISTING TOPICS:\n{{EXISTING_TOPICS}}\n\
-            REGISTERED SOURCES:\n{{REGISTERED_SOURCES}}\n\
+            SOURCES MEMORY:\n{{SOURCES_MEMORY}}\n\
             Return JSON conforming to AuthoredResearchPlan. Use lowercase \
             snake_case for topic_tags and event_type. Include at least one \
-            entry across the expectations buckets. For geographic_scope \
-            entries, use ISO 3166-1 alpha-2 codes when applicable, and \
-            provide a human-readable display label.\
+            entry across the expectations buckets. For document_sources, \
+            emit at least one nomination carrying a real https endpoint_url \
+            and a priority_tier of authoritative_primary, \
+            authoritative_secondary, industry_trade_press, or general_news. \
+            For geographic_scope entries, use ISO 3166-1 alpha-2 codes when \
+            applicable, and provide a human-readable display label.\
         ";
 
         let ctx = sample_ctx();
@@ -1561,5 +1829,35 @@ mod tests {
         assert!(plan.historical_window_days <= MAX_HISTORICAL_WINDOW_DAYS);
         // The plan id was minted server-side, not echoed by the LLM.
         assert_eq!(plan.id.get_version_num(), 7);
+
+        // ADR 0015 / Session 37: every emitted entry must be a
+        // Nomination (Legacy never comes back from a fresh classify),
+        // every nomination's URL must pass UrlGuard (already enforced
+        // by `build_validated_plan`; assert it survived end-to-end),
+        // and every nomination must carry a typed priority tier.
+        for entry in &plan.expectations.document_sources {
+            match entry {
+                DocumentSourceEntry::Nomination(n) => {
+                    assert!(
+                        n.endpoint_url.starts_with("http://")
+                            || n.endpoint_url.starts_with("https://"),
+                        "nomination endpoint_url must be http(s); got {}",
+                        n.endpoint_url
+                    );
+                    // priority_tier is an enum, can't be wrong here —
+                    // pattern-match to make the structural property
+                    // visible in the test surface.
+                    let _ = match n.priority_tier {
+                        PriorityTier::AuthoritativePrimary
+                        | PriorityTier::AuthoritativeSecondary
+                        | PriorityTier::IndustryTradePress
+                        | PriorityTier::GeneralNews => (),
+                    };
+                }
+                DocumentSourceEntry::Legacy(_) => {
+                    panic!("classify_topic must never produce Legacy entries");
+                }
+            }
+        }
     }
 }

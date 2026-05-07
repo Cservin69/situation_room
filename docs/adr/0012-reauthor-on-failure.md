@@ -658,3 +658,40 @@ before being accepted. The reasoning is non-trivial. Future sessions
 must not redo it on the basis of a failing test or a feeling that
 the automated path is "almost ready." The gate conditions are the
 minimum evidence base. Trust the process.
+
+## Amendment 1 (Session 37) — `config/sources.toml` references superseded by ADR 0015
+
+**Status**: Accepted.
+**Date**: 2026-05-07
+**Scope**: Two procedural references in this ADR to
+`config/sources.toml` are obsolete under ADR 0015. The ADR's
+substantive content (the reauthor flow, the Class A/B/C/D/E
+taxonomy, the frontier-LLM pushback discipline) is unchanged.
+
+ADR 0015 (Session 37) replaced the static source registry with the
+classifier's LLM-emitted sources surface. `config/sources.toml`
+shrunk to two demo entries used by `#[ignore]` tests; the
+production path no longer reads or writes it.
+
+The two affected references:
+
+- §"When a recipe fails at Apply stage", Step 2, **Class C**: the
+  remediation "Update `config/sources.toml` — add to the source's
+  `description` field" no longer applies. The equivalent action
+  is to let the failure surface in the next classification's
+  memory injection (`Store::sources_memory`) via the
+  `recipe_fetch_attempts` row that the failed run wrote. The next
+  classifier sees the failure context and emits a different URL
+  or declines to nominate the source. The `recipe_feedback`
+  channel (ADR 0013) remains available for source-specific
+  corrections the operator wants the recipe author to see across
+  reauthoring.
+- §"When a recipe fails at Apply stage", Step 5: the remediation
+  "annotate the source in `config/sources.toml` as Class
+  B-resistant" no longer applies. Same equivalent: the failed
+  `recipe_fetch_attempts` row carries the failure-message signal
+  the next classifier reads.
+
+This amendment does not change the reauthor flow itself. It
+re-points two procedural recommendations from a deleted file to
+the surface that replaces it.

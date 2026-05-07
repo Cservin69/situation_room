@@ -62,29 +62,39 @@ Per ADR 0001, dependency direction is strict and visible in
 per-crate `Cargo.toml`s. Composition happens in
 `apps/desktop/src-tauri/src/main.rs` and `apps/situation_room/src/main.rs`.
 
-## How to add a new data source descriptor
+## How to add a new data source
 
-Edit `config/sources.toml` to add a `[[source]]` table. No Rust code
-changes are needed — the LLM uses the descriptor at classification
-time and the fetch executor's Level-2 author at recipe-authoring
-time. Each entry takes:
+Don't. There is no static source registry to add to.
 
-```toml
-[[source]]
-id                = "stable_snake_case_id"
-display_name      = "Human-readable name"
-description       = """One-paragraph description."""
-authoritative_for = ["topic_or_metric_label", ...]   # optional
-endpoint_hint     = "https://example.com/api/..."     # optional but strongly preferred
-```
+Under ADR 0015 (Session 37), the LLM emits source nominations
+directly during classification. Each nomination carries its own
+`endpoint_url`, `priority_tier`, and an optional `known_id` stamped
+from the operator's in-DB sources memory (the recipes ⨝
+recipe_fetch_attempts ⨝ research_plans join — see
+`crates/storage/src/sources_memory.rs`). There is no
+`config/sources.toml` to edit, no Rust adapter to write, no
+descriptor to author.
 
-Set `endpoint_hint` whenever a stable public URL exists for the
-source. Without it the recipe author falls back to a stub excerpt
-and the resulting recipe is stamped `StubExcerpt` per ADR 0014. If
-no usable hint exists (paywalled feed, login-walled API, etc.),
-document the omission in the description so the next operator and
-the next prompt revision can see it is deliberate. Session 24's
-audit of `config/sources.toml` is the worked example.
+To "add" a new source — meaning, to teach situation_room to fetch
+from a source it has never seen — classify a topic that maps to
+that source. The LLM nominates the URL from training-distribution
+knowledge; the operator accepts the plan and runs a fetch; the
+first successful fetch enters the sources memory. The next
+classification on a related topic sees that URL as recognized
+context and stamps `known_id` against it.
+
+The two surviving entries in `config/sources.toml` (`csv_demo`,
+`json_demo`) are test fixtures used by the executor's `#[ignore]`
+live tests. They are not a registration surface. Don't edit them
+unless you are touching those tests; if you remove either, the
+matching live test fails.
+
+The source-specific principles that previously lived as TOML
+annotations (PDF-vs-HTML strategy, JS-rendering caveat,
+rate-limit notes, paywall caveats) have been absorbed into
+`config/prompts/recipe_author.md` v1.10–v1.12 as principles, not
+routing rules. Edit the prompt when a *category* of failure
+needs new guidance; never name a specific source in the prompt.
 
 ## How to add a new `#[tauri::command]`
 
