@@ -112,6 +112,40 @@
   triggers; today the chip is the user's hook for triggering the
   manual path themselves.
 
+  ITERATES chip (Session 38, ADR 0016)
+  -------------------------------------
+
+  When `recipe.iterator !== null`, the recipe is a listing-shaped
+  recipe: the runtime evaluates the iterator's selector against the
+  fetched document to obtain N matches, then evaluates the inner
+  `extraction` once per match scoped to that match's sub-tree,
+  producing N records per fetch instead of 1. This is the post-
+  ADR-0015 cold-start case (Nature subjects, RSS feeds, arXiv
+  recent, news beats, agency publication indexes).
+
+    - **ITERATES chip** in the recipe head. `--signal-info` hue
+      (informational, not degraded — the recipe is healthy and
+      structurally correct; the cardinality is just non-default).
+      Same baseline + sizing as BAKED / STUB-AUTHORED so the three
+      render coherently when more than one applies.
+    - **Iterator details block** between the extraction and produces
+      blocks, open by default. Renders the iterator's serialized
+      ExtractionSpec as pretty-printed JSON — same opacity-on-the-
+      wire posture as `extraction`. Open by default because for
+      iterator recipes the iterator's selector is more load-bearing
+      for "did the LLM pick the right card boundary?" debugging
+      than the inner extraction is.
+
+  No chip and no block render for scalar recipes (`iterator ===
+  null`) — the absence is the signal: the recipe produces one
+  record per binding per fetch, the pre-Session-38 contract.
+
+  ADR 0016 §"Per-match dedup becomes load-bearing" notes that
+  iterator records carry a per-record `dedup_key` computed from the
+  binding's `dedup_key_field`. The dedup_key isn't surfaced in this
+  panel today — it's a runtime-only concern, visible only through
+  storage queries.
+
   Empty state
   -----------
 
@@ -636,6 +670,26 @@
           title="Authored from a fallback description, not the source's actual response. The recipe is a guess at the response shape. If the source becomes reachable, run fetch again — a future session may surface a 're-author from real bytes' path. ADR 0014."
         >STUB-AUTHORED</span>
       {/if}
+      {#if recipe.iterator !== null}
+        <!--
+          ITERATES chip — ADR 0016 (Session 38). Visible when the
+          recipe carries an iterator (a listing-shaped source: each
+          fetch returns N items, the recipe produces N records).
+          Distinguishes scalar recipes (one record per fetch) from
+          iterator recipes at a glance, so the operator's reading
+          of `records_produced` in the fetch report aligns with
+          the recipe's structural cardinality.
+
+          Same passive-chip posture as BAKED / STUB-AUTHORED: no
+          onclick, the chip is informational. The iterator's
+          actual selector renders inside the iterator details
+          block below.
+        -->
+        <span
+          class="iterates-chip"
+          title="This recipe iterates: the runtime selects N matches with the iterator's selector, then evaluates the extraction once per match. Produces N records per fetch instead of 1. ADR 0016."
+        >ITERATES</span>
+      {/if}
       {#if feedback}
         <!--
           FLAGGED chip — ADR 0013. Visible when the operator has
@@ -748,6 +802,24 @@
       <summary>extraction</summary>
       <pre>{prettyJson(recipe.extraction)}</pre>
     </details>
+
+    {#if recipe.iterator !== null}
+      <!--
+        ADR 0016: iterator block. Renders the iterator's serialized
+        ExtractionSpec as pretty-printed JSON — same opacity-on-the-
+        wire posture as `extraction`, same render style. Open by
+        default because for iterator-bearing recipes the iterator's
+        selector is more load-bearing for "did the LLM pick the
+        right card boundary?" debugging than the inner extraction
+        is — the inner extraction's failure mode is "no leaf within
+        a card", which is local; the iterator's failure mode is
+        "wrong cards entirely", which is structural.
+      -->
+      <details class="block" open>
+        <summary>iterator</summary>
+        <pre>{prettyJson(recipe.iterator)}</pre>
+      </details>
+    {/if}
 
     <details class="block">
       <summary>produces</summary>
@@ -1084,6 +1156,48 @@
     border-radius: 2px;
     color: var(--signal-warning, var(--fg-secondary));
     border: 1px solid var(--signal-warning, var(--border-subtle));
+    background: var(--bg-canvas);
+    cursor: help;
+    align-self: center;
+  }
+
+  /*
+   * ITERATES chip — Session 38, ADR 0016.
+   *
+   * A visible chip in the recipe head announcing the iterator
+   * cardinality contract: this recipe produces N records per fetch
+   * (one per iterator match), not 1. Without the chip, an
+   * iterator recipe would look identical to a scalar recipe in the
+   * card head — the iterator's existence would only show in the
+   * details block below, which is one click away. The fetch
+   * report's `records_produced: 5` would then read as surprising
+   * ("five records from one recipe?"); the chip pre-frames it.
+   *
+   * Color discipline (ADR 0006 §"color is meaning, not decoration"):
+   * `--signal-info` rather than `--signal-warning`. The iterator
+   * isn't a freshness compromise (BAKED) or an authoring gap
+   * (STUB-AUTHORED) — it's an informational descriptor of the
+   * recipe's structural cardinality, in the same family as the
+   * FLAGGED chip below (which is also "the recipe has a
+   * non-default property the user should know about, but it's not
+   * degraded"). Same hue as FLAGGED to mark "informational, not
+   * degraded"; distinct *content* does the disambiguation.
+   *
+   * Same baseline + sizing as .baked-badge / .stub-authored-chip
+   * so the three render coherently left-to-right when a recipe
+   * carries multiple chips. `cursor: help` because passive — the
+   * iterator's actual selector lives in the iterator details
+   * block below.
+   */
+  .iterates-chip {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    padding: 2px 6px;
+    border-radius: 2px;
+    color: var(--signal-info, var(--fg-secondary));
+    border: 1px solid var(--signal-info, var(--border-subtle));
     background: var(--bg-canvas);
     cursor: help;
     align-self: center;

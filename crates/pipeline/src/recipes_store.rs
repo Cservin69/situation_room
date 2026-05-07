@@ -124,6 +124,17 @@ fn recipe_to_row(r: &FetchRecipe) -> Result<RecipeRow, RecipeStoreError> {
         .map_err(|e| RecipeStoreError::Serialize(format!("extraction: {e}")))?;
     let produces_json = serde_json::to_string(&r.produces)
         .map_err(|e| RecipeStoreError::Serialize(format!("produces: {e}")))?;
+    // ADR 0016: serialize the optional iterator the same way as
+    // `extraction`. Storage carries the column as nullable JSON
+    // (migration 0015), so `None` rides as SQL NULL — we never
+    // serialize the literal string `"null"` into the column.
+    let iterator_json = match &r.iterator {
+        Some(spec) => Some(
+            serde_json::to_string(spec)
+                .map_err(|e| RecipeStoreError::Serialize(format!("iterator: {e}")))?,
+        ),
+        None => None,
+    };
 
     Ok(RecipeRow {
         id: r.id,
@@ -148,6 +159,8 @@ fn recipe_to_row(r: &FetchRecipe) -> Result<RecipeRow, RecipeStoreError> {
         prior_recipe_id: r.prior_recipe_id,
         // Track A, Session 25/26: travels with prior_recipe_id.
         reauthor_reason: r.reauthor_reason.clone(),
+        // ADR 0016: storage carries the iterator JSON verbatim.
+        iterator: iterator_json,
     })
 }
 
@@ -158,6 +171,17 @@ fn stored_to_recipe(s: StoredRecipe) -> Result<FetchRecipe, RecipeStoreError> {
         .map_err(|e| RecipeStoreError::Deserialize(format!("produces: {e}")))?;
     let source_url = url::Url::parse(&s.source_url)
         .map_err(|e| RecipeStoreError::Deserialize(format!("source_url: {e}")))?;
+    // ADR 0016: parse the optional iterator. Storage gives us
+    // `Option<String>` of the JSON; we lift it back to
+    // `Option<ExtractionSpec>` here. Pre-Session-38 rows arrive as
+    // `None` (NULL → None in row_to_stored).
+    let iterator: Option<ExtractionSpec> = match s.iterator {
+        Some(json) => Some(
+            serde_json::from_str(&json)
+                .map_err(|e| RecipeStoreError::Deserialize(format!("iterator: {e}")))?,
+        ),
+        None => None,
+    };
 
     Ok(FetchRecipe {
         id: s.id,
@@ -180,6 +204,8 @@ fn stored_to_recipe(s: StoredRecipe) -> Result<FetchRecipe, RecipeStoreError> {
         prior_recipe_id: s.prior_recipe_id,
         // Track A, Session 25/26: paired with prior_recipe_id.
         reauthor_reason: s.reauthor_reason,
+        // ADR 0016: parsed above.
+        iterator,
     })
 }
 
@@ -211,6 +237,8 @@ mod tests {
                     path: "value".into(),
                     source: FieldValueSource::Extracted,
                 }],
+                // ADR 0016: scalar-recipe context (no dedup_key_field).
+                dedup_key_field: None,
             }],
             authored_at: Utc.with_ymd_and_hms(2026, 4, 22, 0, 0, 0).unwrap(),
             authored_by: "xai".into(),
@@ -224,6 +252,8 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: scalar-recipe context (no iterator).
+            iterator: None,
         }
     }
 
@@ -392,5 +422,62 @@ mod tests {
 
         let all = load_recipes_for_plan(&store, plan_id).unwrap();
         assert_eq!(all.len(), 2, "both versions should be visible");
+    }
+
+    // -----------------------------------------------------------------
+    // Session 38 — iterator round-trip through the typed save/load
+    // boundary (ADR 0016)
+    // -----------------------------------------------------------------
+
+    /// A scalar recipe (no iterator) round-trips through save/load
+    /// with `iterator: None` on the way out. The pre-Session-38
+    /// contract is unchanged.
+    #[test]
+    fn scalar_recipe_round_trips_with_no_iterator() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let recipe = sample(); // sample() sets iterator: None
+        let id = recipe.id;
+        save_recipe(&store, &recipe).unwrap();
+
+        let back = load_recipe(&store, id).unwrap().expect("present");
+        assert!(back.iterator.is_none(), "scalar recipe loads with iterator None");
+    }
+
+    /// An iterator-bearing recipe round-trips the typed
+    /// `Option<ExtractionSpec>` through the JSON column verbatim.
+    /// This is the load-bearing guarantee that the storage→pipeline
+    /// boundary doesn't drop the iterator: without it, iterator
+    /// recipes would write to disk but load back as scalar recipes
+    /// — silent regression to the pre-Session-38 cardinality bug.
+    #[test]
+    fn iterator_recipe_round_trips_through_storage() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let mut recipe = sample();
+        // Switch both selectors to css_select so the recipe is
+        // mode-congruent (the validator would enforce this; we
+        // build directly here to test the storage round-trip in
+        // isolation).
+        recipe.extraction = ExtractionSpec::CssSelect {
+            selector: "h3.headline".into(),
+            attribute: None,
+        };
+        recipe.iterator = Some(ExtractionSpec::CssSelect {
+            selector: ".article-card".into(),
+            attribute: None,
+        });
+        recipe.produces[0].dedup_key_field = Some("value".into());
+        let id = recipe.id;
+        save_recipe(&store, &recipe).unwrap();
+
+        let back = load_recipe(&store, id).unwrap().expect("present");
+        assert_eq!(back.iterator, recipe.iterator, "iterator must round-trip");
+        assert_eq!(
+            back.produces[0].dedup_key_field, recipe.produces[0].dedup_key_field,
+            "dedup_key_field must round-trip"
+        );
     }
 }

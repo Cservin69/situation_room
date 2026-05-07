@@ -1,7 +1,8 @@
 # ADR 0016 — Extraction iterator: representing listing-shaped sources
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-07
+**Accepted**: 2026-05-07 (Session 38 — Phase 1 implementation complete)
 **Related**: ADR 0007 (research function: two-level LLM
 architecture, especially the closed-extraction-vocabulary
 discipline), ADR 0003 (six record types as governance boundary),
@@ -397,10 +398,18 @@ async-loaded cards we don't see), the implementation is wrong.
 
 ## Status
 
-**Proposed**, awaiting Session 38 implementation. The decision was
-ratified by the operator at the end of Session 37 with the framing
-"the work is one level lower, in the extraction vocabulary, and the
-move is one new concept (iterator) composed orthogonally with the
-existing five modes." This ADR records that decision.
+**Accepted** (2026-05-07, Session 38). The decision was ratified by
+the operator at the end of Session 37 with the framing "the work is
+one level lower, in the extraction vocabulary, and the move is one
+new concept (iterator) composed orthogonally with the existing five
+modes." Phase 1 implementation landed in Session 38: storage column
+(migration v15), typed pipeline plumbing, runtime path for
+`css_select × css_select`, validator with four invariants (mode
+congruence, csv_cell-iterator-column-empty, dedup_key_field-required-
+on-iterator, dedup_key_field-references-real-path), DTO surface,
+recipe-author prompt v1.13, and a live ignored test against a real
+listing. Phase 2 (multi-extracted fields per match, JSON / CSV / PDF
+iterator runtime) defers to its own ADR after Phase 1 has run in
+production for a few cycles.
 
 End of ADR.

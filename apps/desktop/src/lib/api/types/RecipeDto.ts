@@ -45,6 +45,21 @@ dedup_key: string | null, plan_id: string, source_id: string, source_url: string
  */
 extraction: unknown, 
 /**
+ * ADR 0016 iterator. `None` for scalar recipes (the
+ * pre-Session-38 contract; the recipe produces one record per
+ * `produces` binding per fetch). `Some(spec)` for iterator-
+ * bearing recipes against listing-shaped sources; the runtime
+ * evaluates `iterator` against the fetched document to obtain N
+ * matches, then evaluates `extraction` once per match scoped to
+ * that match's sub-tree, producing N records per binding.
+ *
+ * Opaque on the wire (TypeScript `unknown`) because the
+ * frontend's recipe-inspection panel renders this as
+ * pretty-printed JSON next to `extraction`. Per-mode rendering
+ * is deferred until a future session needs it.
+ */
+iterator: unknown, 
+/**
  * The production bindings — record_type + field_mappings per
  * binding. Same opacity rationale as `extraction`.
  */

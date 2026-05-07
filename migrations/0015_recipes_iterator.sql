@@ -1,0 +1,69 @@
+-- situation_room schema, version 0015.
+--
+-- ADR 0016: extraction iterator (Phase 1). Listing-shaped sources
+-- (Nature subjects, RSS, arXiv recent, news beats, agency indexes —
+-- the post-ADR-0015 cold-start nomination distribution) need to
+-- produce N records per fetch instead of 1. The closed extraction
+-- vocabulary stays at five scalar modes; ADR 0016 adds one
+-- orthogonal recipe-level field — `iterator` — whose value is
+-- itself an `ExtractionSpec` drawn from the same closed enum. The
+-- runtime evaluates `iterator` to obtain N matches, then evaluates
+-- the recipe's existing `extraction` field once per match scoped to
+-- that match's sub-tree, producing one record per match.
+--
+-- See `docs/adr/0016-extraction-iterator.md` for the full
+-- rationale, including why the iterator is a separate field
+-- (orthogonal to the closed extraction enum) rather than five
+-- companion `_each` modes (option (a) in §Alternatives considered)
+-- or a per-extraction `cardinality` flag (option (b)).
+--
+-- ## Why nullable, why no default, why no constraint
+--
+-- Existing recipes carry NULL → `iterator: None` in Rust. The
+-- change is additive and backward-compatible: pre-Session-38
+-- recipes behave exactly as today (one record per recipe per
+-- fetch), and re-authoring is not required for any existing
+-- source. Only recipes against listing-shaped sources populate
+-- the field.
+--
+-- ## DuckDB ALTER TABLE — same lessons as migrations 0008 / 0010 /
+-- 0011 / 0012
+--
+-- Per the comment block in `0005_research_plan_status.sql` (and
+-- repeated in 0008, 0010, 0011, 0012 — each adding an optional
+-- field to `recipes`), DuckDB rejects two paths to a `NOT NULL
+-- DEFAULT` ALTER:
+--
+--   1. `ADD COLUMN ... NOT NULL DEFAULT ...` — "Adding columns
+--      with constraints not yet supported".
+--   2. `ADD COLUMN ... DEFAULT ...; ALTER COLUMN ... SET NOT
+--      NULL;` — "Cannot alter entry because there are entries
+--      that depend on it" when indexes exist on the table.
+--
+-- The `recipes` table carries `idx_recipes_dedup_key` and
+-- `idx_recipes_plan_source` from migration 0003, which would
+-- block path (2). The column is nullable on purpose; absence-of-
+-- iterator is the default shape for any pre-ADR-0016 recipe and
+-- for every recipe against an instance URL (one item, not many).
+--
+-- The Rust type (`FetchRecipe.iterator: Option<ExtractionSpec>`)
+-- is the load-bearing invariant — same posture as `static_payload`
+-- in 0008, `authored_from` in 0010, `prior_recipe_id` in 0011,
+-- and `reauthor_reason` in 0012. NULL on disk → `None` in Rust,
+-- with `recipes_store::stored_to_recipe` doing the lift.
+--
+-- ## Why JSON, not TEXT
+--
+-- The column carries a serialized `ExtractionSpec` (a tagged enum
+-- with mode-specific fields). DuckDB's JSON type validates
+-- well-formedness on write — a hand-edit that put unparseable
+-- text in the column would fail INSERT rather than silently
+-- corrupt the recipe row. This matches the existing `extraction`
+-- and `produces` columns from migration 0003, which are also
+-- JSON for the same reason.
+
+ALTER TABLE recipes ADD COLUMN iterator JSON;
+
+-- Record this migration.
+INSERT INTO schema_migrations (version, description)
+    VALUES (15, 'recipes.iterator column (ADR 0016)');

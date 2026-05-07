@@ -454,6 +454,36 @@ pub struct RecipeAuthoringOutput {
     /// flat shape does.
     #[serde(default)]
     pub decline_reason: String,
+
+    /// ADR 0016: optional listing iterator. When `Some(spec)`, the
+    /// runtime evaluates `spec` against the fetched document to
+    /// obtain N matches, then evaluates `extraction` once per match
+    /// scoped to that match's sub-tree, producing one record per
+    /// match per `produces` binding. When `None`, the recipe is a
+    /// scalar recipe (one record per binding per fetch — the
+    /// pre-Session-38 contract).
+    ///
+    /// **Mode congruence is required.** The validator rejects a
+    /// `css_select` iterator paired with a `json_path` extraction,
+    /// and so on for every cross-mode pairing. Phase 1 wires the
+    /// runtime for the `css_select` × `css_select` pair only; the
+    /// validator enforces congruence for every mode so the recipe
+    /// shape on disk is honest about what it intends.
+    ///
+    /// **Per-binding dedup is required.** Every binding under an
+    /// iterator-bearing recipe must specify
+    /// `dedup_key_field`, naming one of its `field_mappings` paths.
+    /// The validator enforces presence and path-existence.
+    ///
+    /// **Wire shape.** `Option<AuthoredExtractionSpec>` (a nested
+    /// optional struct) rather than the empty-string-as-absent
+    /// idiom used for top-level `String` fields, because the schema
+    /// accepts nested `Option<Struct>` cleanly — see
+    /// `AuthoredExtractionSpec::CsvCell::row_filter` as the
+    /// in-codebase precedent. The schema-level nullability rejection
+    /// only bites top-level string-typed `Option<T>`s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iterator: Option<AuthoredExtractionSpec>,
 }
 
 /// Mirror of [`ExtractionSpec`] with `JsonSchema` derived.
@@ -509,6 +539,31 @@ pub struct AuthoredProductionBinding {
     pub record_type: AuthoredRecordType,
     pub expectation: AuthoredExpectationRef,
     pub field_mappings: Vec<AuthoredFieldMap>,
+    /// ADR 0016: required when [`RecipeAuthoringOutput::iterator`] is
+    /// `Some`, ignored otherwise. Names one of the `field_mappings`
+    /// paths whose extracted value identifies the record across
+    /// re-fetches (the headline, the article URL, the paper id).
+    /// The runtime computes per-record `dedup_key` as
+    /// `{recipe.id}:{field_value}` so re-fetching the same listing
+    /// produces no duplicates.
+    ///
+    /// **Wire shape: empty-string-as-absent.** Same idiom as
+    /// [`RecipeAuthoringOutput::static_payload`] and `decline_reason`
+    /// — xAI's structured-output schema rejects top-level
+    /// `Option<String>` cleanly, so empty string carries the absence
+    /// signal. The validator collapses empty/whitespace-only to
+    /// `None` and then enforces presence per ADR 0016.
+    ///
+    /// `Option<String>` rather than `String` here because
+    /// `AuthoredProductionBinding` is *nested* inside
+    /// `RecipeAuthoringOutput.produces` (an array), and nested
+    /// optional strings work cleanly under the schema (compare
+    /// `AuthoredExtractionSpec::CssSelect::attribute`'s
+    /// `Option<String>`, the existing precedent). The empty-string
+    /// idiom is reserved for the *top-level* string fields where
+    /// the schema's nullability rejection bites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_key_field: Option<String>,
 }
 
 /// The three record types a recipe may produce at authoring time.
@@ -917,6 +972,98 @@ fn build_validated_recipe(
         }
     };
 
+    // 7. ADR 0016: iterator validation.
+    //
+    // Iteration is structurally orthogonal to the closed extraction
+    // vocabulary, but its honest use requires four contracts the
+    // validator enforces here. The runtime in `recipe_apply::apply`
+    // assumes all four; without them, an iterator-bearing recipe
+    // would either silently mis-iterate (wrong scope) or produce
+    // duplicate records on every refresh (no per-record dedup).
+    //
+    //   (a) **Mode congruence.** A `css_select` iterator pairs
+    //       only with a `css_select` extraction; `json_path` with
+    //       `json_path`; etc. The per-match scope is mode-specific
+    //       (a DOM sub-tree for CSS, a JSON value for JsonPath); a
+    //       cross-mode pairing has no defined scope semantics.
+    //
+    //   (b) **CsvCell iterator: column must be empty.** The CSV
+    //       iterator selects rows; the inner extraction selects a
+    //       cell within each row. A non-empty `column` at iterator
+    //       position is the LLM trying to pre-pick a cell at the
+    //       row-iteration layer, which is meaningless. Forward-
+    //       compatible guard: the runtime doesn't yet exercise CSV
+    //       iteration but the validator rejects the malformed shape
+    //       so an LLM that produces it sees the contract violation.
+    //
+    //   (c) **Every binding has dedup_key_field.** With one record
+    //       per match instead of one per recipe, the natural-key
+    //       discipline must include something stable per record.
+    //       A binding without `dedup_key_field` would write
+    //       `dedup_key = NULL` — duplicates multiply on every fetch.
+    //
+    //   (d) **dedup_key_field references a real path.** The named
+    //       field must appear in the binding's `field_mappings`. A
+    //       reference to a non-existent path would fail at apply
+    //       time on every fetch; catching it at authoring time is
+    //       cheaper.
+    let iterator = match output.iterator {
+        None => None,
+        Some(authored_iter) => {
+            // (a) Mode congruence is checked against the *typed*
+            // pre-converted shapes — `AuthoredExtractionSpec`'s
+            // discriminant matches the runtime's `ExtractionSpec`
+            // discriminant by name (mirror-shape contract, see
+            // `authored_extraction_spec_mirror_matches_runtime`).
+            // We compare on the authored side because we have it
+            // in hand before the conversion.
+            check_iterator_mode_congruence(&authored_iter, &extraction)?;
+
+            // Convert the iterator spec the same way the main
+            // extraction was converted — same bounds checks
+            // (non-empty selector, page >= 1, etc.).
+            let iter_spec = convert_extraction(authored_iter)?;
+
+            // (b) CsvCell iterator: column must be empty (forward-
+            // compatible guard; the runtime doesn't iterate CSV in
+            // Phase 1 but the recipe shape on disk should be honest).
+            if let ExtractionSpec::CsvCell { ref column, .. } = iter_spec {
+                if !column.is_empty() {
+                    return Err(AuthoringError::InvalidRecipe(format!(
+                        "iterator csv_cell.column must be empty (the iterator \
+                         selects rows; the inner extraction selects a cell within \
+                         each row). Got column {column:?}."
+                    )));
+                }
+            }
+
+            // (c) + (d) Per-binding dedup_key_field discipline.
+            for (i, binding) in produces.iter().enumerate() {
+                let field = binding.dedup_key_field.as_deref().ok_or_else(|| {
+                    AuthoringError::InvalidRecipe(format!(
+                        "binding[{i}]: iterator-bearing recipes require \
+                         dedup_key_field on every production binding (ADR 0016 \
+                         §Carry-forward dependencies). Without it, re-fetching the \
+                         same listing produces N duplicate records per fetch."
+                    ))
+                })?;
+                if !binding.field_mappings.iter().any(|fm| fm.path == field) {
+                    let known_paths: Vec<&str> = binding
+                        .field_mappings
+                        .iter()
+                        .map(|fm| fm.path.as_str())
+                        .collect();
+                    return Err(AuthoringError::InvalidRecipe(format!(
+                        "binding[{i}]: dedup_key_field {field:?} does not match \
+                         any field_mappings path. Known paths: {known_paths:?}."
+                    )));
+                }
+            }
+
+            Some(iter_spec)
+        }
+    };
+
     Ok(FetchRecipe {
         id: Uuid::now_v7(),
         dedup_key: None, // caller sets this — convention is
@@ -939,7 +1086,60 @@ fn build_validated_recipe(
         authored_from: situation_room_storage::AuthoredFrom::Unknown,
         prior_recipe_id: None,
         reauthor_reason: None,
+        // ADR 0016: validated above (step 7). `None` for scalar
+        // recipes (the pre-Session-38 contract), `Some(spec)` for
+        // iterator-bearing recipes.
+        iterator,
     })
+}
+
+/// ADR 0016: enforce mode congruence between iterator and extraction.
+///
+/// The per-match scope is mode-specific: `css_select` iterators
+/// scope to a DOM sub-tree, `json_path` iterators scope to a JSON
+/// value, `csv_cell` iterators scope to a CSV row, `regex_capture`
+/// iterators scope to the matched text, `pdf_table` iterators scope
+/// to a table row. Cross-mode pairings have no defined scope
+/// semantics: a `css_select` iterator with a `json_path` extraction
+/// would have no meaningful "evaluate the JSON path against this
+/// DOM node" interpretation. Reject the pair at authoring time
+/// rather than at apply time, where the failure would happen on
+/// every fetch forever.
+///
+/// Compared on the authored side because the authored shape and
+/// the runtime shape are byte-for-byte serde-equivalent (the
+/// `authored_extraction_spec_mirror_matches_runtime` test pins
+/// that). The discriminant name is what we check; the inner
+/// fields (selector strings, JSON paths, etc.) don't enter
+/// congruence — only the mode name does.
+fn check_iterator_mode_congruence(
+    iter: &AuthoredExtractionSpec,
+    inner: &ExtractionSpec,
+) -> Result<(), AuthoringError> {
+    let iter_mode = match iter {
+        AuthoredExtractionSpec::JsonPath { .. } => "json_path",
+        AuthoredExtractionSpec::CssSelect { .. } => "css_select",
+        AuthoredExtractionSpec::CsvCell { .. } => "csv_cell",
+        AuthoredExtractionSpec::PdfTable { .. } => "pdf_table",
+        AuthoredExtractionSpec::RegexCapture { .. } => "regex_capture",
+    };
+    let inner_mode = match inner {
+        ExtractionSpec::JsonPath { .. } => "json_path",
+        ExtractionSpec::CssSelect { .. } => "css_select",
+        ExtractionSpec::CsvCell { .. } => "csv_cell",
+        ExtractionSpec::PdfTable { .. } => "pdf_table",
+        ExtractionSpec::RegexCapture { .. } => "regex_capture",
+    };
+    if iter_mode != inner_mode {
+        return Err(AuthoringError::InvalidRecipe(format!(
+            "iterator mode {iter_mode:?} does not match extraction mode \
+             {inner_mode:?}. Iterator and extraction must use the same \
+             mode (ADR 0016 §\"Per-match evaluation semantics, by mode\"): \
+             css_select pairs with css_select, json_path pairs with \
+             json_path, etc."
+        )));
+    }
+    Ok(())
 }
 
 fn convert_extraction(
@@ -1054,6 +1254,11 @@ fn convert_binding(
         },
         expectation,
         field_mappings,
+        // ADR 0016: threaded from `b.dedup_key_field` below in step 5.
+        // For now, the placeholder None compiles; the validator
+        // override at the call site (`build_validated_recipe`) is
+        // what enforces presence-when-iterator-Some.
+        dedup_key_field: b.dedup_key_field.filter(|s| !s.trim().is_empty()),
     })
 }
 
@@ -1560,9 +1765,14 @@ mod tests {
                         },
                     },
                 ],
+                // ADR 0016: scalar-recipe fixture (no iterator).
+                dedup_key_field: None,
             }],
             static_payload: String::new(),
             decline_reason: String::new(),
+            // ADR 0016: scalar-recipe fixture (no iterator). Iterator-
+            // bearing variants are exercised in dedicated tests below.
+            iterator: None,
         }
     }
 
@@ -2724,5 +2934,208 @@ mod tests {
                 panic!("expected decline or recipe; got error: {other:?}");
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Session 38 — iterator validation (ADR 0016)
+    // ---------------------------------------------------------------------
+
+    /// Helper: a `good_output()` shape with an iterator added and the
+    /// binding upgraded to event-shape (so a `headline` field can
+    /// stand in as the dedup_key_field reference). Per ADR 0016 the
+    /// dedup_key_field must reference one of the binding's
+    /// field_mappings paths.
+    fn good_iterator_output() -> RecipeAuthoringOutput {
+        let mut out = good_output();
+        // Switch to css_select × css_select so the iterator/extraction
+        // pair is mode-congruent (ADR 0016 §"Per-match evaluation
+        // semantics, by mode" — Phase 1 wires css_select).
+        out.extraction = AuthoredExtractionSpec::CssSelect {
+            selector: "h3.c-card__title a".into(),
+            attribute: None,
+        };
+        out.iterator = Some(AuthoredExtractionSpec::CssSelect {
+            selector: ".c-card".into(),
+            attribute: None,
+        });
+        // Upgrade the binding: event-shape with a `headline` field
+        // that the dedup_key_field references.
+        out.produces = vec![AuthoredProductionBinding {
+            record_type: AuthoredRecordType::Event,
+            expectation: AuthoredExpectationRef::EventType { index: 0 },
+            field_mappings: vec![
+                AuthoredFieldMap {
+                    path: "event_type".into(),
+                    source: AuthoredFieldValueSource::Literal {
+                        value: serde_json::json!("milestone_announced"),
+                    },
+                },
+                AuthoredFieldMap {
+                    path: "headline".into(),
+                    source: AuthoredFieldValueSource::Extracted,
+                },
+            ],
+            dedup_key_field: Some("headline".into()),
+        }];
+        out
+    }
+
+    /// The plan used in iterator tests carries an `event_types` list
+    /// so the `EventType { index: 0 }` reference resolves. Built on
+    /// top of `sample_plan` so the rest of validation (URL guard,
+    /// observation_metric bounds) stays comfortable.
+    fn iterator_sample_plan() -> ResearchPlan {
+        let plan = sample_plan();
+        // sample_plan already has one event_type expectation; that's
+        // what `EventType { index: 0 }` references. No changes needed.
+        let _ = &plan.expectations.event_types[0]; // assert presence
+        plan
+    }
+
+    /// The happy path: a mode-congruent iterator-bearing recipe with
+    /// dedup_key_field set passes validation. This is the
+    /// post-Session-38 listing-source shape.
+    #[test]
+    fn iterator_with_mode_congruence_and_dedup_key_field_validates() {
+        let recipe = build_validated_recipe(
+            good_iterator_output(),
+            &iterator_sample_plan(),
+            "xai",
+        )
+        .expect("congruent iterator-bearing recipe should validate");
+        assert!(
+            matches!(recipe.iterator, Some(ExtractionSpec::CssSelect { .. })),
+            "expected css_select iterator, got {:?}",
+            recipe.iterator
+        );
+        assert_eq!(
+            recipe.produces[0].dedup_key_field.as_deref(),
+            Some("headline"),
+            "dedup_key_field should be threaded through"
+        );
+    }
+
+    /// Cross-mode iterator/extraction pairs are rejected. ADR 0016's
+    /// per-match scope semantics are mode-specific; a `css_select`
+    /// iterator with a `json_path` inner extraction has no defined
+    /// scope.
+    #[test]
+    fn iterator_validates_mode_congruence() {
+        let mut out = good_iterator_output();
+        // Iterator is css_select; switch the extraction to json_path.
+        out.extraction = AuthoredExtractionSpec::JsonPath {
+            path: "$.title".into(),
+        };
+        let err = build_validated_recipe(out, &iterator_sample_plan(), "xai").unwrap_err();
+        let msg = match err {
+            AuthoringError::InvalidRecipe(m) => m,
+            other => panic!("expected InvalidRecipe, got {other:?}"),
+        };
+        assert!(
+            msg.contains("css_select") && msg.contains("json_path"),
+            "error should name both modes, got: {msg}"
+        );
+    }
+
+    /// An iterator-bearing recipe whose binding has no
+    /// dedup_key_field is rejected. Without the field, iterator-
+    /// produced records would write `dedup_key = NULL` and re-fetches
+    /// would multiply duplicates.
+    #[test]
+    fn iterator_requires_dedup_key_field() {
+        let mut out = good_iterator_output();
+        out.produces[0].dedup_key_field = None;
+        let err = build_validated_recipe(out, &iterator_sample_plan(), "xai").unwrap_err();
+        let msg = match err {
+            AuthoringError::InvalidRecipe(m) => m,
+            other => panic!("expected InvalidRecipe, got {other:?}"),
+        };
+        assert!(
+            msg.contains("dedup_key_field"),
+            "error should name dedup_key_field, got: {msg}"
+        );
+    }
+
+    /// An iterator-bearing recipe whose dedup_key_field references a
+    /// path not in field_mappings is rejected. Catches a typo at
+    /// authoring time rather than at apply time on every fetch.
+    #[test]
+    fn dedup_key_field_must_reference_existing_path() {
+        let mut out = good_iterator_output();
+        out.produces[0].dedup_key_field = Some("not_a_real_path".into());
+        let err = build_validated_recipe(out, &iterator_sample_plan(), "xai").unwrap_err();
+        let msg = match err {
+            AuthoringError::InvalidRecipe(m) => m,
+            other => panic!("expected InvalidRecipe, got {other:?}"),
+        };
+        assert!(
+            msg.contains("not_a_real_path") && msg.contains("dedup_key_field"),
+            "error should name both the bad path and the field, got: {msg}"
+        );
+    }
+
+    /// Empty-string `dedup_key_field` collapses to `None` per the
+    /// existing `convert_binding` contract — and is therefore
+    /// rejected when `iterator` is `Some`. The empty-string idiom
+    /// matches `static_payload` / `decline_reason`'s wire shape.
+    #[test]
+    fn empty_dedup_key_field_collapses_and_iterator_rejects_it() {
+        let mut out = good_iterator_output();
+        out.produces[0].dedup_key_field = Some("   ".into());
+        let err = build_validated_recipe(out, &iterator_sample_plan(), "xai").unwrap_err();
+        assert!(matches!(err, AuthoringError::InvalidRecipe(m) if m.contains("dedup_key_field")));
+    }
+
+    /// CsvCell at iterator position with non-empty `column` is
+    /// rejected — the column is meaningless at the row-iteration
+    /// layer (the inner extraction picks the cell). Forward-compatible
+    /// guard: the runtime doesn't yet exercise CSV iteration, but the
+    /// validator rejects the malformed shape.
+    #[test]
+    fn iterator_csv_cell_with_non_empty_column_is_rejected() {
+        let mut out = good_iterator_output();
+        // Both iterator and extraction switch to csv_cell so mode
+        // congruence is satisfied; we test only the column rule.
+        out.extraction = AuthoredExtractionSpec::CsvCell {
+            column: "value".into(),
+            row_filter: None,
+        };
+        out.iterator = Some(AuthoredExtractionSpec::CsvCell {
+            column: "this_should_be_empty".into(),
+            row_filter: None,
+        });
+        // Switch the binding to observation-shape so a `value`
+        // field exists for dedup_key_field to reference.
+        out.produces = vec![AuthoredProductionBinding {
+            record_type: AuthoredRecordType::Observation,
+            expectation: AuthoredExpectationRef::ObservationMetric { index: 0 },
+            field_mappings: vec![AuthoredFieldMap {
+                path: "value".into(),
+                source: AuthoredFieldValueSource::Extracted,
+            }],
+            dedup_key_field: Some("value".into()),
+        }];
+        let err = build_validated_recipe(out, &iterator_sample_plan(), "xai").unwrap_err();
+        let msg = match err {
+            AuthoringError::InvalidRecipe(m) => m,
+            other => panic!("expected InvalidRecipe, got {other:?}"),
+        };
+        assert!(
+            msg.contains("csv_cell") && msg.contains("column"),
+            "error should name both, got: {msg}"
+        );
+    }
+
+    /// Scalar recipes (no iterator) without dedup_key_field still
+    /// validate — the field is optional in scalar mode. Pre-Session-38
+    /// recipes have always validated without it; this test pins that
+    /// invariant.
+    #[test]
+    fn scalar_recipe_without_dedup_key_field_still_validates() {
+        // good_output() is scalar (iterator: None) and its binding
+        // has dedup_key_field: None. If the iterator validator
+        // accidentally tightened the scalar path, this fails.
+        let _ = build_validated_recipe(good_output(), &sample_plan(), "xai")
+            .expect("scalar recipe without dedup_key_field must still validate");
     }
 }

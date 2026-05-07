@@ -120,6 +120,27 @@ const EXTRACTED_SCALAR_MAX_BYTES: usize = 2048;
 /// UI's recipe panel. A multi-KB blob makes all three illegible.
 const CONTENT_ASSEMBLY_REASON_MAX_CHARS: usize = 600;
 
+/// ADR 0016 §Consequences: hard cap on records-per-recipe in
+/// iterator mode. A listing page with 10 000 items would otherwise
+/// produce 10 000 records per fetch; capping at 500 surfaces the
+/// truncation as a structured error rather than letting the recipe
+/// silently flood the database.
+///
+/// Phase 1 chose 500 as a generous bound for real-world listings:
+/// Nature subjects (~30), arXiv recent (~50), RSS feeds (typically
+/// ≤ 50), USPTO patent search (≤ 100 per page), agency publication
+/// indexes (≤ 100 per page). The largest realistic listings sit
+/// well under the cap; anything above is either a
+/// pagination-shaped source (a separate ADR) or a recipe pointed at
+/// the wrong tier of resource (an authoring error the operator
+/// should see and reject).
+///
+/// Overflow surfaces as `ApplyError::Extraction { mode: <iter_mode>,
+/// reason: "iterator produced N matches; cap is 500" }` so the
+/// operator's mental model — "the runtime catches mismatches; that's
+/// the trust contract" — stays intact under iteration.
+pub const MAX_RECORDS_PER_RECIPE: usize = 500;
+
 /// Reject an extraction whose result exceeds the scalar bound.
 /// Returns the original string unchanged when within bound.
 ///
@@ -231,22 +252,350 @@ pub enum ApplyError {
 /// Apply a recipe to fetched bytes, producing zero or more records.
 ///
 /// Returns `Vec<Record>` rather than `Record` because a single recipe
-/// may produce multiple records per fetch (each binding → one record).
+/// may produce multiple records per fetch. Two cardinality cases:
+///
+/// - **Scalar recipe** (`recipe.iterator` is `None`, the
+///   pre-Session-38 contract): one `extract` call, then one record
+///   per `produces` binding. Output length equals
+///   `recipe.produces.len()`.
+///
+/// - **Iterator recipe** (ADR 0016, Session 38, `recipe.iterator`
+///   is `Some`): the iterator selects N matches against the fetched
+///   document; for each match the recipe's `extraction` field is
+///   evaluated *scoped to that match's sub-tree*; one record is
+///   produced per match per binding. Output length is
+///   `N * recipe.produces.len()`, capped at
+///   [`MAX_RECORDS_PER_RECIPE`] across the whole recipe.
 pub fn apply(ctx: ApplyContext<'_>) -> Result<Vec<Record>, ApplyError> {
-    // 1. Extract a single scalar value from the bytes. Every mode
-    //    currently returns one value; multi-value extraction would
-    //    be a mode-shape change, not just a different path.
+    match &ctx.recipe.iterator {
+        None => apply_scalar(ctx),
+        Some(iter_spec) => apply_iterator(ctx, iter_spec),
+    }
+}
+
+/// Pre-Session-38 scalar contract: one extract, one record per
+/// binding. Behaviour unchanged from prior sessions.
+fn apply_scalar(ctx: ApplyContext<'_>) -> Result<Vec<Record>, ApplyError> {
+    // 1. Extract a single scalar value from the bytes.
     let extracted = extract(&ctx.recipe.extraction, ctx.bytes)?;
 
-    // 2. For each binding, build one record.
+    // 2. For each binding, build one record. Scalar-mode records
+    //    carry `dedup_key: None` — the pre-Session-38 contract,
+    //    documented in ADR 0016 §Carry-forward dependencies. A
+    //    future session may backfill scalar dedup keys; iteration
+    //    is not the place to clean it up universally.
     let mut records = Vec::with_capacity(ctx.recipe.produces.len());
     for (idx, binding) in ctx.recipe.produces.iter().enumerate() {
-        let record = build_record(binding, idx, &extracted, &ctx)
+        let record = build_record(binding, idx, &extracted, &ctx, None)
             .and_then(|r| crate::normalize::finalize(r, ctx.plan, ctx.recipe))?;
         records.push(record);
     }
 
     Ok(records)
+}
+
+/// ADR 0016 iterator path. Evaluate the iterator against the bytes
+/// to obtain N matches; for each match, evaluate the recipe's
+/// `extraction` scoped to that match's sub-tree; build one record
+/// per match per binding, stamping a per-record `dedup_key` from
+/// the binding's `dedup_key_field`.
+///
+/// Phase 1 wires the `css_select` × `css_select` pair only. Other
+/// modes return `ApplyError::NotImplemented` with a precise message
+/// pointing the operator at the Phase 2 boundary. The validator
+/// (`build_validated_recipe`) only persists congruent pairs, so an
+/// iterator-bearing recipe's iter-mode and inner-mode always agree
+/// at this point — but defensive checks are cheap and the failure
+/// shape is more informative than a panic.
+fn apply_iterator(
+    ctx: ApplyContext<'_>,
+    iter_spec: &ExtractionSpec,
+) -> Result<Vec<Record>, ApplyError> {
+    match (iter_spec, &ctx.recipe.extraction) {
+        (
+            ExtractionSpec::CssSelect {
+                selector: iter_selector,
+                attribute: _,
+            },
+            ExtractionSpec::CssSelect {
+                selector: inner_selector,
+                attribute: inner_attribute,
+            },
+        ) => apply_css_iterator(
+            ctx,
+            iter_selector,
+            inner_selector,
+            inner_attribute.as_deref(),
+        ),
+        (iter_other, inner_other) => {
+            // The validator should reject these at authoring time;
+            // surfacing here means a hand-edit or a Phase-2-shaped
+            // recipe arrived at the runtime. Name both modes so
+            // the operator can act.
+            let iter_name = mode_name(iter_other);
+            let inner_name = mode_name(inner_other);
+            Err(ApplyError::NotImplemented {
+                mode: "iterator",
+                reason: format!(
+                    "iterator runtime is wired for css_select × css_select \
+                     only in Phase 1 (ADR 0016). Got iter={iter_name}, \
+                     inner={inner_name}. Other modes are tracked for Phase 2; \
+                     until then, recipes against listing-shaped sources of \
+                     other modes should decline at authoring time."
+                ),
+            })
+        }
+    }
+}
+
+/// Tag a closed-vocabulary mode with its serde-canonical name. Used
+/// for iterator-path error messages and the Phase-2 `NotImplemented`
+/// branch above. Centralized so the strings can't drift from the
+/// `serde(rename_all = "snake_case")` discriminator on
+/// [`ExtractionSpec`].
+fn mode_name(spec: &ExtractionSpec) -> &'static str {
+    match spec {
+        ExtractionSpec::JsonPath { .. } => "json_path",
+        ExtractionSpec::CssSelect { .. } => "css_select",
+        ExtractionSpec::CsvCell { .. } => "csv_cell",
+        ExtractionSpec::PdfTable { .. } => "pdf_table",
+        ExtractionSpec::RegexCapture { .. } => "regex_capture",
+    }
+}
+
+/// Iterate over CSS-selected DOM nodes, applying the inner CSS
+/// selector to each match's sub-tree. ADR 0016's Phase 1 path.
+///
+/// `scraper::ElementRef::select` is the load-bearing primitive: it
+/// runs the inner selector against the matched element's *sub-tree*
+/// rather than the whole document, which is what "scope to the
+/// matched node" means for the CSS mode. We use `next()` on the
+/// per-match select iterator (first-match-within-scope) — the same
+/// posture as scalar `extract_css_select` — because Phase 1 is
+/// "single extracted field per match" (ADR 0016 §"Phase 1"). Phase
+/// 2 will move to per-field sub-extractors per binding.
+///
+/// The cap [`MAX_RECORDS_PER_RECIPE`] applies to the *number of
+/// matches*, not the post-binding total. We bound the iterator's
+/// output before doing any per-match work so a runaway listing
+/// (10 000 cards) costs ~one `Selector::parse` call plus the cap
+/// check, not 10 000 sub-extractions.
+fn apply_css_iterator(
+    ctx: ApplyContext<'_>,
+    iter_selector: &str,
+    inner_selector: &str,
+    inner_attribute: Option<&str>,
+) -> Result<Vec<Record>, ApplyError> {
+    let html_str = std::str::from_utf8(ctx.bytes).map_err(|e| ApplyError::Extraction {
+        mode: "css_select",
+        reason: format!("bytes were not UTF-8: {e}"),
+    })?;
+    let doc = Html::parse_document(html_str);
+
+    let iter_sel = Selector::parse(iter_selector).map_err(|e| ApplyError::Extraction {
+        mode: "css_select",
+        reason: format!("iterator selector did not parse: {e}"),
+    })?;
+    let inner_sel = Selector::parse(inner_selector).map_err(|e| ApplyError::Extraction {
+        mode: "css_select",
+        reason: format!("inner selector did not parse: {e}"),
+    })?;
+
+    // Materialise matches into a Vec so we can cap and count up
+    // front. `Html::select` returns an iterator; collecting is
+    // cheap (it stores `ElementRef`, which is a thin reference,
+    // not a node copy).
+    let matches: Vec<scraper::ElementRef<'_>> = doc.select(&iter_sel).collect();
+    if matches.is_empty() {
+        return Err(ApplyError::Extraction {
+            mode: "css_select",
+            reason: format!(
+                "iterator selector {iter_selector:?} matched no elements"
+            ),
+        });
+    }
+    if matches.len() > MAX_RECORDS_PER_RECIPE {
+        return Err(ApplyError::Extraction {
+            mode: "css_select",
+            reason: format!(
+                "iterator produced {} matches; cap is {} (ADR 0016 \
+                 §Consequences). Likely cause: the iterator selector \
+                 matches too broadly (every link rather than every card), \
+                 or the source is a pagination-shaped listing whose \
+                 first page already exceeds the cap. Refine the selector \
+                 to target distinct cards, or pick a narrower listing \
+                 endpoint.",
+                matches.len(),
+                MAX_RECORDS_PER_RECIPE,
+            ),
+        });
+    }
+
+    let mut records = Vec::with_capacity(matches.len() * ctx.recipe.produces.len());
+    for matched in matches.iter() {
+        // Per-match extraction: run the inner selector against the
+        // matched node's *sub-tree* (`ElementRef::select`), not
+        // against the whole document. Take the first match within
+        // scope — Phase 1's single-extracted-field-per-match
+        // contract.
+        let extracted = extract_css_within(*matched, &inner_sel, inner_attribute)?;
+
+        for (idx, binding) in ctx.recipe.produces.iter().enumerate() {
+            // Resolve the dedup_key_field's value from the just-
+            // -extracted scalar. The validator guaranteed
+            // `dedup_key_field` is present and references a path
+            // in `field_mappings`; we re-read the binding here
+            // because that resolution is per-record and depends on
+            // the per-match `extracted` value.
+            let dedup_key = compute_dedup_key(binding, &extracted, ctx.recipe)?;
+            let record = build_record(binding, idx, &extracted, &ctx, Some(dedup_key))
+                .and_then(|r| crate::normalize::finalize(r, ctx.plan, ctx.recipe))?;
+            records.push(record);
+        }
+    }
+
+    Ok(records)
+}
+
+/// Compute a per-record dedup_key for an iterator-produced record.
+///
+/// Shape: `{recipe.id}:{field_value}`. The recipe id is stable
+/// across re-fetches (within one version) — re-authoring produces a
+/// new recipe row, which is the boundary the version chain handles
+/// (ADR 0012). The field value is the per-card identifier the
+/// iterator-author named via `dedup_key_field` (the headline, the
+/// article URL, the paper id).
+///
+/// Bounded length: the field value is truncated at 200 chars to
+/// keep dedup keys index-friendly. ADR 0016 §"Per-match dedup
+/// becomes load-bearing" notes this contract.
+///
+/// Resolution rule for `dedup_key_field`:
+///   - If the named path's `FieldValueSource` is `Extracted`, the
+///     dedup-key value is the extracted scalar.
+///   - If `Literal`, the value is the literal (rare but legal —
+///     a constant-keyed binding).
+///   - If `FromPlan`, the value is the plan-derived string.
+///
+/// The validator already guaranteed `dedup_key_field` is `Some` and
+/// references an existing `field_mappings.path` for iterator
+/// recipes; the `expect`/`unreachable` here documents that
+/// invariant for the next reader.
+fn compute_dedup_key(
+    binding: &ProductionBinding,
+    extracted: &str,
+    recipe: &FetchRecipe,
+) -> Result<String, ApplyError> {
+    let field_path = binding.dedup_key_field.as_deref().ok_or_else(|| {
+        // Belt-and-braces: the validator should have rejected this
+        // recipe at authoring time. If it didn't, surface a
+        // concrete error rather than panicking — the operator's
+        // re-author path is the right next step.
+        ApplyError::FieldMapping {
+            reason: "iterator recipe missing dedup_key_field (validator \
+                     should have rejected this; the row may be a hand-edit \
+                     or pre-validation legacy)"
+                .into(),
+        }
+    })?;
+
+    let fm = binding
+        .field_mappings
+        .iter()
+        .find(|fm| fm.path == field_path)
+        .ok_or_else(|| ApplyError::FieldMapping {
+            reason: format!(
+                "dedup_key_field {field_path:?} does not match any \
+                 field_mappings path; the validator should have rejected \
+                 this at authoring time"
+            ),
+        })?;
+
+    let raw = match &fm.source {
+        FieldValueSource::Extracted => extracted.to_string(),
+        FieldValueSource::Literal { value } => match value {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        },
+        FieldValueSource::FromPlan { pointer: _ } => {
+            // Plan-derived dedup keys are legal but unusual (the
+            // value is constant per binding, which collapses N
+            // records to 1 distinct dedup_key per binding). We
+            // resolve via a placeholder that callers can recognise;
+            // a real plan-derived dedup key would also be available
+            // through `resolve_field_value`, but threading the plan
+            // here would expand the function signature for a code
+            // path no realistic recipe takes. Document the boundary.
+            return Err(ApplyError::FieldMapping {
+                reason: format!(
+                    "dedup_key_field {field_path:?} uses FromPlan source; \
+                     iterator recipes need per-record dedup, and a plan-\
+                     derived field is constant across records. Author the \
+                     recipe with `extracted` for the dedup_key_field's \
+                     source, or pick a different path."
+                ),
+            });
+        }
+    };
+
+    // Bound the field-value portion. 200 chars is generous for a
+    // headline / URL / id and small enough to keep the dedup_key
+    // column index-friendly. UTF-8-safe truncation.
+    const FIELD_VALUE_BUDGET: usize = 200;
+    let trimmed: String = raw.chars().take(FIELD_VALUE_BUDGET).collect();
+
+    Ok(format!("{}:{}", recipe.id, trimmed))
+}
+
+/// Extract a single scalar from an `ElementRef`'s sub-tree by
+/// running an inner CSS selector. Mirrors the scalar
+/// `extract_css_select` shape (text-or-attribute, empty-string
+/// rejection, scalar-size cap) but evaluates against the matched
+/// node rather than the whole document.
+///
+/// Returns the extracted scalar verbatim; the bound check via
+/// [`bound_extracted`] catches selectors that accidentally match a
+/// container instead of a leaf, the same way the scalar path does.
+fn extract_css_within(
+    matched: scraper::ElementRef<'_>,
+    inner_sel: &Selector,
+    attribute: Option<&str>,
+) -> Result<String, ApplyError> {
+    let first = matched.select(inner_sel).next().ok_or_else(|| {
+        ApplyError::Extraction {
+            mode: "css_select",
+            reason: "inner selector matched no elements within iterator \
+                     match (the iterator's selector matched a card, but \
+                     the inner selector found nothing inside it). Likely \
+                     cause: the inner selector is targeted at a sibling \
+                     rather than a descendant of the iterator's match."
+                .into(),
+        }
+    })?;
+
+    let out = match attribute {
+        Some(attr_name) => first
+            .value()
+            .attr(attr_name)
+            .ok_or_else(|| ApplyError::Extraction {
+                mode: "css_select",
+                reason: format!(
+                    "iterator-matched element has no attribute {attr_name:?}"
+                ),
+            })?
+            .to_string(),
+        None => first.text().collect::<String>().trim().to_string(),
+    };
+
+    if out.is_empty() {
+        return Err(ApplyError::Extraction {
+            mode: "css_select",
+            reason: "inner selection within iterator match resolved to \
+                     empty string"
+                .into(),
+        });
+    }
+    bound_extracted(out, "css_select")
 }
 
 // ---------------------------------------------------------------------------
@@ -760,6 +1109,7 @@ fn build_record(
     index: usize,
     extracted: &str,
     ctx: &ApplyContext<'_>,
+    dedup_key: Option<String>,
 ) -> Result<Record, ApplyError> {
     // Build a JSON object from the field mappings, then deserialize
     // into the concrete content type. This keeps the record types
@@ -811,6 +1161,12 @@ fn build_record(
 
     let content_value = Value::Object(content_json);
 
+    // ADR 0016: `dedup_key` is `Some` for iterator-produced records
+    // (computed from the binding's `dedup_key_field`) and `None` for
+    // scalar recipes (today's contract). The value lands on every
+    // record type's `dedup_key: Option<String>` field; storage's
+    // upsert logic uses it for iterator records and treats NULL as
+    // "no idempotency key" for scalar records, exactly as today.
     let record = match binding.record_type {
         RecordType::Observation => {
             let content: ObservationContent = serde_json::from_value(content_value)
@@ -819,7 +1175,7 @@ fn build_record(
                 })?;
             Record::Observation(Observation {
                 id: Uuid::now_v7(),
-                dedup_key: None,
+                dedup_key: dedup_key.clone(),
                 envelope,
                 content,
             })
@@ -831,7 +1187,7 @@ fn build_record(
                 })?;
             Record::Event(Event {
                 id: Uuid::now_v7(),
-                dedup_key: None,
+                dedup_key: dedup_key.clone(),
                 envelope,
                 content,
             })
@@ -843,7 +1199,7 @@ fn build_record(
                 })?;
             Record::Relation(Relation {
                 id: Uuid::now_v7(),
-                dedup_key: None,
+                dedup_key,
                 envelope,
                 content,
             })
@@ -1107,6 +1463,8 @@ mod tests {
                         source: FieldValueSource::Literal { value: json!("annual") },
                     },
                 ],
+                // ADR 0016: scalar-recipe context (no dedup_key_field).
+                dedup_key_field: None,
             }],
             authored_at: Utc.with_ymd_and_hms(2026, 4, 22, 0, 0, 0).unwrap(),
             authored_by: "xai".into(),
@@ -1117,6 +1475,8 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: scalar-recipe context (no iterator).
+            iterator: None,
         }
     }
 
@@ -1990,5 +2350,277 @@ C 4
         };
         let err = apply(ctx).unwrap_err();
         assert!(matches!(err, ApplyError::ContentAssembly { .. }), "got {err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Session 38 — iterator runtime (ADR 0016 Phase 1)
+    // -----------------------------------------------------------------------
+
+    /// A plan whose first event_type expectation is `milestone_announced`,
+    /// matching the listing-source case the iterator targets. Built from
+    /// the lithium-shaped `plan()` so the rest of the apply path
+    /// (provenance, topic tags) stays unchanged across scalar and
+    /// iterator tests.
+    fn iterator_plan() -> ResearchPlan {
+        plan() // sample plan already has one event_type expectation
+    }
+
+    /// Helper: build an iterator-bearing recipe with css_select ×
+    /// css_select. The iterator selects `.card` elements; the inner
+    /// extraction reads each card's `h3` text. Each card produces
+    /// one Event record with a literal event_type and an extracted
+    /// headline; dedup_key_field references "headline".
+    fn iterator_event_recipe(iter_selector: &str, inner_selector: &str) -> FetchRecipe {
+        FetchRecipe {
+            id: Uuid::now_v7(),
+            dedup_key: None,
+            plan_id: Uuid::now_v7(),
+            source_id: "listing_source".into(),
+            source_url: Url::parse("https://example.com/listing").unwrap(),
+            extraction: ExtractionSpec::CssSelect {
+                selector: inner_selector.into(),
+                attribute: None,
+            },
+            iterator: Some(ExtractionSpec::CssSelect {
+                selector: iter_selector.into(),
+                attribute: None,
+            }),
+            produces: vec![ProductionBinding {
+                record_type: RecordType::Event,
+                expectation: ExpectationRef::EventType { index: 0 },
+                field_mappings: vec![
+                    FieldMap {
+                        path: "event_type".into(),
+                        source: FieldValueSource::Literal {
+                            value: json!("milestone_announced"),
+                        },
+                    },
+                    FieldMap {
+                        path: "headline".into(),
+                        source: FieldValueSource::Extracted,
+                    },
+                ],
+                dedup_key_field: Some("headline".into()),
+            }],
+            authored_at: Utc.with_ymd_and_hms(2026, 5, 7, 0, 0, 0).unwrap(),
+            authored_by: "xai".into(),
+            version: 1,
+            static_payload: None,
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
+        }
+    }
+
+    /// Three-card listing: iterator selects three `.card`s, inner
+    /// selector reads each card's `h3`, three Event records emerge
+    /// with the three headlines verbatim. ADR 0016's Phase 1 happy
+    /// path.
+    #[test]
+    fn css_select_iterator_produces_n_records() {
+        let html = br#"
+            <html><body>
+              <div class="card"><h3>Quantum supremacy claim verified</h3></div>
+              <div class="card"><h3>Photonic chip hits 1024 qubits</h3></div>
+              <div class="card"><h3>Error correction crosses threshold</h3></div>
+            </body></html>
+        "#;
+        let recipe = iterator_event_recipe(".card", "h3");
+        let p = iterator_plan();
+        let ctx = ApplyContext {
+            recipe: &recipe,
+            plan: &p,
+            bytes: html,
+            fetched_at: fetched_at(),
+        };
+        let records = apply(ctx).unwrap();
+        assert_eq!(records.len(), 3, "expected one record per card");
+
+        // Each record is an Event with the matching headline and the
+        // literal event_type.
+        let headlines: Vec<&str> = records
+            .iter()
+            .map(|r| match r {
+                Record::Event(e) => e.content.headline.as_str(),
+                other => panic!("expected Event, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            headlines,
+            vec![
+                "Quantum supremacy claim verified",
+                "Photonic chip hits 1024 qubits",
+                "Error correction crosses threshold",
+            ]
+        );
+
+        // Each record carries a stamped dedup_key of the form
+        // `{recipe.id}:{headline}` — the per-record natural key
+        // ADR 0016 §"Per-match dedup becomes load-bearing" requires.
+        for (rec, expected_headline) in records.iter().zip(headlines.iter()) {
+            let key = match rec {
+                Record::Event(e) => e.dedup_key.as_ref().expect("dedup_key set"),
+                _ => unreachable!(),
+            };
+            let want = format!("{}:{}", recipe.id, expected_headline);
+            assert_eq!(key, &want, "dedup_key mismatch");
+        }
+    }
+
+    /// Cap enforcement: 600 cards in the document → ApplyError::Extraction
+    /// with the cap message. No records are produced.
+    #[test]
+    fn iterator_caps_records_at_max() {
+        // Build an HTML body with 600 cards. Keep the per-card payload
+        // tiny so the test is fast; the cap check fires before any
+        // per-match work happens.
+        let mut body = String::with_capacity(60_000);
+        body.push_str("<html><body>");
+        for i in 0..600 {
+            body.push_str(&format!("<div class=\"card\"><h3>card {i}</h3></div>"));
+        }
+        body.push_str("</body></html>");
+        let recipe = iterator_event_recipe(".card", "h3");
+        let p = iterator_plan();
+        let ctx = ApplyContext {
+            recipe: &recipe,
+            plan: &p,
+            bytes: body.as_bytes(),
+            fetched_at: fetched_at(),
+        };
+        let err = apply(ctx).unwrap_err();
+        match err {
+            ApplyError::Extraction { mode, reason } => {
+                assert_eq!(mode, "css_select");
+                assert!(
+                    reason.contains("cap is")
+                        && reason.contains(&MAX_RECORDS_PER_RECIPE.to_string()),
+                    "expected cap message, got: {reason}"
+                );
+            }
+            other => panic!("expected Extraction error, got {other:?}"),
+        }
+    }
+
+    /// Iterator with zero matches reports the iterator selector by
+    /// name (not the inner selector) so the operator's debug path
+    /// points at the right level. The contrast with the scalar path
+    /// (which reports the only selector's name) matters: iterator
+    /// recipes have two selectors and the failure layer needs to be
+    /// unambiguous.
+    #[test]
+    fn iterator_with_zero_matches_reports_iterator_selector() {
+        let html = b"<html><body><p>nothing here</p></body></html>";
+        let recipe = iterator_event_recipe(".card", "h3");
+        let p = iterator_plan();
+        let ctx = ApplyContext {
+            recipe: &recipe,
+            plan: &p,
+            bytes: html,
+            fetched_at: fetched_at(),
+        };
+        let err = apply(ctx).unwrap_err();
+        match err {
+            ApplyError::Extraction { mode, reason } => {
+                assert_eq!(mode, "css_select");
+                assert!(reason.contains("iterator"), "got: {reason}");
+                assert!(reason.contains(".card"), "got: {reason}");
+            }
+            other => panic!("expected Extraction error, got {other:?}"),
+        }
+    }
+
+    /// When the iterator matches but the inner selector misses inside
+    /// a card, the error message points at the inner-selector layer,
+    /// not the iterator. Tests the symmetry of layer-naming with
+    /// `iterator_with_zero_matches_reports_iterator_selector` above.
+    #[test]
+    fn iterator_inner_selector_miss_reports_inner_layer() {
+        let html = b"<html><body>
+            <div class=\"card\"><p>no h3 in here</p></div>
+        </body></html>";
+        let recipe = iterator_event_recipe(".card", "h3");
+        let p = iterator_plan();
+        let ctx = ApplyContext {
+            recipe: &recipe,
+            plan: &p,
+            bytes: html,
+            fetched_at: fetched_at(),
+        };
+        let err = apply(ctx).unwrap_err();
+        match err {
+            ApplyError::Extraction { mode, reason } => {
+                assert_eq!(mode, "css_select");
+                assert!(
+                    reason.contains("inner selector") && reason.contains("iterator"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected Extraction error, got {other:?}"),
+        }
+    }
+
+    /// Cross-mode iterator/extraction pairs surface as
+    /// `NotImplemented` at the apply boundary. The validator should
+    /// reject these at authoring time; this test pins the runtime's
+    /// defensive shape for hand-edits and Phase-2-shaped recipes.
+    #[test]
+    fn iterator_with_cross_mode_pair_is_not_implemented() {
+        // Build a recipe with css_select iterator and json_path
+        // extraction directly (bypassing the validator).
+        let mut recipe = iterator_event_recipe(".card", "h3");
+        recipe.extraction = ExtractionSpec::JsonPath {
+            path: "$.title".into(),
+        };
+        let html = b"<html><body><div class=\"card\"><h3>x</h3></div></body></html>";
+        let p = iterator_plan();
+        let ctx = ApplyContext {
+            recipe: &recipe,
+            plan: &p,
+            bytes: html,
+            fetched_at: fetched_at(),
+        };
+        let err = apply(ctx).unwrap_err();
+        match err {
+            ApplyError::NotImplemented { mode, reason } => {
+                assert_eq!(mode, "iterator");
+                assert!(reason.contains("css_select") && reason.contains("json_path"));
+            }
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    /// Scalar-recipe records continue to carry `dedup_key: None` after
+    /// Session 38. ADR 0016 §Carry-forward dependencies: the scalar
+    /// path is unchanged; only iterator records get the per-record key.
+    #[test]
+    fn scalar_recipe_records_still_carry_no_dedup_key() {
+        let csv = b"country,production\nChile,49000\n";
+        let recipe = recipe_with(ExtractionSpec::CsvCell {
+            column: "production".into(),
+            row_filter: Some(RowFilter::Equals {
+                column: "country".into(),
+                value: "Chile".into(),
+            }),
+        });
+        let p = plan();
+        let ctx = ApplyContext {
+            recipe: &recipe,
+            plan: &p,
+            bytes: csv,
+            fetched_at: fetched_at(),
+        };
+        let records = apply(ctx).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Observation(o) => {
+                assert!(
+                    o.dedup_key.is_none(),
+                    "scalar recipe should carry no dedup_key, got {:?}",
+                    o.dedup_key
+                );
+            }
+            other => panic!("expected Observation, got {other:?}"),
+        }
     }
 }

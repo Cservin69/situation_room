@@ -658,6 +658,9 @@ mod tests {
             authored_from: AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: this fixture predates iteration; scalar
+            // recipe semantics are what its callers expect.
+            iterator: None,
         };
         store.insert_recipe(&row).unwrap();
         id

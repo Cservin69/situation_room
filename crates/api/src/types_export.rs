@@ -922,6 +922,20 @@ pub struct RecipeDto {
     /// TypeScript sees `unknown` and the frontend pretty-prints.
     #[ts(type = "unknown")]
     pub extraction: serde_json::Value,
+    /// ADR 0016 iterator. `None` for scalar recipes (the
+    /// pre-Session-38 contract; the recipe produces one record per
+    /// `produces` binding per fetch). `Some(spec)` for iterator-
+    /// bearing recipes against listing-shaped sources; the runtime
+    /// evaluates `iterator` against the fetched document to obtain N
+    /// matches, then evaluates `extraction` once per match scoped to
+    /// that match's sub-tree, producing N records per binding.
+    ///
+    /// Opaque on the wire (TypeScript `unknown`) because the
+    /// frontend's recipe-inspection panel renders this as
+    /// pretty-printed JSON next to `extraction`. Per-mode rendering
+    /// is deferred until a future session needs it.
+    #[ts(type = "unknown")]
+    pub iterator: Option<serde_json::Value>,
     /// The production bindings — record_type + field_mappings per
     /// binding. Same opacity rationale as `extraction`.
     #[ts(type = "unknown")]
@@ -997,6 +1011,19 @@ impl RecipeDto {
                     "_raw": r.produces_json,
                 })
             });
+        // ADR 0016: the storage layer carries the iterator as
+        // `Option<String>` (a JSON string or NULL). Lift to the
+        // wire's `Option<Value>` — same parse-on-error fallback as
+        // `extraction` above so a corrupt iterator JSON surfaces as
+        // a structured error rather than dropping the whole recipe.
+        let iterator = r.iterator.map(|raw| {
+            serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|e| {
+                serde_json::json!({
+                    "_parse_error": e.to_string(),
+                    "_raw": raw,
+                })
+            })
+        });
         Self {
             id: r.id.to_string(),
             dedup_key: r.dedup_key,
@@ -1004,6 +1031,7 @@ impl RecipeDto {
             source_id: r.source_id,
             source_url: r.source_url,
             extraction,
+            iterator,
             produces,
             authored_at: r.authored_at,
             authored_by: r.authored_by,
@@ -1702,6 +1730,8 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: StoredRecipe test fixture; iteration not exercised here.
+            iterator: None,
         };
         let dto = RecipeDto::from_stored(stored.clone());
         assert_eq!(dto.id, stored.id.to_string());
@@ -1745,6 +1775,8 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: StoredRecipe test fixture; iteration not exercised here.
+            iterator: None,
         };
         let dto = RecipeDto::from_stored(stored);
         let err = dto
@@ -1784,6 +1816,8 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: StoredRecipe test fixture; iteration not exercised here.
+            iterator: None,
         };
         let dto = RecipeDto::from_stored(stored);
         assert!(dto.static_payload.is_none());
@@ -1813,9 +1847,76 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: StoredRecipe test fixture; iteration not exercised here.
+            iterator: None,
         };
         let dto = RecipeDto::from_stored(stored);
         assert_eq!(dto.static_payload.as_deref(), Some(payload));
+    }
+
+    /// ADR 0016: a `StoredRecipe` with `iterator: None` lifts to a
+    /// DTO with `iterator: None`. The pre-Session-38 contract:
+    /// scalar recipes carry no iterator on the wire, the frontend
+    /// renders the recipe card without the `× iterates` badge, and
+    /// the iterator block doesn't appear under the extraction block.
+    #[test]
+    fn recipe_dto_iterator_is_none_when_absent() {
+        use chrono::TimeZone;
+        let stored = situation_room_storage::StoredRecipe {
+            id: uuid::Uuid::now_v7(),
+            dedup_key: Some("plan-x:scalar".into()),
+            plan_id: uuid::Uuid::now_v7(),
+            source_id: "scalar_source".into(),
+            source_url: "https://example.com/data.csv".into(),
+            extraction_json: r#"{"mode":"csv_cell","column":"value"}"#.into(),
+            produces_json: "[]".into(),
+            authored_at: chrono::Utc.with_ymd_and_hms(2026, 5, 7, 10, 0, 0).unwrap(),
+            authored_by: "xai".into(),
+            version: 1,
+            static_payload: None,
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
+            iterator: None,
+        };
+        let dto = RecipeDto::from_stored(stored);
+        assert!(dto.iterator.is_none(), "scalar recipe DTO carries no iterator");
+    }
+
+    /// ADR 0016: iterator round-trip from storage to DTO. The
+    /// storage carries a JSON string; the DTO carries the parsed
+    /// `serde_json::Value` so the frontend doesn't `JSON.parse` at
+    /// render time. The `_parse_error` fallback path is symmetric
+    /// to `extraction`'s — a corrupt iterator JSON surfaces as a
+    /// structured error inside the field, not a 500 across the
+    /// listing.
+    #[test]
+    fn recipe_dto_iterator_round_trips_from_stored() {
+        use chrono::TimeZone;
+        let iter_json = r#"{"mode":"css_select","selector":".c-card"}"#;
+        let stored = situation_room_storage::StoredRecipe {
+            id: uuid::Uuid::now_v7(),
+            dedup_key: Some("plan-x:listing".into()),
+            plan_id: uuid::Uuid::now_v7(),
+            source_id: "listing_source".into(),
+            source_url: "https://example.com/listing".into(),
+            extraction_json: r#"{"mode":"css_select","selector":"h3"}"#.into(),
+            produces_json: "[]".into(),
+            authored_at: chrono::Utc.with_ymd_and_hms(2026, 5, 7, 10, 0, 0).unwrap(),
+            authored_by: "xai".into(),
+            version: 1,
+            static_payload: None,
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
+            iterator: Some(iter_json.into()),
+        };
+        let dto = RecipeDto::from_stored(stored);
+        let value = dto.iterator.as_ref().expect("iterator should be Some");
+        // Verify the parsed shape — same access pattern the frontend
+        // uses (recipe.iterator?.mode === 'css_select').
+        assert_eq!(value["mode"], serde_json::json!("css_select"));
+        assert_eq!(value["selector"], serde_json::json!(".c-card"));
     }
 
     /// ADR 0013 — `StoredRecipeFeedback` lifts cleanly into the wire
@@ -1905,6 +2006,8 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::StubExcerpt,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: StoredRecipe test fixture; iteration not exercised here.
+            iterator: None,
         };
         let dto = RecipeDto::from_stored(stored);
         assert_eq!(dto.authored_from, AuthoredFromDto::StubExcerpt);
@@ -1936,6 +2039,8 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::Unknown,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: StoredRecipe test fixture; iteration not exercised here.
+            iterator: None,
         };
         let dto = RecipeDto::from_stored(stored);
         assert_eq!(dto.authored_from, AuthoredFromDto::Unknown);

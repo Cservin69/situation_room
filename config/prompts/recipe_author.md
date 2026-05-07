@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.12
+# Recipe Author Prompt — v1.13
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -795,6 +795,18 @@ The top-level shape is:
     - `{"kind": "from_plan", "pointer": "<pointer>"}` — take the
       value from the research plan itself at the given pointer (e.g.
       `"expectations.observation_metrics.0.name"`).
+  - `dedup_key_field`: optional string. **Required when `iterator`
+    is set; ignored otherwise.** Names one of this binding's
+    `field_mappings` paths whose extracted value identifies the
+    record across re-fetches. The named field's source must be
+    `extracted`, not `literal` or `from_plan`. See "Iterating over
+    listings" above.
+- `iterator`: optional object. **Default to omitting this field.**
+  When present, the recipe is a listing-shaped recipe (see
+  "Iterating over listings" above). The shape is itself an
+  extraction spec — same five modes — drawn at iterator position.
+  The iterator's mode must match the inner `extraction` mode. When
+  set, every `produces` binding must specify `dedup_key_field`.
 - `static_payload`: string. **Default to the empty string `""`.** A
   bake-time-frozen JSON / CSV / HTML / text body the runtime will
   serve to extraction in place of an HTTP fetch — see "Strategy for
@@ -927,12 +939,22 @@ recipe you produce has a `produces` array of bindings. The
 relationship between bucket size and `produces.len()` matters
 for honest coverage.
 
-**The runtime extracts one scalar per fetch.** A recipe's
+**Default cardinality: one scalar per fetch.** A scalar recipe's
 `extraction` step pulls one value out of the fetched bytes (one
 JSONPath result, one CSV cell, one CSS selector match, one
 regex capture group). The `produces` array then describes how
 that single scalar — together with `literal` and `from_plan`
-sources — populates one or more record bindings.
+sources — populates one or more record bindings. This is the
+default cardinality for sources whose URL identifies a single
+item (an instance endpoint).
+
+**Listing cardinality: N records per fetch via `iterator`.** When
+the source's URL identifies a listing of items, the recipe can
+opt into iterator mode (see "Iterating over listings" below) and
+produce N records per fetch instead of 1. The bindings are
+evaluated once per match. The `produces.len()` math below applies
+*per match*; the recipe's total record count for one fetch is
+`produces.len() × match_count`.
 
 This means:
 
@@ -966,6 +988,136 @@ expectation count, produce one binding for the most load-
 bearing expectation and let the user see the real coverage. The
 plan can be refined; additional recipes can be authored. Silent
 partial coverage is worse than visible narrow coverage.
+
+## Iterating over listings — when one fetch should produce N records
+
+The five extraction modes are *scalar*: each returns one value.
+This is the right shape when the URL identifies a single item —
+a specific filing, a specific regulation, one indicator's most
+recent value. It is the wrong shape when the URL identifies a
+*listing* of items, because the recipe captures one of N items
+per fetch and the other N-1 are unrepresented in storage.
+
+The optional top-level `iterator` field makes a recipe produce N
+records per fetch. When set, the runtime:
+
+1. evaluates `iterator` against the fetched document to obtain N
+   matches,
+2. for each match, evaluates the recipe's `extraction` field
+   *scoped to that match's sub-tree*,
+3. produces one record per match per `produces` binding.
+
+When `iterator` is unset (or the empty/absent shape), the
+recipe behaves as today: one fetch → one scalar → bindings →
+one set of records (the scalar contract above).
+
+### When to use `iterator`
+
+Use it when the URL identifies a **listing of multiple items
+of the kind the plan asks for**: a news index, a search results
+page, an archive feed, a subjects index, a publication list.
+Each row, card, item, or feed entry on the page is one record
+the plan would treat as an instance of its expectations.
+
+Do not use it when the URL identifies a **single item**: a
+particular filing, a specific regulation, one indicator's value.
+A scalar recipe is honest about producing one record per fetch
+of one specific thing; an iterator on a single-item URL would
+either match nothing (selector misses) or match the same one
+thing over and over with different scopes.
+
+### Mode congruence
+
+The iterator's mode must match the inner `extraction` mode. CSS
+with CSS, JSON path with JSON path, CSV with CSV, regex with
+regex. Cross-mode pairings are rejected at validation, because
+the per-match scope is mode-specific: a CSS iterator scopes to a
+DOM sub-tree, a JSON path iterator scopes to a JSON value, a
+CSV iterator scopes to one row. There is no defined scope for
+"evaluate this JSON path against this DOM node."
+
+### Per-record dedup is required
+
+With one record per match instead of one per recipe, the
+natural-key discipline must include something stable per record.
+Every `produces` binding under an iterator-bearing recipe must
+specify `dedup_key_field` — a string naming one of that
+binding's `field_mappings.path` values whose extracted value
+identifies the record across re-fetches.
+
+The runtime computes per-record `dedup_key` from that field's
+extracted value. Re-fetching the same listing produces no
+duplicates (the headlines stay stable across fetches) while a
+new headline at the top of the listing produces a new record.
+
+The named field's source must be `extracted`, not `literal` or
+`from_plan` — a literal or plan-derived source is constant
+across records, which collapses N records to 1 distinct dedup
+key. The validator rejects this. In practice this means the
+load-bearing extracted leaf per card (the headline, the title,
+the article URL, the paper id) is what `dedup_key_field`
+references.
+
+### Worked example — iterator-bearing recipe
+
+A research news index page where each item is a news card with
+a title element. The plan asks for events of type
+`milestone_announced`.
+
+```json
+{
+  "extraction": { "mode": "css_select", "selector": "h3.title a" },
+  "iterator":   { "mode": "css_select", "selector": ".article-card" },
+  "produces": [{
+    "expectation": { "list": "event_type", "index": 0 },
+    "record_type": "event",
+    "field_mappings": [
+      { "path": "event_type", "source": { "kind": "literal", "value": "milestone_announced" } },
+      { "path": "headline",   "source": { "kind": "extracted" } }
+    ],
+    "dedup_key_field": "headline"
+  }]
+}
+```
+
+The runtime selects all `.article-card` elements (suppose 30 of
+them), then for each card runs `h3.title a` against that card's
+sub-tree to extract the headline. 30 Event records emerge per
+fetch, each with the literal `event_type` and a per-card
+`headline`. `dedup_key_field: "headline"` means each record's
+`dedup_key` is computed from the headline string, so re-fetching
+the same listing produces no duplicates.
+
+### Worked example — single-instance recipe (no iterator)
+
+A specific filing's instance page describes one item. The plan
+asks for one specific event the user is tracking.
+
+```json
+{
+  "extraction": { "mode": "css_select", "selector": "h1.filing-title" },
+  "produces": [{
+    "expectation": { "list": "event_type", "index": 0 },
+    "record_type": "event",
+    "field_mappings": [
+      { "path": "event_type", "source": { "kind": "literal", "value": "filing_published" } },
+      { "path": "headline",   "source": { "kind": "extracted" } }
+    ]
+  }]
+}
+```
+
+No iterator. One record per fetch. `dedup_key_field` not
+needed because there is no per-record dedup story — the recipe
+is structurally one-record-per-recipe.
+
+### Iterator caps
+
+Each fetch is hard-capped at a finite number of records (the
+runtime enforces it). A listing whose first page yields more
+than the cap surfaces as a recipe failure — refine the iterator
+selector to target distinct cards (not every link on the page),
+or pick a narrower listing endpoint.
 
 ## What NOT to produce
 
@@ -1018,6 +1170,25 @@ partial coverage is worse than visible narrow coverage.
   endpoint family. Substituting an instance URL is a coverage
   failure (one item, not many) and a freshness failure (same
   item every fetch).
+- Do not set `iterator` on a recipe whose URL identifies a single
+  item. The iterator's purpose is N-records-per-fetch over a
+  listing of items; on a single-item URL it either matches
+  nothing (selector misses) or matches the same one element
+  multiple times across re-fetches (silent over-coverage).
+  Single-item URLs use the scalar contract: omit `iterator`. See
+  "Iterating over listings" above.
+- Do not pair an iterator with a different inner extraction mode.
+  CSS iterators pair only with CSS extractions, JSON path with
+  JSON path, etc. Cross-mode pairings have no defined per-match
+  scope; the validator rejects them.
+- Do not author an iterator-bearing recipe whose binding has no
+  `dedup_key_field`. Without it, every re-fetch of the same
+  listing produces N duplicate records — the runtime has no per-
+  record natural key to dedupe by. The `dedup_key_field` must
+  name one of the binding's own `field_mappings` paths and that
+  field's source must be `extracted` (constant sources collapse
+  N records to 1 distinct key). See "Iterating over listings"
+  above.
 
 ## One-shot, no follow-up
 
@@ -1030,6 +1201,38 @@ you pick.
 
 ### Changelog
 
+- **v1.13** (2026-05-07) — ADR 0016 (Session 38). Output contract
+  changes: a new optional top-level field `iterator` (an
+  `ExtractionSpec` from the same closed enum, drawn at iterator
+  position) makes a recipe produce N records per fetch instead of
+  1. Every binding under an iterator-bearing recipe must specify
+  `dedup_key_field` — a string naming one of that binding's
+  `field_mappings.path` values whose extracted value identifies
+  the record across re-fetches. The validator at
+  `build_validated_recipe` enforces four contracts: (a) iterator
+  and inner extraction must share a mode; (b) iterator-position
+  CsvCell must have empty `column`; (c) every binding must have
+  `dedup_key_field` when iterator is set; (d) the named path must
+  reference an existing field_mapping. New top-level prose
+  section: "Iterating over listings — when one fetch should
+  produce N records," sitting after the revised "Coverage
+  discipline" section. The previous Coverage discipline framing
+  ("the runtime extracts one scalar per fetch") is broadened to
+  acknowledge the two cardinality cases — scalar and listing —
+  with a forward-pointer to the iterator section. Two worked
+  examples: an iterator-bearing recipe over a generic news
+  listing, and a contrasting single-instance recipe over a
+  generic filing page. Both examples are principle-only — no
+  named URLs, no specific sources (Session 34 / Session 37 lesson
+  in full force). Three new "What NOT to produce" bullets
+  forbidding iterator-on-single-instance, cross-mode pairings,
+  and missing `dedup_key_field`. Existing recipes lacking
+  `iterator` deserialize cleanly via serde defaults
+  (`#[serde(default, skip_serializing_if = "Option::is_none")]`
+  on `FetchRecipe.iterator` and on
+  `ProductionBinding.dedup_key_field`); migration v15 adds the
+  storage column nullable. No re-authoring required for any
+  existing recipe — the change is fully additive.
 - **v1.12** (2026-05-07) — ADR 0015 (Session 37). No structural
   change to the recipe-author prompt; this entry records that the
   classifier now emits source URLs directly (the

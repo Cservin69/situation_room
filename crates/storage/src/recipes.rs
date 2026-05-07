@@ -130,6 +130,28 @@ pub struct RecipeRow {
     /// normally; `Some(bytes)` short-circuits the fetch and feeds
     /// these bytes to the apply stage. See ADR 0007 Amendment 3.
     pub static_payload: Option<String>,
+    /// JSON-encoded `Option<ExtractionSpec>` — the ADR 0016 iterator.
+    /// `None` means "scalar recipe" (the pre-ADR-0016 contract: one
+    /// record per recipe per fetch). `Some(json)` means "iterator
+    /// recipe": the runtime evaluates this spec against the fetched
+    /// document to get N matches, then evaluates `extraction_json`
+    /// once per match scoped to the match's sub-tree, producing one
+    /// record per match per `produces` binding.
+    ///
+    /// Stored as a JSON string (DuckDB's JSON column type) so the
+    /// column round-trips through `serde_json::from_str` /
+    /// `serde_json::to_string` exactly like `extraction_json`. The
+    /// typed pipeline crate (`recipes_store::stored_to_recipe`)
+    /// parses this back into the typed `Option<ExtractionSpec>` at
+    /// the boundary; storage stays the persistence layer and never
+    /// types the inner shape.
+    ///
+    /// **Why nullable on disk.** Migration 0015 added the column
+    /// nullable. Existing rows arrive with NULL → `None` here. The
+    /// recipe-author validator (`build_validated_recipe`) decides
+    /// whether to populate the field per ADR 0016's mode-congruence
+    /// and dedup_key_field rules; storage just persists the bytes.
+    pub iterator: Option<String>,
     /// Where the recipe-author prompt's document excerpt came from
     /// (real bytes vs. stub). See [`AuthoredFrom`] and ADR 0014.
     /// New recipes always carry `FetchedBytes` or `StubExcerpt`;
@@ -189,6 +211,11 @@ pub struct StoredRecipe {
     /// `None` for recipes authored before Session 18 (migration 0008
     /// adds the column nullable; existing rows read NULL).
     pub static_payload: Option<String>,
+    /// ADR 0016 iterator — see [`RecipeRow::iterator`]. NULL on disk
+    /// → `None` here. Pre-ADR-0016 recipes (and post-ADR-0016
+    /// recipes against single-instance URLs) carry `None`; recipes
+    /// against listing-shaped sources carry `Some(json)`.
+    pub iterator: Option<String>,
     /// Authoring provenance — see [`AuthoredFrom`] and ADR 0014.
     /// Reads NULL → `Unknown` for recipes authored before migration
     /// v10. Reads the recorded variant otherwise.
@@ -220,8 +247,9 @@ impl Store {
             "INSERT INTO recipes (
                 id, dedup_key, plan_id, source_id, source_url,
                 extraction, produces, authored_at, authored_by, version,
-                static_payload, authored_from, prior_recipe_id, reauthor_reason
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                static_payload, authored_from, prior_recipe_id, reauthor_reason,
+                iterator
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 r.id,
                 r.dedup_key,
@@ -237,6 +265,7 @@ impl Store {
                 r.authored_from.as_str(),
                 r.prior_recipe_id,
                 r.reauthor_reason,
+                r.iterator,
             ],
         )
         .map_err(StorageError::DuckDb)?;
@@ -255,7 +284,8 @@ impl Store {
             .prepare(
                 "SELECT id, dedup_key, plan_id, source_id, source_url,
                         extraction, produces, authored_at, authored_by, version,
-                        static_payload, authored_from, prior_recipe_id, reauthor_reason
+                        static_payload, authored_from, prior_recipe_id, reauthor_reason,
+                        iterator
                  FROM recipes WHERE id = ?",
             )
             .map_err(StorageError::DuckDb)?;
@@ -281,7 +311,8 @@ impl Store {
             .prepare(
                 "SELECT id, dedup_key, plan_id, source_id, source_url,
                         extraction, produces, authored_at, authored_by, version,
-                        static_payload, authored_from, prior_recipe_id, reauthor_reason
+                        static_payload, authored_from, prior_recipe_id, reauthor_reason,
+                        iterator
                  FROM recipes
                  WHERE dedup_key = ?
                  ORDER BY version DESC
@@ -336,7 +367,8 @@ impl Store {
             .prepare(
                 "SELECT id, dedup_key, plan_id, source_id, source_url,
                         extraction, produces, authored_at, authored_by, version,
-                        static_payload, authored_from, prior_recipe_id, reauthor_reason
+                        static_payload, authored_from, prior_recipe_id, reauthor_reason,
+                        iterator
                  FROM recipes
                  WHERE plan_id = ?
                  ORDER BY authored_at DESC, version DESC",
@@ -466,6 +498,15 @@ fn row_to_stored(row: &duckdb::Row<'_>) -> Result<StoredRecipe> {
         // prior_recipe_id. NULL → None for first-authored recipes;
         // re-authored rows carry Some(failure_msg + operator_note).
         reauthor_reason: row.get(13).map_err(StorageError::DuckDb)?,
+        // ADR 0016: NULL on disk → None. Pre-Session-38 recipes
+        // and post-Session-38 recipes against single-instance URLs
+        // both carry NULL; only iterator-bearing recipes (against
+        // listing-shaped sources) carry Some(json). The typed
+        // pipeline crate (`recipes_store::stored_to_recipe`)
+        // parses the inner JSON into a typed
+        // `Option<ExtractionSpec>` at the boundary; storage stays
+        // string-typed.
+        iterator: row.get(14).map_err(StorageError::DuckDb)?,
     })
 }
 
@@ -500,6 +541,11 @@ mod tests {
             // Track A: paired with prior_recipe_id. None for
             // first-authored recipes. Re-author tests populate both.
             reauthor_reason: None,
+            // ADR 0016: tests that don't exercise iteration leave
+            // `iterator` at None — the scalar-recipe shape, the
+            // pre-ADR-0016 contract. The new iterator round-trip
+            // test below explicitly populates Some(json).
+            iterator: None,
         }
     }
 
@@ -1181,5 +1227,94 @@ mod tests {
         let got = store.get_recipe(new_id).unwrap().expect("row should exist");
         assert_eq!(got.reauthor_reason.as_deref(), Some(reason));
         assert_eq!(got.prior_recipe_id, Some(prior_id));
+    }
+
+    // -----------------------------------------------------------------
+    // Session 38 — iterator field (ADR 0016)
+    // -----------------------------------------------------------------
+
+    /// A recipe without an iterator (the pre-ADR-0016 contract: scalar
+    /// recipe, one record per fetch) reads back with `iterator: None`.
+    /// `sample_row` already sets the field to None; this test pins
+    /// the round-trip so a future migration that accidentally writes
+    /// a non-NULL default would fail visibly here.
+    #[test]
+    fn recipe_round_trips_with_no_iterator() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let id = Uuid::now_v7();
+        let row = sample_row(id); // sample_row sets iterator: None
+        store.insert_recipe(&row).unwrap();
+
+        let got = store.get_recipe(id).unwrap().expect("row should exist");
+        assert!(
+            got.iterator.is_none(),
+            "expected None for scalar recipe, got {:?}",
+            got.iterator
+        );
+    }
+
+    /// Iterator-bearing shape: a recipe that carries an iterator JSON
+    /// round-trips it verbatim. The runtime parses the JSON into a
+    /// typed `ExtractionSpec` at the pipeline boundary
+    /// (`recipes_store::stored_to_recipe`); storage stays string-typed.
+    #[test]
+    fn recipe_round_trips_with_iterator() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let id = Uuid::now_v7();
+        let mut row = sample_row(id);
+        // The iterator is a serialized ExtractionSpec — same shape as
+        // `extraction_json`, but evaluated at iterator position. Here
+        // we exercise css_select because that's the Phase 1 mode (ADR
+        // 0016 §"Per-match evaluation semantics, by mode"); the
+        // storage layer is mode-agnostic and would persist any
+        // valid ExtractionSpec JSON identically.
+        let iter_json = r#"{"mode":"css_select","selector":".c-card"}"#;
+        row.iterator = Some(iter_json.into());
+        store.insert_recipe(&row).unwrap();
+
+        let got = store.get_recipe(id).unwrap().expect("row should exist");
+        assert_eq!(got.iterator.as_deref(), Some(iter_json));
+    }
+
+    /// `recipes_for_plan` (the executor's primary read path) carries
+    /// the iterator through. Without this guarantee the executor
+    /// would read NULL for every iterator-bearing recipe and silently
+    /// fall back to scalar-recipe semantics — exactly the bug ADR
+    /// 0016 fixes, re-introduced from a different angle.
+    #[test]
+    fn recipes_for_plan_carries_iterator_through() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_id = Uuid::now_v7();
+
+        let mut scalar = sample_row(Uuid::now_v7());
+        scalar.plan_id = plan_id;
+        scalar.dedup_key = Some("scalar".into());
+        store.insert_recipe(&scalar).unwrap();
+
+        let mut iterating = sample_row(Uuid::now_v7());
+        iterating.plan_id = plan_id;
+        iterating.dedup_key = Some("iterating".into());
+        let iter_json = r#"{"mode":"css_select","selector":".c-card"}"#;
+        iterating.iterator = Some(iter_json.into());
+        store.insert_recipe(&iterating).unwrap();
+
+        let recipes = store.recipes_for_plan(plan_id).unwrap();
+        assert_eq!(recipes.len(), 2);
+        let scalar_back = recipes
+            .iter()
+            .find(|r| r.dedup_key.as_deref() == Some("scalar"))
+            .expect("scalar recipe present");
+        let iterating_back = recipes
+            .iter()
+            .find(|r| r.dedup_key.as_deref() == Some("iterating"))
+            .expect("iterating recipe present");
+        assert!(scalar_back.iterator.is_none());
+        assert_eq!(iterating_back.iterator.as_deref(), Some(iter_json));
     }
 }

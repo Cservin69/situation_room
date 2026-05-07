@@ -167,6 +167,8 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: scalar-recipe context (no iterator).
+            iterator: None,
         }
     }
 

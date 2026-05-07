@@ -1772,6 +1772,8 @@ mod tests {
                         },
                     },
                 ],
+                // ADR 0016: scalar-recipe context (no dedup_key_field).
+                dedup_key_field: None,
             }],
             authored_at: Utc.with_ymd_and_hms(2026, 4, 28, 0, 0, 0).unwrap(),
             authored_by: "test".into(),
@@ -1781,6 +1783,8 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: scalar-recipe context (no iterator).
+            iterator: None,
         }
     }
 
@@ -1825,6 +1829,8 @@ mod tests {
                         },
                     },
                 ],
+                // ADR 0016: scalar-recipe context (no dedup_key_field).
+                dedup_key_field: None,
             }],
             authored_at: Utc.with_ymd_and_hms(2026, 4, 28, 0, 0, 0).unwrap(),
             authored_by: "test".into(),
@@ -1834,6 +1840,8 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: scalar-recipe context (no iterator).
+            iterator: None,
         }
     }
 
@@ -1880,12 +1888,68 @@ mod tests {
                         },
                     },
                 ],
+                // ADR 0016: scalar-recipe context (no dedup_key_field).
+                dedup_key_field: None,
             }],
             authored_at: Utc.with_ymd_and_hms(2026, 4, 28, 0, 0, 0).unwrap(),
             authored_by: "test".into(),
             version: 1,
             static_payload: None,
             // ADR 0014: test fixture; provenance not exercised here.
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
+            // ADR 0016: scalar-recipe context (no iterator).
+            iterator: None,
+        }
+    }
+
+    /// ADR 0016 Phase 1 helper: an iterator-bearing CSS recipe whose
+    /// outer selector picks `.card` elements and whose inner selector
+    /// reads each card's `h3` text into the binding's `headline`
+    /// field. Each match emits one Event record; `dedup_key_field`
+    /// references "headline" so the runtime stamps a per-record key.
+    ///
+    /// This mirrors the empirical shape of the Nature subjects /
+    /// qt.eu listings that motivated ADR 0016 — `.card`-class
+    /// containers, an `h3` headline child — in a portable form
+    /// suitable for `StaticFetcher` fixtures.
+    fn working_iterator_recipe(plan: &ResearchPlan, url: &str) -> FetchRecipe {
+        FetchRecipe {
+            id: Uuid::now_v7(),
+            dedup_key: Some(format!("{}:demo_iter", plan.id)),
+            plan_id: plan.id,
+            source_id: "demo_iter".into(),
+            source_url: Url::parse(url).unwrap(),
+            extraction: ExtractionSpec::CssSelect {
+                selector: "h3".into(),
+                attribute: None,
+            },
+            iterator: Some(ExtractionSpec::CssSelect {
+                selector: ".card".into(),
+                attribute: None,
+            }),
+            produces: vec![ProductionBinding {
+                record_type: RecordType::Event,
+                expectation: ExpectationRef::EventType { index: 0 },
+                field_mappings: vec![
+                    FieldMap {
+                        path: "event_type".into(),
+                        source: FieldValueSource::Literal {
+                            value: json!("mine_opened"),
+                        },
+                    },
+                    FieldMap {
+                        path: "headline".into(),
+                        source: FieldValueSource::Extracted,
+                    },
+                ],
+                dedup_key_field: Some("headline".into()),
+            }],
+            authored_at: Utc.with_ymd_and_hms(2026, 5, 7, 0, 0, 0).unwrap(),
+            authored_by: "test".into(),
+            version: 1,
+            static_payload: None,
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
@@ -1937,6 +2001,8 @@ mod tests {
                         },
                     },
                 ],
+                // ADR 0016: scalar-recipe context (no dedup_key_field).
+                dedup_key_field: None,
             }],
             authored_at: Utc.with_ymd_and_hms(2026, 4, 28, 0, 0, 0).unwrap(),
             authored_by: "test".into(),
@@ -1946,6 +2012,8 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: scalar-recipe context (no iterator).
+            iterator: None,
         }
     }
 
@@ -2024,6 +2092,72 @@ mod tests {
         assert_eq!(runs[0].recipes_attempted, 1);
         assert_eq!(runs[0].recipes_succeeded, 1);
         assert_eq!(runs[0].records_produced, 1);
+        assert!(runs[0].finished_at.is_some());
+        assert!(runs[0].error_summary.is_none());
+    }
+
+    /// ADR 0016 Phase 1 — end-to-end iterator path. One HTML body,
+    /// 5 cards, the iterator-bearing recipe produces 5 Event records
+    /// in one fetch run. The fetch_runs row carries the cumulative
+    /// records_produced count. This is the test that pins ADR 0016's
+    /// Validation contract (§Validation): "The Nature recipe and the
+    /// qt.eu recipe should each produce N>1 Event records." The
+    /// fixture is portable (no real Nature URL); the live test
+    /// covers the real source.
+    #[tokio::test]
+    async fn run_fetch_with_iterator_recipe_produces_n_records() {
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let url = "https://example.test/listing.html";
+        let recipe = working_iterator_recipe(&plan, url);
+        save_recipe(&store, &recipe).unwrap();
+
+        // Five-card listing — the kind of shape the post-ADR-0015
+        // classifier nominates and ADR 0016 makes addressable.
+        let html = br#"
+            <html><body>
+              <div class="card"><h3>First milestone</h3></div>
+              <div class="card"><h3>Second milestone</h3></div>
+              <div class="card"><h3>Third milestone</h3></div>
+              <div class="card"><h3>Fourth milestone</h3></div>
+              <div class="card"><h3>Fifth milestone</h3></div>
+            </body></html>
+        "#;
+        let fetcher = StaticFetcher::new().with(url, html);
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: "unused — recipes already authored",
+            sources: &[],
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+
+        assert_eq!(report.plan_id, plan.id);
+        assert_eq!(report.recipes_attempted, 1);
+        assert_eq!(report.recipes_succeeded, 1);
+        // The cardinality story: one recipe, five matches, five
+        // records. The pre-Session-38 contract would have produced
+        // exactly 1 record here (the empirical defect ADR 0016
+        // documents).
+        assert_eq!(report.records_produced, 5);
+        assert_eq!(report.outcomes.len(), 1);
+        match &report.outcomes[0] {
+            RecipeOutcome::Succeeded {
+                records_produced, ..
+            } => assert_eq!(*records_produced, 5),
+            other => panic!("expected Succeeded, got {other:?}"),
+        }
+
+        // The fetch_runs row reflects the cumulative count, not
+        // recipe-count.
+        let runs = store.recent_fetch_runs_for_plan(plan.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].records_produced, 5);
         assert!(runs[0].finished_at.is_some());
         assert!(runs[0].error_summary.is_none());
     }
@@ -3204,6 +3338,8 @@ mod tests {
                         },
                     },
                 ],
+                // ADR 0016: scalar-recipe context (no dedup_key_field).
+                dedup_key_field: None,
             }],
             authored_at: Utc::now(),
             authored_by: "live_test".into(),
@@ -3213,6 +3349,8 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: scalar-recipe context (no iterator).
+            iterator: None,
         };
         save_recipe(&store, &recipe).unwrap();
 
@@ -3321,6 +3459,8 @@ mod tests {
                         },
                     },
                 ],
+                // ADR 0016: scalar-recipe context (no dedup_key_field).
+                dedup_key_field: None,
             }],
             authored_at: Utc::now(),
             authored_by: "live_test".into(),
@@ -3330,6 +3470,8 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: scalar-recipe context (no iterator).
+            iterator: None,
         };
         save_recipe(&store, &recipe).unwrap();
 
@@ -3845,6 +3987,8 @@ mod tests {
                         },
                     },
                 ],
+                // ADR 0016: scalar-recipe context (no dedup_key_field).
+                dedup_key_field: None,
             }],
             authored_at: Utc::now(),
             authored_by: "live_test".into(),
@@ -3854,6 +3998,8 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: scalar-recipe context (no iterator).
+            iterator: None,
         };
         save_recipe(&store, &recipe).unwrap();
 
@@ -3889,5 +4035,147 @@ mod tests {
         let runs = store.recent_fetch_runs_for_plan(plan.id, 5).unwrap();
         assert!(!runs.is_empty());
         assert!(runs[0].finished_at.is_some(), "fetch_run must be closed");
+    }
+
+    // -----------------------------------------------------------------------
+    // Session 38 — live iterator test (ADR 0016)
+    //
+    // ADR 0016's empirical falsifiability claim, in code: re-classify
+    // a quantum-computing-shaped topic, accept the plan, run a fetch,
+    // assert N>1 Event records persist from at least one source. The
+    // pre-Session-38 contract produced 1 record per source; the
+    // post-Session-38 runtime should produce N. The threshold (≥10)
+    // matches the handoff's bar — listings have variable cardinality
+    // day-to-day, but a real listing's first page should comfortably
+    // clear it.
+    //
+    // Fixture choice: pre-authored iterator-bearing recipe against a
+    // canonical listing endpoint (default: a public RSS / Atom feed
+    // surfaced via env override so the test is portable across
+    // environments). The test uses `UnreachableProvider` to enforce
+    // ADR 0007's golden rule — the runtime must not call the LLM.
+    // The classification step is *not* re-run live here; that's
+    // covered by `recipe_author::live_author_recipe_against_xai_*`
+    // and `research_classifier::live_classify_topic_against_xai_*`.
+    // What this test pins is the iterator runtime against real bytes.
+    //
+    // Override knobs:
+    //   FETCH_LIVE_ITERATOR_URL       — listing URL (HTML)
+    //   FETCH_LIVE_ITERATOR_OUTER     — iterator CSS selector
+    //   FETCH_LIVE_ITERATOR_INNER     — inner CSS selector for the
+    //                                   per-card extracted leaf
+    //   FETCH_LIVE_ITERATOR_MIN       — minimum records to assert
+    //                                   (default 10)
+    //
+    // Defaults target a stable, simple test page (httpbin's HTML
+    // sample) when none are set. Real-source verification —
+    // `quantum-computing` against Nature subjects — is the operator's
+    // path: set the env vars to the target listing and re-run.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_iterator_against_real_listing_produces_n_records() {
+        use situation_room_secure::http::{SecureHttpClient, SecureHttpConfig};
+
+        let _ = dotenvy::dotenv();
+
+        let url = std::env::var("FETCH_LIVE_ITERATOR_URL").unwrap_or_else(|_| {
+            // A small, stable HTML page with multiple list items —
+            // safe default that doesn't depend on a third-party
+            // listing's day-to-day cardinality. Operators chasing
+            // the ADR 0016 empirical claim override with the real
+            // target (e.g. a Nature subjects URL).
+            "https://www.w3.org/TR/html52/".to_string()
+        });
+        let outer = std::env::var("FETCH_LIVE_ITERATOR_OUTER")
+            .unwrap_or_else(|_| "li".to_string());
+        let inner = std::env::var("FETCH_LIVE_ITERATOR_INNER")
+            .unwrap_or_else(|_| "a".to_string());
+        let min: u32 = std::env::var("FETCH_LIVE_ITERATOR_MIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+
+        let http = SecureHttpClient::new(SecureHttpConfig::default()).unwrap();
+
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let recipe = FetchRecipe {
+            id: Uuid::now_v7(),
+            dedup_key: Some(format!("{}:iter_live", plan.id)),
+            plan_id: plan.id,
+            source_id: "iter_live".into(),
+            source_url: Url::parse(&url).expect("FETCH_LIVE_ITERATOR_URL must be a valid URL"),
+            extraction: ExtractionSpec::CssSelect {
+                selector: inner,
+                attribute: None,
+            },
+            iterator: Some(ExtractionSpec::CssSelect {
+                selector: outer,
+                attribute: None,
+            }),
+            produces: vec![ProductionBinding {
+                record_type: RecordType::Event,
+                expectation: ExpectationRef::EventType { index: 0 },
+                field_mappings: vec![
+                    FieldMap {
+                        path: "event_type".into(),
+                        source: FieldValueSource::Literal {
+                            value: serde_json::json!("mine_opened"),
+                        },
+                    },
+                    FieldMap {
+                        path: "headline".into(),
+                        source: FieldValueSource::Extracted,
+                    },
+                ],
+                dedup_key_field: Some("headline".into()),
+            }],
+            authored_at: Utc::now(),
+            authored_by: "live_test".into(),
+            version: 1,
+            static_payload: None,
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
+        };
+        save_recipe(&store, &recipe).expect("save recipe");
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &http,
+            provider: &provider,
+            recipe_author_prompt: "unused — recipe pre-authored",
+            sources: &[],
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id)
+            .await
+            .expect("live fetch should succeed against pre-authored iterator recipe");
+
+        // The cardinality story ADR 0016 makes the architectural claim
+        // about: N>1 records per fetch. The threshold is generous
+        // because real listings have day-to-day variability.
+        assert!(
+            report.records_produced >= min,
+            "expected >= {min} records, got {} — listing may be \
+             unexpectedly thin or the iterator selector is too narrow. \
+             Override FETCH_LIVE_ITERATOR_* env vars for a different target.",
+            report.records_produced
+        );
+        assert_eq!(report.recipes_succeeded, 1);
+
+        // Audit row exists and was closed; records_produced reflects
+        // the cumulative count (one recipe, N records).
+        let runs = store.recent_fetch_runs_for_plan(plan.id, 5).unwrap();
+        assert!(!runs.is_empty());
+        assert!(runs[0].finished_at.is_some(), "fetch_run must be closed");
+        assert!(
+            runs[0].records_produced >= min,
+            "fetch_run.records_produced must reflect the cumulative count"
+        );
     }
 }

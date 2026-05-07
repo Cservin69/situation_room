@@ -82,7 +82,50 @@ pub struct FetchRecipe {
     pub source_url: Url,
 
     /// How to pull values out of the fetched content.
+    ///
+    /// **In iterator mode** (when [`Self::iterator`] is `Some`),
+    /// this spec is evaluated *per match* against the iterator's
+    /// matched sub-tree, not against the whole document. ADR 0016.
     pub extraction: ExtractionSpec,
+
+    /// ADR 0016: optional listing iterator. When `Some`, the
+    /// runtime evaluates this spec against the fetched document
+    /// to obtain N matches, then evaluates [`Self::extraction`]
+    /// once per match scoped to that match's sub-tree, producing
+    /// one record per match per [`ProductionBinding`]. When
+    /// `None`, the recipe produces exactly one record per binding
+    /// per fetch — the pre-Session-38 contract, unchanged.
+    ///
+    /// **Mode congruence is required.** A `css_select` iterator
+    /// pairs with a `css_select` extraction (the inner selector
+    /// runs against the matched DOM node's sub-tree); `json_path`
+    /// pairs with `json_path` (the inner path runs against the
+    /// matched JSON value as root); etc. Cross-mode pairings are
+    /// rejected at recipe-author validation
+    /// ([`recipe_author::build_validated_recipe`](super::recipe_author)).
+    /// Phase 1 (Session 38) only wires the runtime for the
+    /// `css_select` × `css_select` pair; the validator enforces
+    /// the contract for every mode so the recipe shape on disk is
+    /// honest about what it intends, even when the runtime hasn't
+    /// caught up.
+    ///
+    /// **Per-match dedup is load-bearing.** With one record per
+    /// match instead of one per recipe, the natural-key discipline
+    /// must include something stable per record (the headline, the
+    /// article URL, the paper id). Every [`ProductionBinding`]
+    /// under an iterator-bearing recipe must specify
+    /// [`ProductionBinding::dedup_key_field`]; the runtime computes
+    /// the per-record `dedup_key` from that field's extracted
+    /// value. The validator enforces presence and path-existence.
+    ///
+    /// **Serde discipline.** `#[serde(default,
+    /// skip_serializing_if = "Option::is_none")]` keeps existing
+    /// recipe JSON deserializing cleanly (legacy recipes lack the
+    /// field; default is `None`) and keeps the wire form compact
+    /// for the common scalar-recipe case. Storage's migration v15
+    /// adds the column nullable; NULL on disk → `None` here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iterator: Option<ExtractionSpec>,
 
     /// What records this recipe produces. A single recipe can produce
     /// multiple records per fetch (e.g. a CSV row that yields one
@@ -321,6 +364,35 @@ pub struct ProductionBinding {
     /// One entry per field of the target record's content type,
     /// mapping an extracted path to the field.
     pub field_mappings: Vec<FieldMap>,
+
+    /// ADR 0016: dedup-key source for iterator-produced records.
+    ///
+    /// In iterator mode (when [`FetchRecipe::iterator`] is `Some`),
+    /// the runtime produces N records from one recipe and needs a
+    /// per-record natural key. This field names one of the
+    /// [`Self::field_mappings`] paths whose extracted value
+    /// identifies the record across re-fetches (the headline, the
+    /// article URL, the paper id). The runtime computes
+    /// [`situation_room_core::Record`]'s `dedup_key` as
+    /// `{recipe.id}:{field_value}` so re-fetching the same listing
+    /// produces no duplicates while the headlines stay stable.
+    ///
+    /// **Required when `iterator` is `Some`; optional otherwise.**
+    /// The validator
+    /// ([`recipe_author::build_validated_recipe`](super::recipe_author))
+    /// enforces presence under iterator mode and verifies the named
+    /// path exists in `field_mappings`. In scalar-recipe mode (the
+    /// pre-Session-38 contract), `dedup_key` on the produced record
+    /// stays NULL — same as today's events table — and a future
+    /// session may backfill it.
+    ///
+    /// **Serde discipline.** `#[serde(default,
+    /// skip_serializing_if = "Option::is_none")]` keeps pre-Session-38
+    /// `produces_json` arrays deserializing cleanly without a
+    /// migration (the column carries a `Vec<struct>`, and serde
+    /// extends struct shapes additively).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_key_field: Option<String>,
 }
 
 /// Reference into a `ResearchPlan`'s `RecordExpectations`.
@@ -435,6 +507,8 @@ mod tests {
                         },
                     },
                 ],
+                // ADR 0016: scalar-recipe sample, no dedup key field.
+                dedup_key_field: None,
             }],
             authored_at: Utc.with_ymd_and_hms(2026, 4, 20, 12, 0, 0).unwrap(),
             authored_by: "sk-a...z9qp".into(), // fingerprint format per ApiKey::fingerprint
@@ -446,6 +520,9 @@ mod tests {
             authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: scalar recipe — no iterator. Iterator-bearing
+            // shape is exercised in dedicated tests below.
+            iterator: None,
         }
     }
 
@@ -733,6 +810,99 @@ mod tests {
         assert!(
             json.contains(r#""authored_from":"stub_excerpt""#),
             "expected snake_case wire form, got: {json}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Session 38 — iterator field (ADR 0016)
+    // -----------------------------------------------------------------
+
+    /// `iterator: None` is omitted from the wire form — same shape as
+    /// `static_payload: None` and the other optional fields. Keeps
+    /// pre-Session-38 recipe JSON compact and unchanged.
+    #[test]
+    fn iterator_is_optional_and_omits_when_absent() {
+        let r = sample_recipe(); // sample_recipe sets iterator: None
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            !json.contains("iterator"),
+            "expected iterator omitted from wire form, got: {json}"
+        );
+    }
+
+    /// Iterator-bearing shape: a recipe with `iterator: Some(spec)`
+    /// round-trips through JSON unchanged. The shape is one new
+    /// optional field at the recipe level whose value is itself an
+    /// `ExtractionSpec` from the same closed enum (ADR 0016 §"The
+    /// shape").
+    #[test]
+    fn iterator_field_round_trips_through_serde() {
+        let mut r = sample_recipe();
+        r.iterator = Some(ExtractionSpec::CssSelect {
+            selector: ".c-card".into(),
+            attribute: None,
+        });
+        // The sample uses a PdfTable extraction; for iterator-mode
+        // round-trip we use a css_select inner extraction so the
+        // recipe is self-consistent under ADR 0016's mode-congruence
+        // contract — although serde itself doesn't enforce that
+        // contract (the validator does), keeping the fixture
+        // congruent makes the test honest about what a real
+        // iterator-bearing recipe looks like.
+        r.extraction = ExtractionSpec::CssSelect {
+            selector: "h3.c-card__title a".into(),
+            attribute: None,
+        };
+        // And the binding gets a dedup_key_field referencing one of
+        // its own field_mappings paths (`headline`, here standing in
+        // for what an event-shaped recipe would carry).
+        r.produces[0].dedup_key_field = Some("headline".into());
+
+        let json = serde_json::to_string(&r).unwrap();
+        // Wire form carries both new fields under their canonical
+        // serde names.
+        assert!(json.contains(r#""iterator""#), "got: {json}");
+        assert!(json.contains(r#""dedup_key_field":"headline""#), "got: {json}");
+
+        let back: FetchRecipe = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, back);
+    }
+
+    /// Backward compat: a recipe JSON written before Session 38 (no
+    /// `iterator` field, no `dedup_key_field` field on bindings)
+    /// deserializes cleanly via serde defaults. This is the load-
+    /// bearing guarantee for migration 0015's "additive, no
+    /// re-authoring required" claim.
+    #[test]
+    fn legacy_recipe_without_iterator_or_dedup_key_field_deserializes() {
+        // Authored a `FetchRecipe` JSON literal with NO iterator
+        // field and NO dedup_key_field on its binding. If
+        // serde-default doesn't kick in, this fails with a
+        // `missing field` error.
+        let json = r#"{
+            "id": "01904ad6-9c7f-7000-8000-000000000000",
+            "dedup_key": "legacy:test:obs",
+            "plan_id": "01904ad6-9c80-7000-8000-000000000000",
+            "source_id": "legacy_source",
+            "source_url": "https://example.test/data.csv",
+            "extraction": {"mode": "csv_cell", "column": "value"},
+            "produces": [{
+                "record_type": "observation",
+                "expectation": {"list": "observation_metric", "index": 0},
+                "field_mappings": [
+                    {"path": "value", "source": {"kind": "extracted"}}
+                ]
+            }],
+            "authored_at": "2026-04-22T12:00:00Z",
+            "authored_by": "xai",
+            "version": 1
+        }"#;
+        let r: FetchRecipe = serde_json::from_str(json)
+            .expect("legacy recipe JSON must deserialize via serde defaults");
+        assert!(r.iterator.is_none(), "legacy recipe should default iterator to None");
+        assert!(
+            r.produces[0].dedup_key_field.is_none(),
+            "legacy binding should default dedup_key_field to None"
         );
     }
 }

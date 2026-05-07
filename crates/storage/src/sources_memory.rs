@@ -293,6 +293,8 @@ mod tests {
             authored_from: AuthoredFrom::FetchedBytes,
             prior_recipe_id: None,
             reauthor_reason: None,
+            // ADR 0016: this fixture predates iteration.
+            iterator: None,
         };
         store.insert_recipe(&row).expect("insert recipe");
     }

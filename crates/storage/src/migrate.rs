@@ -98,6 +98,11 @@ const MIGRATIONS: &[Migration] = &[
             "../../../migrations/0014_recipe_fetch_attempts_content_type.sql"
         ),
     },
+    Migration {
+        version: 15,
+        description: "recipes.iterator column (ADR 0016)",
+        sql: include_str!("../../../migrations/0015_recipes_iterator.sql"),
+    },
 ];
 
 /// Apply every migration whose version is not yet in
