@@ -1157,3 +1157,138 @@ Rationale:
   synthetic test fixture. `tests/fixtures/pdf/README.md`
   documents provenance and regeneration.
 
+## Amendment 6 (Session 35) — Plan-first authoring + multi-source as the architectural norm
+
+**Status**: Accepted, in effect.
+**Date**: 2026-05-06
+**Scope**: Encodes two principles that have been implicit since
+the architecture was set down but were drifting in practice. Both
+are prompt-level and ADR-level: prompts ship the principle, the
+ADR carries it across sessions.
+
+### Principle 1: Plan-first authoring
+
+The recipe author's job, restated as a contract:
+
+> The plan is the specification. The candidate source is a
+> candidate. Author when its bytes can populate the plan's
+> expectations; decline when they cannot.
+
+The Level-1 / Level-2 split in the original Decision section
+already implied this — Level 1 produces the spec, Level 2 fills
+it. What the original did not say explicitly, and what sessions
+30→34 showed was needed in writing: the recipe author's primary
+input is **the plan**, not **the source**. The source is read
+through the plan's lens. A source whose bytes don't fit the plan
+is a decline, not a recipe to be twisted into shape.
+
+The sessions-30-through-34 prompt arc revealed the cost of leaving
+this implicit. Each session added a finer-grained source-side
+rule (URL hygiene, endpoint tiers, parameter substitution, type
+honesty, plan coherence as a URL-discipline subsection). Each
+revision improved the prompt locally but reinforced the source-
+anchored frame globally — the LLM read more rules about how to
+navigate sources well, not more rules about whether the source
+was the right candidate at all. Session 35's `hungarian barley
+production` run produced a GDP recipe in answer to a barley
+plan, with the URL substituted and the JSONPath
+filter-expression-shaped per v1.10's pre-flight checklist. The
+recipe was well-formed by every source-side rule the prompt
+encoded; it was wrong by the rule the prompt had never written
+down.
+
+Recipe author prompt v1.11 (Session 35) inverts the frame: a new
+top-level section *"The plan is your specification — author
+from the plan, not from the source"* sits immediately after
+"Your role" and before the closed vocabulary; the plan
+placeholder block is relocated from line ~240 to line ~117 so
+the LLM reads the plan in document order before vocabulary,
+decline path, source context, and URL discipline; the v1.10
+"Plan coherence" URL-discipline subsection is retained but
+reframed as a downstream consequence of the new top-level
+frame; the decline path gains an explicit failure shape
+("source publishes a related but not-the-plan's-asked-for
+metric") with the GDP/barley anti-example.
+
+### Principle 2: Multi-source as the architectural norm
+
+situation_room's product is a workstation that surfaces what
+*several* authoritative sources say about the same plan,
+together. Cross-source convergence and divergence are the
+analytical signal the workstation exists to surface. A plan
+nominating one or two sources is not a smaller version of the
+product — it is a structurally fragile one. Any recipe
+declines (the source covers an adjacent topic but doesn't
+publish the plan's specific metric) or any apply failures
+(wrong path, stale endpoint, JS-only content) leave the plan
+empty or near-empty.
+
+The architectural norm: **5–10 source nominations per plan**
+when the topic admits it. Documents-only thin topics (the OFAC
+SDN case) may legitimately stay below this band; nothing else
+should. Single-source-per-plan was an *interim* shape used to
+harden the wiring, the storage, and the UI — it was never the
+product, and prompt prose treating it as the default was
+misleading future sessions.
+
+Classifier prompt v1.5 (Session 35) ships this as a new
+subsection *"Source breadth — multi-source by default"* inside
+the priority-discipline section, with worked-example breadth
+guidance per topic shape. The lithium worked example is
+expanded from 3 nominations to 7 to model the behavior; the
+OFAC second example is annotated as the explicit exception.
+
+### Why both principles travel together
+
+The two principles reinforce each other:
+
+- Plan-first authoring tells each recipe author "decline when
+  this source's bytes don't fit the plan." That makes decline a
+  legitimate first-class outcome rather than a failure to ship
+  a recipe.
+- Multi-source breadth at the classifier level ensures that an
+  individual decline does not empty the plan. Five to ten
+  nominations means the plan still produces a multi-angled
+  workstation even if half decline or fail.
+
+Either principle alone is fragile. Plan-first authoring with
+single-source plans means the most common outcome of a properly-
+declining author is an empty plan — which feels like a regression
+to the operator and pulls future prompt revisions back toward
+"author something, anything." Multi-source breadth with source-
+anchored authoring means seven sources each producing a recipe
+that fits its source rather than the plan — which produces seven
+plausible-but-wrong recipes per plan. Together: each author can
+honestly decline when their source doesn't fit, and the plan
+still surfaces real records from the sources whose bytes do fit.
+
+### What this amendment is NOT
+
+- **Not new code.** Prompt-level + ADR-level only. No DTO
+  changes, no migration, no new commands. `cargo check`,
+  `cargo test`, the desktop UI, and ts-rs codegen are all
+  unaffected. Previously-authored recipes remain valid as data;
+  the next time the operator flags a recipe and reauthor runs,
+  the v1.11 prompt loads.
+- **Not a hard floor on source count.** The 5–10 band is a
+  target. Topics that genuinely warrant 12 or 3 are fine if
+  each nomination's angle can be named. The discipline the
+  amendment encodes is "do not reflexively name one or two
+  sources because they came to mind first," not "always nominate
+  exactly seven."
+- **Not source-specific routing.** The plan-first frame and
+  the multi-source norm are both source-agnostic principles.
+  The amendment continues ADR 0007's golden rule: prompts
+  teach principles, not source-by-source routing.
+- **Not a retroactive re-classify of past plans.** Plans that
+  were classified under v1.4 with one or two sources stay as
+  they are. The amendment changes the shape of *future*
+  classifications.
+
+### Code references
+
+- `config/prompts/recipe_author.md` — v1.11.
+- `config/prompts/research_classifier.md` — v1.5.
+- `STOCKPILE_HANDOFF_SESSION35.md` — session followup with
+  the empirical lineage (sessions 30→34 → 35).
+

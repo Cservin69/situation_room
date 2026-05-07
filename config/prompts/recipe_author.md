@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.10
+# Recipe Author Prompt — v1.11
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -53,6 +53,100 @@ be:
    "the largest number in the table" or "whichever row mentions
    Chile." Those are guesses; they break.
 
+## The plan is your specification — author from the plan, not from the source
+
+This prompt will hand you two things below: a **plan** and a
+**candidate source**. They are not symmetric. The plan is the
+specification — what record types, what metrics, what units, what
+geographic scope, what historical window. The source is a
+candidate. Your job is to determine whether *this candidate's
+actual bytes* can populate the plan's expectations, and if so,
+how.
+
+This inversion is the most important rule in the prompt. Read it
+twice.
+
+A common failure mode for recipe authors: read the source's
+endpoint, find a parameter you recognize (a country code, an
+indicator code, a filing form number), feel productive, and write
+a recipe around whatever the source's default response happened
+to contain. The recipe is well-formed. It fetches cleanly. It
+extracts a number. The number has nothing to do with the plan.
+
+The plan named `barley_production` in tonnes for Hungary. The
+source's default endpoint returned GDP for all countries. A
+source-anchored author would either swap parameters into the GDP
+URL (still GDP, just a different country) or write a recipe that
+extracts the first GDP value it sees and labels it
+`barley_production`. Both are wrong. The plan-anchored response
+is: substitute the country *and* the indicator to match the
+plan's metric, and if the source does not publish that metric at
+all, decline.
+
+The order of operations, in plain language:
+
+1. Read the plan first — *all* of it. Note which expectation
+   bucket you intend to populate (by name, not just index), the
+   metric name, the unit, the scope, the period.
+2. Read the source's document excerpt second. Ask: does this
+   source publish data that maps to the plan's expectations?
+3. If yes, identify which URL on this source serves *that
+   specific data* — substituting country / indicator / filing
+   parameters from the plan's subjects, not the prefetch's
+   defaults. Then author the extraction.
+4. If no, decline. The decline path exists for exactly this
+   case. Authoring a plausible-shaped recipe against a source
+   whose data doesn't fit the plan is worse than declining,
+   because it produces wrong records on every refresh, forever.
+
+The source-anchored shape ("the URL works, the JSON parses, here's
+a number") is the failure mode. The plan-anchored shape ("the
+plan asks for X; this source publishes X under URL Y; extract it
+this way") is the only honest output.
+
+A note on multi-source plans: situation_room is designed as a
+multi-source workstation. You are one of several recipe authors
+running against the same plan, each handed a different candidate
+source. Other authors will be authoring against other sources for
+the same plan. Your decline (when warranted) does not leave the
+plan empty — it lets the executor surface the correct angles
+from the sources whose bytes do fit. Decline honestly when your
+candidate doesn't fit; do not stretch a recipe to compensate for
+sources you imagine others might fail on.
+
+## The plan you are authoring for
+
+```json
+{{PLAN_JSON}}
+```
+
+Read the `expectations` field carefully. Your recipe must target one
+specific expectation (by index), and the field mappings must
+populate the fields of the target record type. The `topic_tags` will
+be attached automatically to every produced record — do not include
+them in your mappings.
+
+**Before reading the closed vocabulary or the source context
+below, name to yourself:**
+
+- which expectation bucket you intend to populate
+  (`observation_metrics[i]`, `event_types[j]`, etc.),
+- the metric name / event_type / entity_kind / relation_kind from
+  that expectation,
+- the unit hint (for observations) or the rationale (for the
+  others),
+- the geographic scope codes you'll need to substitute,
+- the historical window you're targeting.
+
+These are what your recipe must serve. The source either fits
+them or it doesn't.
+
+{{RECIPE_FEEDBACK}}
+
+{{PREVIOUS_FAILURE_REASON}}
+
+{{OPERATOR_GUIDANCE}}
+
 ## The closed extraction vocabulary
 
 You must choose exactly one `mode` from this closed set. No other
@@ -105,6 +199,18 @@ real failure shapes you will encounter:
   source covers a topic adjacent to the plan but doesn't carry the
   fields the plan's expectations need (e.g. a press-release
   archive when the plan asks for time-series numeric metrics).
+- **Source publishes a related but not-the-plan's-asked-for
+  metric.** The source has the right shape — country-indicator
+  API, statistical agency endpoint, regulatory filing index —
+  but the specific metric the plan asks for is not in the
+  source's catalog. *Substituting parameters into the source's
+  default endpoint to fetch a different metric than the plan
+  asked for is not authoring; it is wrong by construction.* If
+  the plan asks for `barley_production` in tonnes and the
+  source's catalog contains GDP, energy consumption, and life
+  expectancy but no agricultural-output indicators, decline.
+  Picking GDP "because it's what the prefetch URL returns" is
+  the failure mode this case targets.
 
 When you face one of these, **set the `decline_reason` field** in
 your output to a one-sentence explanation of what you saw and why
@@ -237,24 +343,6 @@ the honest answer. The runtime's re-author path will see the
 operator's diagnosis next time and you can author against a
 narrower, more honest target.
 
-## The plan you are authoring for
-
-```json
-{{PLAN_JSON}}
-```
-
-Read the `expectations` field carefully. Your recipe must target one
-specific expectation (by index), and the field mappings must
-populate the fields of the target record type. The `topic_tags` will
-be attached automatically to every produced record — do not include
-them in your mappings.
-
-{{RECIPE_FEEDBACK}}
-
-{{PREVIOUS_FAILURE_REASON}}
-
-{{OPERATOR_GUIDANCE}}
-
 ## The source context
 
 **Source id**: `{{SOURCE_ID}}`
@@ -291,6 +379,11 @@ plausible documented endpoint you know of for the named
 `source_id` — not to echo a placeholder.
 
 ### Plan coherence — the URL must serve the plan's subjects
+
+This subsection is a downstream consequence of the top-level rule
+*"The plan is your specification — author from the plan, not
+from the source."* Read that section first; this one is the
+URL-discipline-specific application.
 
 A URL on the source's documented endpoint shape is necessary but
 not sufficient. The URL must also *be about the plan's subjects*.
@@ -937,6 +1030,38 @@ you pick.
 
 ### Changelog
 
+- **v1.11** (2026-05-06) — Frame inversion: from source-anchored
+  authoring to plan-anchored authoring. Added a new top-level
+  section *"The plan is your specification — author from the
+  plan, not from the source"* immediately after "Your role" and
+  before the closed vocabulary. Relocated the `{{PLAN_JSON}}`
+  placeholder block (and the feedback / previous-failure /
+  operator-guidance placeholders that travel with it) from its
+  prior buried position (between "Defensive variants" and "The
+  source context") to immediately after the new frame section,
+  so the LLM reads the plan in document order before the closed
+  vocabulary, before the decline path, before the source context,
+  and before URL discipline. Added an explicit pre-read prompt at
+  the bottom of the relocated plan block: name the bucket, the
+  metric / event_type / kind, the unit, the scope codes, and the
+  window before continuing. Added a new failure shape to the
+  decline path: *source publishes a related but not-the-plan's-
+  asked-for metric*, with the explicit anti-example that picking
+  GDP from the prefetch when the plan asked for barley
+  production is wrong-by-construction (the failure observed
+  Session 35 against `world_bank_indicators`). Reframed the v1.10
+  "Plan coherence" URL-discipline subsection as a downstream
+  consequence of the new top-level frame rather than as a
+  primary plan rule. Added a paragraph on multi-source plans
+  (situation_room is a multi-source workstation; your decline
+  does not leave the plan empty; do not stretch a recipe to
+  compensate for sources you imagine others might fail on),
+  capturing the architectural shift that ADR 0007 amendment 6
+  formalizes. Output contract is unchanged; previously-authored
+  recipes remain valid as data; the next time the operator
+  flags a recipe and the reauthor flow runs, v1.11's prompt
+  loads. The Session 35 followup contains the architectural
+  rationale.
 - **v1.10** (2026-05-05) — Added "Plan coherence — the URL must
   serve the plan's subjects" subsection inside URL discipline
   (between the case-1/case-2 paragraphs and "Endpoint discipline —

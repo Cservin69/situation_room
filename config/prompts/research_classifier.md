@@ -1,4 +1,4 @@
-# Research Classifier Prompt — v1.4
+# Research Classifier Prompt — v1.5
 
 <!--
     This file is the Level-1 research classifier prompt for situation_room.
@@ -283,6 +283,64 @@ A rough hierarchy, from highest to lowest priority:
 - **General news** — broad-audience reporting. Useful for events
   and timelines, weakest for numbers.
 
+### Source breadth — multi-source by default
+
+situation_room is a multi-source workstation. The product is not
+"the answer from the best source"; it is "the picture that
+emerges when several authoritative sources converge or
+disagree." Aim for **5 to 10 source nominations per plan** when
+the topic admits it.
+
+The reason: at recipe-authoring time, each nominated source is
+handed to a separate recipe author run. Some will author cleanly;
+some will decline (the source covers an adjacent topic but does
+not publish the plan's specific metric); some will produce
+recipes that fail at apply (wrong path, stale endpoint, JS-only
+content). A plan that nominates only one or two sources is
+fragile against any of those — a single decline empties the
+plan, a single apply failure halves the picture. A plan that
+nominates 5–10 sources is *robust*: even if half decline or fail,
+the workstation still surfaces a multi-angled view.
+
+This is not "spam every source you can think of." Each nomination
+must still pass the priority discipline above — authoritative
+primary first, with industry trade press and general news only
+where they meaningfully add a register the primaries don't
+carry. The goal is **breadth across angles**, not breadth for its
+own sake.
+
+Examples of breadth done right, by topic shape:
+
+- **Commodities supply chain** — primary statistical agencies
+  (USGS, EIA, the relevant national stats body), secondary
+  aggregators (IEA, OECD, World Bank if they publish the
+  commodity), regulatory filings (SEC EDGAR, the relevant
+  national stock-exchange filings), industry trade press for
+  pricing (Argus, Fastmarkets), one or two general-news
+  sources for events. Six to ten total is normal.
+- **Regulatory / policy topic** — the regulator's own
+  publications, the legislature's records, the EU/national
+  legal database (EUR-Lex, etc.), industry associations'
+  comment filings, two or three news sources covering the
+  policy beat. Five to eight total is normal.
+- **Sovereign / macro** — IMF, World Bank, OECD, the country's
+  central bank, the country's statistics office, one or two
+  market-data sources, news. Six to nine total is normal.
+- **Documents-only / events-only thin topic** (the OFAC SDN
+  case below) — the canonical feed plus one or two
+  authoritative secondaries that re-publish or analyze it.
+  Two to four total is acceptable; *one* is fragile.
+
+The five-to-ten band is a target, not a hard floor. A topic that
+genuinely warrants twelve or three is fine if you can name each
+nomination's angle. What's *not* fine is reflexively naming one
+or two sources because they came to mind first.
+
+When you nominate more than two sources, order them by priority
+(authoritative primary first) but do not omit lower-tier
+sources just because higher-tier ones exist — the workstation
+benefits from cross-tier triangulation.
+
 Currently registered sources:
 
 {{REGISTERED_SOURCES}}
@@ -455,11 +513,27 @@ User topic: `lithium supply chain`
         "preferred_source_ids": ["usgs_mcs"]
       },
       {
-        "description": "SEC EDGAR filings of listed lithium producers",
+        "description": "SEC EDGAR filings of listed lithium producers (Albemarle, SQM, Livent, Tianqi via cross-listings)",
         "preferred_source_ids": ["sec_edgar"]
       },
       {
+        "description": "World Bank commodity prices statistical bulletin (Pink Sheet) — lithium and battery-metals series",
+        "preferred_source_ids": ["world_bank_indicators"]
+      },
+      {
+        "description": "International Energy Agency — Critical Minerals Outlook and Global EV Outlook",
+        "preferred_source_ids": []
+      },
+      {
         "description": "Argus and Fastmarkets pricing reports (industry trade press)",
+        "preferred_source_ids": []
+      },
+      {
+        "description": "Australian Office of the Chief Economist — Resources and Energy Quarterly (mine-level production data for the largest producing country)",
+        "preferred_source_ids": []
+      },
+      {
+        "description": "Reuters and Bloomberg commodities desk for events (mine openings, export-control announcements, offtake signings)",
         "preferred_source_ids": []
       }
     ],
@@ -487,8 +561,14 @@ Notice in the example:
   that explain *why* they matter, not what they are.
 - Entity exemplars are named specifically, prefixed with the
   kind, not generic categories.
-- `document_sources` are ordered: authoritative primary (USGS,
-  SEC) first, industry trade press (Argus, Fastmarkets) second.
+- `document_sources` lists seven nominations, ordered by priority:
+  authoritative primary statistical agencies first (USGS, SEC EDGAR,
+  World Bank), authoritative secondary aggregators next (IEA,
+  Australian Office of the Chief Economist), then industry trade
+  press (Argus, Fastmarkets), then general-news for events
+  (Reuters, Bloomberg). Five to ten nominations is the target band
+  for topics this rich; a single-source plan would be fragile
+  against decline-at-author-time and apply failures.
 - `assertion_guidance` describes claim patterns, not claims.
 
 ## A second worked example — different shape
@@ -542,6 +622,18 @@ relationship networks, not about claim attribution. The
 `interpretation` paragraph explicitly says so, which is the
 trust signal the user reads first.
 
+Note also: this plan has only one `document_sources` entry, well
+below the five-to-ten target. That is the deliberate exception
+the breadth-discipline section above flagged: a documents-only
+thin topic where the canonical feed *is* the source and the
+"angles" are not multiple. A more rigorous classification would
+add one or two authoritative secondaries that re-publish or
+analyze the OFAC feed (e.g. the Office of Inspector General
+reports on sanctions enforcement, the Treasury press feed) — and
+that would still be appropriate. What's not appropriate is to
+treat a one-source nomination as the default shape: the OFAC
+case is the *exception*, not the template.
+
 The contrast with the lithium example is the point: bucket-fill
 should reflect what the topic *is*, not a habit of producing the
 same shape every time.
@@ -588,6 +680,23 @@ honest about what the workstation will surface.
 
 ### Changelog
 
+- **v1.5** (2026-05-06) — Multi-source as the default. Added a new
+  *"Source breadth — multi-source by default"* subsection inside
+  "Registered sources — priority discipline" establishing 5–10
+  source nominations per plan as the target band. Rationale:
+  situation_room is a multi-source workstation; recipe authors
+  run independently per source and some will decline or fail at
+  apply, so a single-source plan is structurally fragile.
+  Expanded the lithium worked example's `document_sources` from 3
+  nominations to 7 (USGS MCS, SEC EDGAR, World Bank Pink Sheet,
+  IEA Critical Minerals Outlook, Argus/Fastmarkets, Australian
+  Office of the Chief Economist, Reuters/Bloomberg) to model the
+  new behavior; updated the post-example commentary accordingly.
+  Annotated the OFAC SDN second worked example as the explicit
+  exception (documents-only thin topic where one canonical feed
+  is the source and "angles" are not multiple), not the
+  template. ADR 0007 amendment 6 formalizes this as
+  architectural principle. Output contract is unchanged.
 - **v1.4** (2026-05-01) — Tightened topic reuse from "plausibly
   about the same subject" to a substantive test (same regulatory
   framework / supply chain / event class / sector). Added a UDB

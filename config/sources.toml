@@ -212,6 +212,226 @@ authoritative_for = ["country_macro_forecasts"]
 # next release lands.
 endpoint_hint = "https://data.imf.org/en/datasets/IMF.RES:WEO"
 
+[[source]]
+id = "eurostat"
+display_name = "Eurostat"
+description = """
+The European Union's official statistical office. Comprehensive
+country-level statistics for all EU member states (and EFTA where
+agreements apply) covering economy, population, agriculture, energy,
+transport, environment, regional indicators, and labour market.
+Authoritative for EU member-state statistics where a national
+statistics office's data has been harmonized to EU methodology.
+
+Data shape: most datasets are exposed as JSON-stat (a nested
+envelope with `dimension`, `value`, `id`, `size` keys; values are a
+flat array indexed by the cartesian product of dimensions). The
+recipe author should expect to parse JSON-stat envelope structure
+rather than a flat array of records — this is unlike the World
+Bank shape. The bulk-download CSV alternative is also available
+per dataset for recipes that prefer csv_cell over json_path.
+"""
+authoritative_for = [
+    "eu_member_state_statistics",
+    "eu_agriculture",
+    "eu_economy",
+    "eu_energy",
+    "eu_environment",
+]
+# Cereals production (including rice, excluding seed) by EU member
+# state, in EU-standard humidity. Stable Eurostat dataset code
+# `tag00115` exposed via the dissemination API. Returns JSON-stat
+# envelope. Small response (a handful of dimensions, 27+ countries,
+# annual frequency) — fits the prefetch excerpt budget. The LLM
+# learns the JSON-stat shape from this excerpt and authors recipes
+# for adjacent agricultural and economic datasets by substituting
+# the dataset code in the URL path.
+#
+# Dataset codes follow Eurostat's dissemination naming
+# (`tag00115`, `nama_10_gdp`, `demo_pjan`, etc.) and are documented
+# in the data-browser UI at
+# https://ec.europa.eu/eurostat/databrowser/. The LLM substitutes
+# the per-plan dataset code into the URL path; URL discipline rules
+# (Session 34, v1.10) cover the substitution semantics.
+endpoint_hint = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/tag00115?format=JSON"
+
+[[source]]
+id = "oecd"
+display_name = "OECD Statistics"
+description = """
+The Organisation for Economic Co-operation and Development's
+statistical database. Cross-country comparable indicators across
+OECD member states (38 countries) plus selected non-member
+economies, covering national accounts, employment, education,
+health, environment, public finance, and trade in services.
+Authoritative for cross-OECD comparison studies where consistent
+methodology across countries matters more than the depth of any
+single country's domestic data.
+
+Data shape: SDMX-JSON envelope (a structured response with
+`dataSets`, `structure`, `dimensions`, `attributes` — values are
+nested in `dataSets[0].observations` keyed by dimension index
+strings like "0:0:0:0"). Less ergonomic than World Bank's flat
+shape but documented and stable. The recipe author should expect
+to traverse the dimension structure rather than indexing
+positionally.
+"""
+authoritative_for = [
+    "oecd_cross_country_indicators",
+    "national_accounts",
+    "labour_market",
+    "public_finance",
+]
+# OECD Quarterly National Accounts (QNA) — quarterly GDP and
+# components for OECD member states. Stable dataset; the URL
+# pattern is documented in the OECD's SDMX-JSON API guide
+# (https://data.oecd.org/api/sdmx-json-documentation/). The
+# example request below pulls one country (Germany), one measure
+# (GDP at current prices), one quarter — small enough for the
+# prefetch budget while showing the SDMX-JSON envelope shape.
+#
+# When the recipe author substitutes per-plan parameters, the
+# pattern is `/data/{DATASET}/{COUNTRY}.{MEASURE}.{ADJUSTMENT}.{FREQ}/all`
+# — a positional dotted-path filter, distinct from World Bank's
+# query-parameter style.
+endpoint_hint = "https://stats.oecd.org/SDMX-JSON/data/QNA/DEU.B1_GE.CUR.Q/all?startTime=2024-Q1&endTime=2024-Q1"
+
+[[source]]
+id = "faostat"
+display_name = "FAOSTAT"
+description = """
+The Food and Agriculture Organization of the United Nations'
+statistical database. Global coverage (245 countries and
+territories) of agricultural production, trade, food security,
+land use, livestock, fisheries, forestry, prices, and inputs
+(fertilizer, pesticides). Time series from 1961 forward for most
+domains.
+
+Authoritative for cross-country agricultural production and trade
+statistics. Where a country's national stats office reports the
+same metric directly (e.g. KSH for Hungary), the national source
+is more current; FAOSTAT is the right choice for cross-country
+comparison or for countries without a strong national statistics
+infrastructure.
+
+Data shape: REST API at faostatservices.fao.org returns JSON with
+a top-level `data` array of records. Each record carries
+`Area Code`, `Item Code`, `Element Code`, `Year`, `Value`, `Unit`.
+Filterable by area, item, element, and year query parameters. The
+LLM should treat the catalog of `Item Code` values (barley=44,
+wheat=15, etc.) as plan-substitutable; the catalog itself is
+discoverable at /api/v1/{lang}/codes/items/{domain}.
+"""
+authoritative_for = [
+    "global_agriculture",
+    "crop_production",
+    "livestock",
+    "food_security",
+    "fisheries",
+]
+# FAOSTAT REST API — production, crops and livestock products
+# domain (`QCL`). Example request: barley (item 44), Hungary
+# (area 97), one recent year. Returns a small JSON response
+# showing the per-record shape the recipe author needs. The URL
+# pattern is `/api/v1/{lang}/data/{DOMAIN}?area={n}&item={n}&year={yyyy}`;
+# domain code substitution covers the major agricultural metrics
+# (QCL = production, TCL = trade, FBS = food balance sheets).
+endpoint_hint = "https://faostatservices.fao.org/api/v1/en/data/QCL?area_codes=97&item_codes=44&year=2022"
+
+[[source]]
+id = "ksh_hungary"
+display_name = "KSH (Hungarian Central Statistical Office)"
+description = """
+Magyarország központi statisztikai hivatala — Hungary's national
+statistical office. Authoritative primary source for Hungarian
+domestic statistics: population, economy, employment,
+agriculture, energy, environment, prices, and regional data.
+Where a topic is Hungary-focused, KSH is the most current and
+methodologically rigorous source for Hungarian-side numbers,
+typically more current than Eurostat's harmonized data (which
+re-publishes KSH submissions on a lag).
+
+Public face: the STADAT data tables collection
+(https://www.ksh.hu/stadat_eng for English, /stadat for
+Hungarian). STADAT exposes thousands of small data tables
+organized by topic (agriculture, demography, economy, etc.) as
+HTML tables with stable identifiers; each table has a dedicated
+URL and a downloadable XLSX/CSV alternative. KSH also runs a
+separate STATINFO portal (https://statinfo.ksh.hu/) for
+deeper cube-style queries with per-dataset URL patterns.
+
+Data shape: STADAT individual tables are HTML — the recipe
+author picks `css_select` against the table cell coordinates,
+or follows the table's CSV/XLSX download link for `csv_cell`.
+Some tables are pivoted (years across columns rather than
+rows); the recipe author handles this via the row-filter
+discipline already covered in the recipe author prompt.
+"""
+authoritative_for = [
+    "hungarian_statistics",
+    "hungarian_agriculture",
+    "hungarian_economy",
+    "hungarian_demographics",
+]
+# STADAT English-language directory — a stable HTML index of all
+# published statistical tables grouped by theme. The LLM reads
+# the table-of-contents shape and either authors a `css_select`
+# recipe targeting one of the indexed tables or follows the
+# table's per-table URL. STADAT URLs follow the pattern
+# /stadat_eng/{theme}/{subtheme}/{table_id}.html — stable across
+# years; older tables move to an archive section but new
+# vintages keep their canonical id.
+endpoint_hint = "https://www.ksh.hu/stadat_eng"
+
+[[source]]
+id = "eu_cap"
+display_name = "EU Common Agricultural Policy — DG AGRI dashboards"
+description = """
+The European Commission's Directorate-General for Agriculture
+and Rural Development (DG AGRI) publishes regular market
+observatories, dashboards, and the agri-food data portal
+(agridata.ec.europa.eu) covering EU agricultural markets:
+cereals, oilseeds, rice, sugar, dairy, beef, pigmeat,
+sheep & goat, poultry, eggs, fruit & vegetables, olive oil,
+wine. Authoritative for EU-level agricultural market
+intelligence and CAP (Common Agricultural Policy) monitoring.
+
+Caveat — many DG AGRI dashboards are JavaScript-rendered single-
+page apps with the underlying data feeds reachable but not
+discoverable from the dashboard URL alone. Where this is the
+case, the recipe author may need to author against the underlying
+data feed (often a JSON or CSV download accessible via the
+dashboard's "export" or "download data" link) rather than the
+dashboard page itself. ADR 0014's chip mechanic surfaces stub-
+authored recipes when the pre-fetch lands on an empty
+JS-rendered page.
+
+Authoritative for: EU market prices and balances; CAP support
+flows by member state; common market organization (CMO)
+statistics. Less authoritative for member-state-internal
+statistics (those belong to Eurostat or the national stats
+office).
+"""
+authoritative_for = [
+    "eu_agricultural_markets",
+    "cap_payments",
+    "eu_market_observatory",
+]
+# Agri-food data portal landing page — directory of every
+# DG AGRI dashboard and dataset. HTML; the LLM uses this as a
+# discovery surface to pick the right per-topic dashboard URL
+# (cereals, dairy, etc.) and then authors against either the
+# dashboard's underlying data feed or the static
+# documentation/PDF where the dashboard is JS-rendered.
+#
+# The cereals-specific dashboard is at
+# https://agridata.ec.europa.eu/extensions/DashboardCereals/CerealsProduction.html
+# but JS-rendered; the underlying CSV is reachable via the
+# dashboard's export link. The LLM should expect to hunt for
+# the export endpoint per "Hunt the URL end-to-end" discipline
+# (recipe author prompt, Session 21 v1.6).
+endpoint_hint = "https://agridata.ec.europa.eu/extensions/DataPortal/home.html"
+
 # ---- Authoritative secondary --------------------------------------------
 
 [[source]]

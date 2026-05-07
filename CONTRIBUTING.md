@@ -6,10 +6,14 @@ reports, and design feedback.
 
 ## Before you start
 
-1. Read [`docs/architecture/overview.md`](docs/architecture/overview.md).
-2. Read the relevant ADR(s) in `docs/adr/`. The schema and architectural
-   decisions are deliberate; please discuss in an issue before proposing
-   changes to them.
+1. Read the ADRs in [`docs/adr/`](docs/adr/) — they encode the
+   load-bearing architectural decisions. ADR 0007 (research
+   function: two-level LLM architecture) is the most important
+   for understanding how the workstation is built.
+2. Read [`README.md`](README.md) for what situation_room is and
+   how to run it locally.
+3. The schema and architectural decisions are deliberate; please
+   discuss in an issue before proposing changes to them.
 
 ## Development setup
 
