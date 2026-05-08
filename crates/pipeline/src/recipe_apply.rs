@@ -2960,4 +2960,105 @@ C 4
             "no-match json_path should surface as Extraction; got {err:?}"
         );
     }
+
+    #[test]
+    fn validate_recipe_json_path_rejects_world_bank_leading_null_trap() {
+        // Session 41 item 6: end-to-end pin against the World-Bank-
+        // shaped null trap that motivated the JSON outline in item 3.
+        // The World Bank Open Data API publishes time-series arrays
+        // where the most-recent rows carry `"value": null` for
+        // unpublished data — a positional index like `$[1][0].value`
+        // hits the most recent row, which is null on every fetch
+        // forever. The runtime's `extract_json_path` returns an error
+        // when every matched node is null (Session 32b); the
+        // validator inherits that error through the mode-agnostic
+        // dispatch in `validate_recipe_against_bytes` (Session 41
+        // patch 1) and converts it to `AuthoringError::Declined` at
+        // the recipe-author layer rather than persisting a recipe
+        // that would fail on every apply.
+        //
+        // This test pins the validator's contract for that specific
+        // failure shape: a positional-index recipe against the
+        // leading-null array must Decline at authoring, with the
+        // runtime's null-skip error text intact (it tells the LLM
+        // the fix verbatim — write a filter expression — so the
+        // retry loop can re-author productively).
+        //
+        // **Architectural intent.** This test does NOT add any
+        // dispatch logic to `validate_recipe_against_bytes`. It is
+        // an integration test in the validator-level sense: it
+        // exercises the same dispatch path the runtime uses at
+        // apply time, against fixture bytes that exhibit the
+        // canonical class. End-to-end through `author_recipe`
+        // would add no coverage that this test doesn't already
+        // provide; the conversion to `AuthoringError::Declined`
+        // is structural (the `if let Err(apply_err) = ... return
+        // Err(AuthoringError::Declined { reason: format!(...) })`
+        // tail of `author_recipe`).
+        let bytes = br#"[
+            {"page": 1, "per_page": 4, "total": 4},
+            [
+                {"country": "AUS", "year": "2026", "value": null},
+                {"country": "AUS", "year": "2025", "value": null},
+                {"country": "AUS", "year": "2024", "value": 88000},
+                {"country": "AUS", "year": "2023", "value": 86000}
+            ]
+        ]"#;
+
+        // Recipe under test: positional index into the inner
+        // array's first element. This is the exact authoring
+        // mistake the leading-null trap punishes — `$[1][0].value`
+        // is `null`, but `$[1][2].value` (the third element) is
+        // `88000`.
+        let trap_recipe = recipe_with(ExtractionSpec::JsonPath {
+            path: "$[1][0].value".into(),
+        });
+        let err = validate_recipe_against_bytes(&trap_recipe, bytes)
+            .expect_err(
+                "positional indices into the leading-null array must \
+                 fail validation, not silently produce a null record",
+            );
+        match err {
+            ApplyError::Extraction { mode, reason } => {
+                assert_eq!(mode, "json_path");
+                // The runtime's reason names the failure shape
+                // (`null`) and suggests the fix (filter expression).
+                // Both are part of the contract the LLM relies on
+                // when re-authoring after a Decline — surfacing
+                // them through the validator is what closes the
+                // loop. See `extract_json_path` lines ~685–690.
+                assert!(
+                    reason.to_lowercase().contains("null"),
+                    "validator failure must name the null-only condition; \
+                     got reason: {reason}"
+                );
+                assert!(
+                    reason.contains("filter expression")
+                        || reason.contains("?(@."),
+                    "validator failure must suggest the filter-expression \
+                     fix verbatim so the recipe-author retry loop can \
+                     re-author productively; got reason: {reason}"
+                );
+            }
+            other => panic!(
+                "expected Extraction error from json_path; got {other:?}"
+            ),
+        }
+
+        // Sanity check: the canonical fix (a filter-expression path
+        // that skips null values) must validate cleanly against the
+        // same bytes. Without this assertion the negative test above
+        // could pass for the wrong reason — e.g., if the validator
+        // were rejecting all json_path recipes — and the LLM's
+        // re-authored recipe would still fail to land. Pinning the
+        // positive case here keeps the contract two-sided.
+        let fixed_recipe = recipe_with(ExtractionSpec::JsonPath {
+            path: "$[1][?(@.value)].value".into(),
+        });
+        validate_recipe_against_bytes(&fixed_recipe, bytes).expect(
+            "the filter-expression fix the runtime suggests must validate \
+             cleanly; otherwise the retry loop would never land a recipe \
+             for World-Bank-shaped sources",
+        );
+    }
 }

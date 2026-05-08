@@ -21,6 +21,19 @@
 //! client (ADR 0009 §"The rule"), bounds-check every prompt before send,
 //! wire shapes deserialised through forgiving private types.
 //!
+//! ## Reasoning-effort plumbing
+//!
+//! [`CompletionRequest::reasoning_effort`] is part of the trait shape
+//! Session 43 added so the xAI provider can route per-tier reasoning
+//! intensity onto its chat/completions wire. **This provider ignores
+//! the field**: the Anthropic Messages API does not currently accept
+//! a per-request reasoning-intensity parameter, and we explicitly do
+//! not synthesise one — pretending to honor a knob that has no wire
+//! effect would mislead callers into thinking they have cost
+//! differentiation here when they do not. If Anthropic later adds an
+//! equivalent parameter, the change lands in this provider's
+//! `build_body`; the trait shape already carries the field.
+//!
 //! ## Truncation-retry path
 //!
 //! Anthropic surfaces truncation through `stop_reason: "max_tokens"`,
@@ -524,6 +537,10 @@ impl LlmProvider for AnthropicProvider {
             schema: request.schema.clone(),
             max_tokens: retry_max_tokens,
             temperature: request.temperature,
+            // Preserved for parity with the trait shape; the
+            // Anthropic provider does not currently map this onto
+            // the wire (see comment on `complete`).
+            reasoning_effort: request.reasoning_effort,
         };
         match self.send_one(tier, &retry_req, schema_requested).await {
             Ok((resp, was_truncated_again)) => {
@@ -701,6 +718,7 @@ mod tests {
             // serialized JSON number roundtrips cleanly. See the
             // comment on the equivalent xAI test.
             temperature: 0.5,
+            reasoning_effort: None,
         };
         let body = p.build_body(ModelTier::Cheap, &req);
 
@@ -729,6 +747,7 @@ mod tests {
             schema: None,
             max_tokens: 8,
             temperature: 0.0,
+            reasoning_effort: None,
         };
         let body = p.build_body(ModelTier::Workhorse, &req);
         assert!(
@@ -758,6 +777,7 @@ mod tests {
             schema: Some(schema),
             max_tokens: 128,
             temperature: 0.0,
+            reasoning_effort: None,
         };
         let body = p.build_body(ModelTier::Frontier, &req);
 
@@ -1135,6 +1155,7 @@ mod tests {
             schema: None,
             max_tokens: 8,
             temperature: 0.0,
+            reasoning_effort: None,
         };
         let resp = provider
             .complete(ModelTier::Cheap, req)
@@ -1170,6 +1191,7 @@ mod tests {
             schema: Some(schema),
             max_tokens: 256,
             temperature: 0.0,
+            reasoning_effort: None,
         };
         let resp = provider
             .complete(ModelTier::Workhorse, req)

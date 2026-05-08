@@ -305,6 +305,10 @@ pub async fn classify_topic(
         // A little variation produces better topic_tags reuse than a hard
         // greedy decode.
         temperature: 0.2,
+        // Tier mapping decides reasoning intensity (cheap → Low by
+        // default on xAI). Per-call overrides are not used for
+        // classification.
+        reasoning_effort: None,
     };
 
     let resp = provider.complete(tier, req).await?;

@@ -10,7 +10,7 @@ pub mod openai;
 pub mod grok;
 pub mod gemini;
 
-pub use trait_def::{LlmProvider, LlmError, ModelTier, CompletionRequest, CompletionResponse, StructuredOutputSchema};
+pub use trait_def::{LlmProvider, LlmError, ModelTier, ReasoningEffort, CompletionRequest, CompletionResponse, StructuredOutputSchema};
 pub use router::ProviderRouter;
 pub use grok::{XaiProvider, XaiConfig, XAI_API_KEY_ENV};
 // Session 23 — Anthropic provider promoted from stub to real

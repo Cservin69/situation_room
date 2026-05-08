@@ -148,6 +148,11 @@ pub async fn propose_source_url(
         // knowledge, not generation. Same discipline as recipe
         // authoring.
         temperature: 0.0,
+        // Per-tier reasoning intensity comes from the provider's tier
+        // mapping (cheap → Low on xAI by default — propose-URL is the
+        // canonical cheap-tier call). Per-call/per-source overrides
+        // belong nowhere; see ReasoningEffort doc comment.
+        reasoning_effort: None,
     };
 
     let resp = provider.complete(tier, req).await?;

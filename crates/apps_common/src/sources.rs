@@ -328,7 +328,20 @@ authoritative_for = ["industrial_metals_prices"]
 
     /// Tiny in-process tempdir helper. We don't pull in `tempfile`
     /// for one test fixture; this is enough.
+    ///
+    /// Uniqueness sources, layered for parallel safety on modern
+    /// hardware: `SystemTime::now().as_nanos()` (cross-process),
+    /// `thread::current().id()` (cross-test within a process), and a
+    /// process-wide `AtomicUsize` counter (cross-test on the same
+    /// thread, rare but possible under nextest). Without the counter
+    /// the nanos-only version collided on fast hardware when two
+    /// `cargo test` threads happened to enter `tempdir()` within the
+    /// same nanosecond — Session 41 patch 2 saw this manifest as a
+    /// flaky `load_source_descriptors_respects_limit` ("left: 'a' /
+    /// right: 'wb'"). Session 43 drive-by per the handoff.
     fn tempdir() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let mut p = std::env::temp_dir();
         let nonce: u64 = {
             use std::time::{SystemTime, UNIX_EPOCH};
@@ -337,7 +350,17 @@ authoritative_for = ["industrial_metals_prices"]
                 .unwrap()
                 .as_nanos() as u64
         };
-        p.push(format!("situation_room_apps_common_test_{nonce}"));
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Sanitize the thread id — `ThreadId(N)`'s parens are not
+        // path-illegal but they're awkward, and any surprising char
+        // would break create_dir_all on Windows builds.
+        let tid_clean: String = format!("{:?}", std::thread::current().id())
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        p.push(format!(
+            "situation_room_apps_common_test_{nonce}_{tid_clean}_{seq}"
+        ));
         std::fs::create_dir_all(&p).unwrap();
         // The dir leaks on test crash; acceptable for now.
         p

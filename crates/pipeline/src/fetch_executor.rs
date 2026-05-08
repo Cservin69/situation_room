@@ -1221,19 +1221,28 @@ async fn prefetch_excerpt(
 
     // Branch on payload kind. PDFs go through `pdf_extract` +
     // `detect_pdf_tables`; HTML goes through `scraper` to produce a
-    // structural digest in the runtime's parsed shape; everything
-    // else falls through to the existing UTF-8-lossy path. We do
-    // the dispatch here, not in a separate helper, because the
-    // truncation + framing logic is the same shape across all
-    // branches — just over different "body" strings.
+    // structural digest in the runtime's parsed shape; JSON goes
+    // through `serde_json` to produce a path/type shape outline;
+    // everything else falls through to the UTF-8-lossy raw-bytes
+    // path. We do the dispatch here, not in a separate helper,
+    // because the truncation + framing logic is the same shape
+    // across all branches — just over different "body" strings.
     //
-    // **Session 41 — three-way dispatch.** Item 1 added the PDF
-    // branch's framed-table format; item 2 adds the HTML branch's
-    // structural digest, mirroring the same architectural posture:
+    // **Session 41 — four-way dispatch.** Item 1 added the PDF
+    // branch's framed-table format; item 2 added the HTML branch's
+    // structural digest; item 3 adds the JSON branch's shape
+    // outline. All three mirror the same architectural posture:
     // the LLM sees what the runtime sees, parsed by the same crate
-    // (`scraper`) the runtime queries against. JSON sources still
-    // fall through to the lossy raw-bytes path until item 3 lands
-    // (Session 41 patch 3).
+    // the runtime queries against (`pdf_extract`,
+    // `scraper`, `serde_json` respectively).
+    //
+    // **One asymmetry worth flagging.** Unlike PDF and HTML, where
+    // the rendered text fully replaces the raw bytes (the rendered
+    // form IS the parseable structure), the JSON branch keeps the
+    // raw bytes underneath the outline. The LLM may still need to
+    // see specific values to author a filter expression — the
+    // outline is a navigation aid above the bytes, not a
+    // replacement for them.
     let (body, kind_annotation) = if is_pdf(&bytes) {
         match render_pdf_text_with_tables(&bytes) {
             Ok(text) => (text, "PDF (text + detected tables)".to_string()),
@@ -1283,6 +1292,50 @@ async fn prefetch_excerpt(
                          modes cannot author against this source, decline.)"
                     ),
                     "HTML (digest failed)".to_string(),
+                )
+            }
+        }
+    } else if is_json(&bytes) {
+        match render_json_shape(&bytes) {
+            Ok(outline) => {
+                // Outline above, raw bytes below. Whatever budget
+                // remains after the outline is spent on raw bytes;
+                // the outer truncation in `prefetch_excerpt` will
+                // also bound the combined string, so this is
+                // defense-in-depth against a pathological outline
+                // dwarfing the budget alone.
+                let raw_budget = PREFETCH_EXCERPT_BUDGET.saturating_sub(outline.len());
+                let raw_trimmed: &[u8] = if bytes.len() > raw_budget {
+                    &bytes[..raw_budget]
+                } else {
+                    &bytes[..]
+                };
+                let combined = format!(
+                    "{outline}\n{}",
+                    String::from_utf8_lossy(raw_trimmed)
+                );
+                (combined, "JSON (shape outline + raw bytes)".to_string())
+            }
+            Err(e) => {
+                // serde_json parse failed even though `is_json`
+                // sniffed a JSON-looking prefix — likely truncated
+                // upstream or genuinely malformed. Surface honestly
+                // so the LLM declines rather than authoring against
+                // a garbled blob.
+                warn!(
+                    source_id = %source_id,
+                    url = %url,
+                    error = %e,
+                    "json shape outline construction failed; surfacing as unreadable in excerpt"
+                );
+                (
+                    format!(
+                        "(could not parse this JSON — {e}. \
+                         No parsed structure is available; if your \
+                         closed-vocabulary modes cannot author against \
+                         this source, decline.)"
+                    ),
+                    "JSON (parse failed)".to_string(),
                 )
             }
         }
@@ -1835,6 +1888,381 @@ fn truncate_to_budget(s: &str, budget: usize) -> String {
         cut -= 1;
     }
     format!("{}[...truncated at {} bytes]", &s[..cut], budget)
+}
+
+// ---------------------------------------------------------------------------
+// JSON shape outline (Session 41 item 3)
+//
+// JSON sources fell through to `from_utf8_lossy` until this patch — the
+// LLM authored `json_path` recipes by guessing the shape from a
+// truncated body. That works for small responses and silently fails
+// for large nested ones; it's the class that produced the World Bank
+// null trap (Session 32: "most-recent rows carry null for unpublished
+// data") because the LLM saw the leading raw bytes only, where the
+// nulls all happen to live, and assumed positional indices into the
+// array would land on real numbers.
+//
+// The shape outline is a navigation aid: it surfaces the parsed
+// structure (paths + types + array cardinality, with explicit
+// polymorphic-type annotation and first-N samples for polymorphic
+// leaves) ABOVE the raw bytes. Unlike the PDF and HTML branches,
+// where the rendered text fully replaces the raw bytes (no
+// information is lost — the rendered text IS the parseable
+// structure), the JSON branch keeps the raw bytes underneath the
+// outline. The LLM may still need to see specific values to author
+// a filter expression; the outline tells it where to look.
+//
+// The outline is parsed with `serde_json::Value` — the same crate
+// `recipe_apply::extract_json_path` queries against at apply time.
+// By construction, a path the LLM reads off the outline is one the
+// runtime will resolve to the same value at apply.
+// ---------------------------------------------------------------------------
+
+/// Hard cap on how many distinct paths the outline lists. A
+/// pathological JSON document (10000-key flat object, or a deeply
+/// nested array of objects with thousands of keys per element) would
+/// otherwise crowd the prefetch's overall byte budget. The truncation
+/// marker tells the LLM elision happened so it doesn't assume the
+/// listed paths are exhaustive.
+const JSON_OUTLINE_PATH_LIMIT: usize = 50;
+/// How many leaf samples to record per path before we stop. The
+/// World Bank null trap typically shows 4–6 leading nulls before the
+/// first real value; 5 is enough to make the pattern visible without
+/// drowning the outline in long arrays of identical values.
+const JSON_OUTLINE_SAMPLE_LIMIT: usize = 5;
+/// Per-leaf-sample byte budget. Caps the rendered length of any one
+/// sample so a single 100 KiB string value can't push the outline
+/// off the budget.
+const JSON_OUTLINE_LEAF_PREVIEW_BUDGET: usize = 80;
+/// How many elements of the first non-empty array to render verbatim
+/// in the head-elements section. Two is enough to show the LLM the
+/// repeating shape (and a leading-null pair when the trap is
+/// present); more would bloat the outline without adding evidence.
+const JSON_OUTLINE_FIRST_ELEMENTS: usize = 2;
+
+/// `true` iff `bytes` looks like JSON: starts with (after an
+/// optional UTF-8 BOM and any leading ASCII whitespace) either `{`
+/// or `[`. We deliberately do NOT match bare scalar JSON values
+/// (`42`, `"foo"`, `true`, `null`) — a real source publishing a
+/// scalar at the document root is unheard of, and accepting them
+/// would false-positive on plain-text payloads that happen to start
+/// with a digit or quote. PDFs (`%PDF-`) and HTML (chevron-leading)
+/// are also rejected by this rule.
+fn is_json(bytes: &[u8]) -> bool {
+    let after_bom = bytes
+        .strip_prefix(b"\xEF\xBB\xBF")
+        .unwrap_or(bytes);
+    let trimmed = match after_bom
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+    {
+        Some(i) => &after_bom[i..],
+        None => return false,
+    };
+    matches!(trimmed.first(), Some(b'{') | Some(b'['))
+}
+
+/// Per-path observations accumulated during the JSON walk. The
+/// outline renders one line per `(path, JsonPathStats)` pair; the
+/// stats record what types we saw at this path, the array size when
+/// the path resolved to an array, and a bounded sample of leaf
+/// values for polymorphic-leaf annotation.
+struct JsonPathStats {
+    /// All distinct JSON type labels observed at this path. Stored
+    /// in a `BTreeSet<&'static str>` so the rendered union is
+    /// deterministic (`null|number`, never `number|null`) and so
+    /// `is_polymorphic_leaf` can decide cheaply.
+    types: std::collections::BTreeSet<&'static str>,
+    /// `Some((min, max))` if any observation was an array. The pair
+    /// captures cardinality variation across siblings — a key that
+    /// holds arrays of different lengths under different parents
+    /// renders as `array[lo..hi]`; a uniform shape renders as
+    /// `array[N]`.
+    array_len: Option<(usize, usize)>,
+    /// Leaf-value previews observed at this path, capped at
+    /// `JSON_OUTLINE_SAMPLE_LIMIT`. Only populated for non-container
+    /// observations; container-only paths leave this empty.
+    samples: Vec<String>,
+}
+
+impl JsonPathStats {
+    fn new() -> Self {
+        Self {
+            types: std::collections::BTreeSet::new(),
+            array_len: None,
+            samples: Vec::new(),
+        }
+    }
+    fn observe_type(&mut self, t: &'static str) {
+        self.types.insert(t);
+    }
+    fn observe_array_len(&mut self, len: usize) {
+        self.array_len = Some(match self.array_len {
+            None => (len, len),
+            Some((lo, hi)) => (lo.min(len), hi.max(len)),
+        });
+    }
+    fn observe_sample(&mut self, preview: String) {
+        if self.samples.len() < JSON_OUTLINE_SAMPLE_LIMIT {
+            self.samples.push(preview);
+        }
+    }
+    /// A leaf is polymorphic when ≥2 distinct types were observed
+    /// AND none of those types is a container (object/array). The
+    /// container exclusion is deliberate: a path observed as both
+    /// `array` and `object` across siblings is structural confusion,
+    /// not the leaf-polymorphism class — the World Bank null trap
+    /// (`null|number`) and string-vs-number variants are leaf
+    /// problems with a JSONPath filter-expression fix.
+    fn is_polymorphic_leaf(&self) -> bool {
+        if self.types.len() < 2 {
+            return false;
+        }
+        self.types.iter().all(|t| !matches!(*t, "object" | "array"))
+    }
+}
+
+/// Map a `serde_json::Value` to the type label used in the outline.
+/// Six labels — one per `Value` variant — keep the surface tiny and
+/// the polymorphic-leaf check (which excludes `object` and `array`)
+/// trivially correct.
+fn json_type_label(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Render a leaf value as a one-line preview suitable for a sample
+/// list. Strings are debug-quoted (so spaces and control chars stay
+/// visible); numbers/bools/null are formatted as their JSON text.
+/// Containers fall through to `Display`, which shouldn't fire because
+/// the caller only previews leaves, but defending against it costs
+/// nothing.
+fn json_leaf_preview(v: &serde_json::Value) -> String {
+    let raw = match v {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => format!("{:?}", s),
+        other => other.to_string(),
+    };
+    truncate_to_budget(&raw, JSON_OUTLINE_LEAF_PREVIEW_BUDGET)
+}
+
+/// Recursively walk a `serde_json::Value`, accumulating one entry per
+/// distinct path. Object keys descend as `path.key`; array elements
+/// collapse to `path[]` (so `$.data[0].country` and `$.data[1].country`
+/// merge into one entry: `$.data[].country`). The collapse matches
+/// how a JSONPath author addresses array contents — what the LLM
+/// reads off the outline is what it would write into a recipe.
+///
+/// Path storage is a `Vec<(String, JsonPathStats)>` plus a
+/// `HashMap<String, usize>` for O(1) lookup; this preserves DFS
+/// visit order in the rendered outline. (Workspace `serde_json`
+/// does not enable `preserve_order`, so within an object the key
+/// iteration order is the inner map's deterministic order — that
+/// becomes the visit order, and the outline order, by construction.)
+fn walk_json(
+    value: &serde_json::Value,
+    path: &str,
+    paths: &mut Vec<(String, JsonPathStats)>,
+    index: &mut std::collections::HashMap<String, usize>,
+    first_array: &mut Option<String>,
+) {
+    let stats_idx = match index.get(path) {
+        Some(&i) => i,
+        None => {
+            paths.push((path.to_string(), JsonPathStats::new()));
+            let i = paths.len() - 1;
+            index.insert(path.to_string(), i);
+            i
+        }
+    };
+    paths[stats_idx].1.observe_type(json_type_label(value));
+
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let child = format!("{path}.{k}");
+                walk_json(v, &child, paths, index, first_array);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            paths[stats_idx].1.observe_array_len(arr.len());
+            // The first non-empty array we encounter during DFS
+            // becomes the source of the head-elements section. This
+            // is deterministic and covers the common shapes —
+            // `{data: [...], meta: {...}}` highlights `data`,
+            // `[[...], [...]]` highlights the outer first non-empty,
+            // and a top-level array highlights itself.
+            if first_array.is_none() && !arr.is_empty() {
+                *first_array = Some(path.to_string());
+            }
+            let child = format!("{path}[]");
+            for el in arr {
+                walk_json(el, &child, paths, index, first_array);
+            }
+        }
+        leaf => {
+            paths[stats_idx].1.observe_sample(json_leaf_preview(leaf));
+        }
+    }
+}
+
+/// Build the JSON shape outline for `bytes`. Returns the rendered
+/// outline as a `String` on success, or a stringified parse error
+/// when `serde_json` rejects the bytes (the caller surfaces the
+/// failure to the LLM honestly rather than guessing).
+///
+/// **Output shape** (this is the contract the prompt section
+/// references):
+///
+/// ```text
+/// --- JSON shape (parsed by serde_json) ---
+/// $ : object
+/// $.data : array[24]
+/// $.data[].country : string
+/// $.data[].value : null|number   ← polymorphic; first 5 values: ["null", "null", "1234", "1100", "950"]
+/// $.data[].date : string
+/// $.meta : object
+/// $.meta.total : number
+///
+/// --- First 2 elements of $.data ---
+/// [
+///   {"country":"...","value":null,"date":"2026"},
+///   ...
+/// ]
+/// --- end JSON shape ---
+/// ```
+///
+/// Polymorphic-leaf paths get the `← polymorphic` marker plus a
+/// sample of leading values so a leading-null pattern is visible
+/// at authoring time (the World Bank trap class). Non-polymorphic
+/// leaves render with a single type label; arrays render with their
+/// observed cardinality (`array[N]` or `array[lo..hi]`).
+fn render_json_shape(bytes: &[u8]) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| format!("JSON bytes did not parse: {e}"))?;
+
+    let mut paths: Vec<(String, JsonPathStats)> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut first_array: Option<String> = None;
+    walk_json(&value, "$", &mut paths, &mut index, &mut first_array);
+
+    let mut out = String::new();
+    out.push_str("--- JSON shape (parsed by serde_json) ---\n");
+
+    let shown = paths.len().min(JSON_OUTLINE_PATH_LIMIT);
+    for (path, stats) in paths.iter().take(shown) {
+        out.push_str(path);
+        out.push_str(" : ");
+        if stats.is_polymorphic_leaf() {
+            let union: Vec<&str> = stats.types.iter().copied().collect();
+            out.push_str(&union.join("|"));
+            out.push_str("   ← polymorphic; first ");
+            out.push_str(&stats.samples.len().to_string());
+            out.push_str(" values: [");
+            out.push_str(
+                &stats
+                    .samples
+                    .iter()
+                    .map(|s| format!("{s:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            out.push_str("]\n");
+        } else if stats.types.len() == 1 {
+            let t = *stats.types.iter().next().expect("len==1");
+            if t == "array" {
+                match stats.array_len {
+                    Some((lo, hi)) if lo == hi => {
+                        out.push_str(&format!("array[{lo}]"))
+                    }
+                    Some((lo, hi)) => {
+                        out.push_str(&format!("array[{lo}..{hi}]"))
+                    }
+                    None => out.push_str("array"),
+                }
+            } else {
+                out.push_str(t);
+            }
+            out.push('\n');
+        } else {
+            // Multi-type observation that includes a container — emit
+            // the union without the polymorphic marker. This is rare
+            // (it indicates structural confusion: the same path is
+            // sometimes an object, sometimes a leaf) and the LLM
+            // should treat it as a sign to inspect the raw bytes.
+            let union: Vec<&str> = stats.types.iter().copied().collect();
+            out.push_str(&union.join("|"));
+            out.push('\n');
+        }
+    }
+    if paths.len() > shown {
+        out.push_str(&format!(
+            "  [... {} more paths truncated]\n",
+            paths.len() - shown
+        ));
+    }
+
+    if let Some(arr_path) = first_array {
+        if let Some(arr_value) = resolve_array_at_path(&value, &arr_path) {
+            let take = arr_value.len().min(JSON_OUTLINE_FIRST_ELEMENTS);
+            if take > 0 {
+                out.push_str(&format!(
+                    "\n--- First {take} element{} of {arr_path} ---\n",
+                    if take == 1 { "" } else { "s" }
+                ));
+                let head: Vec<&serde_json::Value> =
+                    arr_value.iter().take(take).collect();
+                let rendered = serde_json::to_string_pretty(&head)
+                    .unwrap_or_else(|_| "[serialization failed]".to_string());
+                // Per-section cap on the head bytes — generous
+                // enough for two non-trivial objects, bounded
+                // enough that a 1 MiB element can't dominate.
+                out.push_str(&truncate_to_budget(
+                    &rendered,
+                    JSON_OUTLINE_LEAF_PREVIEW_BUDGET
+                        * JSON_OUTLINE_FIRST_ELEMENTS
+                        * 8,
+                ));
+                out.push('\n');
+            }
+        }
+    }
+
+    out.push_str("--- end JSON shape ---\n");
+    Ok(out)
+}
+
+/// Resolve a dotted path like `$.data` (or just `$`) to its
+/// underlying `Vec<Value>` when the path resolves to an array. Used
+/// to render the head-elements section. Returns `None` for paths
+/// containing array-element segments (`[]`) — by construction
+/// `first_array` is set to a path *containing* the array, never one
+/// that descends into its elements, so this is a defense.
+fn resolve_array_at_path<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a Vec<serde_json::Value>> {
+    let stripped = path.strip_prefix('$').unwrap_or(path);
+    let mut cur = value;
+    for segment in stripped.split('.').filter(|s| !s.is_empty()) {
+        // Element-index segments (`[]`) shouldn't appear here, but
+        // `Value::get` would just miss them; rejecting cleanly keeps
+        // the contract honest.
+        if segment.contains('[') {
+            return None;
+        }
+        cur = cur.get(segment)?;
+    }
+    cur.as_array()
 }
 
 /// Build a stub excerpt for cases where pre-fetch is impossible
@@ -5083,6 +5511,331 @@ mod tests {
         assert!(
             out.contains("visible text truncated"),
             "digest must mark truncation explicitly; got:\n{out}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Session 41 item 3 — JSON shape outline
+    //
+    // The LLM sees what `serde_json` parsed out of the bytes — the same
+    // crate `recipe_apply::extract_json_path` queries against at apply
+    // time. These tests pin the outline format against in-memory JSON
+    // fixtures. The polymorphic-leaf annotation is the principle that
+    // catches the World Bank / OECD / Eurostat null-trap class without
+    // naming any of those sources in the code.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_json_recognizes_json_objects_and_arrays() {
+        assert!(is_json(b"{\"data\": []}"));
+        assert!(is_json(b"[1, 2, 3]"));
+        assert!(is_json(b"   \n  {\"x\":1}"));
+        assert!(is_json(b"\xEF\xBB\xBF{\"x\":1}"));
+        assert!(is_json(b"\xEF\xBB\xBF\n[1,2]"));
+    }
+
+    #[test]
+    fn is_json_rejects_non_json_payloads() {
+        // PDF magic.
+        assert!(!is_json(b"%PDF-1.4\n..."));
+        // HTML.
+        assert!(!is_json(b"<!DOCTYPE html><html>..."));
+        assert!(!is_json(b"<html>"));
+        // Bare scalar JSON values — accepted by serde_json but
+        // unheard of as document roots; rejecting avoids false-
+        // positives on plain text starting with a digit or quote.
+        assert!(!is_json(b"42"));
+        assert!(!is_json(b"\"a string\""));
+        assert!(!is_json(b"true"));
+        assert!(!is_json(b"null"));
+        // CSV / plain text / empty.
+        assert!(!is_json(b"country,production\nChile,49000\n"));
+        assert!(!is_json(b""));
+        assert!(!is_json(b"   "));
+    }
+
+    #[test]
+    fn render_json_shape_surfaces_paths_types_and_array_cardinality() {
+        // Compact fixture covering: top-level object, nested array,
+        // nested object, scalar leaves of distinct types, and
+        // verifies cardinality is rendered as `array[N]` for
+        // uniform shape.
+        let json = br#"{
+            "data": [
+                {"country": "AUS", "year": 2024, "value": 88000},
+                {"country": "CHL", "year": 2024, "value": 49000}
+            ],
+            "meta": { "total": 2 }
+        }"#;
+        let out = render_json_shape(json)
+            .expect("well-formed JSON must produce an outline");
+
+        assert!(
+            out.contains("--- JSON shape (parsed by serde_json) ---"),
+            "outline must start with its header marker; got:\n{out}"
+        );
+        assert!(
+            out.contains("$ : object"),
+            "outline must list the root path with its type; got:\n{out}"
+        );
+        assert!(
+            out.contains("$.data : array[2]"),
+            "outline must list the data array with its cardinality; got:\n{out}"
+        );
+        assert!(
+            out.contains("$.data[].country : string"),
+            "outline must collapse array-index paths to `[]`; got:\n{out}"
+        );
+        assert!(
+            out.contains("$.data[].year : number"),
+            "outline must list scalar leaf types under array-element paths; got:\n{out}"
+        );
+        assert!(
+            out.contains("$.meta.total : number"),
+            "outline must descend into nested objects; got:\n{out}"
+        );
+        assert!(
+            out.contains("--- end JSON shape ---"),
+            "outline must terminate with its end marker; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_json_shape_annotates_polymorphic_leaf_with_samples() {
+        // The World Bank null-trap fixture: an array whose `value`
+        // field is null in the leading elements (most-recent years
+        // with unpublished data) and number in the trailing
+        // elements (older years with published data). This is the
+        // class the outline must surface unambiguously — the
+        // `null|number` polymorphic annotation plus the leading-null
+        // sample sequence are what tells the LLM to author a filter
+        // expression instead of a positional index.
+        let json = br#"[
+            {"meta": "page info"},
+            [
+                {"country": "AUS", "year": "2026", "value": null},
+                {"country": "AUS", "year": "2025", "value": null},
+                {"country": "AUS", "year": "2024", "value": 88000},
+                {"country": "AUS", "year": "2023", "value": 86000}
+            ]
+        ]"#;
+        let out = render_json_shape(json)
+            .expect("well-formed JSON must produce an outline");
+
+        // The polymorphic union must appear, in deterministic
+        // (`null|number`) order — the BTreeSet sort makes this
+        // stable across runs.
+        assert!(
+            out.contains("null|number"),
+            "polymorphic leaf must render as `null|number`; got:\n{out}"
+        );
+        // The polymorphic marker tells the LLM to look at the
+        // sample list rather than assume the leaf is uniformly
+        // typed.
+        assert!(
+            out.contains("← polymorphic"),
+            "polymorphic-leaf paths must carry the `← polymorphic` marker; got:\n{out}"
+        );
+        // The leading-null sample sequence is what closes the trap:
+        // the LLM sees the first observed values are null and writes
+        // a filter expression on the first attempt.
+        assert!(
+            out.contains("\"null\""),
+            "polymorphic-leaf samples must include leading null values; got:\n{out}"
+        );
+        // At least one numeric value should also appear in the
+        // sample list — this is what tells the LLM the path *does*
+        // hold real numbers further into the array.
+        assert!(
+            out.contains("\"88000\"") || out.contains("\"86000\""),
+            "polymorphic-leaf samples must include at least one observed \
+             number to confirm real values exist; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_json_shape_caps_path_count_at_limit() {
+        // Build a flat object with > JSON_OUTLINE_PATH_LIMIT keys.
+        // The outline must list the first N and emit an explicit
+        // truncation marker; without the cap, a pathological JSON
+        // document could crowd the prefetch's overall byte budget.
+        let mut body = String::from("{");
+        let total = JSON_OUTLINE_PATH_LIMIT + 10;
+        for i in 0..total {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!("\"k{i}\":{i}"));
+        }
+        body.push('}');
+        let out = render_json_shape(body.as_bytes())
+            .expect("well-formed JSON must produce an outline");
+        assert!(
+            out.contains("more paths truncated"),
+            "outline must mark path-limit truncation explicitly; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_json_shape_renders_first_elements_of_first_array() {
+        // The head-elements section gives the LLM concrete values
+        // to confirm "yes, this row holds the value I want." It
+        // should target the first non-empty array seen during DFS
+        // (here: `$.data`) and render the first
+        // `JSON_OUTLINE_FIRST_ELEMENTS` elements as JSON.
+        let json = br#"{
+            "data": [
+                {"country": "AUS", "year": 2024, "value": 88000},
+                {"country": "CHL", "year": 2024, "value": 49000},
+                {"country": "ARG", "year": 2024, "value": 9600}
+            ]
+        }"#;
+        let out = render_json_shape(json)
+            .expect("well-formed JSON must produce an outline");
+        assert!(
+            out.contains("--- First 2 elements of $.data ---"),
+            "outline must announce the head-elements section with its \
+             count and target path; got:\n{out}"
+        );
+        // The first element's country must appear; the third must
+        // not (the section is bounded at FIRST_ELEMENTS=2).
+        assert!(
+            out.contains("\"AUS\""),
+            "head section must include the first element's values; got:\n{out}"
+        );
+        assert!(
+            !out.contains("\"ARG\""),
+            "head section must be capped at JSON_OUTLINE_FIRST_ELEMENTS=2; \
+             the third element must NOT appear; got:\n{out}"
+        );
+    }
+
+    /// End-to-end check on the framing: a JSON source travels through
+    /// the executor's pre-fetch + propose-URL + recipe-author retry
+    /// loop, and the prompt the recipe-author LLM finally sees has
+    /// the shape-outline framing — not raw `from_utf8_lossy` bytes
+    /// alone. Mirrors the PDF and HTML integration tests in shape.
+    #[tokio::test]
+    async fn prefetch_excerpt_for_json_url_yields_shape_outline_to_recipe_author() {
+        use std::sync::Mutex;
+
+        struct PromptCapturingProvider {
+            seen: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl LlmProvider for PromptCapturingProvider {
+            fn id(&self) -> &'static str {
+                "prompt_capturing"
+            }
+            fn supported_tiers(&self) -> &[ModelTier] {
+                &[ModelTier::Cheap, ModelTier::Workhorse]
+            }
+            async fn complete(
+                &self,
+                tier: ModelTier,
+                req: situation_room_llm::CompletionRequest,
+            ) -> Result<situation_room_llm::CompletionResponse, situation_room_llm::LlmError>
+            {
+                if matches!(tier, ModelTier::Workhorse) {
+                    self.seen.lock().unwrap().push(req.user.clone());
+                }
+                let canned = if matches!(tier, ModelTier::Cheap) {
+                    serde_json::json!({
+                        "url": "https://example.test/series.json",
+                        "rationale": "fixture",
+                    })
+                } else {
+                    serde_json::json!({
+                        "source_url": "https://example.test/series.json",
+                        "extraction": { "mode": "regex_capture", "pattern": ".*", "group": 0 },
+                        "produces": [],
+                        "decline_reason": "test pin: surface the prompt we just saw",
+                    })
+                };
+                Ok(situation_room_llm::CompletionResponse {
+                    text: serde_json::to_string(&canned).unwrap(),
+                    structured: Some(canned),
+                    provider: "prompt_capturing".into(),
+                    model: "test".into(),
+                    input_tokens: None,
+                    output_tokens: None,
+                })
+            }
+        }
+
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let url = "https://example.test/series.json";
+        // World-Bank-shaped fixture: paginationmeta then a data
+        // array with leading-null `value` rows. The recipe-author
+        // prompt must carry the outline header AND the polymorphic
+        // annotation for `value` AND the raw bytes underneath.
+        let json = br#"[
+            {"page": 1, "per_page": 4, "total": 4},
+            [
+                {"country": "AUS", "year": "2026", "value": null},
+                {"country": "AUS", "year": "2025", "value": null},
+                {"country": "AUS", "year": "2024", "value": 88000},
+                {"country": "AUS", "year": "2023", "value": 86000}
+            ]
+        ]"#;
+        let fetcher = StaticFetcher::new().with(url, json);
+
+        let provider = PromptCapturingProvider {
+            seen: Mutex::new(Vec::new()),
+        };
+        let sources: Vec<SourceDescriptor> = vec![];
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
+            sources: &sources,
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+        // Recipe-author declined (canned response), so exactly one
+        // Declined outcome.
+        assert_eq!(report.outcomes.len(), 1);
+
+        let prompts = provider.seen.lock().unwrap();
+        assert!(
+            !prompts.is_empty(),
+            "recipe-author should have been called at least once"
+        );
+        let last = &prompts[prompts.len() - 1];
+        // Outline header — pinning this catches accidental
+        // regressions where the JSON branch is bypassed entirely.
+        assert!(
+            last.contains("--- JSON shape (parsed by serde_json) ---"),
+            "recipe-author prompt should carry the JSON outline header. \
+             Pre-Session-41-patch-3 it carried raw from_utf8_lossy bytes \
+             only and the LLM had to mentally walk the shape."
+        );
+        // Polymorphic annotation on the `value` leaf — the World
+        // Bank trap class. Without this, the LLM has no signal
+        // that `$[1][0].value` would land on a null at apply time.
+        assert!(
+            last.contains("null|number"),
+            "outline must annotate the polymorphic `value` leaf as \
+             `null|number`; got prompt:\n{last}"
+        );
+        // Raw bytes underneath — unlike PDF/HTML, the JSON branch
+        // keeps the raw bytes so the LLM can read specific values
+        // when authoring filter expressions.
+        assert!(
+            last.contains("\"per_page\""),
+            "JSON branch must keep the raw bytes under the outline; \
+             got prompt:\n{last}"
+        );
+        // Excerpt header annotation announces the JSON branch.
+        assert!(
+            last.contains("JSON (shape outline + raw bytes)"),
+            "excerpt header should announce that bytes were parsed \
+             as JSON and that the outline coexists with raw bytes; \
+             got prompt:\n{last}"
         );
     }
 

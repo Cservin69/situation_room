@@ -53,6 +53,7 @@ use situation_room_secure::secrets::ApiKey;
 
 use crate::providers::trait_def::{
     CompletionRequest, CompletionResponse, LlmError, LlmProvider, ModelTier,
+    ReasoningEffort,
 };
 
 /// Environment variable the provider reads its key from.
@@ -67,6 +68,23 @@ pub const XAI_API_KEY_ENV: &str = "XAI_API_KEY";
 pub const XAI_FRONTIER_MODEL_ENV: &str = "XAI_FRONTIER_MODEL";
 pub const XAI_WORKHORSE_MODEL_ENV: &str = "XAI_WORKHORSE_MODEL";
 pub const XAI_CHEAP_MODEL_ENV: &str = "XAI_CHEAP_MODEL";
+
+/// Environment variables for per-tier reasoning-effort overrides.
+/// Optional; if any is unset (or set to an empty / whitespace-only
+/// string) the tier's hardcoded default in [`XaiConfig::default`] is
+/// used. Same posture as the per-tier model overrides above. Added
+/// in Session 43 to deliver cost-tier differentiation that the May
+/// 2026 xAI lineup consolidation made unreachable through model
+/// strings alone (Session 42 patch 4 — see comment on
+/// [`XaiConfig::default`]).
+///
+/// Accepted values are `low`, `medium`, `high` (case-insensitive,
+/// whitespace-trimmed). Anything else is treated as "absent" and the
+/// default applies — a typo in shell scripting silently degrades to
+/// the default rather than crashing the provider on a 400 from xAI.
+pub const XAI_FRONTIER_EFFORT_ENV: &str = "XAI_FRONTIER_EFFORT";
+pub const XAI_WORKHORSE_EFFORT_ENV: &str = "XAI_WORKHORSE_EFFORT";
+pub const XAI_CHEAP_EFFORT_ENV: &str = "XAI_CHEAP_EFFORT";
 
 /// xAI chat completions endpoint. Overridable (only) for tests.
 const DEFAULT_ENDPOINT: &str = "https://api.x.ai/v1/chat/completions";
@@ -90,20 +108,67 @@ pub struct XaiConfig {
     pub frontier_model: String,
     pub workhorse_model: String,
     pub cheap_model: String,
+    /// Per-tier reasoning intensity. xAI's chat/completions endpoint
+    /// accepts a `reasoning_effort` parameter on each request; routing
+    /// cheap-tier calls at low effort and frontier-tier calls at high
+    /// effort delivers the cost differentiation a model-string swap
+    /// can't on the post-consolidation catalog (Session 43,
+    /// architectural follow-up to Session 42 patch 4).
+    pub frontier_effort: ReasoningEffort,
+    pub workhorse_effort: ReasoningEffort,
+    pub cheap_effort: ReasoningEffort,
 }
 
 impl Default for XaiConfig {
     fn default() -> Self {
-        // Defaults confirmed against console.x.ai on 2026-04-22.
-        // Frontier: the reasoning flagship. Cheap (and current workhorse
-        // placeholder): the fast reasoning model — the default everyday
-        // tier. The workhorse slot intentionally mirrors cheap until a
-        // distinct mid-tier model is named; do not guess at one.
-        // See https://docs.x.ai/api for the live catalog.
+        // Defaults re-confirmed against the xAI catalog on 2026-05-08
+        // (Session 42 item 7) and the reasoning-effort plumbing
+        // landed in Session 43.
+        //
+        // xAI consolidated their lineup in May 2026: eight legacy
+        // models — grok-4-fast, grok-4-0709, grok-3,
+        // grok-code-fast-1, grok-imagine-image-pro, and the
+        // grok-4-1-fast variants among others — retire on
+        // 2026-05-15. The two models surviving the cutoff are:
+        //
+        // - `grok-4.3` — flagship, 1M context, $1.25/$2.50
+        //   per-million tokens (doubling above 200 KiB). xAI's
+        //   official recommendation for all callers.
+        // - `grok-4.20` — long-context option, 2M context, $2/$6.
+        //   *More* expensive than 4.3, not cheaper.
+        //
+        // There is no current xAI model string that cost-
+        // differentiates a cheap tier from a frontier tier the way
+        // our `ModelTier` enum implies. The cost lever xAI now
+        // exposes is `grok-4.3`'s reasoning intensity (low/medium/
+        // high) — a per-request parameter. Session 43 plumbs that
+        // intensity through this struct (`*_effort`) and through
+        // `CompletionRequest::reasoning_effort`; per-tier defaults
+        // below give the cost differentiation that the model-string
+        // map can't on this catalog.
+        //
+        // Defaults: frontier = High (authoring deserves the deep
+        // think), workhorse = Medium (sane balance for everyday
+        // extraction), cheap = Low (propose-URL and classification
+        // run fast and cheap). All three model slots remain
+        // `grok-4.3` because that is xAI's official recommendation;
+        // the boot-log line
+        //   `frontier=grok-4.3 workhorse=grok-4.3 cheap=grok-4.3`
+        // is therefore correct, not config drift, and the per-tier
+        // effort line beside it now carries the actual cost lever.
+        //
+        // The xAI catalog drifts; if a distinct cheap-tier model
+        // appears (or the consolidation reverses), update these
+        // strings — that is a config edit, not a code fix.
+        // See https://docs.x.ai/developers/models for the live
+        // catalog.
         Self {
             frontier_model: "grok-4.3".to_string(),
             workhorse_model: "grok-4.3".to_string(),
             cheap_model: "grok-4.3".to_string(),
+            frontier_effort: ReasoningEffort::High,
+            workhorse_effort: ReasoningEffort::Medium,
+            cheap_effort: ReasoningEffort::Low,
         }
     }
 }
@@ -117,21 +182,46 @@ impl XaiConfig {
         }
     }
 
-    /// Build a config by reading the three optional env vars and
-    /// falling back to [`XaiConfig::default`] for any that are unset
-    /// or empty/whitespace-only.
+    /// Per-tier reasoning intensity. Mirrors [`Self::model_for`] for
+    /// the new cost-differentiation lever; see the [`XaiConfig`] doc
+    /// comment for the architectural rationale.
+    pub fn effort_for(&self, tier: ModelTier) -> ReasoningEffort {
+        match tier {
+            ModelTier::Frontier => self.frontier_effort,
+            ModelTier::Workhorse => self.workhorse_effort,
+            ModelTier::Cheap => self.cheap_effort,
+        }
+    }
+
+    /// Build a config by reading the optional env vars and falling
+    /// back to [`XaiConfig::default`] for any that are unset or
+    /// empty/whitespace-only.
     ///
     /// Empty-string normalisation matches the `endpoint_hint` discipline
     /// from Session 10's TOML loaders: a blank string is "absent", not
     /// "use literal empty model name." A literal empty model name would
     /// be rejected by xAI with a 400, which is a worse failure mode than
     /// silently using the default.
+    ///
+    /// Effort values follow the same posture: an unrecognised string
+    /// (typo, case-fold variant we don't accept, etc.) degrades to the
+    /// default for that tier rather than crashing the provider on a
+    /// 400. See [`parse_effort`] for the accepted forms.
     pub fn from_env() -> Self {
         let defaults = Self::default();
         Self {
             frontier_model: env_or(XAI_FRONTIER_MODEL_ENV, &defaults.frontier_model),
             workhorse_model: env_or(XAI_WORKHORSE_MODEL_ENV, &defaults.workhorse_model),
             cheap_model: env_or(XAI_CHEAP_MODEL_ENV, &defaults.cheap_model),
+            frontier_effort: env_effort_or(
+                XAI_FRONTIER_EFFORT_ENV,
+                defaults.frontier_effort,
+            ),
+            workhorse_effort: env_effort_or(
+                XAI_WORKHORSE_EFFORT_ENV,
+                defaults.workhorse_effort,
+            ),
+            cheap_effort: env_effort_or(XAI_CHEAP_EFFORT_ENV, defaults.cheap_effort),
         }
     }
 }
@@ -142,6 +232,58 @@ fn env_or(name: &str, default: &str) -> String {
     match std::env::var(name) {
         Ok(v) if !v.trim().is_empty() => v,
         _ => default.to_string(),
+    }
+}
+
+/// Parse a [`ReasoningEffort`] from a user-facing string. Accepts
+/// `low`, `medium`, `high` case-insensitively with surrounding
+/// whitespace trimmed. Any other input — typos, alternative spellings
+/// like `lo` / `med`, or empty/whitespace strings — returns `None`,
+/// which the env-reading helper translates to "use default" rather
+/// than rejecting the boot.
+///
+/// We deliberately do *not* alias `none`/`off`/`disabled` to a
+/// reasoning level today: xAI's `grok-4.3` cannot fully disable
+/// reasoning (catalog notes promise a non-reasoning variant later),
+/// and silently mapping `disabled` to `Low` would mask the user's
+/// expectation that no reasoning would happen at all.
+fn parse_effort(raw: &str) -> Option<ReasoningEffort> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        _ => None,
+    }
+}
+
+/// Read an env var into a [`ReasoningEffort`], falling back to the
+/// supplied default if the var is unset, empty, whitespace-only, or
+/// holds an unrecognised value. Mirrors [`env_or`]'s posture: a
+/// shell-script typo silently degrades to the default rather than
+/// crashing the provider.
+fn env_effort_or(name: &str, default: ReasoningEffort) -> ReasoningEffort {
+    match std::env::var(name) {
+        Ok(v) => parse_effort(&v).unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+/// Wire-format string xAI's chat/completions endpoint expects for the
+/// `reasoning_effort` body field. Three accepted values; anything
+/// else yields a 400 from the gateway.
+///
+/// xAI's Responses API (`/v1/responses`) uses a different shape for
+/// the same parameter — a nested object `{"reasoning":{"effort":
+/// "high"}}`. We post to chat/completions (OpenAI-compat), so the
+/// flat string form is what we send. If xAI ever migrates the chat/
+/// completions endpoint to the nested form, this helper plus its one
+/// callsite in [`XaiProvider::build_body`] is the only thing that
+/// needs to change.
+fn effort_wire_str(e: ReasoningEffort) -> &'static str {
+    match e {
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
     }
 }
 
@@ -180,13 +322,19 @@ impl XaiProvider {
         ApiKey::from_env_optional(XAI_API_KEY_ENV).map(|k| {
             let mut p = Self::new(http, k);
             p.config = XaiConfig::from_env();
-            // Log the resolved model identifiers at INFO so operators
-            // who set the env vars can confirm the override took
-            // effect. The model names are not secret.
+            // Log the resolved model identifiers and per-tier
+            // reasoning-effort levels at INFO so operators who set the
+            // env vars can confirm the override took effect. None of
+            // these values is secret. The effort line is the actual
+            // cost lever post-Session-43; the model line documents
+            // that the catalog still recommends a single string.
             tracing::info!(
                 frontier = %p.config.frontier_model,
                 workhorse = %p.config.workhorse_model,
                 cheap = %p.config.cheap_model,
+                frontier_effort = ?p.config.frontier_effort,
+                workhorse_effort = ?p.config.workhorse_effort,
+                cheap_effort = ?p.config.cheap_effort,
                 "xai: provider configured"
             );
             p
@@ -216,11 +364,33 @@ impl XaiProvider {
         }
         messages.push(json!({ "role": "user", "content": req.user }));
 
+        // Pick the reasoning effort per the documented precedence:
+        // request-level override wins (rare; usually a test pinning
+        // wire shape), otherwise fall back to the per-tier mapping
+        // configured on the provider. Per-source rules belong
+        // nowhere — see [`ReasoningEffort`] doc comment.
+        let effort = req
+            .reasoning_effort
+            .unwrap_or_else(|| self.config.effort_for(tier));
+
         let mut body = json!({
             "model": self.config.model_for(tier),
             "messages": messages,
             "max_tokens": req.max_tokens,
             "temperature": req.temperature,
+            // xAI's chat/completions endpoint accepts the flat
+            // `reasoning_effort` field (OpenAI-compat shape). The
+            // newer xAI Responses API (`/v1/responses`) uses a
+            // nested object instead — `{"reasoning":{"effort":...}}`
+            // — alongside an `input` field rather than `messages`.
+            // We post to chat/completions, so the flat form is
+            // correct here. If a live grok-4.3 run shows the legacy
+            // endpoint silently ignoring this parameter, the
+            // architectural follow-up is migrating to the Responses
+            // API; that change is out of scope for Session 43 and
+            // would be its own session because it touches the
+            // endpoint, the body shape, and the response parser.
+            "reasoning_effort": effort_wire_str(effort),
         });
 
         if let Some(schema) = &req.schema {
@@ -402,6 +572,11 @@ impl LlmProvider for XaiProvider {
             schema: request.schema.clone(),
             max_tokens: retry_max_tokens,
             temperature: request.temperature,
+            // Preserve the original effort across the retry: doubling
+            // the token budget is the only knob this path turns; the
+            // reasoning intensity stays whatever the first attempt
+            // resolved (request override or per-tier mapping).
+            reasoning_effort: request.reasoning_effort,
         };
         match self.send_one(tier, &retry_req, schema_requested).await {
             Ok(r) => {
@@ -560,6 +735,7 @@ mod tests {
             // values like 0.1 or 0.3 differ between f32 and f64
             // representations and would cause a spurious mismatch.
             temperature: 0.5,
+            reasoning_effort: None,
         };
         let body = p.build_body(ModelTier::Cheap, &req);
 
@@ -587,6 +763,7 @@ mod tests {
             schema: None,
             max_tokens: 8,
             temperature: 0.0,
+            reasoning_effort: None,
         };
         let body = p.build_body(ModelTier::Workhorse, &req);
         let messages = body["messages"].as_array().unwrap();
@@ -612,6 +789,7 @@ mod tests {
             schema: Some(schema),
             max_tokens: 128,
             temperature: 0.0,
+            reasoning_effort: None,
         };
         let body = p.build_body(ModelTier::Frontier, &req);
 
@@ -641,10 +819,47 @@ mod tests {
             frontier_model: "f".into(),
             workhorse_model: "w".into(),
             cheap_model: "c".into(),
+            frontier_effort: ReasoningEffort::High,
+            workhorse_effort: ReasoningEffort::Medium,
+            cheap_effort: ReasoningEffort::Low,
         };
         assert_eq!(cfg.model_for(ModelTier::Frontier), "f");
         assert_eq!(cfg.model_for(ModelTier::Workhorse), "w");
         assert_eq!(cfg.model_for(ModelTier::Cheap), "c");
+    }
+
+    #[test]
+    fn effort_for_maps_each_tier_to_its_configured_intensity() {
+        // Mirror of `model_for_maps_each_tier_to_its_configured_name` for
+        // the parallel cost-differentiation lever Session 43 added.
+        // Intentionally pick a *different* High/Medium/Low arrangement
+        // from the default so a regression that wires Frontier to
+        // Low (the cheap default) would fail this test, not silently
+        // pass on the same value.
+        let cfg = XaiConfig {
+            frontier_model: "f".into(),
+            workhorse_model: "w".into(),
+            cheap_model: "c".into(),
+            frontier_effort: ReasoningEffort::Low,
+            workhorse_effort: ReasoningEffort::High,
+            cheap_effort: ReasoningEffort::Medium,
+        };
+        assert_eq!(cfg.effort_for(ModelTier::Frontier), ReasoningEffort::Low);
+        assert_eq!(cfg.effort_for(ModelTier::Workhorse), ReasoningEffort::High);
+        assert_eq!(cfg.effort_for(ModelTier::Cheap), ReasoningEffort::Medium);
+    }
+
+    #[test]
+    fn xai_config_default_assigns_high_medium_low_per_tier() {
+        // The defaults are the actual cost-differentiation policy
+        // (Session 43): frontier authoring deserves the deep think,
+        // cheap propose-URL/classification gets fast and cheap. Pin
+        // the policy so a future "let's set everything to medium for
+        // safety" silent edit fails this test.
+        let cfg = XaiConfig::default();
+        assert_eq!(cfg.frontier_effort, ReasoningEffort::High);
+        assert_eq!(cfg.workhorse_effort, ReasoningEffort::Medium);
+        assert_eq!(cfg.cheap_effort, ReasoningEffort::Low);
     }
 
     #[test]
@@ -748,6 +963,12 @@ mod tests {
         std::env::remove_var(XAI_FRONTIER_MODEL_ENV);
         std::env::remove_var(XAI_WORKHORSE_MODEL_ENV);
         std::env::remove_var(XAI_CHEAP_MODEL_ENV);
+        // Session 43 effort env vars share the same lock; clearing
+        // them in the same helper keeps the model-env tests isolated
+        // from the new effort tests if they ever land between runs.
+        std::env::remove_var(XAI_FRONTIER_EFFORT_ENV);
+        std::env::remove_var(XAI_WORKHORSE_EFFORT_ENV);
+        std::env::remove_var(XAI_CHEAP_EFFORT_ENV);
     }
 
     #[test]
@@ -797,6 +1018,213 @@ mod tests {
         std::env::set_var(XAI_CHEAP_MODEL_ENV, "   \t  ");
         let cfg = XaiConfig::from_env();
         assert_eq!(cfg.cheap_model, XaiConfig::default().cheap_model);
+        clear_model_envs();
+    }
+
+    // -----------------------------------------------------------------
+    // Session 43 — reasoning-effort wire mapping + per-tier env overrides
+    //
+    // These tests pin two contracts:
+    //   1. The wire body carries `reasoning_effort` driven by the
+    //      provider's per-tier mapping, with a request-level Some(_)
+    //      taking precedence — that's the cost-tier-differentiation
+    //      lever Session 42 patch 4 deferred and Session 43 lands.
+    //   2. The three new env vars (`XAI_*_EFFORT`) follow the same
+    //      empty/whitespace-as-unset posture as the existing model
+    //      env vars; an unrecognised string degrades to default rather
+    //      than crashing the provider.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_body_emits_per_tier_reasoning_effort_from_default_config() {
+        // The default mapping: frontier=High, workhorse=Medium,
+        // cheap=Low. Verify each tier emits the corresponding wire
+        // string, with no request-level override.
+        let p = test_provider();
+        let req = CompletionRequest {
+            system: None,
+            user: "ping".into(),
+            schema: None,
+            max_tokens: 8,
+            temperature: 0.0,
+            reasoning_effort: None,
+        };
+
+        let frontier_body = p.build_body(ModelTier::Frontier, &req);
+        assert_eq!(
+            frontier_body["reasoning_effort"],
+            json!("high"),
+            "default frontier tier maps to 'high'"
+        );
+
+        let workhorse_body = p.build_body(ModelTier::Workhorse, &req);
+        assert_eq!(
+            workhorse_body["reasoning_effort"],
+            json!("medium"),
+            "default workhorse tier maps to 'medium'"
+        );
+
+        let cheap_body = p.build_body(ModelTier::Cheap, &req);
+        assert_eq!(
+            cheap_body["reasoning_effort"],
+            json!("low"),
+            "default cheap tier maps to 'low'"
+        );
+    }
+
+    #[test]
+    fn build_body_request_level_effort_overrides_tier_mapping() {
+        // A request-level Some(_) wins over the tier mapping. This
+        // is the per-call escape hatch for tests pinning wire shape
+        // — *not* a per-source routing knob (see ReasoningEffort
+        // doc comment).
+        let p = test_provider();
+        let req = CompletionRequest {
+            system: None,
+            user: "ping".into(),
+            schema: None,
+            max_tokens: 8,
+            temperature: 0.0,
+            // Request asks Low even though the Frontier tier would
+            // otherwise emit High from default config. Override wins.
+            reasoning_effort: Some(ReasoningEffort::Low),
+        };
+        let body = p.build_body(ModelTier::Frontier, &req);
+        assert_eq!(body["reasoning_effort"], json!("low"));
+    }
+
+    #[test]
+    fn build_body_uses_provider_config_effort_when_request_is_none() {
+        // Mirror of the previous test, configured via a non-default
+        // XaiConfig: Frontier configured at Low (artificial — this is
+        // exactly the scenario an operator setting XAI_FRONTIER_EFFORT=
+        // low for cost-savings would land in). Body should reflect it.
+        let cfg = XaiConfig {
+            frontier_model: "x".into(),
+            workhorse_model: "x".into(),
+            cheap_model: "x".into(),
+            frontier_effort: ReasoningEffort::Low,
+            workhorse_effort: ReasoningEffort::High,
+            cheap_effort: ReasoningEffort::Medium,
+        };
+        let provider = test_provider().with_config(cfg);
+        let req = CompletionRequest {
+            system: None,
+            user: "ping".into(),
+            schema: None,
+            max_tokens: 8,
+            temperature: 0.0,
+            reasoning_effort: None,
+        };
+        assert_eq!(
+            provider.build_body(ModelTier::Frontier, &req)["reasoning_effort"],
+            json!("low")
+        );
+        assert_eq!(
+            provider.build_body(ModelTier::Workhorse, &req)["reasoning_effort"],
+            json!("high")
+        );
+        assert_eq!(
+            provider.build_body(ModelTier::Cheap, &req)["reasoning_effort"],
+            json!("medium")
+        );
+    }
+
+    #[test]
+    fn effort_wire_str_emits_low_medium_high_strings() {
+        // The wire is sensitive to exact spelling; pin all three.
+        // Anything else risks a 400 from xAI's gateway. If xAI ever
+        // migrates chat/completions to the Responses-API nested form
+        // (`reasoning: {effort: ...}`), this helper *and* its sole
+        // caller in build_body change together — see the comment on
+        // `effort_wire_str` and `build_body`.
+        assert_eq!(effort_wire_str(ReasoningEffort::Low), "low");
+        assert_eq!(effort_wire_str(ReasoningEffort::Medium), "medium");
+        assert_eq!(effort_wire_str(ReasoningEffort::High), "high");
+    }
+
+    #[test]
+    fn parse_effort_accepts_low_medium_high_case_insensitively() {
+        // Shell scripts may export `LOW` or `Low`; trim and case-fold
+        // so they all land at the same enum.
+        assert_eq!(parse_effort("low"), Some(ReasoningEffort::Low));
+        assert_eq!(parse_effort("LOW"), Some(ReasoningEffort::Low));
+        assert_eq!(parse_effort("Medium"), Some(ReasoningEffort::Medium));
+        assert_eq!(parse_effort("HIGH"), Some(ReasoningEffort::High));
+        assert_eq!(parse_effort("  high  "), Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn parse_effort_rejects_unknown_values_returning_none() {
+        // Anything not in the accepted set yields None; the env helper
+        // translates None to "use default" rather than crashing the
+        // provider on a 400.
+        assert_eq!(parse_effort(""), None);
+        assert_eq!(parse_effort("   "), None);
+        assert_eq!(parse_effort("lo"), None);
+        assert_eq!(parse_effort("med"), None);
+        // Deliberately not aliased — see parse_effort doc comment.
+        assert_eq!(parse_effort("none"), None);
+        assert_eq!(parse_effort("disabled"), None);
+        assert_eq!(parse_effort("extreme"), None);
+    }
+
+    #[test]
+    fn xai_config_from_env_picks_up_effort_overrides() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_model_envs();
+        std::env::set_var(XAI_FRONTIER_EFFORT_ENV, "low");
+        std::env::set_var(XAI_CHEAP_EFFORT_ENV, "HIGH");
+        let cfg = XaiConfig::from_env();
+        assert_eq!(cfg.frontier_effort, ReasoningEffort::Low);
+        assert_eq!(cfg.cheap_effort, ReasoningEffort::High);
+        // Unset workhorse stays at default.
+        assert_eq!(
+            cfg.workhorse_effort,
+            XaiConfig::default().workhorse_effort
+        );
+        clear_model_envs();
+    }
+
+    #[test]
+    fn xai_config_from_env_treats_empty_effort_string_as_unset() {
+        // Same posture as the model-env tests — a blank export from a
+        // shell conditional stays at default rather than crashing on a
+        // 400.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_model_envs();
+        std::env::set_var(XAI_WORKHORSE_EFFORT_ENV, "");
+        let cfg = XaiConfig::from_env();
+        assert_eq!(
+            cfg.workhorse_effort,
+            XaiConfig::default().workhorse_effort
+        );
+        clear_model_envs();
+    }
+
+    #[test]
+    fn xai_config_from_env_treats_whitespace_only_effort_as_unset() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_model_envs();
+        std::env::set_var(XAI_CHEAP_EFFORT_ENV, "   \t  ");
+        let cfg = XaiConfig::from_env();
+        assert_eq!(cfg.cheap_effort, XaiConfig::default().cheap_effort);
+        clear_model_envs();
+    }
+
+    #[test]
+    fn xai_config_from_env_unrecognised_effort_value_falls_back_to_default() {
+        // A typo in shell scripting ("highest") should not crash the
+        // provider; it degrades to the tier's default.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_model_envs();
+        std::env::set_var(XAI_FRONTIER_EFFORT_ENV, "highest");
+        let cfg = XaiConfig::from_env();
+        assert_eq!(
+            cfg.frontier_effort,
+            XaiConfig::default().frontier_effort,
+            "typo degrades to default rather than crashing the provider"
+        );
         clear_model_envs();
     }
 
@@ -933,6 +1361,7 @@ mod tests {
             schema: None,
             max_tokens: 8,
             temperature: 0.0,
+            reasoning_effort: None,
         };
         let resp = provider
             .complete(ModelTier::Cheap, req)
@@ -965,6 +1394,7 @@ mod tests {
             schema: Some(schema),
             max_tokens: 64,
             temperature: 0.0,
+            reasoning_effort: None,
         };
         let resp = provider
             .complete(ModelTier::Workhorse, req)

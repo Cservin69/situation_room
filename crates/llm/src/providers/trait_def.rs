@@ -25,6 +25,36 @@ pub enum ModelTier {
     Cheap,
 }
 
+/// Reasoning intensity for models that expose it as a request parameter
+/// (xAI's `grok-4.3`, OpenAI's o-series, …).
+///
+/// `Low` returns faster and burns fewer reasoning tokens; `High` lets
+/// the model think longer for harder problems. The cost lever xAI now
+/// exposes after the May 2026 lineup consolidation is exactly this
+/// parameter — model-string swaps no longer differentiate cheap from
+/// frontier on xAI's catalog (Session 42 patch 4).
+///
+/// **Per-tier defaults live on the provider config**, e.g.
+/// [`crate::providers::grok::XaiConfig`]'s `frontier_effort` /
+/// `workhorse_effort` / `cheap_effort` fields. Callers normally leave
+/// [`CompletionRequest::reasoning_effort`] as `None` and let the
+/// provider pick from its tier mapping. Setting it explicitly on a
+/// [`CompletionRequest`] is for the rare callsite that needs to pin a
+/// specific value across tiers (e.g. a test asserting wire shape).
+///
+/// **Do not encode source-specific routing here.** A rule like "if
+/// URL host is X, use High" is the failure mode the operator has
+/// caught more than once across sessions; per-tier mapping is fine,
+/// per-source is not. The LLM is the only specialist that decides
+/// what each source needs — we only decide what the *tier* should
+/// cost-budget for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
 /// JSON schema constraint for structured output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StructuredOutputSchema {
@@ -45,6 +75,23 @@ pub struct CompletionRequest {
     pub max_tokens: u32,
     /// Sampling temperature, 0.0 – 1.0. Use low values for extraction.
     pub temperature: f32,
+    /// Optional per-call override of the provider's per-tier reasoning-
+    /// intensity default. `None` (the normal path) means "use whatever
+    /// the provider's per-tier mapping says for this tier" —
+    /// configured on the provider, not the call site. `Some(e)` pins
+    /// the request body's effort to `e` regardless of tier.
+    ///
+    /// Providers that don't currently expose a reasoning-intensity
+    /// parameter on the wire (Anthropic Messages today, OpenAI for
+    /// non-reasoning models, all current stubs) ignore this field
+    /// rather than pretend to honor it. The xAI provider is the only
+    /// one that maps it onto the wire today; see
+    /// [`crate::providers::grok`] for the per-tier mapping and the
+    /// body-field shape used.
+    ///
+    /// See [`ReasoningEffort`] for the principle on why per-source
+    /// rules belong nowhere.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// One completion response.

@@ -158,13 +158,21 @@ error-shaped output (see the schema) rather than inventing a mode.
   compliant — so filter expressions like `$[1][?(@.value)].value`
   (select children whose `value` field is truthy) and
   `$[1][?(@.value > 1000)].value` are supported and often
-  necessary. **For time-series JSON APIs whose most-recent rows
-  carry `null` for unpublished data (World Bank, OECD, Eurostat,
-  many country-stats endpoints), do NOT author a positional
-  index like `$[1][0].value` — index 0 hits the most recent
-  year, which is null every time.** Use a filter expression
-  instead. See "Type honesty" below for the failure shape this
-  avoids.
+  necessary. Author the path against the entries listed under
+  `--- JSON shape (parsed by serde_json) ---` in the prefetch
+  excerpt: those are the paths `serde_json` actually parsed out,
+  and the runtime queries the same crate at apply time. A path
+  annotated `null|number   ← polymorphic` is the trigger to
+  write a filter expression — that annotation means leading
+  values at this path were observed as `null` and only later
+  elements carried real numbers, so a positional index would
+  land on a null on every fetch. **For time-series JSON APIs
+  whose most-recent rows carry `null` for unpublished data
+  (World Bank, OECD, Eurostat, many country-stats endpoints),
+  do NOT author a positional index like `$[1][0].value` — index
+  0 hits the most recent year, which is null every time.** Use
+  a filter expression instead. See "Type honesty" below for the
+  failure shape this avoids.
 - `css_select` — for HTML pages. Fields: `selector` (CSS selector),
   optional `attribute` (pull an attribute rather than text). Author
   the selector against the elements listed under
@@ -778,9 +786,18 @@ with a structural digest produced by the same `scraper` parser the
 runtime queries at apply time — every `<table>`, `<ul>`, `<ol>`, and
 repeating `tag.class` selector is listed with its parsed shape so
 you author selectors against elements `scraper` confirmed match real
-markup. In both cases the framing is the runtime's view of the
-bytes, not a separate interpretation: a coordinate or selector you
-read off the excerpt is one the runtime will use unchanged.
+markup. When the source is JSON, the excerpt opens with a path/type
+outline produced by the same `serde_json` parser the runtime queries
+at apply time — every path listed is one the runtime will resolve,
+polymorphic leaves are annotated with their union type and a sample
+of leading values, so the leading-null pattern in time-series arrays
+is visible at authoring time. (Unlike PDF and HTML, the JSON outline
+sits *above* the raw bytes rather than replacing them — when you
+need a specific value to author a filter expression, scroll past
+the outline and read the bytes underneath.) In all three cases the
+framing is the runtime's view of the bytes, not a separate
+interpretation: a coordinate, selector, or path you read off the
+excerpt is one the runtime will use unchanged.
 
 **Treat this as a snapshot, not a schema.** Tomorrow's fetch will
 produce structurally similar content with different values. Your

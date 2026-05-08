@@ -369,6 +369,11 @@ pub async fn author_recipe(
         max_tokens: 4096,
         // Zero temperature: recipe authoring is extraction, not generation.
         temperature: 0.0,
+        // Tier mapping decides reasoning intensity (frontier → High by
+        // default on xAI — recipe authoring is the canonical frontier-
+        // tier call where the deep think is worth it). Per-call/per-
+        // source overrides are forbidden by ReasoningEffort's contract.
+        reasoning_effort: None,
     };
 
     let fingerprint = provider.id().to_string(); // stable provider id; key fingerprint
