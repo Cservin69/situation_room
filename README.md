@@ -179,4 +179,11 @@ crate you intend to touch.
 
 ## License
 
-See [`LICENSE`](LICENSE).
+**Starting from this point forward**, this project is licensed under the **PolyForm Noncommercial License 1.0.0**.
+
+- You may **freely copy, modify, and use** the code for **non-commercial** purposes (personal use, research, education, non-profit, etc.).
+- **Commercial use is not allowed** — this includes selling the software, offering it as a paid service, or using it in a commercial product without permission.
+
+Previous versions remain under the MIT License.
+
+If you need a **commercial license**, please contact me.
