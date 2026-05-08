@@ -2,14 +2,21 @@
 import type { PriorityTierDto } from "./PriorityTierDto";
 
 /**
- * Wire shape for a post-ADR-0015 document-source nomination. The
- * classifier emits the URL directly; the executor authors against
- * it without any registry lookup.
+ * Wire shape for a post-Session-39 document-source nomination.
+ *
+ * The classifier no longer emits URLs; URL discovery happens in the
+ * fetch executor's per-attempt propose-URL step. The plan persists
+ * only what it needs to drive that step: a stable `nomination_id`
+ * (server-stamped UUIDv7), a description specific enough that the
+ * propose-URL LLM can locate a real endpoint, and a priority tier
+ * for source-priority ordering in the UI.
  */
-export type DocumentSourceNominationDto = { description: string, endpoint_url: string, priority_tier: PriorityTierDto, 
+export type DocumentSourceNominationDto = { 
 /**
- * `null` on the wire when the LLM did not stamp a known_id (the
- * cold-start case). The frontend uses presence to decide whether
- * to show the recognized-source badge.
+ * UUIDv7 stamped at classify time. Stable across re-runs of the
+ * same plan even when the retry loop picks different URLs each
+ * run. Used as the `dedup_key` component on recipes; surfaces
+ * in the UI for traceability but is not the operator-friendly
+ * id on most screens.
  */
-known_id: string | null, };
+nomination_id: string, description: string, priority_tier: PriorityTierDto, };

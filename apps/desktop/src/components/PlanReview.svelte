@@ -362,29 +362,30 @@
       {#each plan.expectations.document_sources as s, i (i)}
         {#if s.kind === 'nomination'}
           <!--
-            ADR 0015 / Session 37: post-Session-37 plans carry
-            DocumentSourceEntryDto.Nomination — endpoint_url +
-            priority_tier + optional known_id. Rendered as the
-            primary-line URL with the tier badge and an optional
-            recognition chip.
+            Session 39: post-Session-39 plans carry description-only
+            nominations (no URL, no known_id). The propose-URL step
+            picks the URL each fetch attempt fetches; URLs surface on
+            the recipes / fetch-run panels, not here.
+
+            Rendered as: description as the primary line, tier as an
+            info chip, nomination_id as a short prefix for
+            traceability (matching the recipe-id-prefix convention).
           -->
           <ExpectationRow
             label={s.description}
-            rationale={s.endpoint_url}
+            rationale={'nomination ' + s.nomination_id.slice(0, 8)}
           >
             {#snippet aside()}
               <Chip label={s.priority_tier.replace(/_/g, ' ')} tone="info" />
-              {#if s.known_id}
-                <Chip label={'known: ' + s.known_id} tone="positive" />
-              {/if}
             {/snippet}
           </ExpectationRow>
         {:else if s.kind === 'legacy'}
           <!--
-            Pre-Session-37 plan persisted with DocumentSourceHintDto
-            on the wire as Legacy. Rendered with a clear
-            re-classify-to-update affordance — the executor will
-            surface RecipeOutcomeDto.LegacyPlanCannotAuthor for each
+            Pre-Session-39 plan (or pre-Session-37 plan with the older
+            hint shape) persisted with DocumentSourceHintDto on the
+            wire as Legacy. Rendered with a clear re-classify-to-update
+            affordance — the executor will surface
+            RecipeOutcomeDto.LegacyPlanCannotAuthor for each
             preferred_source_id when the operator hits Run Fetch on
             this plan.
           -->

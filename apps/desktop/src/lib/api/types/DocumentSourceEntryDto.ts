@@ -14,10 +14,14 @@ import type { DocumentSourceNominationDto } from "./DocumentSourceNominationDto"
  *
  * The frontend should:
  *
- * - For `Nomination`: render the new tile with the URL, tier, and
- *   optional known_id badge.
+ * - For `Nomination`: render the description, the priority-tier
+ *   badge, and the nomination_id (typically as a short prefix for
+ *   traceability, similar to how recipes show their id prefix).
+ *   No URL is shown at this layer — URLs are runtime artifacts of
+ *   the retry loop and live on the recipes / fetch-run surfaces.
  * - For `Legacy`: render a "legacy entry — re-classify to update"
- *   stub. The plan was classified before Session 37 / ADR 0015
- *   and its sources cannot be authored against without re-classification.
+ *   stub. The plan was classified before Session 39 (or before
+ *   Session 37, for pre-ADR-0015 plans) and its sources cannot be
+ *   authored against without re-classification.
  */
 export type DocumentSourceEntryDto = { "kind": "nomination" } & DocumentSourceNominationDto | { "kind": "legacy" } & DocumentSourceHintDto;

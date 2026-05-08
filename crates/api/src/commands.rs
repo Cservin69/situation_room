@@ -123,6 +123,10 @@ pub struct AppState {
     pub http: Arc<SecureHttpClient>,
     pub classifier_prompt: &'static str,
     pub recipe_author_prompt: &'static str,
+    /// The Session-39 propose-URL prompt — consumed by the fetch
+    /// executor's per-attempt URL-discovery step. Loaded the same way
+    /// as the other prompts (binary `include_str!`).
+    pub propose_url_prompt: &'static str,
     /// Doc-narrowed under ADR 0015 (Session 37). The classifier no
     /// longer consults this list; only the executor's `#[ignore]`
     /// live tests do (against `csv_demo` / `json_demo`). Production
@@ -155,6 +159,7 @@ impl AppState {
         http: Arc<SecureHttpClient>,
         classifier_prompt: &'static str,
         recipe_author_prompt: &'static str,
+        propose_url_prompt: &'static str,
         sources: Vec<PipelineSourceDescriptor>,
     ) -> Self {
         Self {
@@ -163,6 +168,7 @@ impl AppState {
             http,
             classifier_prompt,
             recipe_author_prompt,
+            propose_url_prompt,
             sources,
         }
     }
@@ -840,9 +846,13 @@ pub async fn run_fetch_for_plan(
         http: state.http.as_ref(),
         provider: state.provider.as_ref(),
         recipe_author_prompt: state.recipe_author_prompt,
+        propose_url_prompt: state.propose_url_prompt,
         // The same slice the classifier sees, threaded through to
-        // the executor for endpoint_hint lookup at Level-2 authoring
-        // time (Session 10, Option F).
+        // the executor. Doc-narrowed under ADR 0015 (Session 37) and
+        // further under Session 39: production authoring no longer
+        // consults this slice. Pass-through preserved for the
+        // `#[ignore]` live tests that author against the demo
+        // fixtures.
         sources: state.sources.as_slice(),
     };
 

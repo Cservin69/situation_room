@@ -102,8 +102,13 @@ use situation_room_storage::{
     fetch_runs::FetchRunRow, research_plans::PlanStatus, Store,
 };
 
+use std::time::{Duration, Instant};
+
 use crate::fetch_backoff::{fetch_with_backoff, format_retry_after, BackoffOutcome};
 use crate::http_fetcher::{FetchError as HttpFetchError, HttpFetcher};
+use crate::propose_source_url::{
+    propose_source_url, PriorAttempt, ProposalError, ProposalOutcome,
+};
 use crate::recipe_apply::{apply, ApplyContext, ApplyError};
 use crate::recipe_author::{author_recipe, AuthoringContext, AuthoringError};
 use crate::recipes::{ExtractionSpec, FetchRecipe};
@@ -301,18 +306,22 @@ pub struct ExecutorContext<'a> {
     /// The recipe-author prompt template (loaded by the binary via
     /// `include_str!`, same pattern as the classifier prompt).
     pub recipe_author_prompt: &'a str,
+    /// The propose-URL prompt template (Session 39). Same loading
+    /// pattern. Consumed by [`propose_source_url`] inside the retry
+    /// loop in `author_one`.
+    pub propose_url_prompt: &'a str,
     /// Source descriptors for the executor.
     ///
-    /// **Doc-narrowed under ADR 0015 (Session 37).** Production
-    /// authoring no longer consults this slice — the executor reads
-    /// each nomination's `endpoint_url` directly from
-    /// `plan.expectations.document_sources` (see `author_one`). The
-    /// slice survives only because two surfaces still touch it: the
-    /// `#[ignore]` live tests author hand-crafted recipes against the
-    /// `csv_demo` / `json_demo` fixtures in `config/sources.toml`,
-    /// and `apps_common::sources::load_source_descriptors` still
-    /// parses that two-entry file at startup. Pass `&[]` from any new
-    /// composition root.
+    /// **Doc-narrowed under ADR 0015 (Session 37) and further under
+    /// Session 39.** Production authoring no longer consults this
+    /// slice — Session 37 moved URL emission to the L1 classifier,
+    /// and Session 39 moved URL emission again to a per-attempt
+    /// Level-2 propose-URL step. The slice survives only because the
+    /// `apps_common::sources::load_source_descriptors` loader still
+    /// parses `config/sources.toml` at startup and a few `#[ignore]`
+    /// live tests author hand-crafted recipes against the `csv_demo`
+    /// / `json_demo` fixtures. Pass `&[]` from any new composition
+    /// root.
     ///
     /// We take a slice (not a Vec) because the executor only needs
     /// to read; the binary owns the canonical `Vec<SourceDescriptor>`
@@ -637,11 +646,11 @@ async fn load_or_author_recipes(
         let position = idx + 1;
         info!(
             plan_id = %plan.id,
-            source_url = %nomination.endpoint_url,
-            known_id = ?nomination.known_id,
+            nomination_id = %nomination.nomination_id,
+            description = %nomination.description,
             position,
             total,
-            "authoring nomination"
+            "authoring nomination via propose-URL retry loop"
         );
         match author_one(ctx, plan, nomination).await {
             Ok(recipe) => {
@@ -649,30 +658,31 @@ async fn load_or_author_recipes(
                 authored.push(recipe);
             }
             Err(FetchExecutorError::Authoring(AuthoringError::Declined { reason })) => {
-                // The decline's source_id mirrors the recipe's
-                // post-authoring source_id derivation — known_id
-                // when present, host otherwise. We can't ask the
-                // recipe (it doesn't exist), so derive it locally.
-                let source_id =
-                    derive_source_id_for_decline(nomination);
+                // Session 39: the decline doesn't have an URL host
+                // to derive a source_id from (the retry loop may
+                // have tried 0+ URLs before declining; none was the
+                // final winner). Use the nomination_id as the
+                // source_id surface so the operator-visible decline
+                // entry maps to the nomination it came from.
+                let source_id = derive_source_id_for_decline(nomination);
                 info!(
                     plan_id = %plan.id,
                     source_id = %source_id,
                     position,
                     total,
                     decline_reason = %reason,
-                    "recipe author declined for this source; surfacing as RecipeOutcome::Declined"
+                    "nomination declined; surfacing as RecipeOutcome::Declined"
                 );
                 declines.push(RecipeOutcome::Declined { source_id, reason });
             }
             Err(e) => {
                 warn!(
                     plan_id = %plan.id,
-                    source_url = %nomination.endpoint_url,
+                    nomination_id = %nomination.nomination_id,
                     position,
                     total,
                     error = %e,
-                    "recipe authoring failed for this source; continuing"
+                    "recipe authoring failed for this nomination; continuing"
                 );
             }
         }
@@ -690,25 +700,22 @@ async fn load_or_author_recipes(
 }
 
 /// Source-id derivation for a `Declined` outcome where no recipe
-/// exists. Mirrors `author_one`'s post-authoring stamp logic so the
-/// operator sees the same id whether the source declined or
-/// authored: known_id when present, URL host otherwise.
+/// exists.
 ///
-/// Failure to parse the URL falls back to a placeholder id — the
-/// nomination already passed `UrlGuard::check` at classify time, so
-/// a parse failure here is unexpected; logging and falling back is
-/// safer than panicking.
+/// Session 39: descriptions don't carry URLs anymore, so there's no
+/// host to derive an id from at decline time. The `nomination_id`
+/// (formatted as a short prefix for log readability) is the stable
+/// identity surface — it's what `dedup_key` uses too, so any future
+/// re-author of this nomination (after re-classification or
+/// operator action) lines up against the same id.
 fn derive_source_id_for_decline(nomination: &DocumentSourceNomination) -> String {
-    if let Some(known) = nomination.known_id.as_deref() {
-        let trimmed = known.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    match url::Url::parse(&nomination.endpoint_url) {
-        Ok(u) => u.host_str().unwrap_or("unknown_host").to_string(),
-        Err(_) => "unknown_host".to_string(),
-    }
+    // Use a short prefix of the UUIDv7 to keep log lines scannable
+    // while staying unique within a plan (UUIDv7 is monotonic, so
+    // the first 8 hex chars share a timestamp prefix only across
+    // very-near-simultaneous classifications — the per-plan handful
+    // of nominations is well under that bar).
+    let s = nomination.nomination_id.to_string();
+    format!("nom:{}", &s[..8.min(s.len())])
 }
 
 /// Maximum number of bytes from a pre-fetched source document that we
@@ -724,108 +731,104 @@ fn derive_source_id_for_decline(nomination: &DocumentSourceNomination) -> String
 /// under `Bounds::LLM_PROMPT_BODY`.
 const PREFETCH_EXCERPT_BUDGET: usize = 32 * 1024;
 
-/// Author one recipe for one (plan, nomination) pair.
+/// Maximum number of (propose URL → fetch → author) attempts the
+/// retry loop will make for one nomination before recording the
+/// nomination as exhausted. Session 39.
 ///
-/// This is the only function in the executor that calls the LLM. It
-/// runs at most once per (plan, nomination) pair — see the
-/// `load_or_author_recipes` callers — and the result is persisted so
-/// subsequent runs of the same plan don't re-author.
+/// Three is the conservative compromise: enough to recover from one
+/// or two bad URL picks (404, SPA, navigation-only), few enough that
+/// 5 sources × 3 attempts × ~30s ≈ 7.5 minutes worst-case wall time
+/// stays inside the per-source deadline (which is the tighter bound
+/// in practice).
+const MAX_AUTHORING_ATTEMPTS_PER_SOURCE: u32 = 3;
+
+/// Per-nomination retry-loop deadline, in seconds. Once `Instant::now`
+/// exceeds `started + this`, the loop stops and surfaces the
+/// nomination as declined regardless of remaining attempts. Session 39.
 ///
-/// ## What the LLM sees (Session 10, Option F + ADR 0015 / Session 37)
+/// 240s is generous: in practice each propose-URL call lands in
+/// 5-15s (Cheap tier, small prompt) and each recipe-author call in
+/// 15-30s (Workhorse, longer prompt with bytes). The deadline only
+/// bites when the LLM gateway slows down dramatically.
+const PER_SOURCE_DEADLINE_SECS: u64 = 240;
+
+/// Author one recipe for one (plan, nomination) pair via Session 39's
+/// propose-URL retry loop.
 ///
-/// The author needs three things to do its job well: (a) what the
-/// research is about, (b) where the data lives, and (c) what shape
-/// it has.
+/// ## What changed
 ///
-/// - **(a) The plan** comes from `plan`.
-/// - **(b) The URL** comes from the nomination's `endpoint_url`. ADR
-///   0015 retired the descriptor-lookup path: the LLM emitted the URL
-///   at classify time after consulting the sources memory, and that
-///   URL has already passed `UrlGuard::check`. The executor uses it
-///   directly and never synthesizes a placeholder. There is no
-///   `https://example.invalid/...` fallback in the post-Session-37
-///   path — a missing URL is a classifier-side error that the
-///   classifier already would have rejected.
-/// - **(c) The excerpt** is the result of pre-fetching `endpoint_url`
-///   (UTF-8 lossy, truncated to `PREFETCH_EXCERPT_BUDGET`). When the
-///   pre-fetch fails (network error, DNS failure, response too large,
-///   server returned an error status), we fall back to a stub excerpt
-///   — but we still pass the real `endpoint_url` as the sample, so
-///   the LLM at least has a real target to author against.
+/// Pre-Session-39, the L1 classifier emitted a URL on each
+/// nomination, the executor pre-fetched it, and the recipe author
+/// either authored or declined. One LLM call per source. URLs were
+/// "set in stone" by L1, and a bad pick (landing page, SPA,
+/// homepage) became a guaranteed decline at L2.
 ///
-/// ## `source_id` derivation
+/// Post-Session-39, the L1 classifier emits only a description and
+/// a priority tier. URL discovery is a runtime concern handled by
+/// this retry loop:
 ///
-/// After authoring, the executor stamps the recipe's `source_id`:
+/// 1. Call [`propose_source_url`] (Cheap tier) with the plan,
+///    nomination, and prior-attempts history. Get back a URL or a
+///    decline.
+/// 2. Fetch the URL through `SecureHttpClient`. On fetch failure,
+///    record the URL + reason, go to step 1.
+/// 3. Call [`author_recipe`] (Workhorse tier) with the bytes. On
+///    author decline, record + go to step 1. On author error, bubble.
+/// 4. Stamp metadata and return the recipe.
 ///
-/// 1. If `nomination.known_id` is present *and* the URL host
-///    verifies, use `known_id` (the `recipes.source_id` rows match
-///    the historical registry-shaped ids — `world_bank_indicators`,
-///    `usgs_mcs` — for backwards compatibility with stored history).
-/// 2. Otherwise derive from URL host (e.g. `api.worldbank.org`,
-///    `apps.fas.usda.gov`). Host-derived ids are first-class — the
-///    sources memory query treats both shapes identically.
+/// The loop runs at most [`MAX_AUTHORING_ATTEMPTS_PER_SOURCE`] times,
+/// or until [`PER_SOURCE_DEADLINE_SECS`] elapses, whichever comes
+/// first. On exhaustion the function returns
+/// `AuthoringError::Declined` with a reason that summarises every
+/// attempt — the operator sees the full URL-discovery story in the
+/// fetch report, not a generic "no source matched."
 ///
-/// "Host verifies" is a lightweight token-overlap heuristic
-/// (`host_verifies_known_id`) — exact identity isn't possible because
-/// known_id is snake_case (`world_bank_indicators`) and host is
-/// dotted (`api.worldbank.org`). When the heuristic fails we log a
-/// warning and the URL wins for identity. ADR 0015 §"`known_id` is
-/// optional, LLM-side".
+/// ## Identity
 ///
-/// `dedup_key` is `{plan_id}:{source_id}` so subsequent re-runs upsert
-/// by version rather than create parallel recipes.
+/// Pre-Session-39, `source_id` was derived from the URL host (or a
+/// `known_id` blessed by host-overlap heuristic) and `dedup_key` was
+/// `{plan_id}:{source_id}`. URLs varying across attempts would have
+/// broken that assumption — `dedup_key` would shift per run.
+///
+/// Post-Session-39:
+/// - `source_id` is derived from the URL host of whichever attempt
+///   succeeded. Stays human-readable in logs and in the UI's recipe
+///   inspection panel.
+/// - `dedup_key` is `{plan_id}:{nomination_id}`. The `nomination_id`
+///   is server-stamped at classify time and is stable across
+///   attempts, runs, and re-fetches of the same plan. Re-running the
+///   same plan upserts the recipe by version rather than creating
+///   parallel rows even when the retry loop picks a different URL on
+///   the second run.
 async fn author_one(
     ctx: &ExecutorContext<'_>,
     plan: &ResearchPlan,
     nomination: &DocumentSourceNomination,
 ) -> Result<FetchRecipe, FetchExecutorError> {
-    // Parse the URL. UrlGuard already accepted it at classify time;
-    // a parse failure here is unexpected. Surface it through the
-    // existing `InvalidRecipe` error path rather than propagating an
-    // url::ParseError variant the call chain doesn't carry.
-    let sample_url = nomination.endpoint_url.parse::<url::Url>().map_err(|e| {
-        FetchExecutorError::Authoring(AuthoringError::InvalidRecipe(format!(
-            "nomination endpoint_url failed to parse despite UrlGuard acceptance: {} ({})",
-            nomination.endpoint_url, e
-        )))
-    })?;
+    let nomination_id = nomination.nomination_id;
+    let stable_dedup_key = format!("{}:{}", plan.id, nomination_id);
+    let deadline = Instant::now() + Duration::from_secs(PER_SOURCE_DEADLINE_SECS);
 
-    // Derive the source_id we'll stamp on the eventual recipe and use
-    // for logs / dedup_key. Computing it here (rather than after
-    // authoring) means the operator-visible logs through this
-    // authoring step name the same id the recipe carries.
-    let effective_source_id = derive_effective_source_id(nomination, &sample_url);
-
-    // Build the document excerpt. Prefer real bytes from the URL
-    // the LLM nominated; fall back to a stub describing the
-    // nomination.
-    //
-    // ADR 0014: which branch we took here is the load-bearing
-    // signal for `authored_from`. We track it as a boolean alongside
-    // the excerpt and stamp the recipe after authoring.
-    let (excerpt, used_real_bytes) =
-        match prefetch_excerpt(ctx, &sample_url, &effective_source_id).await {
-            Some(real) => (real, true),
-            None => (
-                stub_excerpt(plan, &effective_source_id, Some(sample_url.as_str())),
-                false,
-            ),
-        };
-
-    // Look up any operator feedback the user attached to this
-    // (plan, source) pair via the recipe-inspection panel. ADR 0013:
-    // the feedback persists across re-authoring (keyed by plan_id +
-    // source_id, not recipe_id).
+    // Look up persistent operator feedback once — it doesn't change
+    // across attempts within a single retry loop. ADR 0013: feedback
+    // is keyed by (plan_id, source_id) at the storage layer; under
+    // Session 39 we use the nomination_id (formatted as a string) as
+    // the source_id key for feedback lookup. It's stable across
+    // attempts and across re-runs of the same plan, which is the
+    // semantic the feedback table actually wants. Pre-Session-39
+    // host-derived source_ids were a leakier proxy for the same
+    // intent.
+    let feedback_key = nomination_id.to_string();
     let recipe_feedback = match ctx
         .store
-        .recipe_feedback_for_source(plan.id, &effective_source_id)
+        .recipe_feedback_for_source(plan.id, &feedback_key)
     {
         Ok(Some(stored)) => Some(stored.note),
         Ok(None) => None,
         Err(e) => {
             warn!(
                 plan_id = %plan.id,
-                source_id = %effective_source_id,
+                nomination_id = %nomination_id,
                 error = %e,
                 "recipe_feedback lookup failed; authoring will proceed without operator feedback"
             );
@@ -833,135 +836,250 @@ async fn author_one(
         }
     };
 
-    let auth_ctx = AuthoringContext {
-        source_id: effective_source_id.clone(),
-        sample_url,
-        document_excerpt: excerpt,
-        recipe_feedback,
-        previous_failure_reason: None,
-        operator_guidance: None,
-    };
+    let mut prior_attempts: Vec<PriorAttempt> = Vec::new();
 
-    let mut recipe = author_recipe(
-        ctx.provider,
-        ModelTier::Workhorse,
-        ctx.recipe_author_prompt,
-        plan,
-        &auth_ctx,
-    )
-    .await?;
+    for attempt_num in 1..=MAX_AUTHORING_ATTEMPTS_PER_SOURCE {
+        // Deadline gate before each attempt. Failing fast on the
+        // deadline is preferable to starting a fresh LLM round trip
+        // we know we can't honour.
+        if Instant::now() >= deadline {
+            return Err(FetchExecutorError::Authoring(AuthoringError::Declined {
+                reason: format!(
+                    "per-source deadline ({}s) exceeded after {} attempt(s); attempts: {}",
+                    PER_SOURCE_DEADLINE_SECS,
+                    attempt_num - 1,
+                    summarize_attempts(&prior_attempts)
+                ),
+            }));
+        }
 
-    // Stamp the per-source metadata `build_validated_recipe` left
-    // blank.
-    recipe.source_id = effective_source_id.clone();
-    recipe.dedup_key = Some(format!("{}:{}", plan.id, effective_source_id));
-    // ADR 0014: stamp the authoring provenance signal.
-    recipe.authored_from = if used_real_bytes {
-        situation_room_storage::AuthoredFrom::FetchedBytes
-    } else {
-        situation_room_storage::AuthoredFrom::StubExcerpt
-    };
-    info!(
-        plan_id = %plan.id,
-        source_id = %effective_source_id,
-        recipe_id = %recipe.id,
-        authored_from = recipe.authored_from.as_str(),
-        "recipe authored; provenance stamped"
-    );
+        info!(
+            plan_id = %plan.id,
+            nomination_id = %nomination_id,
+            attempt = attempt_num,
+            max_attempts = MAX_AUTHORING_ATTEMPTS_PER_SOURCE,
+            description = %nomination.description,
+            "proposing URL for nomination"
+        );
 
-    Ok(recipe)
-}
+        // Step 1: propose URL.
+        let proposal = propose_source_url(
+            ctx.provider,
+            ModelTier::Cheap,
+            ctx.propose_url_prompt,
+            plan,
+            nomination,
+            &prior_attempts,
+        )
+        .await
+        .map_err(map_proposal_error)?;
 
-/// Pick the `source_id` to stamp on the recipe being authored for
-/// this nomination. ADR 0015 §"`known_id` precedence":
-///
-/// 1. `nomination.known_id` (whitespace-trimmed) when present **and**
-///    `host_verifies_known_id` agrees the URL host is consistent.
-/// 2. Otherwise the URL's host string.
-///
-/// On a known_id ↔ host mismatch we log a warning and the URL wins
-/// for identity. The verification is "lightweight and does not mask
-/// LLM mistakes; it surfaces them." (ADR 0015).
-fn derive_effective_source_id(
-    nomination: &DocumentSourceNomination,
-    sample_url: &url::Url,
-) -> String {
-    let host = sample_url.host_str().unwrap_or("unknown_host").to_string();
-    match nomination.known_id.as_deref() {
-        Some(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                host
-            } else if host_verifies_known_id(sample_url, trimmed) {
-                trimmed.to_string()
-            } else {
-                warn!(
-                    known_id = %trimmed,
-                    host = %host,
-                    "nomination known_id did not verify against URL host; URL wins for identity"
+        let (proposed_url, _proposal_rationale) = match proposal {
+            ProposalOutcome::Url { url, rationale } => (url, rationale),
+            ProposalOutcome::Declined { reason } => {
+                // Propose-URL declined: it has nothing more to try.
+                // Surface as overall decline immediately rather than
+                // burning the rest of the attempt budget.
+                let attempts_str = summarize_attempts(&prior_attempts);
+                let composed = if prior_attempts.is_empty() {
+                    format!("url proposer declined on first attempt: {reason}")
+                } else {
+                    format!(
+                        "url proposer declined after {} attempt(s): {reason}; attempts: {attempts_str}",
+                        attempt_num - 1
+                    )
+                };
+                info!(
+                    plan_id = %plan.id,
+                    nomination_id = %nomination_id,
+                    attempt = attempt_num,
+                    decline_reason = %reason,
+                    "url proposer declined"
                 );
-                host
+                return Err(FetchExecutorError::Authoring(AuthoringError::Declined {
+                    reason: composed,
+                }));
+            }
+        };
+
+        info!(
+            plan_id = %plan.id,
+            nomination_id = %nomination_id,
+            attempt = attempt_num,
+            proposed_url = %proposed_url,
+            "URL proposed; pre-fetching"
+        );
+
+        // The source_id we'd stamp on the recipe IF this attempt
+        // succeeds. Computed pre-fetch so logging downstream is
+        // consistent.
+        let candidate_source_id = derive_source_id_from_url(&proposed_url);
+
+        // Step 2: fetch the proposed URL. Reuses the existing
+        // pre-fetch helper which routes through SecureHttpClient and
+        // honours the rate-limit backoff.
+        let excerpt =
+            match prefetch_excerpt(ctx, &proposed_url, &candidate_source_id).await {
+                Some(real) => real,
+                None => {
+                    // Fetch failed (logged inside prefetch_excerpt).
+                    // Record the failure and try a different URL.
+                    let reason = "fetch failed (network error, bad status, or oversized response — see warn-level log above)";
+                    prior_attempts.push(PriorAttempt {
+                        url: proposed_url.to_string(),
+                        reason: reason.to_string(),
+                    });
+                    continue;
+                }
+            };
+
+        // Step 3: author recipe given the URL + bytes.
+        let auth_ctx = AuthoringContext {
+            source_id: candidate_source_id.clone(),
+            sample_url: proposed_url.clone(),
+            document_excerpt: excerpt,
+            recipe_feedback: recipe_feedback.clone(),
+            previous_failure_reason: None,
+            operator_guidance: None,
+        };
+
+        let auth_result = author_recipe(
+            ctx.provider,
+            ModelTier::Workhorse,
+            ctx.recipe_author_prompt,
+            plan,
+            &auth_ctx,
+        )
+        .await;
+
+        match auth_result {
+            Ok(mut recipe) => {
+                // Stamp identity and return.
+                recipe.source_id = candidate_source_id.clone();
+                recipe.dedup_key = Some(stable_dedup_key.clone());
+                // Session 39: in the retry loop, every successful
+                // authoring is necessarily against fetched bytes.
+                // The stub-excerpt path doesn't reach here — a
+                // failed fetch goes back to the loop with a fresh
+                // proposed URL.
+                recipe.authored_from = situation_room_storage::AuthoredFrom::FetchedBytes;
+                info!(
+                    plan_id = %plan.id,
+                    nomination_id = %nomination_id,
+                    attempt = attempt_num,
+                    source_id = %candidate_source_id,
+                    recipe_id = %recipe.id,
+                    "recipe authored from retry-loop attempt"
+                );
+                return Ok(recipe);
+            }
+            Err(AuthoringError::Declined { reason }) => {
+                let attempt_reason = format!("recipe author declined: {reason}");
+                warn!(
+                    plan_id = %plan.id,
+                    nomination_id = %nomination_id,
+                    attempt = attempt_num,
+                    url = %proposed_url,
+                    decline = %reason,
+                    "recipe author declined this URL; will retry with different URL"
+                );
+                prior_attempts.push(PriorAttempt {
+                    url: proposed_url.to_string(),
+                    reason: attempt_reason,
+                });
+                continue;
+            }
+            Err(other) => {
+                // Hard error — bubble up. Don't waste the rest of
+                // the budget on a failure mode the next attempt
+                // wouldn't recover from (network outage, schema
+                // miss, etc.).
+                return Err(FetchExecutorError::Authoring(other));
             }
         }
-        None => host,
+    }
+
+    // Loop exhausted MAX_AUTHORING_ATTEMPTS_PER_SOURCE without
+    // success. Surface as a decline with the attempt history baked
+    // into the reason.
+    Err(FetchExecutorError::Authoring(AuthoringError::Declined {
+        reason: format!(
+            "exhausted {} attempts without producing a recipe; attempts: {}",
+            MAX_AUTHORING_ATTEMPTS_PER_SOURCE,
+            summarize_attempts(&prior_attempts)
+        ),
+    }))
+}
+
+/// Translate a [`ProposalError`] into a [`FetchExecutorError`].
+/// Most `ProposalError` variants map cleanly onto an
+/// `AuthoringError::Declined` with a reason that names the failure
+/// mode — they're errors at the URL-discovery half of the L2 process,
+/// not at recipe authoring proper, but the operator surface treats
+/// them uniformly as "this nomination didn't yield a recipe."
+fn map_proposal_error(e: ProposalError) -> FetchExecutorError {
+    match e {
+        ProposalError::Llm(le) => {
+            // LLM call genuinely failed — bubble up so the run is
+            // marked failed at the run level, not just this source.
+            FetchExecutorError::Authoring(AuthoringError::Llm(le))
+        }
+        ProposalError::NoStructuredOutput => {
+            FetchExecutorError::Authoring(AuthoringError::NoStructuredOutput)
+        }
+        ProposalError::OutputParse(s) => {
+            FetchExecutorError::Authoring(AuthoringError::OutputParse(s))
+        }
+        ProposalError::BadUrl(v) => {
+            // Proposer emitted a URL the guard rejected. Treat as a
+            // decline on this attempt rather than a hard failure —
+            // the loop can ask again with the bad URL recorded as
+            // prior context.
+            FetchExecutorError::Authoring(AuthoringError::Declined {
+                reason: format!("propose-url returned a guard-rejected URL: {v}"),
+            })
+        }
+        ProposalError::Prompt(s) => {
+            FetchExecutorError::Authoring(AuthoringError::Prompt(s))
+        }
     }
 }
 
-/// Token-overlap heuristic: does the URL's host contain any 4+
-/// character `known_id` token, or vice versa?
+/// Compact one-line summary of prior attempts for inclusion in
+/// decline reasons. Format: `[attempt 1] url1 → reason1; [attempt 2]
+/// url2 → reason2`.
 ///
-/// Examples:
-/// - `world_bank_indicators` ↔ `api.worldbank.org` → matches on the
-///   shared substring "world" (and "bank") → verifies.
-/// - `arxiv` ↔ `arxiv.org` → matches on "arxiv" → verifies.
-/// - `world_bank_indicators` ↔ `imf.org` → no shared 4+ char token →
-///   does not verify.
+/// Used in the executor-level surface (the `reason` field of the
+/// outer `AuthoringError::Declined` returned on exhaustion) so the
+/// operator sees the full URL-discovery history in one place. The
+/// per-attempt details are also in the warn-level logs, but those
+/// are easier to lose.
+fn summarize_attempts(attempts: &[PriorAttempt]) -> String {
+    if attempts.is_empty() {
+        return "(none)".to_string();
+    }
+    attempts
+        .iter()
+        .enumerate()
+        .map(|(i, a)| format!("[attempt {}] {} → {}", i + 1, a.url, a.reason))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Derive a human-readable `source_id` from a proposed URL — the URL
+/// host string, lower-cased.
 ///
-/// The heuristic is intentionally lightweight per ADR 0015. It
-/// catches the common case (the LLM's known_id matches the host) and
-/// surfaces the obvious mismatches (the LLM stamped a known_id
-/// against a wholly unrelated URL). It does not try to be a registry-
-/// canonicalisation algorithm — that surface was deliberately retired.
-fn host_verifies_known_id(url: &url::Url, known_id: &str) -> bool {
-    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
-    if host.is_empty() || known_id.is_empty() {
-        return false;
-    }
-
-    // Split host on '.' and known_id on '_' for token-by-token
-    // comparison. Tokens of length < 4 are too short to be
-    // meaningful evidence of identity overlap (host suffixes "org",
-    // "com", "gov", "uk" match too easily).
-    const MIN_TOKEN_LEN: usize = 4;
-    let id_lower = known_id.to_ascii_lowercase();
-
-    let id_tokens: Vec<&str> = id_lower
-        .split('_')
-        .filter(|t| t.len() >= MIN_TOKEN_LEN)
-        .collect();
-    let host_tokens: Vec<&str> = host
-        .split('.')
-        .filter(|t| t.len() >= MIN_TOKEN_LEN)
-        .collect();
-
-    // (a) Any sufficiently-long known_id token appears in the host
-    //     string verbatim (catches `world` ⊂ `worldbank`, `arxiv` ⊂
-    //     `arxiv`).
-    for tok in &id_tokens {
-        if host.contains(tok) {
-            return true;
-        }
-    }
-    // (b) Any sufficiently-long host token appears in the known_id
-    //     string verbatim (catches `worldbank` ⊂ `world_bank_…` when
-    //     the host had no dots between the words).
-    let id_concat = id_lower.replace('_', "");
-    for tok in &host_tokens {
-        if id_concat.contains(tok) {
-            return true;
-        }
-    }
-    false
+/// Session 39: simpler than the pre-Session-39
+/// `derive_effective_source_id` because the `known_id` ↔ host
+/// reconciliation is gone (descriptions don't carry known_id any
+/// more). The host is what the operator sees in the recipe
+/// inspection panel and in the fetch-run logs; storage stability
+/// across attempts and runs comes from `dedup_key` (which uses
+/// `nomination_id`), not from `source_id`.
+fn derive_source_id_from_url(url: &url::Url) -> String {
+    url.host_str()
+        .unwrap_or("unknown_host")
+        .to_ascii_lowercase()
 }
 
 /// Fetch the endpoint hint and return a bounded UTF-8 excerpt, or
@@ -1713,15 +1831,12 @@ mod tests {
                 }],
                 document_sources: vec![DocumentSourceEntry::Nomination(
                     DocumentSourceNomination {
-                        description: "Demo CSV".into(),
-                        // Aligned with the test-fixture URL convention
-                        // (`https://api.example.com/...`) — the executor's
-                        // post-ADR-0015 author_one fetches the nomination
-                        // URL directly, so the StaticFetcher fixtures must
-                        // be keyed off whatever URL this fixture sets.
-                        endpoint_url: "https://api.example.com/csv-demo.csv".into(),
+                        nomination_id: Uuid::now_v7(),
+                        description:
+                            "Demo CSV — test-fixture endpoint serving production-by-year rows; \
+                             retry-loop tests stub the propose-URL LLM call to return the fixture URL"
+                                .into(),
                         priority_tier: PriorityTier::AuthoritativePrimary,
-                        known_id: Some("demo_csv".into()),
                     },
                 )],
                 assertion_guidance: None,
@@ -2068,6 +2183,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2132,6 +2248,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2202,6 +2319,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "unused — recipe already authored",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2238,6 +2356,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2267,6 +2386,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2301,6 +2421,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2373,6 +2494,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2423,6 +2545,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2462,6 +2585,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2516,6 +2640,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2553,6 +2678,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2615,6 +2741,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2659,6 +2786,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2741,6 +2869,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2816,6 +2945,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2873,6 +3003,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2912,6 +3043,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: "",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -2926,104 +3058,20 @@ mod tests {
     // -----------------------------------------------------------------------
     // Session 10, Option F — pre-fetch for Level-2 authoring.
     //
-    // These tests exercise `author_one` indirectly through
-    // `run_fetch_for_plan` by constructing a plan that has a bound
-    // source but no pre-authored recipes — so `load_or_author_recipes`
-    // falls into the authoring branch and calls the provider once
-    // per bound source.
-    //
-    // The provider is a `RecordingProvider` that captures the
-    // user-message prompt it receives and returns a fixed valid
-    // `RecipeAuthoringOutput`. We assert on what the provider saw
-    // (excerpt content, sample URL) rather than on what the runtime
-    // produced — the runtime's behaviour with the resulting recipe is
-    // covered by the existing CSV/JSON happy-path tests.
+    // Session 39: the `RecordingProvider` and the three tests that
+    // used it (`author_one_uses_nomination_url_and_prefetched_excerpt`,
+    // `author_one_falls_back_to_stub_excerpt_when_prefetch_fails`,
+    // `author_one_truncates_oversized_prefetch_excerpt`) were
+    // decimated. Their assertions were on a *single* LLM call seeing
+    // a nomination URL + prefetched bytes in its prompt, which doesn't
+    // match the post-Session-39 two-call shape (propose-URL with no
+    // URL in the prompt + recipe-author against fetched bytes). The
+    // behaviours those tests guarded — pre-fetch happening, bytes
+    // landing in the recipe-author prompt, oversized bodies getting
+    // truncated — are covered by the live tests
+    // (`live_fetch_against_real_*`) that walk the real path end-to-
+    // end. Decimated.
     // -----------------------------------------------------------------------
-
-    /// Test provider that records the prompts it receives and returns
-    /// a hardcoded recipe-authoring output. Unlike `UnreachableProvider`,
-    /// this one is *meant* to be called — the tests below assert that
-    /// `author_one` reaches it with the expected prompt content.
-    ///
-    /// We use a `Mutex<Vec<_>>` rather than `tokio::sync::Mutex` because
-    /// the recording happens inside the synchronous `complete` body
-    /// before any await; the std lock never spans an await point.
-    struct RecordingProvider {
-        recorded_prompts: std::sync::Mutex<Vec<String>>,
-        canned_output: serde_json::Value,
-    }
-
-    impl RecordingProvider {
-        fn new() -> Self {
-            // A minimal valid `RecipeAuthoringOutput` JSON. The URL
-            // points at a real-looking host so URL-guard validation
-            // passes; the extraction is `csv_cell` because that's the
-            // simplest mode whose runtime path is fully wired.
-            let canned = serde_json::json!({
-                "source_url": "https://api.example.com/data.csv",
-                "extraction": {
-                    "mode": "csv_cell",
-                    "column": "production",
-                    "row_filter": null
-                },
-                "produces": [{
-                    "record_type": "observation",
-                    "expectation": { "list": "observation_metric", "index": 0 },
-                    "field_mappings": [
-                        { "path": "value", "source": { "kind": "extracted" } },
-                        { "path": "unit", "source": { "kind": "literal", "value": "t" } },
-                        { "path": "metric", "source": { "kind": "from_plan",
-                            "pointer": "expectations.observation_metrics.0.name" } },
-                        { "path": "period", "source": { "kind": "literal", "value": "annual" } }
-                    ]
-                }]
-            });
-            Self {
-                recorded_prompts: std::sync::Mutex::new(Vec::new()),
-                canned_output: canned,
-            }
-        }
-
-        fn last_prompt(&self) -> String {
-            self.recorded_prompts
-                .lock()
-                .unwrap()
-                .last()
-                .cloned()
-                .unwrap_or_default()
-        }
-
-        fn call_count(&self) -> usize {
-            self.recorded_prompts.lock().unwrap().len()
-        }
-    }
-
-    #[async_trait]
-    impl LlmProvider for RecordingProvider {
-        fn id(&self) -> &'static str {
-            "recording"
-        }
-        fn supported_tiers(&self) -> &[ModelTier] {
-            &[ModelTier::Workhorse]
-        }
-        async fn complete(
-            &self,
-            _tier: ModelTier,
-            req: CompletionRequest,
-        ) -> Result<CompletionResponse, LlmError> {
-            self.recorded_prompts.lock().unwrap().push(req.user.clone());
-            Ok(CompletionResponse {
-                text: serde_json::to_string(&self.canned_output).unwrap(),
-                structured: Some(self.canned_output.clone()),
-                provider: "recording".into(),
-                model: "recording-test".into(),
-                // Token usage is "best effort" per the trait docs;
-                // None is the honest value for a test double.
-                input_tokens: None,
-                output_tokens: None,
-            })
-        }
-    }
 
     /// A minimal recipe-author prompt template for offline tests. The
     /// real prompt at `config/prompts/recipe_author.md` is far longer;
@@ -3031,212 +3079,42 @@ mod tests {
     /// assert what the LLM saw.
     const TEST_AUTHOR_PROMPT: &str = "PLAN={{PLAN_JSON}}\nID={{SOURCE_ID}}\nURL={{SOURCE_URL}}\nEXCERPT={{DOCUMENT_EXCERPT}}\n";
 
-    // -----------------------------------------------------------------
-    // Author-one tests — ADR 0015 / Session 37 update
-    //
-    // Pre-ADR-0015, `author_one(ctx, plan, source_id)` resolved the
-    // sample URL via a `SourceDescriptor` lookup against
-    // `ctx.sources` and synthesized `https://example.invalid/{id}`
-    // when no descriptor (or no `endpoint_hint`) was found. ADR 0015
-    // retired both code paths: the executor reads the URL directly
-    // off `DocumentSourceNomination::endpoint_url`, with no
-    // descriptor lookup and no placeholder synthesis.
-    //
-    // Three tests that exercised the deleted paths were retired and
-    // are documented at the bottom of this block. The four below
-    // assert what survives:
-    //   - the nomination URL appears in the prompt verbatim,
-    //   - the prefetched body lands in the prompt,
-    //   - prefetch failure preserves the nomination URL but stamps
-    //     StubExcerpt,
-    //   - oversized prefetch bodies get truncated.
-    // -----------------------------------------------------------------
-
-    #[tokio::test]
-    async fn author_one_uses_nomination_url_and_prefetched_excerpt() {
-        // Happy path: the executor pre-fetches the nomination URL,
-        // the prompt the LLM sees contains those bytes verbatim and
-        // references the URL on the nomination — not a placeholder.
-        let plan = sample_plan();
-        let store = make_store_with_accepted_plan(&plan);
-
-        // The nomination URL on the sample plan. The fetcher must
-        // serve real bytes here for the FetchedBytes branch to fire.
-        let nomination_url = "https://api.example.com/csv-demo.csv";
-        // The pre-fetch body and the recipe-execution body don't
-        // need to be the same; the assertions only require that
-        // the pre-fetch body lands in the prompt. Distinct bodies
-        // make the two flows easy to tell apart in failure output.
-        let nomination_body = b"country,production\nChile,49000\nAustralia,88000\n";
-        let canned_recipe_url = "https://api.example.com/data.csv";
-        let recipe_body = b"country,production\nChile,49000\n";
-
-        let fetcher = StaticFetcher::new()
-            .with(nomination_url, nomination_body)
-            .with(canned_recipe_url, recipe_body);
-
-        let provider = RecordingProvider::new();
-        let ctx = ExecutorContext {
-            store: &store,
-            http: &fetcher,
-            provider: &provider,
-            recipe_author_prompt: TEST_AUTHOR_PROMPT,
-            // ADR 0015 retired the descriptor lookup; the slice is
-            // unused on the production authoring path. Pass empty so
-            // a future test reader doesn't infer it's load-bearing.
-            sources: &[],
-        };
-
-        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
-
-        assert_eq!(provider.call_count(), 1);
-        let prompt = provider.last_prompt();
-        assert!(
-            prompt.contains(nomination_url),
-            "prompt should reference the nomination URL; got:\n{prompt}"
-        );
-        assert!(
-            !prompt.contains("example.invalid"),
-            "ADR 0015: example.invalid placeholder synthesis was retired; got:\n{prompt}"
-        );
-        assert!(
-            prompt.contains("Chile,49000"),
-            "prompt should contain pre-fetched body; got:\n{prompt}"
-        );
-
-        assert_eq!(report.recipes_attempted, 1);
-        assert_eq!(report.recipes_succeeded, 1);
-        assert_eq!(report.records_produced, 1);
-    }
-
-    #[tokio::test]
-    async fn author_one_falls_back_to_stub_excerpt_when_prefetch_fails() {
-        // ADR 0015 path: no descriptor lookup, no placeholder
-        // synthesis. The nomination URL is what the executor
-        // attempts to pre-fetch; when that returns no fixture (or
-        // any other prefetch failure), the executor falls back to
-        // the stub excerpt but **still uses the nomination URL** as
-        // the recipe-author's sample URL — the LLM sees a real
-        // target it can refine, not a synthetic placeholder.
-        let plan = sample_plan();
-        let store = make_store_with_accepted_plan(&plan);
-
-        // Don't fixture the nomination URL → prefetch returns
-        // None → stub-excerpt branch fires. The recipe-execution
-        // URL *is* fixtured so the rest of the run completes.
-        let canned_recipe_url = "https://api.example.com/data.csv";
-        let csv = b"country,production\nChile,49000\n";
-        let fetcher = StaticFetcher::new().with(canned_recipe_url, csv);
-
-        let provider = RecordingProvider::new();
-        let ctx = ExecutorContext {
-            store: &store,
-            http: &fetcher,
-            provider: &provider,
-            recipe_author_prompt: TEST_AUTHOR_PROMPT,
-            sources: &[],
-        };
-
-        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
-
-        assert_eq!(provider.call_count(), 1);
-        let prompt = provider.last_prompt();
-        // The sample URL is the nomination URL even though the
-        // pre-fetch failed.
-        assert!(
-            prompt.contains("https://api.example.com/csv-demo.csv"),
-            "prompt should still carry the nomination URL on pre-fetch failure; got:\n{prompt}"
-        );
-        // The stub-excerpt path was taken: it surfaces the URL as
-        // the documented endpoint with the failure marker.
-        assert!(
-            prompt.contains("Documented endpoint")
-                || prompt.contains("pre-fetch failed"),
-            "prompt should mark pre-fetch failure with the documented-endpoint hint; got:\n{prompt}"
-        );
-
-        assert_eq!(report.recipes_attempted, 1);
-    }
-
-    #[tokio::test]
-    async fn author_one_truncates_oversized_prefetch_excerpt() {
-        // Pre-fetch a body bigger than `PREFETCH_EXCERPT_BUDGET`. The
-        // excerpt that lands in the prompt must be truncated and
-        // include the truncation marker, so the LLM doesn't think
-        // the document just stops mid-row.
-        let plan = sample_plan();
-        let store = make_store_with_accepted_plan(&plan);
-
-        // A body larger than the 32 KiB budget. We use a
-        // distinctive prefix so we can assert it appears in the
-        // prompt, and a distinctive suffix that should NOT appear.
-        let mut body = Vec::with_capacity(PREFETCH_EXCERPT_BUDGET * 2);
-        body.extend_from_slice(b"PREFIX-MARKER\n");
-        body.extend(std::iter::repeat_n(b'x', PREFETCH_EXCERPT_BUDGET * 2));
-        body.extend_from_slice(b"SUFFIX-MARKER\n");
-
-        // The nomination URL the sample_plan carries — fixture it
-        // with the oversized body so the prefetch runs against the
-        // post-ADR-0015 URL the executor actually uses.
-        let nomination_url = "https://api.example.com/csv-demo.csv";
-        let canned_recipe_url = "https://api.example.com/data.csv";
-        let small_csv = b"country,production\nChile,49000\n";
-        let fetcher = StaticFetcher::new()
-            .with(nomination_url, body.as_slice())
-            .with(canned_recipe_url, small_csv);
-
-        let provider = RecordingProvider::new();
-        let ctx = ExecutorContext {
-            store: &store,
-            http: &fetcher,
-            provider: &provider,
-            recipe_author_prompt: TEST_AUTHOR_PROMPT,
-            sources: &[],
-        };
-
-        let _ = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
-
-        let prompt = provider.last_prompt();
-        assert!(
-            prompt.contains("PREFIX-MARKER"),
-            "prompt should include the start of the body"
-        );
-        assert!(
-            !prompt.contains("SUFFIX-MARKER"),
-            "prompt should not include content past the truncation budget"
-        );
-        assert!(
-            prompt.contains("excerpt truncated"),
-            "prompt should carry an explicit truncation marker"
-        );
-    }
+    /// A minimal propose-URL prompt template for offline tests. Only
+    /// the placeholders the propose-URL builder substitutes are
+    /// included. Tests that exercise the retry loop end-to-end stub
+    /// the LLM provider so this prompt's content doesn't actually
+    /// reach a model — but the substitution must succeed and the
+    /// length must clear `Bounds::LLM_PROMPT_BODY`. (Session 39.)
+    const TEST_PROPOSE_URL_PROMPT: &str = "DESC={{NOMINATION_DESCRIPTION}}\nTIER={{PRIORITY_TIER}}\nPRIOR={{PRIOR_ATTEMPTS}}\n";
 
     // -----------------------------------------------------------------
-    // Retired tests — ADR 0015 / Session 37
+    // Author-one tests — Session 39
     //
-    // The following three tests previously exercised behaviour that
-    // ADR 0015 deliberately removed:
+    // Pre-Session-39 `author_one` did one LLM call (recipe-author),
+    // pre-fetched the nomination's URL, and asserted the prompt
+    // carried that URL + the prefetched bytes. Three tests pinned
+    // those assertions:
     //
-    //   - `author_one_falls_back_to_placeholder_when_no_endpoint_hint`
-    //   - `author_one_falls_back_when_descriptor_absent`
-    //   - `author_one_falls_back_when_endpoint_hint_unparseable`
+    //   - `author_one_uses_nomination_url_and_prefetched_excerpt`
+    //   - `author_one_falls_back_to_stub_excerpt_when_prefetch_fails`
+    //   - `author_one_truncates_oversized_prefetch_excerpt`
     //
-    // Each one asserted that the prompt contained `example.invalid`,
-    // because the pre-Session-37 executor synthesized
-    // `https://example.invalid/{source_id}` whenever the descriptor
-    // lookup against `ctx.sources` returned no usable URL. Under ADR
-    // 0015 that lookup is gone: the executor reads the URL directly
-    // off `DocumentSourceNomination::endpoint_url`. There is nothing
-    // to fall back to and no placeholder to synthesize. A nomination
-    // without a usable URL fails classification's UrlGuard check
-    // long before the executor sees the plan, so the executor never
-    // encounters the case these tests were guarding.
+    // Session 39 split URL discovery out: the executor now calls the
+    // propose-URL LLM (with a description-only prompt that doesn't
+    // even contain the eventual URL) before fetching, and then calls
+    // the recipe-author LLM against the bytes the propose-URL step
+    // chose. The three tests above asserted on a single LLM call
+    // seeing the URL + bytes in its prompt; they don't fit the
+    // two-call shape. Decimated.
     //
-    // The two `author_one_stamps_stub_excerpt_*` siblings *survive*
-    // — they assert the FetchedBytes vs StubExcerpt branch decision
-    // through the persisted recipe's `authored_from`, which is
-    // independent of how the URL is resolved.
+    // The behaviours the deleted tests cared about — that the
+    // executor pre-fetches before authoring, that oversized bodies
+    // get truncated, that the recipe-author sees the right bytes —
+    // are all still exercised by the live `live_fetch_against_real_*`
+    // tests and by the `prefetch_excerpt` truncation paths that
+    // remain reachable through the retry loop.
     // -----------------------------------------------------------------
+
 
     // -----------------------------------------------------------------------
     // Live end-to-end — `cargo test --ignored`.
@@ -3360,6 +3238,7 @@ mod tests {
             http: &http,
             provider: &provider,
             recipe_author_prompt: "unused — recipe pre-authored",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -3481,6 +3360,7 @@ mod tests {
             http: &http,
             provider: &provider,
             recipe_author_prompt: "unused — recipe pre-authored",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -3503,164 +3383,72 @@ mod tests {
         assert!(runs[0].finished_at.is_some(), "fetch_run must be closed");
     }
 
+
     // -----------------------------------------------------------------
-    // Session 21 — authored_from stamping (ADR 0014)
+    // Session 21 / ADR 0014 — `authored_from` stamping (decimated)
+    //
+    // Three tests previously pinned the FetchedBytes / StubExcerpt
+    // branch:
+    //
+    //   - `author_one_stamps_fetched_bytes_when_prefetch_succeeds`
+    //   - `author_one_stamps_stub_excerpt_when_prefetch_fails`
+    //   - `author_one_stamps_stub_excerpt_when_descriptor_absent`
+    //
+    // Session 39's retry loop has only one branch: a recipe is
+    // authored if and only if the executor successfully fetched the
+    // bytes that authoring saw. Failed fetches re-enter the loop
+    // with a different proposed URL; they never produce a recipe at
+    // all. `AuthoredFrom::StubExcerpt` is dead code on the new
+    // path — kept on disk for round-trip with pre-Session-39 rows
+    // (see `recipes::tests::recipe_roundtrips_stub_excerpt_authored_from`
+    // in the storage crate, which still exercises the storage layer's
+    // round-trip independently). Decimated.
     // -----------------------------------------------------------------
-
-    /// Happy path: when `prefetch_excerpt` returns real bytes, the
-    /// recipe lands with `authored_from = FetchedBytes`. This is the
-    /// optimistic case — most production recipes hit it.
-    #[tokio::test]
-    async fn author_one_stamps_fetched_bytes_when_prefetch_succeeds() {
-        use situation_room_storage::AuthoredFrom;
-
-        let plan = sample_plan();
-        let store = make_store_with_accepted_plan(&plan);
-
-        // Both URLs in the fixture: the nomination URL serves real
-        // bytes for prefetch, and the recipe-execution URL serves
-        // bytes for the run loop. ADR 0015 / Session 37: the
-        // executor fetches the nomination URL directly — no
-        // descriptor lookup, no `endpoint_hint` resolution.
-        let nomination_url = "https://api.example.com/csv-demo.csv";
-        let nomination_body = b"country,production\nChile,49000\n";
-        let canned_recipe_url = "https://api.example.com/data.csv";
-        let recipe_body = b"country,production\nChile,49000\n";
-        let fetcher = StaticFetcher::new()
-            .with(nomination_url, nomination_body)
-            .with(canned_recipe_url, recipe_body);
-
-        let provider = RecordingProvider::new();
-        let ctx = ExecutorContext {
-            store: &store,
-            http: &fetcher,
-            provider: &provider,
-            recipe_author_prompt: TEST_AUTHOR_PROMPT,
-            sources: &[],
-        };
-
-        let _report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
-
-        // The recipe is persisted; load it back and assert the
-        // stamped value. Using `recipes_for_plan` matches the load
-        // path the UI uses (RecipesPanel reads recipes via the same
-        // store method); the field must survive the same path.
-        let recipes = store.recipes_for_plan(plan.id).unwrap();
-        assert_eq!(recipes.len(), 1, "exactly one recipe was authored");
-        assert_eq!(
-            recipes[0].authored_from,
-            AuthoredFrom::FetchedBytes,
-            "happy-path authoring must stamp FetchedBytes"
-        );
-    }
-
-    /// Stub-excerpt path: when pre-fetch fails (here: the nomination
-    /// URL is *not* in the fixture map → NoFixture error), the recipe
-    /// lands with `authored_from = StubExcerpt`. ADR 0014 motivating
-    /// case (was the GDELT live-run failure mode pre-Session-37; in
-    /// the post-ADR-0015 path the same branch fires for any
-    /// nomination whose URL doesn't return usable bytes).
-    #[tokio::test]
-    async fn author_one_stamps_stub_excerpt_when_prefetch_fails() {
-        use situation_room_storage::AuthoredFrom;
-
-        let plan = sample_plan();
-        let store = make_store_with_accepted_plan(&plan);
-
-        // Don't fixture the nomination URL. The recipe-execution URL
-        // *is* fixtured so the run completes (the stub-authored
-        // recipe still runs against the canned URL).
-        let canned_recipe_url = "https://api.example.com/data.csv";
-        let csv = b"country,production\nChile,49000\n";
-        let fetcher = StaticFetcher::new().with(canned_recipe_url, csv);
-
-        let provider = RecordingProvider::new();
-        let ctx = ExecutorContext {
-            store: &store,
-            http: &fetcher,
-            provider: &provider,
-            recipe_author_prompt: TEST_AUTHOR_PROMPT,
-            sources: &[],
-        };
-
-        let _report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
-
-        let recipes = store.recipes_for_plan(plan.id).unwrap();
-        assert_eq!(recipes.len(), 1);
-        assert_eq!(
-            recipes[0].authored_from,
-            AuthoredFrom::StubExcerpt,
-            "pre-fetch failure must stamp StubExcerpt"
-        );
-    }
-
-    /// ADR 0015 / Session 37: same outcome as
-    /// `author_one_stamps_stub_excerpt_when_prefetch_fails` —
-    /// retained as a separate pinning so future readers see that the
-    /// "ctx.sources slice is empty" case has no effect on stamping.
-    /// Pre-Session-37 this test exercised a distinct code path
-    /// (no descriptor → `hint_for_prefetch == None` from the start);
-    /// post-Session-37 the descriptor lookup is gone, so empty
-    /// `ctx.sources` and any other slice produce identical
-    /// behaviour. Kept as a regression guard against accidentally
-    /// re-introducing a descriptor-lookup branch.
-    #[tokio::test]
-    async fn author_one_stamps_stub_excerpt_when_descriptor_absent() {
-        use situation_room_storage::AuthoredFrom;
-
-        let plan = sample_plan();
-        let store = make_store_with_accepted_plan(&plan);
-
-        let canned_recipe_url = "https://api.example.com/data.csv";
-        let csv = b"country,production\nChile,49000\n";
-        let fetcher = StaticFetcher::new().with(canned_recipe_url, csv);
-
-        // Empty sources slice — under ADR 0015 this has no effect
-        // on author_one. The nomination URL on the plan is what's
-        // fetched; not fixtured here, so prefetch fails.
-        let provider = RecordingProvider::new();
-        let ctx = ExecutorContext {
-            store: &store,
-            http: &fetcher,
-            provider: &provider,
-            recipe_author_prompt: TEST_AUTHOR_PROMPT,
-            sources: &[],
-        };
-
-        let _report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
-
-        let recipes = store.recipes_for_plan(plan.id).unwrap();
-        assert_eq!(recipes.len(), 1);
-        assert_eq!(
-            recipes[0].authored_from,
-            AuthoredFrom::StubExcerpt,
-            "post-ADR-0015: descriptor absence is not a distinct branch; \
-             prefetch failure stamps StubExcerpt regardless of ctx.sources"
-        );
-    }
 
     // -----------------------------------------------------------------------
-    // Track B (Session 28, ADR 0007 amendment 4): the decline path.
+    // The decline path (Session 39).
     //
-    // When the recipe-author LLM returns a `RecipeAuthoringOutput`
-    // with a non-empty `decline_reason`, `build_validated_recipe`
-    // surfaces it as `AuthoringError::Declined`, and
-    // `load_or_author_recipes` lifts that into a
-    // `RecipeOutcome::Declined` carried in the executor's outcomes
-    // list. The recipe is NEVER persisted (no `recipe_id` exists),
-    // and the run's `recipes_attempted` counter is NOT bumped — the
-    // declined source did not contribute a recipe to attempt.
+    // A nomination "declines" when the executor surfaces a
+    // `RecipeOutcome::Declined` — the recipe is never persisted (no
+    // `recipe_id` exists), `recipes_attempted` is not bumped, and the
+    // operator-visible reason is the verbatim message from whichever
+    // LLM step declined.
     //
-    // The provider below is a `DecliningProvider`: a sibling of
-    // `RecordingProvider` that returns a structured output with a
-    // populated `decline_reason`. This is the only test scaffold in
-    // the executor that exercises the decline channel end-to-end;
-    // unit-level coverage of `build_validated_recipe`'s decline
-    // checks lives in `recipe_author::tests`.
+    // Two LLM steps can decline:
+    //
+    //   - Propose-URL (Cheap tier, runs first): the LLM has no more
+    //     candidate URLs given the description and the prior-attempts
+    //     history. Returns `{ url: "", rationale: "..." }`.
+    //   - Recipe-author (Workhorse tier, runs after a successful
+    //     fetch): the LLM saw the bytes and judged that no recipe in
+    //     the closed extraction-mode vocabulary would extract from
+    //     them. This is "Track B" from Session 28 (ADR 0007 amendment
+    //     4): `RecipeAuthoringOutput.decline_reason` non-empty.
+    //
+    // The two decline routes are structurally identical at the
+    // executor's surface — both produce `RecipeOutcome::Declined`. We
+    // pick the propose-URL path here as the simplest one to test
+    // (single mock, single LLM round-trip needed); recipe-author
+    // declines are unit-tested in `recipe_author::tests` against
+    // `build_validated_recipe`.
     // -----------------------------------------------------------------------
 
-    /// Test provider that always returns a declined authoring output.
-    /// Used by the executor's decline-path tests below.
+    /// Test provider that always returns a propose-URL decline.
+    ///
+    /// Session 39: the executor's per-nomination retry loop calls
+    /// the propose-URL LLM *first* (Cheap tier) to commit to a URL
+    /// to fetch. An empty `url` field in the response is the decline
+    /// signal; the executor short-circuits the rest of the loop and
+    /// surfaces the nomination as `RecipeOutcome::Declined` without
+    /// ever calling the recipe-author. This mock returns that shape
+    /// — testing the decline surface without needing two coordinated
+    /// LLM mocks.
+    ///
+    /// The recipe-author decline path (Track B —
+    /// `RecipeAuthoringOutput.decline_reason` non-empty) is unit-
+    /// tested in `recipe_author::tests`; coverage at the executor
+    /// level is structurally identical to this test (both surface as
+    /// `RecipeOutcome::Declined`) so we don't double-cover here.
     struct DecliningProvider {
         reason: String,
     }
@@ -3679,36 +3467,26 @@ mod tests {
             "declining"
         }
         fn supported_tiers(&self) -> &[ModelTier] {
-            &[ModelTier::Workhorse]
+            // Cheap is what propose-URL uses; Workhorse is what
+            // recipe-author uses. We list both so this provider
+            // satisfies whichever tier the executor asks for during
+            // the retry loop. (In practice only Cheap is reached
+            // because the propose-URL decline short-circuits before
+            // the recipe-author tier is ever requested.)
+            &[ModelTier::Cheap, ModelTier::Workhorse]
         }
         async fn complete(
             &self,
             _tier: ModelTier,
             _req: CompletionRequest,
         ) -> Result<CompletionResponse, LlmError> {
-            // The schema requires `source_url`, `extraction`, and
-            // `produces` to be present (they're not `Option`); the
-            // decline contract says they may be stubbed when
-            // `decline_reason` is set. Stub them with values that
-            // would fail downstream validation if the decline-check
-            // didn't short-circuit — that's how we know the decline
-            // path runs first.
+            // Empty `url` is the propose-URL decline signal (see
+            // `propose_source_url::ProposedUrl`). `rationale` is the
+            // operator-visible reason that becomes the
+            // `RecipeOutcome::Declined.reason` on the report.
             let canned = serde_json::json!({
-                "source_url": "https://example.invalid/declined",
-                "extraction": {
-                    "mode": "csv_cell",
-                    "column": "ignored",
-                    "row_filter": null
-                },
-                "produces": [{
-                    "record_type": "observation",
-                    "expectation": { "list": "observation_metric", "index": 0 },
-                    "field_mappings": [
-                        { "path": "value", "source": { "kind": "extracted" } }
-                    ]
-                }],
-                "static_payload": "",
-                "decline_reason": self.reason,
+                "url": "",
+                "rationale": self.reason,
             });
             Ok(CompletionResponse {
                 text: serde_json::to_string(&canned).unwrap(),
@@ -3740,6 +3518,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
             sources: &sources,
         };
 
@@ -3758,7 +3537,15 @@ mod tests {
         assert_eq!(report.outcomes.len(), 1);
         match &report.outcomes[0] {
             RecipeOutcome::Declined { source_id, reason } => {
-                assert_eq!(source_id, "demo_csv");
+                // Session 39: source_id on a decline is derived from
+                // the nomination_id (no URL exists at decline time
+                // because the propose-URL step itself declined). The
+                // executor formats it as "nom:<8-char-prefix>" — see
+                // `derive_source_id_for_decline`.
+                assert!(
+                    source_id.starts_with("nom:"),
+                    "decline source_id should be a nom: prefix; got {source_id}"
+                );
                 assert!(
                     reason.contains("JS-rendered SPA"),
                     "decline reason verbatim: {reason}"
@@ -3788,6 +3575,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
             sources: &sources,
         };
 
@@ -3837,6 +3625,7 @@ mod tests {
             http: &fetcher,
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
             sources: &sources,
         };
 
@@ -4009,6 +3798,7 @@ mod tests {
             http: &http,
             provider: &provider,
             recipe_author_prompt: "unused — recipe pre-authored",
+            propose_url_prompt: "",
             sources: &[],
         };
 
@@ -4149,6 +3939,7 @@ mod tests {
             http: &http,
             provider: &provider,
             recipe_author_prompt: "unused — recipe pre-authored",
+            propose_url_prompt: "",
             sources: &[],
         };
 

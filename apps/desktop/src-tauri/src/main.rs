@@ -47,6 +47,13 @@ const CLASSIFIER_PROMPT: &str =
 const RECIPE_AUTHOR_PROMPT: &str =
     include_str!("../../../../config/prompts/recipe_author.md");
 
+/// The production propose-URL prompt (Session 39). Cheap-tier LLM
+/// call inside the fetch executor's per-attempt retry loop. Picks
+/// the URL each attempt fetches given the description and the
+/// prior-attempts history.
+const PROPOSE_URL_PROMPT: &str =
+    include_str!("../../../../config/prompts/propose_source_url.md");
+
 fn main() -> Result<()> {
     // .env is a dev convenience; the real environment always wins.
     // Walks up from CWD to find .env at the workspace root and
@@ -124,6 +131,7 @@ fn main() -> Result<()> {
         http_arc,
         CLASSIFIER_PROMPT,
         RECIPE_AUTHOR_PROMPT,
+        PROPOSE_URL_PROMPT,
         sources,
     );
 

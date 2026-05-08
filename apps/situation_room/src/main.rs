@@ -336,6 +336,10 @@ mod tests {
         );
         assert!(CLASSIFIER_PROMPT.contains("{{TOPIC}}"));
         assert!(CLASSIFIER_PROMPT.contains("{{EXISTING_TOPICS}}"));
-        assert!(CLASSIFIER_PROMPT.contains("{{SOURCES_MEMORY}}"));
+        // Session 39 / v2.0: the {{SOURCES_MEMORY}} placeholder
+        // was removed from the L1 prompt — URL discovery moved to
+        // a separate Level-2 step. The substitution still runs
+        // (harmless no-op when absent), but the prompt no longer
+        // requires the placeholder.
     }
 }

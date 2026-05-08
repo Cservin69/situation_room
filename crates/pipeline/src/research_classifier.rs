@@ -51,7 +51,6 @@ use serde::{Deserialize, Serialize};
 use situation_room_core::vocab::{EntityId, EventType, Topic, Unit, VocabError};
 use situation_room_llm::{CompletionRequest, LlmError, LlmProvider, ModelTier};
 use situation_room_secure::bounds::{check_string, Bounds};
-use situation_room_secure::url_guard::{UrlGuard, UrlViolation};
 use situation_room_storage::sources_memory::MemorySource;
 use thiserror::Error;
 use uuid::Uuid;
@@ -81,16 +80,19 @@ pub struct ClassificationContext {
     /// vocabulary cohesive.
     pub existing_topics: Vec<TopicUsage>,
 
-    /// URLs the operator has previously fetched against successfully,
+    /// Sources the operator has previously fetched against successfully,
     /// derived from the `recipes ⨝ recipe_fetch_attempts ⨝
-    /// research_plans` join. Surfaced through the prompt's
-    /// `{{SOURCES_MEMORY}}` placeholder so the LLM can stamp
-    /// `known_id` on its emissions when the URL it picks corresponds
-    /// to a memory entry. An empty Vec is legal — first-time
-    /// installations have no memory yet, and the prompt's worked
-    /// examples teach the cold-start pattern (emit URLs from
-    /// training-distribution knowledge alone). ADR 0015 §"Memory
-    /// query".
+    /// research_plans` join.
+    ///
+    /// **Post-Session-39:** the L1 prompt no longer references
+    /// `{{SOURCES_MEMORY}}`, so this Vec is currently unused at L1.
+    /// It is preserved on the struct (and the rendering helper still
+    /// exists) for two reasons: (a) Level-2 propose-URL may consume
+    /// past-success memory in a future session as a description-keyed
+    /// hint, and (b) deleting the field plumbing now would churn the
+    /// `ClassificationContext` ABI for no immediate benefit. An empty
+    /// Vec is the expected value passed in by the desktop binary
+    /// today.
     pub sources_memory: Vec<MemorySource>,
 
     /// Free-text feedback the user supplied when rejecting a previous
@@ -195,16 +197,15 @@ pub enum ClassificationError {
 
 /// Assemble the user-message prompt from a template + runtime inputs.
 ///
-/// The template string must contain `{{TOPIC}}`, `{{EXISTING_TOPICS}}`,
-/// `{{SOURCES_MEMORY}}`, and `{{USER_FEEDBACK}}` placeholders.
-/// Missing placeholders are not errors — they're assumed to be
-/// intentional omissions by the prompt author.
-///
-/// `{{SOURCES_MEMORY}}` substitutes to a sorted list of past-success
-/// URLs from the operator's local DuckDB (recency-descending; see
-/// [`render_sources_memory`]). An empty memory renders explicitly so
-/// the LLM sees the cold-start signal rather than a missing section.
-/// ADR 0015 §"Memory query".
+/// The template should contain `{{TOPIC}}`, `{{EXISTING_TOPICS}}`,
+/// and `{{USER_FEEDBACK}}` placeholders. The `{{SOURCES_MEMORY}}`
+/// placeholder used by v1.6 is also still substituted — Session 39
+/// (v2.0) drops it from the prompt template and from the
+/// `AuthoredDocumentSourceNomination` shape, but the substitution
+/// stays here as a harmless no-op so a v1.6 template still loads
+/// cleanly during the rollout. Missing placeholders are not
+/// errors — they're assumed to be intentional omissions by the
+/// prompt author.
 ///
 /// `{{USER_FEEDBACK}}` substitutes to either the empty string (fresh
 /// classification, `previous_rejection_reason: None`) or a complete
@@ -405,16 +406,16 @@ pub struct AuthoredRelationKindExpectation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AuthoredDocumentSourceNomination {
-    /// Why this source fits the plan. Free-form prose; the post-ADR-
-    /// 0015 prompt asks for a one-line rationale tying the source to
-    /// the plan's specific subjects.
+    /// Why this source fits the plan, in enough specificity that the
+    /// Level-2 propose-URL step can locate a concrete data endpoint.
+    /// Names the publisher, the dataset/series/feed, the addressable
+    /// shape — not just an organization.
+    ///
+    /// Post-Session-39 the LLM no longer emits URLs at L1. Description
+    /// quality replaces URL nomination as the contract: a description
+    /// strong enough that a domain-aware Level-2 step can derive a URL
+    /// from it without further user input.
     pub description: String,
-    /// The URL the LLM has chosen for this nomination. Validated
-    /// through `UrlGuard::check` at conversion time. Required —
-    /// emit a real URL or omit the nomination; "I'd like this source
-    /// but don't know how to reach it" is not an option in the
-    /// post-ADR-0015 contract.
-    pub endpoint_url: String,
     /// Source-priority tier as a snake_case string. The LLM-facing
     /// layer carries this as `String` to match the existing
     /// `Authored*` enum-as-string convention; conversion to the
@@ -426,13 +427,6 @@ pub struct AuthoredDocumentSourceNomination {
     /// `authoritative_secondary`, `industry_trade_press`,
     /// `general_news`.
     pub priority_tier: String,
-    /// Optional recognition that this nomination matches a memory
-    /// entry the prompt surfaced. Free-form (the LLM uses the
-    /// `source_id` it saw in the memory bullet); the executor
-    /// verifies via host normalization at recipe-authoring time.
-    /// Empty / whitespace-only normalizes to `None` at conversion.
-    #[serde(default)]
-    pub known_id: Option<String>,
 }
 
 /// LLM-facing form of a geographic scope entry. Mirrors
@@ -648,69 +642,46 @@ fn convert_expectations(
 }
 
 // ---------------------------------------------------------------------------
-// DocumentSourceNomination conversion (ADR 0015, Session 37)
+// ---------------------------------------------------------------------------
+// DocumentSourceNomination conversion (Session 39 — description-only)
 // ---------------------------------------------------------------------------
 
 /// Convert one [`AuthoredDocumentSourceNomination`] into a typed
-/// [`DocumentSourceEntry::Nomination`]. Runs the full ADR-0015
-/// validation discipline:
+/// [`DocumentSourceEntry::Nomination`].
 ///
-/// - `endpoint_url` must be non-empty after trim.
-/// - `endpoint_url` must pass [`UrlGuard::check`] (scheme,
-///   private-IP, port allowlist, length, embedded-credentials checks).
-///   `UrlGuard` is the single point of URL discipline; ADR 0015
-///   §"Validation discipline" explicitly forbids a parallel
-///   `Bounds::ENDPOINT_URL` length check.
+/// Post-Session-39 contract:
+/// - `description` must be non-empty after trim. URL discipline lives
+///   at the Level-2 propose-URL step now; the classifier owns
+///   description quality, not URL correctness.
 /// - `priority_tier` must parse to a [`PriorityTier`] variant. The
 ///   `schemars`-generated JSON Schema does not enumerate the four
 ///   strings (we keep the LLM-facing layer as `String` to match the
 ///   existing `Authored*` convention), so this parse is the
 ///   structural enforcement.
+/// - `nomination_id` is server-stamped with [`Uuid::now_v7`] so each
+///   nomination has stable identity for downstream `dedup_key`
+///   discipline regardless of which URL the retry loop ultimately
+///   picked. The LLM has no input on this field, by design.
 ///
 /// One invalid nomination fails the whole plan — partial validation
 /// would dilute the trust property that an accepted plan is wholly
-/// trustable. ADR 0015 §"Validation discipline".
+/// trustable.
 fn convert_one_nomination(
     raw: AuthoredDocumentSourceNomination,
 ) -> Result<DocumentSourceEntry, ClassificationError> {
-    let endpoint_url = raw.endpoint_url.trim();
-    if endpoint_url.is_empty() {
+    let description = raw.description.trim();
+    if description.is_empty() {
         return Err(ClassificationError::InvalidPlan(
-            "document_sources nomination has empty endpoint_url".into(),
+            "document_sources nomination has empty description".into(),
         ));
     }
 
-    // Single-point URL discipline. UrlGuard handles scheme,
-    // private-IP, embedded-credentials, port allowlist, AND the
-    // 2048-byte length cap.
-    let guard = UrlGuard::new();
-    guard
-        .check(endpoint_url)
-        .map_err(|v: UrlViolation| {
-            ClassificationError::InvalidPlan(format!(
-                "document_sources nomination endpoint_url failed UrlGuard: {v}"
-            ))
-        })?;
-
     let priority_tier = parse_priority_tier(&raw.priority_tier)?;
 
-    let known_id = match raw.known_id {
-        Some(s) => {
-            let trimmed = s.trim().to_string();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }
-        }
-        None => None,
-    };
-
     Ok(DocumentSourceEntry::Nomination(DocumentSourceNomination {
-        description: raw.description,
-        endpoint_url: endpoint_url.to_string(),
+        nomination_id: Uuid::now_v7(),
+        description: description.to_string(),
         priority_tier,
-        known_id,
     }))
 }
 
@@ -1002,10 +973,11 @@ mod tests {
                     rationale: "Operator-asset link".into(),
                 }],
                 document_sources: vec![AuthoredDocumentSourceNomination {
-                    description: "USGS Mineral Commodity Summaries".into(),
-                    endpoint_url: "https://www.usgs.gov/centers/national-minerals-information-center/mineral-commodity-summaries".into(),
+                    description:
+                        "USGS Mineral Commodity Summaries — annual lithium chapter, \
+                         mine production in tonnes by country"
+                            .into(),
                     priority_tier: "authoritative_primary".into(),
-                    known_id: Some("usgs_mcs".into()),
                 }],
                 assertion_guidance: None,
             },
@@ -1331,12 +1303,11 @@ mod tests {
         let mut out = good_output();
         out.expectations = AuthoredRecordExpectations {
             document_sources: vec![AuthoredDocumentSourceNomination {
-                description: "OFAC SDN list".into(),
-                endpoint_url:
-                    "https://www.treasury.gov/ofac/downloads/sdn.xml"
+                description:
+                    "OFAC SDN list publication feed — Treasury's Specially Designated Nationals \
+                     XML, updated on each designation/removal"
                         .into(),
                 priority_tier: "authoritative_primary".into(),
-                known_id: None,
             }],
             ..Default::default()
         };
@@ -1346,18 +1317,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ADR 0015 / Session 37 — nomination validation discipline.
+    // Session 39 — description-only nomination validation discipline.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn build_validated_plan_accepts_nomination_with_valid_url_and_tier() {
+    fn build_validated_plan_accepts_nomination_with_valid_description_and_tier() {
         let plan = build_validated_plan(good_output(), "lithium supply chain").unwrap();
         assert_eq!(plan.expectations.document_sources.len(), 1);
         match &plan.expectations.document_sources[0] {
             DocumentSourceEntry::Nomination(n) => {
                 assert_eq!(n.priority_tier, PriorityTier::AuthoritativePrimary);
-                assert_eq!(n.known_id.as_deref(), Some("usgs_mcs"));
-                assert!(n.endpoint_url.starts_with("https://"));
+                // nomination_id is server-stamped — non-nil UUIDv7.
+                assert_ne!(n.nomination_id, Uuid::nil());
+                assert!(n.description.contains("USGS"));
             }
             DocumentSourceEntry::Legacy(_) => {
                 panic!("freshly classified plan must produce Nomination, not Legacy");
@@ -1366,37 +1338,40 @@ mod tests {
     }
 
     #[test]
-    fn build_validated_plan_rejects_empty_endpoint_url() {
+    fn build_validated_plan_rejects_empty_description() {
         let mut out = good_output();
-        out.expectations.document_sources[0].endpoint_url = "  ".into();
+        out.expectations.document_sources[0].description = "  ".into();
         let err = build_validated_plan(out, "x").unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("empty endpoint_url"), "got {msg}");
+        assert!(msg.contains("empty description"), "got {msg}");
     }
 
     #[test]
-    fn build_validated_plan_rejects_url_blocked_by_url_guard() {
-        // file:// is rejected by UrlGuard's scheme allowlist. The
-        // classifier must surface this as InvalidPlan, not let it
-        // through.
+    fn build_validated_plan_stamps_unique_nomination_ids() {
+        // Two nominations in the same plan must get distinct
+        // nomination_ids — required for downstream dedup_key
+        // discipline. (UUIDv7 is monotonic by construction; the
+        // assertion is that the server stamps both, not a single
+        // shared id.)
         let mut out = good_output();
-        out.expectations.document_sources[0].endpoint_url =
-            "file:///etc/passwd".into();
-        let err = build_validated_plan(out, "x").unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("UrlGuard"), "got {msg}");
-    }
-
-    #[test]
-    fn build_validated_plan_rejects_private_ip_url() {
-        // Cloud metadata endpoint — UrlGuard refuses, classifier
-        // surfaces.
-        let mut out = good_output();
-        out.expectations.document_sources[0].endpoint_url =
-            "http://169.254.169.254/latest/meta-data/".into();
-        let err = build_validated_plan(out, "x").unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("UrlGuard"), "got {msg}");
+        out.expectations.document_sources.push(AuthoredDocumentSourceNomination {
+            description:
+                "SEC EDGAR filings of listed lithium producers — 10-K and 10-Q quarterly disclosures"
+                    .into(),
+            priority_tier: "authoritative_primary".into(),
+        });
+        let plan = build_validated_plan(out, "x").unwrap();
+        let ids: Vec<Uuid> = plan
+            .expectations
+            .document_sources
+            .iter()
+            .filter_map(|e| match e {
+                DocumentSourceEntry::Nomination(n) => Some(n.nomination_id),
+                DocumentSourceEntry::Legacy(_) => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
     }
 
     #[test]
@@ -1407,17 +1382,6 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("priority_tier"), "got {msg}");
         assert!(msg.contains("tier_zero"), "got {msg}");
-    }
-
-    #[test]
-    fn build_validated_plan_normalizes_empty_known_id_to_none() {
-        let mut out = good_output();
-        out.expectations.document_sources[0].known_id = Some("   ".into());
-        let plan = build_validated_plan(out, "x").unwrap();
-        match &plan.expectations.document_sources[0] {
-            DocumentSourceEntry::Nomination(n) => assert!(n.known_id.is_none()),
-            _ => panic!("expected Nomination"),
-        }
     }
 
     #[test]
@@ -1797,13 +1761,14 @@ mod tests {
             You are the research classifier for situation_room.\n\
             TOPIC: {{TOPIC}}\n\
             EXISTING TOPICS:\n{{EXISTING_TOPICS}}\n\
-            SOURCES MEMORY:\n{{SOURCES_MEMORY}}\n\
             Return JSON conforming to AuthoredResearchPlan. Use lowercase \
             snake_case for topic_tags and event_type. Include at least one \
             entry across the expectations buckets. For document_sources, \
-            emit at least one nomination carrying a real https endpoint_url \
-            and a priority_tier of authoritative_primary, \
-            authoritative_secondary, industry_trade_press, or general_news. \
+            emit at least one nomination with a specific description that \
+            names the publisher and dataset (not just an organization), and \
+            a priority_tier of authoritative_primary, authoritative_secondary, \
+            industry_trade_press, or general_news. Do NOT include URLs in \
+            the description — URL discovery happens at Level 2. \
             For geographic_scope entries, use ISO 3166-1 alpha-2 codes when \
             applicable, and provide a human-readable display label.\
         ";
@@ -1830,20 +1795,17 @@ mod tests {
         // The plan id was minted server-side, not echoed by the LLM.
         assert_eq!(plan.id.get_version_num(), 7);
 
-        // ADR 0015 / Session 37: every emitted entry must be a
-        // Nomination (Legacy never comes back from a fresh classify),
-        // every nomination's URL must pass UrlGuard (already enforced
-        // by `build_validated_plan`; assert it survived end-to-end),
-        // and every nomination must carry a typed priority tier.
+        // Session 39: every emitted entry must be a Nomination
+        // (Legacy never comes back from a fresh classify), every
+        // nomination must carry a server-stamped UUIDv7
+        // nomination_id, a non-empty description, and a typed
+        // priority tier.
         for entry in &plan.expectations.document_sources {
             match entry {
                 DocumentSourceEntry::Nomination(n) => {
-                    assert!(
-                        n.endpoint_url.starts_with("http://")
-                            || n.endpoint_url.starts_with("https://"),
-                        "nomination endpoint_url must be http(s); got {}",
-                        n.endpoint_url
-                    );
+                    assert_ne!(n.nomination_id, Uuid::nil());
+                    assert_eq!(n.nomination_id.get_version_num(), 7);
+                    assert!(!n.description.trim().is_empty());
                     // priority_tier is an enum, can't be wrong here —
                     // pattern-match to make the structural property
                     // visible in the test surface.

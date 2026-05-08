@@ -198,12 +198,12 @@ mod tests {
                 }],
                 document_sources: vec![DocumentSourceEntry::Nomination(
                     DocumentSourceNomination {
-                        description: "USGS Mineral Commodity Summaries".into(),
-                        endpoint_url:
-                            "https://www.usgs.gov/centers/national-minerals-information-center/mineral-commodity-summaries"
+                        nomination_id: Uuid::now_v7(),
+                        description:
+                            "USGS Mineral Commodity Summaries — annual lithium chapter, \
+                             mine production in tonnes by country"
                                 .into(),
                         priority_tier: PriorityTier::AuthoritativePrimary,
-                        known_id: Some("usgs_mcs".into()),
                     },
                 )],
                 assertion_guidance: None,

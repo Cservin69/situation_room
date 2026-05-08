@@ -172,16 +172,17 @@ pub struct RecordExpectations {
     pub relation_kinds: Vec<RelationKindExpectation>,
 
     /// Document sources the session wants to fetch from. Each entry is
-    /// either a [`DocumentSourceNomination`] (the post-ADR-0015 shape
-    /// the LLM emits today, carrying its own `endpoint_url` and
-    /// `priority_tier`) or a legacy [`DocumentSourceHint`] (the pre-ADR
-    /// shape carried by plans persisted before Session 37).
+    /// either a [`DocumentSourceNomination`] (the post-Session-39
+    /// description-only shape) or a legacy [`DocumentSourceHint`]
+    /// (pre-Session-37 plans).
     ///
     /// The two are unioned through [`DocumentSourceEntry`] with
     /// `#[serde(untagged)]` so old `research_plans.plan_json` rows
     /// deserialize into `Legacy` and new plans deserialize into
-    /// `Nomination`. ADR 0015 §"Backwards-compatible deserialization
-    /// of legacy plans".
+    /// `Nomination`. Plans classified between Session 37 and Session 39
+    /// (which carried `endpoint_url` but not `nomination_id`) also
+    /// fall through to `Legacy` — they require re-classification to
+    /// be fetchable under the new retry-loop shape.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub document_sources: Vec<DocumentSourceEntry>,
 
@@ -256,47 +257,55 @@ pub struct DocumentSourceHint {
 }
 
 // ---------------------------------------------------------------------------
-// DocumentSourceNomination — the post-ADR-0015 emission shape (Session 37)
+// DocumentSourceNomination — the post-Session-39 description-only shape
 // ---------------------------------------------------------------------------
 
-/// A source the Level-1 classifier nominates for a plan, in the shape
-/// ADR 0015 ratifies. Every nomination carries its own `endpoint_url`
-/// and `priority_tier` directly — no static-registry lookup, no
-/// description-only fallback.
+/// A source the Level-1 classifier nominates for a plan.
 ///
-/// Replaces [`DocumentSourceHint`] for newly classified plans. Plans
-/// classified before Session 37 keep the legacy shape on disk and are
-/// surfaced through [`DocumentSourceEntry::Legacy`]; the executor
-/// produces a per-source `LegacyPlanCannotAuthor` outcome for those
-/// when no recipes have been authored yet (ADR 0015 §"Backwards-
-/// compatible deserialization of legacy plans").
+/// **Session 39 architectural pivot.** L1 no longer emits URLs. The
+/// classifier's job is to describe *what* source fits the plan and
+/// *why*, in enough specificity that a Level-2 propose-URL step can
+/// turn that description into a concrete fetchable URL given the
+/// actual page bytes. URLs are runtime artifacts of the L2 retry
+/// loop, not durable properties of the plan: a single description
+/// may be tried against multiple candidate URLs across attempts
+/// before one succeeds (or all are exhausted and the source declines).
+///
+/// Each nomination carries a server-stamped `nomination_id` (UUIDv7)
+/// at classify time. This is the stable identity used for recipe
+/// dedup_key and re-author scoping — independent of which URL the
+/// retry loop ultimately picked.
+///
+/// Plans classified before this session carry an `endpoint_url` field
+/// and lack `nomination_id`. Those plans fail to deserialize as
+/// `Nomination` (missing required `nomination_id`), fall through to
+/// [`DocumentSourceEntry::Legacy`], and surface as
+/// `LegacyPlanCannotAuthor` outcomes — same pattern Session 37 used
+/// when the nomination shape last changed. Re-classify to use the
+/// new shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentSourceNomination {
-    /// Why this source fits the plan. Shown in the UI and threaded
-    /// into the recipe author's authoring context as part of the
-    /// source description.
-    pub description: String,
+    /// Stable identity for this nomination, server-stamped at
+    /// classify time. Used as the `source_id` component in the
+    /// recipe's `dedup_key` so re-runs upsert correctly even when
+    /// the retry loop picks a different URL on each run.
+    pub nomination_id: Uuid,
 
-    /// The URL the executor pre-fetches and hands to recipe authoring.
-    /// Required and validated through `UrlGuard::check` at conversion
-    /// time — an unparseable, scheme-blocked, or private-IP URL fails
-    /// classification entirely (ADR 0015 §"Validation discipline").
-    pub endpoint_url: String,
+    /// Why this source fits the plan, in enough specificity that
+    /// a Level-2 propose-URL step can locate a concrete data
+    /// endpoint without further user input. Names the publisher,
+    /// the dataset/series/feed, the addressable shape.
+    ///
+    /// Good: "USGS Mineral Commodity Summaries — annual lithium
+    /// chapter, mine production in tonnes by country"
+    ///
+    /// Bad: "USGS data" / "FAO statistics" / "the SEC"
+    pub description: String,
 
     /// Where this nomination sits in the source-priority hierarchy
     /// ADR 0007 amendment 6 ratified. Typed enum; not implicit in
     /// list order.
     pub priority_tier: PriorityTier,
-
-    /// LLM's recognition that this URL matches a memory entry the
-    /// classifier prompt surfaced. `None` when the LLM emitted a URL
-    /// from training-distribution knowledge alone (the cold-start
-    /// pattern). The executor verifies the match by host normalization
-    /// — a mismatch logs a warning and the URL wins for identity (the
-    /// resulting `recipes.source_id` is host-derived). ADR 0015
-    /// §"`DocumentSourceHint` becomes `DocumentSourceNomination`".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub known_id: Option<String>,
 }
 
 /// Source-priority tier as ADR 0007 amendment 6 ratified it. Closed
@@ -329,8 +338,10 @@ pub enum PriorityTier {
 /// Per-plan document-source entry. `#[serde(untagged)]` lets the same
 /// JSON column hold either shape — new plans serialize as `Nomination`,
 /// pre-Session-37 plans round-trip through `Legacy` without touching
-/// disk. ADR 0015 §"Backwards-compatible deserialization of legacy
-/// plans".
+/// disk, and Session-37-to-39 plans (carrying the now-obsolete
+/// `endpoint_url` field but no `nomination_id`) also fall through
+/// to `Legacy` because they fail the post-Session-39 nomination
+/// shape's required-field check.
 ///
 /// The wire DTO that crosses to the desktop frontend (`DocumentSourceEntryDto`
 /// in the `api` crate) is *tagged*, not untagged: the frontend matches
@@ -342,14 +353,15 @@ pub enum PriorityTier {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DocumentSourceEntry {
-    /// Post-ADR-0015 emission. `serde(untagged)` matches this variant
-    /// first because nominations carry the required `endpoint_url`
-    /// field and the legacy hint never does.
+    /// Post-Session-39 emission. `serde(untagged)` matches this variant
+    /// first because nominations carry the required `nomination_id`
+    /// field and neither the legacy hint nor the Session-37-shape
+    /// nomination ever does.
     Nomination(DocumentSourceNomination),
-    /// Pre-Session-37 hint. Reached by `serde(untagged)` only when the
-    /// nomination shape fails to deserialize (typically because
-    /// `endpoint_url` is absent). New plans never serialize this
-    /// variant.
+    /// Catch-all for any non-current shape: pre-Session-37 hints
+    /// (no `endpoint_url`, no `nomination_id`) and Session-37-to-39
+    /// nominations (had `endpoint_url`, never had `nomination_id`).
+    /// New plans never serialize this variant.
     Legacy(DocumentSourceHint),
 }
 
@@ -454,11 +466,11 @@ mod tests {
                 relation_kinds: vec![],
                 document_sources: vec![DocumentSourceEntry::Nomination(
                     DocumentSourceNomination {
-                        description: "SEC filings of listed semi companies".into(),
-                        endpoint_url: "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany"
-                            .into(),
+                        nomination_id: Uuid::now_v7(),
+                        description:
+                            "SEC EDGAR filings of listed semiconductor companies — 10-K and 10-Q quarterly disclosures of fab capex, capacity, and segment revenue"
+                                .into(),
                         priority_tier: PriorityTier::AuthoritativePrimary,
-                        known_id: Some("sec_edgar".into()),
                     },
                 )],
                 assertion_guidance: Some("Prioritize named-official guidance".into()),
@@ -520,39 +532,42 @@ mod tests {
         assert_eq!(json, "{}");
     }
 
-    // ----- ADR 0015 / Session 37 ---------------------------------------------
+    // ----- Session 39 — description-only nomination shape ------------------
 
     #[test]
     fn nomination_round_trips_through_serde() {
+        let nomination_id = Uuid::now_v7();
         let n = DocumentSourceNomination {
-            description: "World Bank country indicators".into(),
-            endpoint_url: "https://api.worldbank.org/v2/country/HU/indicator/AG.PRD.CROP.XD?format=json"
-                .into(),
+            nomination_id,
+            description:
+                "World Bank country indicators — annual macro time-series for sovereign-economy queries"
+                    .into(),
             priority_tier: PriorityTier::AuthoritativePrimary,
-            known_id: Some("world_bank_indicators".into()),
         };
         let entry = DocumentSourceEntry::Nomination(n);
         let json = serde_json::to_string(&entry).unwrap();
         // Untagged: the JSON does not carry a discriminator on disk.
         assert!(!json.contains("\"kind\""));
-        assert!(json.contains("endpoint_url"));
+        // Post-Session-39 the URL fields are gone from the wire shape.
+        assert!(!json.contains("endpoint_url"));
+        assert!(!json.contains("known_id"));
+        assert!(json.contains("nomination_id"));
         assert!(json.contains("priority_tier"));
         let back: DocumentSourceEntry = serde_json::from_str(&json).unwrap();
         match back {
             DocumentSourceEntry::Nomination(b) => {
+                assert_eq!(b.nomination_id, nomination_id);
                 assert_eq!(b.priority_tier, PriorityTier::AuthoritativePrimary);
-                assert_eq!(b.known_id.as_deref(), Some("world_bank_indicators"));
             }
             _ => panic!("nomination should round-trip as Nomination"),
         }
     }
 
     #[test]
-    fn legacy_plan_json_deserializes_as_legacy_variant() {
-        // The wire shape pre-Session-37 plans wrote: `description` +
-        // `preferred_source_ids`, no `endpoint_url`, no
-        // `priority_tier`. ADR 0015 §"Backwards-compatible
-        // deserialization" requires this round-trip.
+    fn pre_session37_legacy_plan_json_deserializes_as_legacy_variant() {
+        // Pre-Session-37 plans wrote `description` + `preferred_source_ids`,
+        // no `endpoint_url`, no `priority_tier`, no `nomination_id`.
+        // Required by storage round-trip discipline.
         let legacy_json = r#"{
             "description": "OFAC SDN list publication feed",
             "preferred_source_ids": ["ofac_sdn"]
@@ -570,6 +585,42 @@ mod tests {
     }
 
     #[test]
+    fn session_37_to_39_plan_json_falls_through_to_legacy() {
+        // Plans classified during the URL-bearing window (Session 37
+        // through 38) had `endpoint_url` + `priority_tier` but no
+        // `nomination_id`. Post-Session-39 these must NOT deserialize
+        // as `Nomination` (would lack the required nomination_id) and
+        // must fall through cleanly. The retry-loop executor surfaces
+        // them as `LegacyPlanCannotAuthor`.
+        let mid_era_json = r#"{
+            "description": "USGS Mineral Commodity Summaries — lithium chapter",
+            "endpoint_url": "https://pubs.usgs.gov/periodicals/mcs2024/mcs2024-lithium.pdf",
+            "priority_tier": "authoritative_primary",
+            "known_id": "usgs_mcs"
+        }"#;
+        let entry: DocumentSourceEntry = serde_json::from_str(mid_era_json).unwrap();
+        match entry {
+            DocumentSourceEntry::Legacy(h) => {
+                // The legacy hint catches everything that fails the
+                // post-Session-39 nomination shape. It only carries
+                // `description` and (defaulted) `preferred_source_ids`;
+                // the URL is silently dropped, which is correct — old
+                // URLs are no longer load-bearing.
+                assert_eq!(
+                    h.description,
+                    "USGS Mineral Commodity Summaries — lithium chapter"
+                );
+            }
+            DocumentSourceEntry::Nomination(_) => {
+                panic!(
+                    "Session 37–38 plans (no nomination_id) must fall through to Legacy, \
+                     not silently deserialize as Nomination"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn priority_tier_serializes_snake_case() {
         let tiers = [
             (PriorityTier::AuthoritativePrimary, "authoritative_primary"),
@@ -582,23 +633,6 @@ mod tests {
             assert_eq!(s, format!("\"{expected}\""));
             let back: PriorityTier = serde_json::from_str(&s).unwrap();
             assert_eq!(back, tier);
-        }
-    }
-
-    #[test]
-    fn nomination_without_known_id_round_trips() {
-        // The cold-start case: LLM emits a URL from training-distribution
-        // knowledge alone; no memory match; `known_id` is absent. Both
-        // omission ("no field") and explicit null must deserialize.
-        let json_omitted = r#"{
-            "description": "arXiv quant-ph daily listings",
-            "endpoint_url": "https://arxiv.org/list/quant-ph/recent",
-            "priority_tier": "authoritative_primary"
-        }"#;
-        let entry: DocumentSourceEntry = serde_json::from_str(json_omitted).unwrap();
-        match entry {
-            DocumentSourceEntry::Nomination(n) => assert!(n.known_id.is_none()),
-            _ => panic!("expected Nomination"),
         }
     }
 }

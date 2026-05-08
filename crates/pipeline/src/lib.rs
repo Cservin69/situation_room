@@ -38,6 +38,7 @@ pub mod fetch_backoff;
 pub mod fetch_executor;
 pub mod http_fetcher;
 pub mod promote;
+pub mod propose_source_url;
 pub mod recipes;
 pub mod recipe_author;
 pub mod recipe_apply;

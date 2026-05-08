@@ -201,19 +201,25 @@ pub enum PriorityTierDto {
     GeneralNews,
 }
 
-/// Wire shape for a post-ADR-0015 document-source nomination. The
-/// classifier emits the URL directly; the executor authors against
-/// it without any registry lookup.
+/// Wire shape for a post-Session-39 document-source nomination.
+///
+/// The classifier no longer emits URLs; URL discovery happens in the
+/// fetch executor's per-attempt propose-URL step. The plan persists
+/// only what it needs to drive that step: a stable `nomination_id`
+/// (server-stamped UUIDv7), a description specific enough that the
+/// propose-URL LLM can locate a real endpoint, and a priority tier
+/// for source-priority ordering in the UI.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
 pub struct DocumentSourceNominationDto {
+    /// UUIDv7 stamped at classify time. Stable across re-runs of the
+    /// same plan even when the retry loop picks different URLs each
+    /// run. Used as the `dedup_key` component on recipes; surfaces
+    /// in the UI for traceability but is not the operator-friendly
+    /// id on most screens.
+    pub nomination_id: String,
     pub description: String,
-    pub endpoint_url: String,
     pub priority_tier: PriorityTierDto,
-    /// `null` on the wire when the LLM did not stamp a known_id (the
-    /// cold-start case). The frontend uses presence to decide whether
-    /// to show the recognized-source badge.
-    pub known_id: Option<String>,
 }
 
 /// Wire shape for one document-source entry on a plan.
@@ -227,11 +233,15 @@ pub struct DocumentSourceNominationDto {
 ///
 /// The frontend should:
 ///
-/// - For `Nomination`: render the new tile with the URL, tier, and
-///   optional known_id badge.
+/// - For `Nomination`: render the description, the priority-tier
+///   badge, and the nomination_id (typically as a short prefix for
+///   traceability, similar to how recipes show their id prefix).
+///   No URL is shown at this layer — URLs are runtime artifacts of
+///   the retry loop and live on the recipes / fetch-run surfaces.
 /// - For `Legacy`: render a "legacy entry — re-classify to update"
-///   stub. The plan was classified before Session 37 / ADR 0015
-///   and its sources cannot be authored against without re-classification.
+///   stub. The plan was classified before Session 39 (or before
+///   Session 37, for pre-ADR-0015 plans) and its sources cannot be
+///   authored against without re-classification.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -553,15 +563,14 @@ impl From<DocumentSourceHint> for DocumentSourceHintDto {
     }
 }
 
-// --- ADR 0015 / Session 37 ------------------------------------------------
+// --- Session 39: description-only nomination DTO --------------------------
 
 impl From<DocumentSourceNomination> for DocumentSourceNominationDto {
     fn from(n: DocumentSourceNomination) -> Self {
         Self {
+            nomination_id: n.nomination_id.to_string(),
             description: n.description,
-            endpoint_url: n.endpoint_url,
             priority_tier: n.priority_tier.into(),
-            known_id: n.known_id,
         }
     }
 }
@@ -1203,12 +1212,11 @@ mod tests {
                     rationale: "Asset link".into(),
                 }],
                 document_sources: vec![P_DSE::Nomination(P_DSN {
-                    description: "USGS MCS".into(),
-                    endpoint_url:
-                        "https://www.usgs.gov/centers/national-minerals-information-center/mineral-commodity-summaries"
+                    nomination_id: uuid::Uuid::now_v7(),
+                    description:
+                        "USGS Mineral Commodity Summaries — annual lithium chapter, mine production by country"
                             .into(),
                     priority_tier: P_PT::AuthoritativePrimary,
-                    known_id: Some("usgs_mcs".into()),
                 })],
                 assertion_guidance: Some("Prioritize official guidance".into()),
             },
