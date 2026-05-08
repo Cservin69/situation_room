@@ -170,14 +170,17 @@ error-shaped output (see the schema) rather than inventing a mode.
 - `csv_cell` — for CSV/TSV. Fields: `column` (header name), optional
   `row_filter` (`equals` on a column, or `labeled_as` for pivoted
   tables).
-- `pdf_table` — for PDF reports with stable table structure. Fields:
-  `page` (1-indexed), `table_index` (0-indexed within the page),
-  `row` (0-indexed, header row is typically 0), `col` (0-indexed).
+- `pdf_table` — for PDFs whose tables tokenize cleanly (each cell's
+  value is a single whitespace-free token like `45000`, `Australia`,
+  `2024-Q1`). Fields: `page` (1-indexed, matches the `[PDF page N]`
+  marker shown in the prefetch excerpt for PDF sources),
+  `table_index` (0-indexed within the page), `row` (0-indexed,
+  header row is typically 0), `col` (0-indexed).
 - `regex_capture` — last resort, for unstructured text. Fields:
   `pattern` (Rust regex syntax), `group` (1-indexed capture group).
 
-Use `pdf_table` for authoritative annual reports (USGS MCS, SEC
-filings) where the structure is stable year-over-year. Use
+Use `pdf_table` for stable tabular PDFs whose layout you can read
+off the page-marker blocks in the prefetch excerpt. Use
 `regex_capture` only when no structured mode works.
 
 ## When no recipe is honestly possible — the decline path
@@ -623,79 +626,65 @@ fresh fetches, until the operator flags it. A few extra seconds
 spent on the checklist now saves the operator a flag-and-reauthor
 round trip later.
 
-## Strategy for PDF sources — HTML first, static payload fallback
+## Strategy for PDF sources
 
 Some sources publish their content primarily as PDF — annual
-reports (USGS Mineral Commodity Summaries, SEC 10-K filings),
-regulatory texts (EUR-Lex regulation PDFs), statistical
-releases. The closed extraction vocabulary's `pdf_table` mode
-exists for this case but is not yet wired in the runtime. In
-the meantime — and often as a better choice even when it lands
-— PDF sources usually have an HTML equivalent that's structured
-enough for one of the four wired modes (`json_path`,
-`css_select`, `csv_cell`, `regex_capture`).
+reports, regulatory texts, statistical releases. The closed
+extraction vocabulary's `pdf_table` mode addresses these directly:
+when the prefetch returns PDF bytes, the runtime extracts the page
+text and shows it to you in the excerpt with `[PDF page N]`
+markers preceding each page (1-indexed). Author `pdf_table`
+coordinates against that marker-bounded text — `page` is the
+marker number, `table_index` is the 0-indexed table within that
+page (use 0 when there is one table per page), `row` and `col`
+are 0-indexed positions within the table (header row is typically
+row 0).
 
-### First move: hunt for the HTML equivalent
+`pdf_table` works when each cell's value is a single
+whitespace-free token. Multi-word cells (`United States`,
+`North Sea`) tokenize as multiple columns and shift the column
+indexing — or, when the multi-word cell is a value rather than a
+header, terminate the detected table at the ragged-token-count
+row. If the excerpt shows multi-word cells in the rows you care
+about, prefer a different mode or decline.
 
-Most authoritative sources publish the same data in multiple
-formats. Your job is to recognize which format the recipe should
-target. Common patterns:
+### Prefer HTML when both formats publish the same data
 
-- **USGS MCS.** Each commodity chapter ships as both
-  `mcsYYYY-<commodity>.pdf` and `mcsYYYY-<commodity>.html`. The
-  HTML is the right target — it carries the same tables in
-  semantic markup that `css_select` can address.
-- **SEC EDGAR.** 10-K and 10-Q filings ship as PDFs and as
-  structured filing documents on EDGAR's filing-detail pages.
-  The HTML / XBRL paths are addressable; the PDF is not.
-- **EUR-Lex regulations.** Each CELEX has both an `EN/PDF` and
-  `EN/TXT` rendering. The HTML rendering is addressable.
-
-When the HTML equivalent exists and carries the same data,
-**author against the HTML.** Use the regular extraction
-vocabulary. Leave `static_payload` as the empty string `""`.
+When the same source publishes the same data as both PDF and HTML
+at parallel URLs, prefer the HTML route. CSS-selector authoring
+against semantic markup is deterministic on the markup tree;
+`pdf_table` authoring depends on positional column alignment that
+the source's typesetter could break in a future revision without
+warning. Look at the URL the prefetch landed on — if a parallel
+HTML URL exists on the same host with the same path shape, set
+`source_url` to the HTML URL, use the regular extraction
+vocabulary, and leave `static_payload` as `""`.
 
 ### Fallback: bake the values into the recipe (`static_payload`)
 
-When the HTML equivalent genuinely doesn't exist, *and* you've
-read the PDF in the prefetch and can transcribe the values the
-plan needs, you may bake the transcribed values into the recipe
-itself via the recipe-level `static_payload` field. The runtime
-serves these baked bytes to extraction in place of an HTTP
-fetch. The recipe's `extraction` mode still applies — the bytes
-just come from the recipe rather than the network.
+When the source has no live HTML companion *and* the PDF's table
+layout doesn't tokenize cleanly for `pdf_table` (multi-word cells,
+merged cells, scanned page images with no embedded text), you may
+transcribe the values from the prefetched PDF text into a small
+JSON document and bake it via the recipe-level `static_payload`
+field. The runtime serves these baked bytes to extraction in
+place of an HTTP fetch. The recipe's `extraction` mode still
+applies — the bytes just come from the recipe rather than the
+network.
 
 This is the bake-time-frozen path. The values are frozen at
 authoring time. There is no live freshness — the recipe will
 emit the same records on every fetch until re-authored. **That
-is the cost.** The benefit is that PDF-only sources become
-addressable without a `pdf_table` runtime, and the user sees a
-visible BAKED badge in the UI making the freshness model
-explicit.
+is the cost.** The benefit is that PDFs that don't admit a
+deterministic positional extractor become addressable, and the
+user sees a visible BAKED badge in the UI making the freshness
+model explicit.
 
 The transcribed payload should be a small JSON document the
 recipe's chosen extraction mode can address. Most baked recipes
 use `json_path` because JSON is the easiest shape to author
 deterministically. The runtime stores the payload string
 verbatim and feeds it to extraction byte-for-byte.
-
-### Worked example — HTML found, author against HTML
-
-> **Plan**: "global lithium production trends".
-> **Source**: `usgs_mcs`. **Prefetch URL**:
-> `https://pubs.usgs.gov/periodicals/mcs2024/mcs2024-lithium.pdf`.
->
-> The recipe author looks at the URL, recognizes the
-> `mcsYYYY-<commodity>.html` pattern, and authors against the
-> HTML companion:
->
-> ```
-> source_url: https://pubs.usgs.gov/periodicals/mcs2024/mcs2024-lithium.html
-> extraction:
->   mode: css_select
->   selector: "table.production tr:nth-child(2) td:nth-child(2)"
-> static_payload: ""
-> ```
 
 ### Worked example — HTML absent, bake the values
 
@@ -704,7 +693,9 @@ verbatim and feeds it to extraction byte-for-byte.
 > publishes PDFs. **Prefetch URL**:
 > `https://www.example-cb.hu/.../press_release_2026Q1.pdf`. No
 > HTML equivalent exists. The PDF excerpt the prefetch returned
-> shows the rate decision text.
+> shows the rate decision text but with multi-word cells
+> (`policy decision`, `unanimous vote`) that don't tokenize for
+> `pdf_table`.
 >
 > The recipe author transcribes the relevant fields into a
 > small JSON document and bakes it:
@@ -721,24 +712,21 @@ verbatim and feeds it to extraction byte-for-byte.
 > the transcribed values, until re-authored. The user sees the
 > BAKED badge in the UI and knows the freshness contract.
 
-### Anti-example — bake when HTML exists
+### Anti-example — bake when a live route exists
 
-> **Plan**: "global gold production".
-> **Source**: `usgs_mcs`. **Prefetch URL**:
-> `https://pubs.usgs.gov/periodicals/mcs2024/mcs2024-gold.pdf`.
-> An HTML equivalent at
-> `https://pubs.usgs.gov/periodicals/mcs2024/mcs2024-gold.html`
-> exists and carries the same production tables.
->
+> The PDF excerpt is what the prefetch returned, and a live HTML
+> companion is reachable on the same host carrying the same data.
 > The author bakes the values into `static_payload` anyway,
 > reasoning "the PDF is what was prefetched."
 >
-> Why wrong: The HTML is fetchable and structured. Baking
-> freezes a real-time data source into bake-time-frozen
-> values. The recipe will report the 2023 production figures
-> forever — even after MCS 2025 ships with 2024 figures. The
-> HTML route is the live recipe. **Bake only when there is no
-> live route.**
+> Why wrong: baking freezes a real-time data source. Once the
+> source publishes a new edition, the live route would carry
+> fresh numbers; the baked recipe would still report the
+> transcribed values forever, until someone re-authors. The
+> fixed cost of finding the live route once is much smaller
+> than the recurring cost of stale records flowing into every
+> plan that depends on this source. **Bake only when there is
+> no live route — neither HTML nor a clean `pdf_table` layout.**
 
 ## Document excerpt
 

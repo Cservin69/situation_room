@@ -704,18 +704,39 @@ async fn load_or_author_recipes(
 ///
 /// Session 39: descriptions don't carry URLs anymore, so there's no
 /// host to derive an id from at decline time. The `nomination_id`
-/// (formatted as a short prefix for log readability) is the stable
-/// identity surface — it's what `dedup_key` uses too, so any future
-/// re-author of this nomination (after re-classification or
-/// operator action) lines up against the same id.
+/// is the stable identity surface — it's what `dedup_key` uses too,
+/// so any future re-author of this nomination (after re-classification
+/// or operator action) lines up against the same id.
+///
+/// **Session 40 — uniqueness fix.** The Session 39 implementation
+/// of this function used `&s[..8]` as a "short prefix for log
+/// readability." That was wrong: UUIDv7's first 48 bits are the
+/// millisecond Unix timestamp, so the first 12 hex chars are
+/// identical across all nominations minted in the same millisecond.
+/// The classifier mints all of one plan's nominations in one tight
+/// loop — well under a millisecond — so every decline in a plan was
+/// receiving the same source_id (`nom:019e06b0` repeated N times in
+/// the live titanium-supply-chain run). Two visible failures:
+///
+///   1. The frontend's `{#each report.outcomes as o (outcomeKey(o))}`
+///      keyed-each in `FetchReport.svelte` produces duplicate keys
+///      and Svelte 5 throws `each_key_duplicate`, leaving the panel
+///      stuck on its summary header without the outcomes list.
+///      That is the "looks identical before and after Run Fetch"
+///      symptom the operator reported.
+///   2. Recipe-feedback (ADR 0013) keys on `(plan_id, source_id)`,
+///      so flagging one declined nomination flagged all of them.
+///      The flag-from-decline channel was unusable for any plan
+///      with >1 decline.
+///
+/// The fix: use the full nomination_id. Storage's
+/// `recipe_feedback.source_id` is `TEXT NOT NULL` with no length
+/// cap, and the API command bounds-checks against `Bounds::URL`
+/// (2,048 chars), so the longer string passes through unchanged.
+/// Log-line scannability is preserved by the existing `position`
+/// + `total` fields the caller logs alongside.
 fn derive_source_id_for_decline(nomination: &DocumentSourceNomination) -> String {
-    // Use a short prefix of the UUIDv7 to keep log lines scannable
-    // while staying unique within a plan (UUIDv7 is monotonic, so
-    // the first 8 hex chars share a timestamp prefix only across
-    // very-near-simultaneous classifications — the per-plan handful
-    // of nominations is well under that bar).
-    let s = nomination.nomination_id.to_string();
-    format!("nom:{}", &s[..8.min(s.len())])
+    format!("nom:{}", nomination.nomination_id)
 }
 
 /// Maximum number of bytes from a pre-fetched source document that we
@@ -1086,10 +1107,34 @@ fn derive_source_id_from_url(url: &url::Url) -> String {
 /// `None` if the fetch failed. Failure is logged at warn level; the
 /// caller decides what to do with the absence.
 ///
-/// We read up to `PREFETCH_EXCERPT_BUDGET` bytes. The HTTP layer
-/// already enforces a much larger ceiling (`max_response_bytes`); the
-/// budget here is about prompt size, not about defending the network
-/// layer.
+/// We read up to `PREFETCH_EXCERPT_BUDGET` bytes of the eventual
+/// excerpt body. The HTTP layer already enforces a much larger
+/// ceiling (`max_response_bytes`); the budget here is about prompt
+/// size, not about defending the network layer.
+///
+/// **Session 40 — PDF text-extraction.** When the fetched bytes are
+/// a PDF (sniffed by the `%PDF-` magic at offset 0), we run them
+/// through `pdf_extract::extract_text_from_mem_by_pages` and feed
+/// the *extracted text* to the LLM rather than the raw binary blob.
+/// Before this change, PDF-bearing URLs reached the recipe-author
+/// LLM as `String::from_utf8_lossy(<binary PDF>)` — i.e., a wall of
+/// `0xEF 0xBF 0xBD` replacement chars with no readable structure —
+/// and the author correctly declined every time with "the excerpt
+/// is a binary PDF dump, no extractable structure." That was the
+/// blocker on every USGS MCS / EUR-Lex / SEC-PDF source in the live
+/// titanium-supply-chain run. The runtime apply path
+/// (`recipe_apply::extract_pdf_table`) was already wired in
+/// Session 29 / ADR 0007 amendment 5; the gap was only at authoring
+/// time, where the LLM needs to *see* the table layout to address
+/// it positionally. Pages are joined with `[PDF page N]` markers so
+/// the LLM can author the `page` coordinate by counting the marker
+/// it lands on.
+///
+/// Failures of the text extraction (encrypted PDFs, malformed PDFs)
+/// fall through to the original UTF-8 lossy form with a clear
+/// "could not extract" annotation; the LLM will then decline rather
+/// than author against garbage. We never block authoring on a
+/// best-effort enrichment.
 async fn prefetch_excerpt(
     ctx: &ExecutorContext<'_>,
     url: &url::Url,
@@ -1138,28 +1183,127 @@ async fn prefetch_excerpt(
         }
     };
 
-    // Truncate at `PREFETCH_EXCERPT_BUDGET` *bytes*, not chars. The
-    // LLM tokenizer doesn't care about UTF-8 boundaries; we use
-    // `from_utf8_lossy` to handle the cut cleanly.
     let byte_count = bytes.len();
-    let trimmed = if byte_count > PREFETCH_EXCERPT_BUDGET {
-        &bytes[..PREFETCH_EXCERPT_BUDGET]
-    } else {
-        &bytes[..]
-    };
-    let body = String::from_utf8_lossy(trimmed).into_owned();
 
-    let truncated_marker = if byte_count > PREFETCH_EXCERPT_BUDGET {
-        format!(
-            "\n\n[... excerpt truncated at {PREFETCH_EXCERPT_BUDGET} bytes; original was {byte_count} bytes ...]"
-        )
+    // Branch on payload kind. PDFs go through pdf_extract; everything
+    // else falls through to the existing UTF-8-lossy path. We only
+    // do the dispatch here, not in a separate helper, because the
+    // truncation + framing logic is the same shape for both branches
+    // — just over different "body" strings.
+    let (body, kind_annotation) = if is_pdf(&bytes) {
+        match render_pdf_text(&bytes) {
+            Ok(text) => (text, "PDF (text extracted)".to_string()),
+            Err(e) => {
+                // pdf-extract failed (encrypted, malformed, exotic
+                // glyph encoding). Surface the failure honestly so
+                // the LLM declines rather than authoring against a
+                // garbled blob. Falling back to from_utf8_lossy here
+                // would just feed it the same binary garbage the
+                // pre-Session-40 code did.
+                warn!(
+                    source_id = %source_id,
+                    url = %url,
+                    error = %e,
+                    "pdf text extraction failed; surfacing as unreadable in excerpt"
+                );
+                (
+                    format!(
+                        "(could not extract text from this PDF — {e}. \
+                         No readable structure is available; if your \
+                         closed-vocabulary modes cannot author against \
+                         this source, decline.)"
+                    ),
+                    "PDF (extraction failed)".to_string(),
+                )
+            }
+        }
     } else {
-        String::new()
+        // Truncate at `PREFETCH_EXCERPT_BUDGET` *bytes*, not chars.
+        // The LLM tokenizer doesn't care about UTF-8 boundaries; we
+        // use `from_utf8_lossy` to handle the cut cleanly.
+        let trimmed = if bytes.len() > PREFETCH_EXCERPT_BUDGET {
+            &bytes[..PREFETCH_EXCERPT_BUDGET]
+        } else {
+            &bytes[..]
+        };
+        (
+            String::from_utf8_lossy(trimmed).into_owned(),
+            "raw bytes".to_string(),
+        )
+    };
+
+    // Final body-length cap, applied uniformly across both branches.
+    // For PDFs the extracted text can balloon well past the raw byte
+    // count (a 200KiB PDF often produces 600KiB of text); for HTML the
+    // pre-truncation upstream already bounded it. Truncate on char
+    // boundaries so we don't slice mid-codepoint.
+    let body_len = body.len();
+    let (body, truncated_marker) = if body_len > PREFETCH_EXCERPT_BUDGET {
+        let mut cut = PREFETCH_EXCERPT_BUDGET;
+        while cut > 0 && !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let marker = format!(
+            "\n\n[... excerpt truncated at {PREFETCH_EXCERPT_BUDGET} bytes; \
+             rendered body was {body_len} bytes ...]"
+        );
+        (body[..cut].to_string(), marker)
+    } else {
+        (body, String::new())
     };
 
     Some(format!(
-        "Source id: {source_id}\nFetched URL: {url}\nFetched bytes: {byte_count}\n\n--- begin excerpt ---\n{body}{truncated_marker}\n--- end excerpt ---\n"
+        "Source id: {source_id}\n\
+         Fetched URL: {url}\n\
+         Fetched bytes: {byte_count} ({kind_annotation})\n\n\
+         --- begin excerpt ---\n\
+         {body}{truncated_marker}\n\
+         --- end excerpt ---\n"
     ))
+}
+
+/// `true` iff `bytes` looks like a PDF: starts with the literal
+/// magic `%PDF-` per ISO 32000-1 §7.5.2. We don't bother checking
+/// the version byte after the dash — pdf-extract handles every
+/// version we care about (1.0–2.0), and a malformed header will
+/// surface as a parse error from `extract_text_from_mem_by_pages`.
+fn is_pdf(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"%PDF-")
+}
+
+/// Run `pdf_extract::extract_text_from_mem_by_pages` and concatenate
+/// the resulting page strings with `[PDF page N]` separators so the
+/// LLM can read structure off the marker that precedes each block of
+/// rows. The same library and the same per-page reader is used at
+/// runtime by `recipe_apply::extract_pdf_table`, so what the LLM
+/// sees here is byte-for-byte the same text the runtime will index
+/// into when it later applies the recipe — same whitespace
+/// collapsing, same line ordering, same multi-word-cell caveat.
+///
+/// Returns the joined text, or a stringified error when pdf-extract
+/// rejects the bytes (encrypted PDF, exotic font, malformed
+/// xref table). The caller annotates the excerpt and lets the LLM
+/// decline.
+fn render_pdf_text(bytes: &[u8]) -> Result<String, String> {
+    let pages = pdf_extract::extract_text_from_mem_by_pages(bytes)
+        .map_err(|e| format!("pdf parse failed: {e}"))?;
+    if pages.is_empty() {
+        return Ok("(PDF parsed but contained zero pages)".to_string());
+    }
+    let mut out = String::new();
+    for (idx, page_text) in pages.iter().enumerate() {
+        // 1-indexed in the marker because that is what the
+        // `pdf_table.page` coordinate uses (PDF page numbers are
+        // 1-indexed by convention, and the runtime extractor
+        // rejects page 0 explicitly).
+        let page_num = idx + 1;
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("[PDF page {page_num}]\n"));
+        out.push_str(page_text.trim_end_matches('\n'));
+    }
+    Ok(out)
 }
 
 /// Build a stub excerpt for cases where pre-fetch is impossible
@@ -3537,14 +3681,23 @@ mod tests {
         assert_eq!(report.outcomes.len(), 1);
         match &report.outcomes[0] {
             RecipeOutcome::Declined { source_id, reason } => {
-                // Session 39: source_id on a decline is derived from
-                // the nomination_id (no URL exists at decline time
-                // because the propose-URL step itself declined). The
-                // executor formats it as "nom:<8-char-prefix>" — see
-                // `derive_source_id_for_decline`.
+                // Session 40: source_id on a decline is derived from
+                // the full nomination_id (no URL exists at decline
+                // time because the propose-URL step itself declined).
+                // The executor formats it as "nom:<full-uuid>" — see
+                // `derive_source_id_for_decline` for why the prior
+                // 8-char prefix was a uniqueness bug.
                 assert!(
                     source_id.starts_with("nom:"),
                     "decline source_id should be a nom: prefix; got {source_id}"
+                );
+                // The full uuid is 36 chars; "nom:" + 36 = 40.
+                assert_eq!(
+                    source_id.len(),
+                    40,
+                    "decline source_id should carry the full nomination_id \
+                     (Session 40 uniqueness fix); got len={} for {source_id}",
+                    source_id.len()
                 );
                 assert!(
                     reason.contains("JS-rendered SPA"),
@@ -3586,6 +3739,86 @@ mod tests {
         assert!(matches!(r2.outcomes[0], RecipeOutcome::Declined { .. }));
         // Still no recipes persisted.
         assert!(store.recipes_for_plan(plan.id).unwrap().is_empty());
+    }
+
+    /// **Session 40 regression test — source_id uniqueness across
+    /// same-millisecond nominations.**
+    ///
+    /// The Session 39 implementation of `derive_source_id_for_decline`
+    /// took the first 8 hex chars of the nomination's UUIDv7. Those
+    /// 32 bits are entirely the millisecond Unix timestamp; all
+    /// nominations minted in the same classifier pass share that
+    /// prefix exactly, so every decline in a plan came back with
+    /// `nom:019e06b0` (or whatever the millisecond happened to be).
+    ///
+    /// The visible failure was on the frontend: the keyed-each in
+    /// `FetchReport.svelte` produces `declined:<source_id>` keys, so
+    /// duplicate source_ids meant duplicate keys and Svelte 5 refused
+    /// to render the outcomes list. The operator's "looks identical
+    /// before and after Run Fetch" symptom was the panel stuck on its
+    /// summary header.
+    ///
+    /// This test pins the fix at the executor boundary: build a plan
+    /// with five nominations (the live titanium-supply-chain run had
+    /// seven), force them all to decline at the propose-URL step, and
+    /// assert every produced `RecipeOutcome::Declined.source_id` is
+    /// pairwise distinct. The nominations are constructed in a tight
+    /// loop without sleeps so the same-millisecond invariant the bug
+    /// depended on is preserved — not as a synchronization trick, just
+    /// to mirror what the live classifier does.
+    #[tokio::test]
+    async fn decline_source_ids_are_unique_across_nominations() {
+        // Build a plan with five fresh nominations. Mint the UUIDv7s
+        // back-to-back so they share their millisecond timestamp
+        // prefix, exactly as the live classifier does.
+        let mut plan = sample_plan();
+        plan.expectations.document_sources = (0..5)
+            .map(|i| {
+                DocumentSourceEntry::Nomination(DocumentSourceNomination {
+                    nomination_id: Uuid::now_v7(),
+                    description: format!("test nomination #{i}"),
+                    priority_tier: PriorityTier::AuthoritativePrimary,
+                })
+            })
+            .collect();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let fetcher = StaticFetcher::new();
+        let provider = DecliningProvider::new(
+            "this source is a JS-rendered SPA; the static HTTP \
+             response carries no extractable data",
+        );
+        let sources: Vec<SourceDescriptor> = vec![];
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
+            sources: &sources,
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+        assert_eq!(report.outcomes.len(), 5);
+
+        // Every outcome is a Declined and every source_id is distinct.
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        for o in &report.outcomes {
+            match o {
+                RecipeOutcome::Declined { source_id, .. } => {
+                    assert!(
+                        seen.insert(source_id),
+                        "duplicate decline source_id {source_id} \
+                         (Session 39 collision regression — \
+                         derive_source_id_for_decline must use the full \
+                         nomination_id, not a prefix)"
+                    );
+                }
+                other => panic!("expected Declined, got: {other:?}"),
+            }
+        }
+        assert_eq!(seen.len(), 5);
     }
 
     // -----------------------------------------------------------------------
@@ -3967,6 +4200,205 @@ mod tests {
         assert!(
             runs[0].records_produced >= min,
             "fetch_run.records_produced must reflect the cumulative count"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Session 40 — PDF text-extraction at prefetch time.
+    //
+    // Before this session the recipe-author LLM saw raw PDF bytes
+    // through `String::from_utf8_lossy`, which is unintelligible
+    // binary, and declined every PDF-bearing source it ever met. The
+    // runtime apply path (`recipe_apply::extract_pdf_table`) was
+    // already wired in Session 29 / ADR 0007 amendment 5; the gap
+    // was at authoring time. These tests pin the new behaviour:
+    // PDFs go through `pdf_extract::extract_text_from_mem_by_pages`,
+    // get joined with `[PDF page N]` separators, and arrive at the
+    // LLM as readable text the same library the runtime uses for
+    // extraction will produce at apply time.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_pdf_recognizes_pdf_magic() {
+        assert!(is_pdf(b"%PDF-1.4\n..."));
+        assert!(is_pdf(b"%PDF-2.0\nfoo"));
+        // Empty / short / wrong-prefix bytes are not PDF.
+        assert!(!is_pdf(b""));
+        assert!(!is_pdf(b"%PD"));
+        assert!(!is_pdf(b"<html>%PDF-fake"));
+        assert!(!is_pdf(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn render_pdf_text_against_lithium_fixture_emits_page_markers_and_table_text() {
+        let out = render_pdf_text(LITHIUM_PDF)
+            .expect("the lithium fixture is a well-formed single-page PDF");
+        // The fixture is one page; the marker uses 1-indexed numbering
+        // because that's the convention the `pdf_table.page` recipe
+        // coordinate uses.
+        assert!(
+            out.starts_with("[PDF page 1]"),
+            "extracted text should start with the page-1 marker; got:\n{out}"
+        );
+        // The fixture's table contains "Country", "Production", and
+        // a row for Australia/Chile/Argentina (see the docstring on
+        // LITHIUM_PDF). pdf-extract is allowed to break the table
+        // into multiple lines, but every cell value must appear
+        // somewhere in the rendered text or the LLM cannot author
+        // coordinates against it.
+        for needle in ["Country", "Production", "Australia", "Chile", "Argentina"] {
+            assert!(
+                out.contains(needle),
+                "rendered PDF text is missing {needle:?}; \
+                 the LLM cannot author pdf_table coordinates against it.\n\
+                 full text:\n{out}"
+            );
+        }
+        // No replacement chars from utf8-lossy. If this fires, the
+        // PDF branch is being missed and we're falling back to the
+        // raw-bytes path.
+        assert!(
+            !out.contains('\u{FFFD}'),
+            "extracted text should be readable, not utf8-lossy garbage"
+        );
+    }
+
+    #[test]
+    fn render_pdf_text_surfaces_errors_for_non_pdf_bytes() {
+        // A byte slice that starts with `%PDF-` but is otherwise junk
+        // exercises the error path. is_pdf would gate this in the
+        // executor (only real PDFs reach render_pdf_text), but the
+        // error path is the fallback we feed the LLM if a real PDF
+        // turns out to be encrypted / malformed; pin it here so a
+        // future pdf_extract upgrade doesn't silently swallow it.
+        let junk = b"%PDF-1.7\n<not actually a valid pdf>";
+        let result = render_pdf_text(junk);
+        assert!(
+            result.is_err() || matches!(&result, Ok(s) if s.is_empty() || s.starts_with("(PDF parsed")),
+            "malformed PDF bytes should surface as an error or a \
+             zero-page parse, not silently produce a random success; got {result:?}"
+        );
+    }
+
+    /// End-to-end check on the framing: a PDF source travels through
+    /// the executor's pre-fetch + propose-URL + recipe-author retry
+    /// loop, and the prompt the recipe-author LLM finally sees has
+    /// the extracted-PDF-text body, not the raw-bytes garbage. We
+    /// assert by inspecting the recipe-author prompt that the
+    /// `RecordingProvider` captured. Mirrors the live failure mode
+    /// from the titanium-supply-chain run: every USGS MCS PDF
+    /// declined with "the excerpt is a binary PDF dump."
+    #[tokio::test]
+    async fn prefetch_excerpt_for_pdf_url_yields_extracted_text_to_recipe_author() {
+        use std::sync::Mutex;
+
+        // A provider that records every recipe-author prompt it gets
+        // shown and replies with a Track-B decline (so the executor
+        // proceeds linearly and the test stays bounded).
+        struct PromptCapturingProvider {
+            seen: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl LlmProvider for PromptCapturingProvider {
+            fn id(&self) -> &'static str {
+                "prompt_capturing"
+            }
+            fn supported_tiers(&self) -> &[ModelTier] {
+                &[ModelTier::Cheap, ModelTier::Workhorse]
+            }
+            async fn complete(
+                &self,
+                tier: ModelTier,
+                req: situation_room_llm::CompletionRequest,
+            ) -> Result<situation_room_llm::CompletionResponse, situation_room_llm::LlmError> {
+                // Workhorse is recipe-author; that's the prompt we
+                // care about pinning. For Cheap (propose-URL) the
+                // executor calls us repeatedly; we always return the
+                // same fixture URL so the propose-URL step terminates
+                // quickly.
+                if matches!(tier, ModelTier::Workhorse) {
+                    self.seen.lock().unwrap().push(req.user.clone());
+                }
+                let canned = if matches!(tier, ModelTier::Cheap) {
+                    serde_json::json!({
+                        "url": "https://example.test/lithium.pdf",
+                        "rationale": "fixture",
+                    })
+                } else {
+                    serde_json::json!({
+                        "source_url": "https://example.test/lithium.pdf",
+                        "extraction": { "mode": "regex_capture", "pattern": ".*", "group": 0 },
+                        "produces": [],
+                        "decline_reason": "test pin: surface the prompt we just saw",
+                    })
+                };
+                Ok(situation_room_llm::CompletionResponse {
+                    text: serde_json::to_string(&canned).unwrap(),
+                    structured: Some(canned),
+                    provider: "prompt_capturing".into(),
+                    model: "test".into(),
+                    input_tokens: None,
+                    output_tokens: None,
+                })
+            }
+        }
+
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let url = "https://example.test/lithium.pdf";
+        let fetcher = StaticFetcher::new().with(url, LITHIUM_PDF);
+
+        let provider = PromptCapturingProvider {
+            seen: Mutex::new(Vec::new()),
+        };
+        let sources: Vec<SourceDescriptor> = vec![];
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
+            sources: &sources,
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+        // The recipe-author declined (test fixture says so), so the
+        // outcome is exactly one Declined.
+        assert_eq!(report.outcomes.len(), 1);
+
+        // The recipe-author prompt was captured at least once. Check
+        // that the captured prompt carries the extracted text — page
+        // marker + table contents — and not raw PDF bytes.
+        let prompts = provider.seen.lock().unwrap();
+        assert!(
+            !prompts.is_empty(),
+            "recipe-author should have been called at least once \
+             before the decline; nothing captured"
+        );
+        let last = &prompts[prompts.len() - 1];
+        assert!(
+            last.contains("[PDF page 1]"),
+            "the recipe-author prompt should carry the per-page \
+             marker emitted by `render_pdf_text`. \
+             pre-Session-40 it carried raw PDF binary instead."
+        );
+        for needle in ["Country", "Production"] {
+            assert!(
+                last.contains(needle),
+                "the recipe-author prompt should carry the extracted \
+                 PDF table text containing {needle:?}"
+            );
+        }
+        // The kind annotation in the excerpt header announces the
+        // extraction explicitly so the LLM knows what it's looking
+        // at — pinning the marker here also catches accidental
+        // regressions where the PDF branch is bypassed entirely.
+        assert!(
+            last.contains("PDF (text extracted)"),
+            "excerpt header should announce that bytes were converted \
+             from PDF; otherwise the LLM has no signal that it's \
+             looking at extracted text rather than the raw source"
         );
     }
 }
