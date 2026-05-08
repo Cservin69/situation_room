@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.13
+# Recipe Author Prompt — v1.14
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -658,13 +658,21 @@ apply time, then frames the result for you in the excerpt:
   `[PDF page N, table M] (R rows × C cols)` followed by one line
   per row showing the row index, the column range, and the
   detected cell values in quoted form.
-- Pages where the detector found no table are announced
-  `[PDF page N] (no table detected)` followed by the page's
-  narrative text. Use that text only to decide *whether* the value
-  you need is on this page; do **not** author `pdf_table`
-  coordinates against pages that declare no table — the runtime
-  will see the same nothing the prefetch saw and the validator
-  will reject the recipe.
+- Pages where the detector found no table are announced by a
+  single line `[PDF page N] (no table detected)` and **nothing
+  else**. Pages without a detected table cannot be addressed by
+  `pdf_table` — the runtime will see the same nothing the prefetch
+  saw and the validator will reject the recipe.
+
+The framed-table list across the document — every
+`[PDF page N, table M] (R rows × C cols)` header followed by its
+quoted row cells — is your navigation index for the PDF. Page
+numbers are inline in every header; each table's row 0 (typically
+column headers like `"Country", "Production"`) names the table.
+Scan the list to pick the page and table whose contents match the
+plan's metric, then author `pdf_table` coordinates against that
+header. There is no separate table-of-contents block above the
+excerpt; the headers themselves are the index.
 
 Because the framed excerpt is produced by the same detector the
 runtime uses, the row and column numbers you read off the headers
@@ -1252,6 +1260,26 @@ you pick.
 
 ### Changelog
 
+- **v1.14** (2026-05-08) — Session 44 (PDF prefetch truncation gap).
+  No output contract change; no schema change. Edits the "Strategy
+  for PDF sources" section to reflect the Session 44 prefetch
+  format change: pages without a detected table now emit only
+  the marker line `[PDF page N] (no table detected)` and no
+  narrative text. Pre-Session-44 the no-table marker was followed
+  by up to 4 KiB of the page's narrative text so the LLM could
+  decide *whether* the value lived on that page; in practice the
+  narrative budget bled out the prefetch excerpt on long PDFs and
+  framed tables on later pages never reached the LLM (the lithium
+  MCS chapter on page 110 fell off the end behind the budget cut
+  at page ~8). v1.14's edit replaces the navigation-by-narrative
+  affordance with navigation-by-framed-table-list: every
+  `[PDF page N, table M] ...` header inlines its page number and
+  its row-0 column headers name the table, so the LLM scans the
+  list of framed tables to pick the right page/table. The "do not
+  author against no-table pages" rule is preserved (validator
+  still rejects), but the rationale is shortened. PDF runtime,
+  table detector, recipe schema, and `pdf_table` coordinate
+  arithmetic are all unchanged. Existing recipes remain valid.
 - **v1.13** (2026-05-07) — ADR 0016 (Session 38). Output contract
   changes: a new optional top-level field `iterator` (an
   `ExtractionSpec` from the same closed enum, drawn at iterator

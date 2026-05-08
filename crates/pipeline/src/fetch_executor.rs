@@ -750,7 +750,22 @@ fn derive_source_id_for_decline(nomination: &DocumentSourceNomination) -> String
 /// Bumping this is fine, but check `build_prompt`'s post-substitution
 /// bound check first; the prompt + plan + excerpt together must stay
 /// under `Bounds::LLM_PROMPT_BODY`.
-const PREFETCH_EXCERPT_BUDGET: usize = 32 * 1024;
+// Session 44 — bumped from 32 KiB to 64 KiB. The 32 KiB ceiling was
+// covering only ~8–10 pages of framed PDF excerpts when the narrative
+// branch on no-table pages emitted up to 4 KiB each. With Session 44's
+// drop of per-page narrative on no-table pages, framing across the
+// whole document becomes much denser — a 110-page PDF with one small
+// table per page is ~55 KiB of framed output, which 32 KiB cannot
+// hold but 64 KiB can. The bump is uniform across the four prefetch
+// branches (PDF, HTML, JSON, raw bytes); HTML/JSON/raw were not the
+// binding constraint, so they simply inherit the headroom. PDFs were
+// the binding constraint, and 64 KiB is the smallest power-of-two
+// budget that fits the full framed-table view of a typical multi-
+// chapter regulatory or statistical PDF (USGS MCS, EUR-Lex annex
+// volumes, RBA stat releases) without truncation. Above that we
+// honestly truncate at the end and the LLM declines on the missing
+// pages — no per-source heuristic, no per-document-class branch.
+const PREFETCH_EXCERPT_BUDGET: usize = 64 * 1024;
 
 /// Maximum number of (propose URL → fetch → author) attempts the
 /// retry loop will make for one nomination before recording the
@@ -1127,8 +1142,10 @@ fn derive_source_id_from_url(url: &url::Url) -> String {
 /// `extract_pdf_table` calls at apply time) so the LLM sees the page
 /// content in the runtime's coordinate space — `[PDF page N, table M]
 /// (R rows × C cols)` followed by the cell values, and `[PDF page N]
-/// (no table detected)` followed by the raw page text for pages
-/// where the detector found nothing tabular.
+/// (no table detected)` for pages where the detector found nothing
+/// tabular. (Session 44 dropped the per-page narrative that pre-
+/// viously followed the no-table marker; see
+/// `render_pdf_text_with_tables`'s rustdoc for the rationale.)
 ///
 /// When the fetched bytes are HTML, we parse them with `scraper`
 /// (the same crate the runtime's `extract_css_select` queries) and
@@ -1416,12 +1433,10 @@ fn is_pdf(bytes: &[u8]) -> bool {
 ///   0-indexed (matching `pdf_table.table_index`); `I` and the col
 ///   range are 0-indexed (matching `pdf_table.row` and
 ///   `pdf_table.col`).
-/// - Pages whose detector found nothing emit
-///   `[PDF page N] (no table detected)` followed by the page's
-///   narrative text, capped per-page to keep the excerpt navigable.
-///   The narrative is for the LLM to decide "is the value on this
-///   page or not"; the LLM should not author `pdf_table` coordinates
-///   against text the detector did not pick up as a table.
+/// - Pages whose detector found nothing emit a single line
+///   `[PDF page N] (no table detected)` and **nothing else**. As of
+///   Session 44 the prior per-page narrative is gone — see "Why
+///   narrative is dropped" below.
 ///
 /// **Why the framing matters.** Pre-Session-41, this function emitted
 /// raw page text with a `[PDF page N]` marker. The LLM had to
@@ -1431,6 +1446,38 @@ fn is_pdf(bytes: &[u8]) -> bool {
 /// rows). With the new framing, the LLM no longer translates
 /// between "what I see on the page" and "what the runtime will
 /// index" — the framing IS what the runtime will index.
+///
+/// **Why narrative is dropped (Session 44).** Pre-Session-44 the
+/// no-table branch followed its marker with up to 4 KiB of the
+/// page's narrative text. The reasoning was navigation — let the
+/// LLM see prose so it could decide which page covered which topic.
+/// In practice that budget bled out the prefetch excerpt: with
+/// `PREFETCH_EXCERPT_BUDGET` at 32 KiB pre-Session-44, a single
+/// long PDF with many narrative-only pages would burn through the
+/// budget on the first 8–10 pages and the framed tables on later
+/// pages would never reach the LLM. The lithium MCS run from
+/// Session 41 patch 1 was the canonical case: chapter on page 110,
+/// budget covered through page 8.
+///
+/// Session 44 drops the narrative entirely and bumps the budget to
+/// 64 KiB. Navigation now happens *through the framed-table list
+/// itself*: every `[PDF page N, table M] ...` header inlines its
+/// page number, and the table's first row (typically column
+/// headers like `"Country", "Production"`) names the table for the
+/// LLM. A 110-page PDF with one small table per page comes in
+/// around 55 KiB of framed output — fits in the new budget,
+/// covers the whole document, and does not require any source-
+/// specific routing or per-document-class heuristic.
+///
+/// Pages whose value lives only in narrative (no detected table on
+/// the page) cannot be addressed by `pdf_table` regardless of how
+/// much narrative we showed the LLM — the runtime would see the
+/// same nothing and the validator would reject the recipe. The
+/// honest endings for those cases are (a) decline the source as
+/// un-addressable by the closed extraction vocabulary or (b)
+/// transcribe values from a *framed* table elsewhere in the
+/// document and bake them via `static_payload`. Both work without
+/// the dropped narrative.
 ///
 /// Returns the joined text, or a stringified error when pdf-extract
 /// rejects the bytes (encrypted PDF, exotic font, malformed
@@ -1454,35 +1501,41 @@ fn render_pdf_text_with_tables(bytes: &[u8]) -> Result<String, String> {
         }
 
         if tables.is_empty() {
-            // No table detected. Emit the marker that says so plus a
-            // capped slice of the page text so the LLM can still
-            // identify which page covers the topic. The LLM should
-            // not author `pdf_table` coordinates against this text;
-            // the runtime would return "no table found on page N"
-            // and the validator would reject the recipe.
-            out.push_str(&format!("[PDF page {page_num}] (no table detected)\n"));
-            // Per-page narrative cap — the prefetch's overall budget
-            // still applies at the outer level, but a single
-            // text-heavy PDF page can dominate the excerpt and
-            // crowd out tables on later pages. 4 KiB per narrative
-            // page leaves room for several pages even when many are
-            // narrative.
-            const PER_PAGE_NARRATIVE_CAP: usize = 4 * 1024;
-            let page_str = page_text.trim_end_matches('\n');
-            if page_str.len() <= PER_PAGE_NARRATIVE_CAP {
-                out.push_str(page_str);
-            } else {
-                let mut cut = PER_PAGE_NARRATIVE_CAP;
-                while cut > 0 && !page_str.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                out.push_str(&page_str[..cut]);
-                out.push_str(&format!(
-                    "\n[... page narrative truncated at {PER_PAGE_NARRATIVE_CAP} bytes; \
-                     full page was {} bytes ...]",
-                    page_str.len()
-                ));
-            }
+            // No table detected. Emit the marker that says so and
+            // nothing else.
+            //
+            // **Session 44 — narrative dropped.** Pre-Session-44 we
+            // followed the marker with up to 4 KiB of the page's
+            // narrative text so the LLM could decide *whether* the
+            // value it needed lived on this page. That budget bled
+            // out the excerpt: a 110-page PDF with 30 narrative pages
+            // burned 120 KiB on text that the LLM could not author
+            // any `pdf_table` coordinates against (the runtime would
+            // see the same nothing the prefetch saw, and the
+            // validator would reject the recipe). The lithium MCS
+            // truncation gap from Session 41 patch 1 was the symptom:
+            // chapter on page 110 fell off the end because narrative
+            // pages dominated the budget.
+            //
+            // Session 44 drops the narrative entirely. The framed-
+            // table list across the document — every
+            // `[PDF page N, table M] (R rows × C cols)` header
+            // followed by quoted row cells — is the navigation
+            // index: page numbers are inline, and each table's
+            // first row typically names the table (column headers).
+            // The LLM picks the page and table to author against by
+            // scanning that list, not by reading prose around it.
+            //
+            // Pages that genuinely host the value only in narrative
+            // (no detected table) cannot be addressed by `pdf_table`
+            // anyway. The LLM's options for those are: (a) decline
+            // the source as un-addressable by the closed extraction
+            // vocabulary, or (b) transcribe values from a *framed*
+            // table elsewhere in the document and bake them via
+            // `static_payload` (see the prompt's "Strategy for PDF
+            // sources" section). Both are honest endings; both work
+            // without the dropped narrative.
+            out.push_str(&format!("[PDF page {page_num}] (no table detected)"));
             continue;
         }
 
@@ -5260,6 +5313,82 @@ mod tests {
             "page 1 should either declare its (single) table or declare \
              that no table was detected — never silently render raw page \
              text. Got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_pdf_text_with_tables_drops_narrative_on_no_table_pages_session_44() {
+        // Session 44: pages where the detector found no table emit
+        // ONLY the marker line `[PDF page N] (no table detected)`
+        // and nothing else. Pre-Session-44 the same page would have
+        // followed the marker with up to 4 KiB of the page's
+        // narrative text, which dominated the prefetch budget on
+        // long PDFs and pushed framed tables on later pages off the
+        // end (the lithium MCS truncation gap on chapter-page-110).
+        //
+        // The test pins the new shape: between the page-1 no-table
+        // marker and the page-2 marker that follows, only the
+        // inter-page padding (`\n\n`) may appear. Any other
+        // characters are narrative leaking through, which is the
+        // regression this test guards against.
+        let out = render_pdf_text_with_tables(LITHIUM_PDF)
+            .expect("the lithium fixture is a well-formed PDF");
+
+        // The page-1 no-table marker must be present. (The
+        // `_emits_no_table_marker_*` test above also checks this,
+        // but we depend on it here so we re-assert for a clear
+        // failure message if the precondition slips.)
+        let marker = "[PDF page 1] (no table detected)";
+        let marker_idx = out.find(marker).unwrap_or_else(|| {
+            panic!(
+                "expected page-1 no-table marker; \
+                 the title page of the lithium fixture should produce it. \
+                 Got:\n{out}"
+            )
+        });
+
+        // Everything between the marker and the next page's marker
+        // must be only inter-page padding. The function emits `\n\n`
+        // before each page after the first; trim that off and the
+        // remainder must be the page-2 marker (table or no-table)
+        // or end-of-string for a single-page PDF.
+        let after_marker = &out[marker_idx + marker.len()..];
+        let after_padding = after_marker.trim_start_matches('\n');
+        assert!(
+            after_padding.is_empty()
+                || after_padding.starts_with("[PDF page 2"),
+            "expected only inter-page padding (\\n\\n) between the \
+             page-1 no-table marker and the page-2 marker — narrative \
+             leaked through. Session 44 dropped narrative on no-table \
+             pages; this test guards the drop. Content between markers:\n\
+             {after_padding:.300}"
+        );
+    }
+
+    #[test]
+    fn prefetch_excerpt_budget_is_at_least_64kb_session_44() {
+        // Session 44 bumped PREFETCH_EXCERPT_BUDGET from 32 KiB to
+        // 64 KiB. The 32 KiB ceiling pre-Session-44 was the binding
+        // constraint behind the lithium MCS truncation gap: framed
+        // output for a 110-page PDF runs ~55 KiB even after Session
+        // 44's narrative drop, which 32 KiB cannot hold but 64 KiB
+        // can. Below the 64 KiB floor the truncation gap returns —
+        // the LLM sees the early framed tables and the late ones
+        // get cut.
+        //
+        // Pin the floor. If a future session lowers this, the
+        // session must update the rationale in the constant's
+        // doc-comment AND in `render_pdf_text_with_tables`'s
+        // rustdoc, then update or delete this test with a comment
+        // explaining what changed in the prefetch architecture
+        // that made the smaller budget viable.
+        assert!(
+            PREFETCH_EXCERPT_BUDGET >= 64 * 1024,
+            "PREFETCH_EXCERPT_BUDGET = {} bytes; Session 44 floor is \
+             64 KiB. Lowering this without re-architecting the PDF \
+             excerpt format reintroduces the lithium MCS truncation \
+             gap (chapter on page 110 falls behind the budget cut).",
+            PREFETCH_EXCERPT_BUDGET
         );
     }
 
