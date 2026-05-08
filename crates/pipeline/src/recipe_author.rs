@@ -328,12 +328,24 @@ pub fn build_prompt_with_fence_id(
 /// The prompt template is passed as a string so callers control how
 /// they load it (from disk, embedded in the binary, a test literal).
 /// The pipeline crate deliberately doesn't reach into the filesystem.
+///
+/// **`original_bytes`** — the raw bytes the document excerpt was
+/// rendered from, when available. Session 41 items 4–6: after the
+/// LLM produces a candidate recipe and structural validation passes,
+/// we run the runtime's own extraction code against these bytes. If
+/// the recipe wouldn't actually extract a value at apply time, we
+/// convert the result to [`AuthoringError::Declined`] rather than
+/// persisting a recipe that would fail forever. `None` is honest
+/// "we have no bytes to validate against" (test paths, legacy
+/// callers); the validator is skipped and the contract reverts to
+/// the pre-Session-41 structural-only check.
 pub async fn author_recipe(
     provider: &dyn LlmProvider,
     tier: ModelTier,
     prompt_template: &str,
     plan: &ResearchPlan,
     ctx: &AuthoringContext,
+    original_bytes: Option<&[u8]>,
 ) -> Result<FetchRecipe, AuthoringError> {
     let user = build_prompt(prompt_template, plan, ctx)?;
 
@@ -367,7 +379,35 @@ pub async fn author_recipe(
     let output: RecipeAuthoringOutput = serde_json::from_value(raw)
         .map_err(|e| AuthoringError::OutputParse(e.to_string()))?;
 
-    build_validated_recipe(output, plan, &fingerprint)
+    let recipe = build_validated_recipe(output, plan, &fingerprint)?;
+
+    // Session 41 items 4–6: authoring-time validation against the
+    // bytes the LLM saw. We run the runtime's own extraction code
+    // path and, if it would fail at apply, convert the failure to
+    // `Declined` rather than persisting a recipe whose application
+    // is structurally guaranteed to fail. The runtime function this
+    // calls is the same one `recipe_apply::apply` calls at fetch
+    // time — by construction the validator and the runtime cannot
+    // disagree about whether a recipe applies.
+    //
+    // Skipped when `original_bytes` is `None` (test paths, legacy
+    // callers without prefetched bytes).
+    if let Some(bytes) = original_bytes {
+        if let Err(apply_err) =
+            crate::recipe_apply::validate_recipe_against_bytes(&recipe, bytes)
+        {
+            return Err(AuthoringError::Declined {
+                reason: format!(
+                    "authoring-time validation against the prefetched bytes failed: \
+                     {apply_err}. The LLM authored a recipe that would not extract a \
+                     value at apply time — declining at authoring rather than \
+                     persisting a recipe whose every fetch would fail."
+                ),
+            });
+        }
+    }
+
+    Ok(recipe)
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +799,21 @@ pub async fn reauthor_recipe(
     // Delegate to the existing authoring path. Same validation,
     // same schema, same provider. The only difference is the
     // ctx now carries the failure context.
-    let mut new_recipe = author_recipe(provider, tier, prompt_template, plan, &auth_ctx).await?;
+    //
+    // Session 41 items 4–6: pass the same `fetched_bytes` we built
+    // the excerpt from through to authoring-time validation. A
+    // re-author that produces a recipe that *also* wouldn't extract
+    // is converted to a Decline here, before the prior recipe gets
+    // overwritten.
+    let mut new_recipe = author_recipe(
+        provider,
+        tier,
+        prompt_template,
+        plan,
+        &auth_ctx,
+        Some(fetched_bytes),
+    )
+    .await?;
 
     // Stamp the lineage fields. `build_validated_recipe` left
     // `source_id` blank and `dedup_key` at None per its contract;
@@ -2431,7 +2485,7 @@ mod tests {
         let ctx = sample_context();
 
         let recipe =
-            author_recipe(&provider, ModelTier::Workhorse, template, &plan, &ctx)
+            author_recipe(&provider, ModelTier::Workhorse, template, &plan, &ctx, None)
                 .await
                 .expect("live recipe authoring should succeed");
 
@@ -2897,7 +2951,7 @@ mod tests {
         };
 
         let result =
-            author_recipe(&provider, ModelTier::Workhorse, template, &plan, &ctx).await;
+            author_recipe(&provider, ModelTier::Workhorse, template, &plan, &ctx, None).await;
 
         match result {
             Err(AuthoringError::Declined { reason }) => {

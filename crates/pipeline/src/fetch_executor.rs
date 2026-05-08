@@ -939,7 +939,7 @@ async fn author_one(
         // Step 2: fetch the proposed URL. Reuses the existing
         // pre-fetch helper which routes through SecureHttpClient and
         // honours the rate-limit backoff.
-        let excerpt =
+        let (excerpt, prefetched_bytes) =
             match prefetch_excerpt(ctx, &proposed_url, &candidate_source_id).await {
                 Some(real) => real,
                 None => {
@@ -970,6 +970,14 @@ async fn author_one(
             ctx.recipe_author_prompt,
             plan,
             &auth_ctx,
+            // Session 41 items 4–6: the same bytes the LLM saw in
+            // the excerpt flow into authoring-time validation.
+            // `author_recipe` calls
+            // `recipe_apply::validate_recipe_against_bytes` after
+            // `build_validated_recipe` succeeds; a recipe that
+            // wouldn't extract against these bytes is converted to
+            // a Decline at authoring time rather than persisted.
+            Some(&prefetched_bytes),
         )
         .await;
 
@@ -1112,34 +1120,60 @@ fn derive_source_id_from_url(url: &url::Url) -> String {
 /// ceiling (`max_response_bytes`); the budget here is about prompt
 /// size, not about defending the network layer.
 ///
-/// **Session 40 — PDF text-extraction.** When the fetched bytes are
-/// a PDF (sniffed by the `%PDF-` magic at offset 0), we run them
-/// through `pdf_extract::extract_text_from_mem_by_pages` and feed
-/// the *extracted text* to the LLM rather than the raw binary blob.
-/// Before this change, PDF-bearing URLs reached the recipe-author
-/// LLM as `String::from_utf8_lossy(<binary PDF>)` — i.e., a wall of
-/// `0xEF 0xBF 0xBD` replacement chars with no readable structure —
-/// and the author correctly declined every time with "the excerpt
-/// is a binary PDF dump, no extractable structure." That was the
-/// blocker on every USGS MCS / EUR-Lex / SEC-PDF source in the live
-/// titanium-supply-chain run. The runtime apply path
-/// (`recipe_apply::extract_pdf_table`) was already wired in
-/// Session 29 / ADR 0007 amendment 5; the gap was only at authoring
-/// time, where the LLM needs to *see* the table layout to address
-/// it positionally. Pages are joined with `[PDF page N]` markers so
-/// the LLM can author the `page` coordinate by counting the marker
-/// it lands on.
+/// **Session 41 — framed-table PDF prefetch + HTML structural
+/// digest.** When the fetched bytes are a PDF, we run them through
+/// `pdf_extract::extract_text_from_mem_by_pages` *and* through
+/// `recipe_apply::detect_pdf_tables` (the same detector
+/// `extract_pdf_table` calls at apply time) so the LLM sees the page
+/// content in the runtime's coordinate space — `[PDF page N, table M]
+/// (R rows × C cols)` followed by the cell values, and `[PDF page N]
+/// (no table detected)` followed by the raw page text for pages
+/// where the detector found nothing tabular.
 ///
-/// Failures of the text extraction (encrypted PDFs, malformed PDFs)
-/// fall through to the original UTF-8 lossy form with a clear
-/// "could not extract" annotation; the LLM will then decline rather
-/// than author against garbage. We never block authoring on a
-/// best-effort enrichment.
+/// When the fetched bytes are HTML, we parse them with `scraper`
+/// (the same crate the runtime's `extract_css_select` queries) and
+/// emit a *structural digest* under
+/// `--- HTML structure (parsed by scraper) ---`: the `<title>` and
+/// `<h1>`s, every `<table>` with its classes/IDs and `(rows × cols)`
+/// shape, every top-level `<ul>`/`<ol>` with its `<li>` cardinality,
+/// and the set of `tag.class` selectors that occur more than once
+/// (iterator-eligible). The digest is followed by a bounded visible-
+/// text rendering with `<script>`/`<style>`/`<noscript>` subtrees
+/// excluded so the LLM can identify which element carries the value
+/// without the page's JavaScript flooding the excerpt.
+///
+/// **Why the HTML digest matters.** Pre-Session-41-patch-2, HTML
+/// reached the recipe-author LLM as `from_utf8_lossy(<raw bytes>)`,
+/// and the LLM had to parse the markup mentally to find the elements
+/// it would address with a CSS selector. The Session 40 Fed H.4.1
+/// failure (`table#balance-sheet td.value matched no elements`) was
+/// the LLM authoring a selector against markup it imagined rather
+/// than against the markup the prefetch returned. With the digest,
+/// the LLM authors selectors against shapes `scraper` confirmed
+/// match real elements; combined with item 4's authoring-time
+/// validation (already shipped in patch 1), no recipe whose selector
+/// would match nothing reaches storage.
+///
+/// JSON and raw-bytes payloads continue to fall through to the
+/// `from_utf8_lossy` path until item 3 (JSON shape outline) lands in
+/// patch 3.
+///
+/// Failures of the text extraction (encrypted PDFs, malformed PDFs,
+/// non-UTF-8 HTML) fall through to a clear "could not extract"
+/// annotation; the LLM will then decline rather than author against
+/// garbage. We never block authoring on a best-effort enrichment.
+///
+/// **Returns**: the formatted excerpt string AND the raw bytes the
+/// excerpt was rendered from. The bytes flow into authoring-time
+/// validation (`recipe_apply::validate_recipe_against_bytes`, called
+/// from `recipe_author::author_recipe`) so the runtime's extractor
+/// runs against the same bytes the LLM saw before any recipe is
+/// persisted. Session 41 items 4–6.
 async fn prefetch_excerpt(
     ctx: &ExecutorContext<'_>,
     url: &url::Url,
     source_id: &str,
-) -> Option<String> {
+) -> Option<(String, Vec<u8>)> {
     // Operator-visible "we're now fetching X" log. The Session 13
     // run had a 1m25s silent stretch that included the time spent
     // pre-fetching; this turns it into a visible step rather than a
@@ -1185,14 +1219,24 @@ async fn prefetch_excerpt(
 
     let byte_count = bytes.len();
 
-    // Branch on payload kind. PDFs go through pdf_extract; everything
-    // else falls through to the existing UTF-8-lossy path. We only
-    // do the dispatch here, not in a separate helper, because the
-    // truncation + framing logic is the same shape for both branches
-    // — just over different "body" strings.
+    // Branch on payload kind. PDFs go through `pdf_extract` +
+    // `detect_pdf_tables`; HTML goes through `scraper` to produce a
+    // structural digest in the runtime's parsed shape; everything
+    // else falls through to the existing UTF-8-lossy path. We do
+    // the dispatch here, not in a separate helper, because the
+    // truncation + framing logic is the same shape across all
+    // branches — just over different "body" strings.
+    //
+    // **Session 41 — three-way dispatch.** Item 1 added the PDF
+    // branch's framed-table format; item 2 adds the HTML branch's
+    // structural digest, mirroring the same architectural posture:
+    // the LLM sees what the runtime sees, parsed by the same crate
+    // (`scraper`) the runtime queries against. JSON sources still
+    // fall through to the lossy raw-bytes path until item 3 lands
+    // (Session 41 patch 3).
     let (body, kind_annotation) = if is_pdf(&bytes) {
-        match render_pdf_text(&bytes) {
-            Ok(text) => (text, "PDF (text extracted)".to_string()),
+        match render_pdf_text_with_tables(&bytes) {
+            Ok(text) => (text, "PDF (text + detected tables)".to_string()),
             Err(e) => {
                 // pdf-extract failed (encrypted, malformed, exotic
                 // glyph encoding). Surface the failure honestly so
@@ -1214,6 +1258,31 @@ async fn prefetch_excerpt(
                          this source, decline.)"
                     ),
                     "PDF (extraction failed)".to_string(),
+                )
+            }
+        }
+    } else if is_html(&bytes) {
+        match render_html_digest(&bytes, PREFETCH_EXCERPT_BUDGET) {
+            Ok(text) => (text, "HTML (structural digest)".to_string()),
+            Err(e) => {
+                // HTML parsing rarely fails — `scraper` is
+                // forgiving by design. The one realistic failure
+                // is invalid UTF-8, which we surface honestly so
+                // the LLM declines rather than authoring against
+                // a guess.
+                warn!(
+                    source_id = %source_id,
+                    url = %url,
+                    error = %e,
+                    "html digest construction failed; surfacing as unreadable in excerpt"
+                );
+                (
+                    format!(
+                        "(could not build a structural digest from this HTML — {e}. \
+                         No parsed structure is available; if your closed-vocabulary \
+                         modes cannot author against this source, decline.)"
+                    ),
+                    "HTML (digest failed)".to_string(),
                 )
             }
         }
@@ -1252,14 +1321,19 @@ async fn prefetch_excerpt(
         (body, String::new())
     };
 
-    Some(format!(
+    let excerpt = format!(
         "Source id: {source_id}\n\
          Fetched URL: {url}\n\
          Fetched bytes: {byte_count} ({kind_annotation})\n\n\
          --- begin excerpt ---\n\
          {body}{truncated_marker}\n\
          --- end excerpt ---\n"
-    ))
+    );
+    // Session 41: return the raw bytes alongside the excerpt so the
+    // caller can hand them to authoring-time validation. The bytes
+    // were already in scope for excerpt rendering; adding them to
+    // the return type is the minimum plumbing change.
+    Some((excerpt, bytes))
 }
 
 /// `true` iff `bytes` looks like a PDF: starts with the literal
@@ -1271,20 +1345,45 @@ fn is_pdf(bytes: &[u8]) -> bool {
     bytes.starts_with(b"%PDF-")
 }
 
-/// Run `pdf_extract::extract_text_from_mem_by_pages` and concatenate
-/// the resulting page strings with `[PDF page N]` separators so the
-/// LLM can read structure off the marker that precedes each block of
-/// rows. The same library and the same per-page reader is used at
-/// runtime by `recipe_apply::extract_pdf_table`, so what the LLM
-/// sees here is byte-for-byte the same text the runtime will index
-/// into when it later applies the recipe — same whitespace
-/// collapsing, same line ordering, same multi-word-cell caveat.
+/// Render PDF bytes as text framed in the runtime's coordinate
+/// space. Same `pdf_extract` library and same
+/// `recipe_apply::detect_pdf_tables` detector the runtime uses at
+/// apply time, so what the LLM sees here is byte-for-byte the same
+/// view the runtime will index into when it later applies the
+/// recipe — same whitespace collapsing, same line ordering, same
+/// table-detection heuristic, same multi-word-cell caveat.
+///
+/// **Frame shape.** For each PDF page:
+///
+/// - Pages whose detector found one or more tables emit, per table,
+///   a header line `[PDF page N, table M] (R rows × C cols)`
+///   followed by a per-row line `row I (col 0..C-1): "v0"  "v1" ...`.
+///   `N` is 1-indexed (matching the `pdf_table.page` recipe field
+///   and the runtime extractor's rejection of page 0); `M` is
+///   0-indexed (matching `pdf_table.table_index`); `I` and the col
+///   range are 0-indexed (matching `pdf_table.row` and
+///   `pdf_table.col`).
+/// - Pages whose detector found nothing emit
+///   `[PDF page N] (no table detected)` followed by the page's
+///   narrative text, capped per-page to keep the excerpt navigable.
+///   The narrative is for the LLM to decide "is the value on this
+///   page or not"; the LLM should not author `pdf_table` coordinates
+///   against text the detector did not pick up as a table.
+///
+/// **Why the framing matters.** Pre-Session-41, this function emitted
+/// raw page text with a `[PDF page N]` marker. The LLM had to
+/// imagine how the detector would tokenize that text into rows;
+/// the lithium MCS run from Session 40 confirmed the imagination
+/// gap (LLM authored `row=11` against a detected table that has 2
+/// rows). With the new framing, the LLM no longer translates
+/// between "what I see on the page" and "what the runtime will
+/// index" — the framing IS what the runtime will index.
 ///
 /// Returns the joined text, or a stringified error when pdf-extract
 /// rejects the bytes (encrypted PDF, exotic font, malformed
 /// xref table). The caller annotates the excerpt and lets the LLM
 /// decline.
-fn render_pdf_text(bytes: &[u8]) -> Result<String, String> {
+fn render_pdf_text_with_tables(bytes: &[u8]) -> Result<String, String> {
     let pages = pdf_extract::extract_text_from_mem_by_pages(bytes)
         .map_err(|e| format!("pdf parse failed: {e}"))?;
     if pages.is_empty() {
@@ -1293,17 +1392,449 @@ fn render_pdf_text(bytes: &[u8]) -> Result<String, String> {
     let mut out = String::new();
     for (idx, page_text) in pages.iter().enumerate() {
         // 1-indexed in the marker because that is what the
-        // `pdf_table.page` coordinate uses (PDF page numbers are
-        // 1-indexed by convention, and the runtime extractor
-        // rejects page 0 explicitly).
+        // `pdf_table.page` coordinate uses.
         let page_num = idx + 1;
+        let tables = crate::recipe_apply::detect_pdf_tables(page_text);
+
         if !out.is_empty() {
             out.push_str("\n\n");
         }
-        out.push_str(&format!("[PDF page {page_num}]\n"));
-        out.push_str(page_text.trim_end_matches('\n'));
+
+        if tables.is_empty() {
+            // No table detected. Emit the marker that says so plus a
+            // capped slice of the page text so the LLM can still
+            // identify which page covers the topic. The LLM should
+            // not author `pdf_table` coordinates against this text;
+            // the runtime would return "no table found on page N"
+            // and the validator would reject the recipe.
+            out.push_str(&format!("[PDF page {page_num}] (no table detected)\n"));
+            // Per-page narrative cap — the prefetch's overall budget
+            // still applies at the outer level, but a single
+            // text-heavy PDF page can dominate the excerpt and
+            // crowd out tables on later pages. 4 KiB per narrative
+            // page leaves room for several pages even when many are
+            // narrative.
+            const PER_PAGE_NARRATIVE_CAP: usize = 4 * 1024;
+            let page_str = page_text.trim_end_matches('\n');
+            if page_str.len() <= PER_PAGE_NARRATIVE_CAP {
+                out.push_str(page_str);
+            } else {
+                let mut cut = PER_PAGE_NARRATIVE_CAP;
+                while cut > 0 && !page_str.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                out.push_str(&page_str[..cut]);
+                out.push_str(&format!(
+                    "\n[... page narrative truncated at {PER_PAGE_NARRATIVE_CAP} bytes; \
+                     full page was {} bytes ...]",
+                    page_str.len()
+                ));
+            }
+            continue;
+        }
+
+        for (table_idx, table) in tables.iter().enumerate() {
+            // detect_pdf_tables only emits tables with ≥2 rows by
+            // contract, but read the shape off the table itself.
+            let row_count = table.len();
+            let col_count = table.first().map(|r| r.len()).unwrap_or(0);
+            // Tables on the same page are separated by a blank line
+            // for readability; the inter-page padding is handled at
+            // the top of each page iteration above.
+            if table_idx > 0 {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "[PDF page {page_num}, table {table_idx}] ({row_count} rows × {col_count} cols)\n"
+            ));
+            let last_col = col_count.saturating_sub(1);
+            for (row_idx, row) in table.iter().enumerate() {
+                // Quote each cell so multi-word values (when they do
+                // appear) and empty cells are visually unambiguous.
+                let cells: Vec<String> =
+                    row.iter().map(|c| format!("{:?}", c)).collect();
+                out.push_str(&format!(
+                    "  row {row_idx} (col 0..{last_col}): {}\n",
+                    cells.join("  ")
+                ));
+            }
+            // Trim the trailing newline added by the last row line so
+            // the next page's `\n\n` separator produces exactly one
+            // blank line.
+            if out.ends_with('\n') {
+                out.pop();
+            }
+        }
     }
     Ok(out)
+}
+
+/// `true` iff `bytes` looks like HTML: starts with (after an optional
+/// UTF-8 BOM and any leading ASCII whitespace) either `<!DOCTYPE` or
+/// `<html` — case-insensitive on the marker, strict on the prefix
+/// shape. We deliberately do *not* match a broader "starts with `<`
+/// plus an alpha character" heuristic: XML, RSS feeds, SVG, and
+/// chevron-leading text would all false-positive into the HTML
+/// branch and produce a misleading digest.
+///
+/// HTML fragments without a wrapping `<html>` (XHR-style API
+/// responses) won't sniff as HTML by this rule. Those are rare in
+/// our use cases (we hit full pages); if a source ships fragments
+/// they currently fall through to the raw-bytes branch and the LLM
+/// reads them through `from_utf8_lossy`. A future session can
+/// broaden the sniff if a real source needs it.
+fn is_html(bytes: &[u8]) -> bool {
+    let after_bom = bytes
+        .strip_prefix(b"\xEF\xBB\xBF")
+        .unwrap_or(bytes);
+    let trimmed = match after_bom
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+    {
+        Some(i) => &after_bom[i..],
+        None => return false,
+    };
+    trimmed
+        .get(..9)
+        .is_some_and(|h| h.eq_ignore_ascii_case(b"<!doctype"))
+        || trimmed
+            .get(..5)
+            .is_some_and(|h| h.eq_ignore_ascii_case(b"<html"))
+}
+
+/// Per-section caps inside the HTML structural digest. Each subsection
+/// is bounded so a pathological page (thousands of tables, thousands
+/// of repeating classes, a 1 MiB `<title>`) cannot crowd the digest's
+/// other subsections out of view. The `_LIMIT` constants are item
+/// counts; the `_BUDGET` constants are byte budgets.
+const HTML_DIGEST_TITLE_BUDGET: usize = 1024;
+const HTML_DIGEST_HEADING_BUDGET: usize = 1024;
+const HTML_DIGEST_TABLE_LIMIT: usize = 50;
+const HTML_DIGEST_LIST_LIMIT: usize = 50;
+const HTML_DIGEST_REPEATING_CLASS_LIMIT: usize = 30;
+/// Tags whose subtrees are excluded from visible-text rendering. A
+/// modern web page can carry hundreds of KiB of inline JavaScript or
+/// CSS — relevant for executing the page, not for authoring an
+/// extraction recipe. Excluding the subtrees keeps the digest's
+/// visible-text section focused on what an end-user would read.
+const HTML_VISIBLE_TEXT_SKIP_TAGS: &[&str] = &["script", "style", "noscript"];
+
+/// Build an HTML structural digest plus a bounded visible-text
+/// rendering, fit within the given byte budget. Mirrors the runtime's
+/// `extract_css_select` parsing (same `scraper` crate) so what the
+/// LLM sees is the same parsed shape the runtime will query at apply
+/// time. Session 41 item 2.
+///
+/// **Output shape.**
+///
+/// ```text
+/// --- HTML structure (parsed by scraper) ---
+/// <title>: Federal Reserve - H.4.1 Statistical Release
+/// <h1>: H.4.1 Statistical Release
+///
+/// Tables:
+///   <table id="balance-sheet" class="data-table"> (15 rows × 8 cols)
+///   <table class="footnote"> (3 rows × 2 cols)
+///
+/// Lists:
+///   <ul class="navigation"> (12 items)
+///   <ol> (5 items)
+///
+/// Repeating element classes (iterator-eligible):
+///   div.card: 8 occurrences
+///   span.value: 24 occurrences
+///
+/// --- Visible text (script/style excluded, truncated) ---
+/// H.4.1 Statistical Release Reserve Balances Held with the Federal Reserve...
+/// ```
+///
+/// **Why this shape.** The structure section gives the LLM the
+/// concrete element identity (tag + class/id) it would author a
+/// CSS selector against, plus the shape (rows × cols, list
+/// cardinality) it would address positionally. The repeating-class
+/// section surfaces iterator candidates (Phase-1 css_select × css_select):
+/// `tag.class` selectors that match more than one element are the
+/// natural outer-iterator targets. The visible-text section gives
+/// the LLM the *content* it needs to identify which element holds
+/// which value — a digest without text would tell it "there's a
+/// table" but not "which row has Chile."
+///
+/// **Budget allocation.** Subsections of the structure summary are
+/// independently capped so a pathological page can't crowd the
+/// digest. Whatever budget remains after the structure summary is
+/// spent on visible text; if the structure alone exceeds budget we
+/// emit no visible text but the structure stays intact.
+///
+/// **What this is NOT.** This is not a fallback heuristic. If
+/// `scraper` parses the bytes into an empty document (real HTML
+/// served as `<html></html>`, JS-rendered SPA shells), the digest
+/// is honest about that and the LLM will decline rather than guess
+/// — same posture the PDF branch takes for "no table detected"
+/// pages.
+fn render_html_digest(bytes: &[u8], budget: usize) -> Result<String, String> {
+    use scraper::{Html, Node, Selector};
+
+    let html_str = std::str::from_utf8(bytes)
+        .map_err(|e| format!("HTML bytes were not UTF-8: {e}"))?;
+    let doc = Html::parse_document(html_str);
+
+    let mut out = String::new();
+    out.push_str("--- HTML structure (parsed by scraper) ---\n");
+
+    // <title>
+    let title_sel = Selector::parse("title")
+        .expect("static selector 'title' must parse");
+    if let Some(title_el) = doc.select(&title_sel).next() {
+        let title: String = title_el.text().collect::<String>();
+        let title = collapse_whitespace(&title);
+        if !title.is_empty() {
+            out.push_str("<title>: ");
+            out.push_str(&truncate_to_budget(&title, HTML_DIGEST_TITLE_BUDGET));
+            out.push('\n');
+        }
+    }
+
+    // <h1>s — list each occurrence
+    let h1_sel = Selector::parse("h1")
+        .expect("static selector 'h1' must parse");
+    for h1 in doc.select(&h1_sel) {
+        let txt = collapse_whitespace(&h1.text().collect::<String>());
+        if !txt.is_empty() {
+            out.push_str("<h1>: ");
+            out.push_str(&truncate_to_budget(&txt, HTML_DIGEST_HEADING_BUDGET));
+            out.push('\n');
+        }
+    }
+
+    // Tables: every <table> with its class/id and (rows × cols).
+    // Rows = number of <tr> descendants. Cols = number of cells in
+    // the first row. We do not filter out nested tables — a nested
+    // table is still an addressable element with its own selector,
+    // and listing it tells the LLM that nested-table addressing is
+    // an option (or a hazard, when the inner table's class collides
+    // with the outer). Cap the count so a pathological page cannot
+    // dominate the digest.
+    let table_sel = Selector::parse("table")
+        .expect("static selector 'table' must parse");
+    let tr_sel = Selector::parse("tr")
+        .expect("static selector 'tr' must parse");
+    let cell_sel = Selector::parse("td, th")
+        .expect("static selector 'td, th' must parse");
+    let tables: Vec<scraper::ElementRef<'_>> = doc.select(&table_sel).collect();
+    if !tables.is_empty() {
+        out.push_str("\nTables:\n");
+        let shown = tables.len().min(HTML_DIGEST_TABLE_LIMIT);
+        for table in tables.iter().take(shown) {
+            let row_count = table.select(&tr_sel).count();
+            let col_count = table
+                .select(&tr_sel)
+                .next()
+                .map(|first_row| first_row.select(&cell_sel).count())
+                .unwrap_or(0);
+            out.push_str("  ");
+            out.push_str(&format_element_signature(*table));
+            out.push_str(&format!(" ({row_count} rows × {col_count} cols)\n"));
+        }
+        if tables.len() > shown {
+            out.push_str(&format!(
+                "  [... {} more tables truncated]\n",
+                tables.len() - shown
+            ));
+        }
+    }
+
+    // Lists: every <ul>/<ol> with cardinality. Same rationale as
+    // tables.
+    let list_sel = Selector::parse("ul, ol")
+        .expect("static selector 'ul, ol' must parse");
+    let li_sel = Selector::parse("li")
+        .expect("static selector 'li' must parse");
+    let lists: Vec<scraper::ElementRef<'_>> = doc.select(&list_sel).collect();
+    if !lists.is_empty() {
+        out.push_str("\nLists:\n");
+        let shown = lists.len().min(HTML_DIGEST_LIST_LIMIT);
+        for list in lists.iter().take(shown) {
+            let item_count = list.select(&li_sel).count();
+            out.push_str("  ");
+            out.push_str(&format_element_signature(*list));
+            out.push_str(&format!(" ({item_count} items)\n"));
+        }
+        if lists.len() > shown {
+            out.push_str(&format!(
+                "  [... {} more lists truncated]\n",
+                lists.len() - shown
+            ));
+        }
+    }
+
+    // Repeating tag.class selectors — count `(tag, class)` pairs.
+    // Anything that appears more than once is iterator-eligible:
+    // a `tag.class` selector matching N elements is what an outer
+    // iterator would target. We include the count so the LLM sees
+    // not just "this class repeats" but "this class repeats 8
+    // times" (relevant for picking the iterator at the right
+    // granularity — 8 cards vs. 800 spans).
+    let star_sel = Selector::parse("*")
+        .expect("static selector '*' must parse");
+    let mut tag_class_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for el in doc.select(&star_sel) {
+        let tag = el.value().name();
+        if let Some(class_attr) = el.value().attr("class") {
+            for class in class_attr.split_whitespace() {
+                let key = format!("{tag}.{class}");
+                *tag_class_counts.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut repeating: Vec<(String, usize)> = tag_class_counts
+        .into_iter()
+        .filter(|(_, n)| *n >= 2)
+        .collect();
+    // Sort by count descending, then by selector for determinism.
+    repeating.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if !repeating.is_empty() {
+        out.push_str("\nRepeating element classes (iterator-eligible):\n");
+        let shown = repeating.len().min(HTML_DIGEST_REPEATING_CLASS_LIMIT);
+        for (selector, count) in repeating.iter().take(shown) {
+            out.push_str(&format!("  {selector}: {count} occurrences\n"));
+        }
+        if repeating.len() > shown {
+            out.push_str(&format!(
+                "  [... {} more truncated]\n",
+                repeating.len() - shown
+            ));
+        }
+    }
+
+    // Visible text: walk the body tree, skipping script/style
+    // subtrees. Whatever budget remains after the structure summary
+    // is spent here.
+    let body_sel = Selector::parse("body")
+        .expect("static selector 'body' must parse");
+    let body = doc.select(&body_sel).next().unwrap_or_else(|| doc.root_element());
+
+    let mut visible = String::new();
+    collect_visible_text(body, &mut visible, budget * 2);
+    let visible = collapse_whitespace(&visible);
+
+    // Compute remaining budget for the visible text section, after
+    // accounting for the section header and a possible truncation
+    // marker. If the structure summary already exhausted the
+    // budget, we emit a minimal "[... no budget left for visible
+    // text]" line so the LLM knows visible text was elided rather
+    // than absent.
+    let header = "\n--- Visible text (script/style excluded, truncated) ---\n";
+    let used = out.len() + header.len();
+    if used >= budget {
+        out.push_str(header);
+        out.push_str("[... structure summary consumed the budget; visible text elided]\n");
+    } else {
+        let visible_budget = budget - used;
+        out.push_str(header);
+        if visible.len() <= visible_budget {
+            out.push_str(&visible);
+            if !visible.is_empty() && !visible.ends_with('\n') {
+                out.push('\n');
+            }
+        } else {
+            let mut cut = visible_budget;
+            while cut > 0 && !visible.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.push_str(&visible[..cut]);
+            out.push_str(&format!(
+                "\n[... visible text truncated at {visible_budget} bytes; \
+                 full body text was {} bytes]\n",
+                visible.len()
+            ));
+        }
+    }
+
+    Ok(out)
+}
+
+/// Format an element as a CSS-selector-like signature using its
+/// classes and id. Used in the HTML digest to give the LLM the
+/// exact element identity it would address with a selector.
+///
+/// Examples:
+/// - `<table>` → `<table>`
+/// - `<table id="x">` → `<table id="x">`
+/// - `<table class="a b">` → `<table class="a b">`
+/// - `<table id="x" class="a">` → `<table id="x" class="a">`
+fn format_element_signature(el: scraper::ElementRef<'_>) -> String {
+    let tag = el.value().name();
+    let id = el.value().attr("id");
+    let class = el.value().attr("class");
+    match (id, class) {
+        (Some(i), Some(c)) => format!("<{tag} id=\"{i}\" class=\"{c}\">"),
+        (Some(i), None) => format!("<{tag} id=\"{i}\">"),
+        (None, Some(c)) => format!("<{tag} class=\"{c}\">"),
+        (None, None) => format!("<{tag}>"),
+    }
+}
+
+/// Walk the element subtree and append visible text to `out`,
+/// skipping subtrees rooted at tags listed in
+/// `HTML_VISIBLE_TEXT_SKIP_TAGS`. Stops appending once `out` reaches
+/// `max_size` to bound the cost on pathological pages.
+///
+/// Recursive on the HTML tree's depth — bounded in practice by
+/// `scraper`'s parser, which produces well-formed trees of bounded
+/// nesting (browsers' parsers reject deeply nested markup).
+fn collect_visible_text(
+    el: scraper::ElementRef<'_>,
+    out: &mut String,
+    max_size: usize,
+) {
+    use scraper::Node;
+    if out.len() >= max_size {
+        return;
+    }
+    for child in el.children() {
+        if out.len() >= max_size {
+            return;
+        }
+        match child.value() {
+            Node::Text(t) => {
+                out.push_str(t);
+                out.push(' ');
+            }
+            Node::Element(child_el) => {
+                let tag = child_el.name();
+                if HTML_VISIBLE_TEXT_SKIP_TAGS.contains(&tag) {
+                    continue;
+                }
+                if let Some(child_ref) = scraper::ElementRef::wrap(child) {
+                    collect_visible_text(child_ref, out, max_size);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collapse runs of ASCII whitespace (including newlines) into single
+/// spaces, and trim leading/trailing whitespace. The visible-text
+/// rendering and the title/heading slots all benefit from this:
+/// HTML's source whitespace is layout-irrelevant and noisy in a
+/// digest.
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+/// Truncate `s` to at most `budget` bytes, on a UTF-8 char boundary,
+/// adding an explicit truncation marker when the cut happens.
+fn truncate_to_budget(s: &str, budget: usize) -> String {
+    if s.len() <= budget {
+        return s.to_string();
+    }
+    let mut cut = budget;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}[...truncated at {} bytes]", &s[..cut], budget)
 }
 
 /// Build a stub excerpt for cases where pre-fetch is impossible
@@ -4206,16 +4737,15 @@ mod tests {
     // -----------------------------------------------------------------------
     // Session 40 — PDF text-extraction at prefetch time.
     //
-    // Before this session the recipe-author LLM saw raw PDF bytes
-    // through `String::from_utf8_lossy`, which is unintelligible
-    // binary, and declined every PDF-bearing source it ever met. The
-    // runtime apply path (`recipe_apply::extract_pdf_table`) was
-    // already wired in Session 29 / ADR 0007 amendment 5; the gap
-    // was at authoring time. These tests pin the new behaviour:
-    // PDFs go through `pdf_extract::extract_text_from_mem_by_pages`,
-    // get joined with `[PDF page N]` separators, and arrive at the
-    // LLM as readable text the same library the runtime uses for
-    // extraction will produce at apply time.
+    // Before Session 40 the recipe-author LLM saw raw PDF bytes through
+    // `String::from_utf8_lossy`, which is unintelligible binary, and
+    // declined every PDF-bearing source it ever met. Session 40 ran the
+    // bytes through `pdf_extract::extract_text_from_mem_by_pages` and
+    // emitted `[PDF page N]` markers between pages so the LLM could
+    // count pages by counting markers. Session 41 then frames detected
+    // tables in the runtime's coordinate space (see the next test
+    // section); the `is_pdf` magic-byte sniff that gates the PDF
+    // branch is unchanged across both sessions.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -4229,28 +4759,52 @@ mod tests {
         assert!(!is_pdf(b"\x89PNG\r\n\x1a\n"));
     }
 
+    // -----------------------------------------------------------------------
+    // Session 41 item 1 — framed-table PDF prefetch
+    //
+    // The old test `render_pdf_text_against_lithium_fixture_emits_page_markers_and_table_text`
+    // asserted the pre-Session-41 marker format (`[PDF page 1]` followed
+    // by raw page text). That format is gone by design: it forced the
+    // LLM to imagine how the runtime's table detector would tokenize
+    // the page text, and the lithium MCS run from Session 40 confirmed
+    // the imagination gap (LLM authored row=11 against a detected
+    // table that had 2 rows). The replacement assertion (`render_pdf_text_with_tables_*`
+    // below) pins the new framing — `[PDF page N, table M]` headers
+    // followed by row-by-row cells — which removes the imagination
+    // step. **Do not add a test that asserts the old format alongside
+    // the new one.** Pick one source of truth.
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn render_pdf_text_against_lithium_fixture_emits_page_markers_and_table_text() {
-        let out = render_pdf_text(LITHIUM_PDF)
-            .expect("the lithium fixture is a well-formed single-page PDF");
-        // The fixture is one page; the marker uses 1-indexed numbering
-        // because that's the convention the `pdf_table.page` recipe
-        // coordinate uses.
+    fn render_pdf_text_with_tables_against_lithium_fixture_emits_framed_tables() {
+        let out = render_pdf_text_with_tables(LITHIUM_PDF)
+            .expect("the lithium fixture is a well-formed PDF");
+        // The fixture's data table is on page 2 (page 1 is a title
+        // page in the synthesized fixture; see
+        // tests/fixtures/pdf/README.md). The page-2 table marker
+        // must be present and must declare a table the runtime
+        // would actually find — the same detector that produced
+        // this output will run at apply time.
         assert!(
-            out.starts_with("[PDF page 1]"),
-            "extracted text should start with the page-1 marker; got:\n{out}"
+            out.contains("[PDF page 2, table 0]"),
+            "framed-table output should announce a table on page 2; got:\n{out}"
         );
-        // The fixture's table contains "Country", "Production", and
-        // a row for Australia/Chile/Argentina (see the docstring on
-        // LITHIUM_PDF). pdf-extract is allowed to break the table
-        // into multiple lines, but every cell value must appear
-        // somewhere in the rendered text or the LLM cannot author
-        // coordinates against it.
+        // The header line declares row × col counts so the LLM can
+        // size the table without counting markup. We don't pin
+        // exact counts here (the detector may evolve) but we do
+        // require the format to declare some.
+        assert!(
+            out.contains("rows ×"),
+            "framed-table header should declare row × col counts; got:\n{out}"
+        );
+        // Cell values from the detected table must appear inline
+        // — these are the strings the LLM will use to confirm "yes,
+        // the row I'm targeting holds the country I want."
         for needle in ["Country", "Production", "Australia", "Chile", "Argentina"] {
             assert!(
                 out.contains(needle),
-                "rendered PDF text is missing {needle:?}; \
-                 the LLM cannot author pdf_table coordinates against it.\n\
+                "framed-table output is missing {needle:?}; \
+                 the LLM cannot identify which row carries the value.\n\
                  full text:\n{out}"
             );
         }
@@ -4259,24 +4813,276 @@ mod tests {
         // raw-bytes path.
         assert!(
             !out.contains('\u{FFFD}'),
-            "extracted text should be readable, not utf8-lossy garbage"
+            "framed-table output should be readable, not utf8-lossy garbage"
         );
     }
 
     #[test]
-    fn render_pdf_text_surfaces_errors_for_non_pdf_bytes() {
+    fn render_pdf_text_with_tables_emits_no_table_marker_when_detector_finds_nothing() {
+        // Page 1 of the lithium fixture is a title-only page with no
+        // tabular content. The framed output should announce that
+        // explicitly — the LLM should not author `pdf_table`
+        // coordinates against pages where the detector found no
+        // table.
+        let out = render_pdf_text_with_tables(LITHIUM_PDF)
+            .expect("the lithium fixture is a well-formed PDF");
+        assert!(
+            out.contains("[PDF page 1] (no table detected)")
+                || out.contains("[PDF page 1, table 0]"),
+            "page 1 should either declare its (single) table or declare \
+             that no table was detected — never silently render raw page \
+             text. Got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_pdf_text_with_tables_surfaces_errors_for_non_pdf_bytes() {
         // A byte slice that starts with `%PDF-` but is otherwise junk
         // exercises the error path. is_pdf would gate this in the
-        // executor (only real PDFs reach render_pdf_text), but the
+        // executor (only real PDFs reach this function), but the
         // error path is the fallback we feed the LLM if a real PDF
         // turns out to be encrypted / malformed; pin it here so a
         // future pdf_extract upgrade doesn't silently swallow it.
         let junk = b"%PDF-1.7\n<not actually a valid pdf>";
-        let result = render_pdf_text(junk);
+        let result = render_pdf_text_with_tables(junk);
         assert!(
             result.is_err() || matches!(&result, Ok(s) if s.is_empty() || s.starts_with("(PDF parsed")),
             "malformed PDF bytes should surface as an error or a \
              zero-page parse, not silently produce a random success; got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Session 41 item 2 — HTML structural digest
+    //
+    // The LLM sees what `scraper` sees, in the parsed shape the
+    // runtime's `extract_css_select` will query at apply time. These
+    // tests pin the digest format against in-memory HTML fixtures.
+    // No live network; HTML is constructed inline so the assertions
+    // can name the exact shape they expect.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_html_recognizes_standard_html_markers() {
+        assert!(is_html(b"<!DOCTYPE html><html>...</html>"));
+        assert!(is_html(b"<!doctype html><html>"));
+        assert!(is_html(b"<html lang=\"en\">"));
+        assert!(is_html(b"<HTML>"));
+        // Leading whitespace tolerated.
+        assert!(is_html(b"\n  <!DOCTYPE html>"));
+        assert!(is_html(b"  <html>"));
+        // Leading UTF-8 BOM tolerated.
+        assert!(is_html(b"\xEF\xBB\xBF<!DOCTYPE html>"));
+        assert!(is_html(b"\xEF\xBB\xBF\n<html>"));
+    }
+
+    #[test]
+    fn is_html_rejects_non_html_payloads() {
+        // PDF magic.
+        assert!(!is_html(b"%PDF-1.4\n..."));
+        // JSON.
+        assert!(!is_html(b"{\"data\": [1, 2, 3]}"));
+        assert!(!is_html(b"[1, 2, 3]"));
+        // CSV.
+        assert!(!is_html(b"country,production\nChile,49000\n"));
+        // Plain text starting with `<` but not the right marker —
+        // this is the principal false-positive risk and the strict
+        // sniff rejects it.
+        assert!(!is_html(b"<note>not html</note>"));
+        // XML / RSS — also chevron-leading but not HTML.
+        assert!(!is_html(b"<?xml version=\"1.0\"?>\n<rss>"));
+        // Empty / very short.
+        assert!(!is_html(b""));
+        assert!(!is_html(b"<"));
+        assert!(!is_html(b"<h"));
+    }
+
+    #[test]
+    fn render_html_digest_surfaces_title_h1_table_and_list_shapes() {
+        // A small page covering the digest's structure-summary
+        // sections: title, one h1, a classed-id table with known
+        // (rows × cols), and a couple of lists with known
+        // cardinalities.
+        let html = br#"<!DOCTYPE html>
+<html>
+<head><title>Federal Reserve - H.4.1 Statistical Release</title></head>
+<body>
+<h1>H.4.1 Statistical Release</h1>
+<table id="balance-sheet" class="data-table">
+  <tr><th>Item</th><th>Amount</th><th>Date</th></tr>
+  <tr><td>Reserves</td><td>3000</td><td>2026-01</td></tr>
+  <tr><td>Securities</td><td>2500</td><td>2026-01</td></tr>
+</table>
+<ul class="navigation"><li>A</li><li>B</li><li>C</li></ul>
+<ol><li>One</li><li>Two</li></ol>
+</body>
+</html>"#;
+        let out = render_html_digest(html, 32 * 1024)
+            .expect("well-formed HTML must produce a digest");
+
+        // Title
+        assert!(
+            out.contains("<title>: Federal Reserve - H.4.1 Statistical Release"),
+            "digest must surface the page title; got:\n{out}"
+        );
+        // H1
+        assert!(
+            out.contains("<h1>: H.4.1 Statistical Release"),
+            "digest must surface the page <h1>; got:\n{out}"
+        );
+        // Table signature with class+id and (rows × cols).
+        assert!(
+            out.contains("<table id=\"balance-sheet\" class=\"data-table\"> (3 rows × 3 cols)"),
+            "digest must list the table with its id, class, and shape; got:\n{out}"
+        );
+        // Lists with cardinalities. Cardinality counts <li> children.
+        assert!(
+            out.contains("<ul class=\"navigation\"> (3 items)"),
+            "digest must list the <ul> with its <li> count; got:\n{out}"
+        );
+        assert!(
+            out.contains("<ol> (2 items)"),
+            "digest must list the <ol> with its <li> count; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_html_digest_surfaces_repeating_tag_class_selectors() {
+        // Iterator-eligible selectors: tag.class pairs that occur
+        // more than once. The LLM uses these to author the outer
+        // selector for an iterator-bearing recipe.
+        let html = br#"<!DOCTYPE html>
+<html><body>
+<div class="card"><h3>One</h3></div>
+<div class="card"><h3>Two</h3></div>
+<div class="card"><h3>Three</h3></div>
+<span class="value">100</span>
+<span class="value">200</span>
+<p class="solo">unique</p>
+</body></html>"#;
+        let out = render_html_digest(html, 32 * 1024)
+            .expect("well-formed HTML must produce a digest");
+        // div.card occurs 3 times; span.value occurs 2 times; p.solo
+        // occurs only once and must NOT appear in the
+        // iterator-eligible section (the N>1 criterion).
+        assert!(
+            out.contains("div.card: 3 occurrences"),
+            "digest must surface div.card with its count; got:\n{out}"
+        );
+        assert!(
+            out.contains("span.value: 2 occurrences"),
+            "digest must surface span.value with its count; got:\n{out}"
+        );
+        // The solo class must not be in the repeating list. We test
+        // via a more specific assertion: the line `p.solo: 1` should
+        // not be present.
+        assert!(
+            !out.contains("p.solo: 1"),
+            "single-occurrence class must not appear in the \
+             iterator-eligible list (N>1 criterion); got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_html_digest_excludes_script_and_style_subtrees_from_visible_text() {
+        // The visible-text section must not include script bodies or
+        // style sheets. A real-world page with 100 KiB of inline JS
+        // would otherwise flood the digest with code the LLM does
+        // not need.
+        let html = br#"<!DOCTYPE html>
+<html>
+<head>
+<title>Page</title>
+<style>.hidden { color: red; UNIQUE_STYLE_TOKEN }</style>
+</head>
+<body>
+<h1>Visible heading</h1>
+<p>Visible paragraph text.</p>
+<script>var UNIQUE_SCRIPT_TOKEN = 42; doSomething();</script>
+<noscript>UNIQUE_NOSCRIPT_TOKEN visible only without JS</noscript>
+</body>
+</html>"#;
+        let out = render_html_digest(html, 32 * 1024)
+            .expect("well-formed HTML must produce a digest");
+
+        // The visible-text section should carry the actual visible
+        // content...
+        assert!(
+            out.contains("Visible heading"),
+            "visible-text section must include <h1> text; got:\n{out}"
+        );
+        assert!(
+            out.contains("Visible paragraph text."),
+            "visible-text section must include <p> text; got:\n{out}"
+        );
+        // ...but not the contents of <script>, <style>, or <noscript>
+        // subtrees. Each of these has a unique token we can grep for.
+        assert!(
+            !out.contains("UNIQUE_SCRIPT_TOKEN"),
+            "<script> subtree must not appear in visible text; got:\n{out}"
+        );
+        assert!(
+            !out.contains("UNIQUE_STYLE_TOKEN"),
+            "<style> subtree must not appear in visible text; got:\n{out}"
+        );
+        assert!(
+            !out.contains("UNIQUE_NOSCRIPT_TOKEN"),
+            "<noscript> subtree must not appear in visible text; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_html_digest_handles_empty_body_gracefully() {
+        // SPA shells: <html><body></body></html>. The digest should
+        // emit the section headers (so the LLM sees "yes, this was
+        // parsed as HTML") and report no tables / no lists / no
+        // repeating classes — and an empty visible-text section.
+        // The LLM should then decline.
+        let html = br#"<!DOCTYPE html>
+<html>
+<head><title>SPA Shell</title></head>
+<body><div id="root"></div></body>
+</html>"#;
+        let out = render_html_digest(html, 32 * 1024)
+            .expect("even an empty SPA shell must produce a parseable digest");
+        assert!(
+            out.contains("--- HTML structure (parsed by scraper) ---"),
+            "digest must always emit its structure header"
+        );
+        assert!(
+            out.contains("<title>: SPA Shell"),
+            "digest must surface the title even on a near-empty page"
+        );
+        // No tables or lists in a div-only shell.
+        assert!(
+            !out.contains("Tables:"),
+            "digest must not claim tables when the page has none"
+        );
+        assert!(
+            !out.contains("Lists:"),
+            "digest must not claim lists when the page has none"
+        );
+    }
+
+    #[test]
+    fn render_html_digest_truncates_visible_text_when_budget_is_small() {
+        // Visible text is bounded by the budget. The truncation
+        // marker must be present and must name the budget so the
+        // LLM and the operator see that elision happened.
+        let mut body = String::from("<!DOCTYPE html><html><body>");
+        // Add ~10 KiB of visible text.
+        for _ in 0..1000 {
+            body.push_str("<p>Lorem ipsum dolor sit amet. </p>");
+        }
+        body.push_str("</body></html>");
+
+        // Tiny budget — structure summary is small but visible text
+        // must get truncated.
+        let out = render_html_digest(body.as_bytes(), 1024)
+            .expect("well-formed HTML must produce a digest");
+        assert!(
+            out.contains("visible text truncated"),
+            "digest must mark truncation explicitly; got:\n{out}"
         );
     }
 
@@ -4368,8 +5174,8 @@ mod tests {
         assert_eq!(report.outcomes.len(), 1);
 
         // The recipe-author prompt was captured at least once. Check
-        // that the captured prompt carries the extracted text — page
-        // marker + table contents — and not raw PDF bytes.
+        // that the captured prompt carries the framed-table format
+        // emitted by `render_pdf_text_with_tables` — Session 41 item 1.
         let prompts = provider.seen.lock().unwrap();
         assert!(
             !prompts.is_empty(),
@@ -4377,11 +5183,23 @@ mod tests {
              before the decline; nothing captured"
         );
         let last = &prompts[prompts.len() - 1];
+        // The LLM must see a per-page marker that either declares a
+        // detected table (`[PDF page N, table M] (R rows × C cols)`)
+        // or explicitly declares no table found
+        // (`[PDF page N] (no table detected)`). Either is honest;
+        // raw page text without a marker is not.
         assert!(
-            last.contains("[PDF page 1]"),
-            "the recipe-author prompt should carry the per-page \
-             marker emitted by `render_pdf_text`. \
-             pre-Session-40 it carried raw PDF binary instead."
+            last.contains("[PDF page 2, table 0]"),
+            "the recipe-author prompt should carry the framed-table \
+             header for the lithium fixture's data table on page 2. \
+             Pre-Session-41 it carried raw page text after `[PDF page N]` \
+             markers and the LLM had to imagine the detector's row count."
+        );
+        assert!(
+            last.contains("rows ×"),
+            "the framed-table header should declare the table's \
+             (rows × cols) shape so the LLM authors against the \
+             runtime's coordinate space, not its own visual count."
         );
         for needle in ["Country", "Production"] {
             assert!(
@@ -4395,10 +5213,141 @@ mod tests {
         // at — pinning the marker here also catches accidental
         // regressions where the PDF branch is bypassed entirely.
         assert!(
-            last.contains("PDF (text extracted)"),
+            last.contains("PDF (text + detected tables)"),
             "excerpt header should announce that bytes were converted \
-             from PDF; otherwise the LLM has no signal that it's \
-             looking at extracted text rather than the raw source"
+             from PDF and tables were detected; otherwise the LLM has \
+             no signal that it's looking at framed-table output rather \
+             than the raw source"
+        );
+    }
+
+    /// End-to-end check on the HTML digest: an HTML source travels
+    /// through the executor's pre-fetch + propose-URL + recipe-author
+    /// retry loop, and the prompt the recipe-author LLM finally sees
+    /// carries the digest framing — not raw `from_utf8_lossy` bytes.
+    /// Mirrors the PDF integration test in shape.
+    #[tokio::test]
+    async fn prefetch_excerpt_for_html_url_yields_structural_digest_to_recipe_author() {
+        use std::sync::Mutex;
+
+        struct PromptCapturingProvider {
+            seen: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl LlmProvider for PromptCapturingProvider {
+            fn id(&self) -> &'static str {
+                "prompt_capturing"
+            }
+            fn supported_tiers(&self) -> &[ModelTier] {
+                &[ModelTier::Cheap, ModelTier::Workhorse]
+            }
+            async fn complete(
+                &self,
+                tier: ModelTier,
+                req: situation_room_llm::CompletionRequest,
+            ) -> Result<situation_room_llm::CompletionResponse, situation_room_llm::LlmError> {
+                if matches!(tier, ModelTier::Workhorse) {
+                    self.seen.lock().unwrap().push(req.user.clone());
+                }
+                let canned = if matches!(tier, ModelTier::Cheap) {
+                    serde_json::json!({
+                        "url": "https://example.test/page.html",
+                        "rationale": "fixture",
+                    })
+                } else {
+                    serde_json::json!({
+                        "source_url": "https://example.test/page.html",
+                        "extraction": { "mode": "regex_capture", "pattern": ".*", "group": 0 },
+                        "produces": [],
+                        "decline_reason": "test pin: surface the prompt we just saw",
+                    })
+                };
+                Ok(situation_room_llm::CompletionResponse {
+                    text: serde_json::to_string(&canned).unwrap(),
+                    structured: Some(canned),
+                    provider: "prompt_capturing".into(),
+                    model: "test".into(),
+                    input_tokens: None,
+                    output_tokens: None,
+                })
+            }
+        }
+
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let url = "https://example.test/page.html";
+        // A small HTML page covering the digest's main sections plus
+        // an iterator-eligible repeating class. The recipe-author
+        // prompt must carry the digest framing; the integration test
+        // pins the framing without coupling to an exact byte layout.
+        let html = br#"<!DOCTYPE html>
+<html>
+<head><title>Reserves Statistical Release</title></head>
+<body>
+<h1>H.4.1</h1>
+<table id="balance-sheet"><tr><th>Item</th><th>Amount</th></tr>
+<tr><td>Reserves</td><td>3000</td></tr></table>
+<div class="card">A</div>
+<div class="card">B</div>
+</body>
+</html>"#;
+        let fetcher = StaticFetcher::new().with(url, html);
+
+        let provider = PromptCapturingProvider {
+            seen: Mutex::new(Vec::new()),
+        };
+        let sources: Vec<SourceDescriptor> = vec![];
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: TEST_AUTHOR_PROMPT,
+            propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
+            sources: &sources,
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+        // Recipe-author declined (canned response), so exactly one
+        // Declined outcome.
+        assert_eq!(report.outcomes.len(), 1);
+
+        let prompts = provider.seen.lock().unwrap();
+        assert!(
+            !prompts.is_empty(),
+            "recipe-author should have been called at least once"
+        );
+        let last = &prompts[prompts.len() - 1];
+        // Digest header: pinning this catches accidental regressions
+        // where the HTML branch is bypassed entirely.
+        assert!(
+            last.contains("--- HTML structure (parsed by scraper) ---"),
+            "the recipe-author prompt should carry the HTML digest \
+             header. Pre-Session-41-patch-2 it carried raw \
+             from_utf8_lossy bytes and the LLM had to mentally parse \
+             the markup."
+        );
+        // Specific structural elements from the fixture.
+        assert!(
+            last.contains("<title>: Reserves Statistical Release"),
+            "the digest must surface the page title from the parsed \
+             HTML; got prompt:\n{last}"
+        );
+        assert!(
+            last.contains("<table id=\"balance-sheet\">"),
+            "the digest must list the table with its id attribute; \
+             got prompt:\n{last}"
+        );
+        assert!(
+            last.contains("div.card: 2 occurrences"),
+            "the digest must surface the iterator-eligible repeating \
+             class; got prompt:\n{last}"
+        );
+        // Excerpt header annotation announces the HTML branch.
+        assert!(
+            last.contains("HTML (structural digest)"),
+            "excerpt header should announce that bytes were parsed \
+             as HTML; got prompt:\n{last}"
         );
     }
 }

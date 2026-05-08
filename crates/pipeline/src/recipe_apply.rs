@@ -607,7 +607,12 @@ fn extract_css_within(
 /// Each extractor is a pure function from bytes → string. No stage
 /// above the extractor mutates or re-interprets the extracted string
 /// — it flows directly into the binding stage.
-fn extract(spec: &ExtractionSpec, bytes: &[u8]) -> Result<String, ApplyError> {
+///
+/// **Visibility**: `pub(crate)` so [`validate_recipe_against_bytes`]
+/// can reuse the same dispatch path the runtime uses at apply time.
+/// Session 41 items 4–6: by construction, what the validator runs
+/// is what the runtime will run.
+pub(crate) fn extract(spec: &ExtractionSpec, bytes: &[u8]) -> Result<String, ApplyError> {
     match spec {
         ExtractionSpec::JsonPath { path } => extract_json_path(bytes, path),
         ExtractionSpec::CssSelect {
@@ -1018,7 +1023,14 @@ fn extract_pdf_table(
 /// The returned shape is `tables[i][row][col]`. `tables` is in
 /// page-reading order; `row` is in line order; `col` is in
 /// left-to-right order.
-fn detect_pdf_tables(page_text: &str) -> Vec<Vec<Vec<String>>> {
+///
+/// **Visibility**: `pub(crate)` so the executor's PDF prefetch path
+/// can frame what the LLM sees in the runtime's coordinate space.
+/// Session 41 item 1: the recipe-author needs to count rows the way
+/// the runtime counts them. Same library, same detector, same
+/// coordinates — by construction, no off-by-one between authoring
+/// and apply.
+pub(crate) fn detect_pdf_tables(page_text: &str) -> Vec<Vec<Vec<String>>> {
     let mut tables: Vec<Vec<Vec<String>>> = Vec::new();
     let mut current_table: Vec<Vec<String>> = Vec::new();
     let mut current_token_count: Option<usize> = None;
@@ -1363,6 +1375,166 @@ fn insert_at_path(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Authoring-time validation against prefetched bytes (Session 41 items 4–6)
+// ---------------------------------------------------------------------------
+//
+// Architectural rationale (ADR 0007 golden rule applied to the
+// authoring loop). Pre-Session-41, the LLM authored a recipe, the
+// validator (`build_validated_recipe`) checked structural shape, and
+// the recipe was persisted. The runtime then attempted to apply it
+// against fetched bytes on every fetch — and an apply failure
+// recurred forever because the recipe was already on disk.
+//
+// Item 4 (css_select), item 5 (pdf_table), item 6 (json_path) close
+// this gap by running the runtime's own extraction code against the
+// *same bytes the LLM saw* immediately after authoring. By
+// construction, no recipe gets persisted that the runtime would fail
+// at apply, because the validator IS the runtime.
+//
+// What this is NOT:
+// - A mode-specific validator. The dispatch goes through [`extract`]
+//   (the same function the runtime calls at apply time) so adding a
+//   new extraction mode under ADR 0007 does not require touching this
+//   function — the closed enum's `match` is in `extract`, not here.
+// - A re-fetch. Validation runs against the bytes the caller already
+//   prefetched. No second network round-trip.
+// - A best-effort heuristic. A failure here is a hard decline; the
+//   recipe is not persisted.
+
+/// Validate that a candidate [`FetchRecipe`] would succeed at apply
+/// time against the given bytes — the same bytes the LLM saw when
+/// authoring the recipe.
+///
+/// Scalar recipes: dispatch through [`extract`] and discard the
+/// extracted string. Any [`ApplyError`] returned by the runtime
+/// extractor is the authoring-time decline reason.
+///
+/// Iterator recipes (Phase 1, ADR 0016): the runtime supports the
+/// `css_select × css_select` pair only. We mirror that contract here
+/// — any other pairing surfaces the same `ApplyError::NotImplemented`
+/// the runtime would produce, but at authoring time so the recipe is
+/// never persisted. For css_select × css_select, the validator
+/// requires the outer iterator to match ≥1 element AND the inner
+/// extraction to match ≥1 element within at least one of those outer
+/// matches. This is the minimum "the runtime would produce records"
+/// contract; a recipe that fails this preflight would fail at apply.
+///
+/// Session 41 items 4–6.
+pub(crate) fn validate_recipe_against_bytes(
+    recipe: &FetchRecipe,
+    bytes: &[u8],
+) -> Result<(), ApplyError> {
+    match &recipe.iterator {
+        None => {
+            // Scalar: same dispatch the runtime uses. Discard the
+            // returned scalar — we only care that extraction
+            // succeeded structurally.
+            extract(&recipe.extraction, bytes).map(|_| ())
+        }
+        Some(iter_spec) => match (iter_spec, &recipe.extraction) {
+            (
+                ExtractionSpec::CssSelect {
+                    selector: iter_selector,
+                    attribute: _,
+                },
+                ExtractionSpec::CssSelect {
+                    selector: inner_selector,
+                    attribute: _,
+                },
+            ) => validate_css_iterator(bytes, iter_selector, inner_selector),
+            (iter_other, inner_other) => {
+                // Mirror the runtime's NotImplemented; the validator
+                // should never disagree with the runtime about which
+                // pairings are supported.
+                Err(ApplyError::NotImplemented {
+                    mode: "iterator",
+                    reason: format!(
+                        "iterator runtime is wired for css_select × css_select \
+                         only in Phase 1 (ADR 0016). Got iter={}, inner={}. \
+                         Other modes are tracked for Phase 2; until then, \
+                         iterator-bearing recipes against listing-shaped \
+                         sources of other modes should decline at authoring.",
+                        mode_name(iter_other),
+                        mode_name(inner_other),
+                    ),
+                })
+            }
+        },
+    }
+}
+
+/// Iterator preflight for css_select × css_select. Mirrors the
+/// runtime's [`apply_css_iterator`] structurally: parse once, run the
+/// outer selector, ensure ≥1 match, then run the inner selector
+/// against each outer match's sub-tree until one matches. Differences
+/// from `apply_css_iterator`:
+/// - No record building (we don't have an `ApplyContext` and don't
+///   need normalized records).
+/// - No cap check — Phase 1's `MAX_RECORDS_PER_RECIPE` cap is a
+///   runtime concern; the validator only asks "would this produce ≥1
+///   record." A recipe that yields too many records still gets
+///   persisted; the runtime caps it on apply.
+/// - Inner-empty / attribute-missing cases are NOT failures here:
+///   those are per-record runtime errors, not "the recipe is
+///   structurally wrong against this page" errors. The validator
+///   defends authoring; the runtime defends apply.
+fn validate_css_iterator(
+    bytes: &[u8],
+    iter_selector: &str,
+    inner_selector: &str,
+) -> Result<(), ApplyError> {
+    let html_str = std::str::from_utf8(bytes).map_err(|e| ApplyError::Extraction {
+        mode: "css_select",
+        reason: format!("bytes were not UTF-8: {e}"),
+    })?;
+    let doc = Html::parse_document(html_str);
+
+    let iter_sel = Selector::parse(iter_selector).map_err(|e| ApplyError::Extraction {
+        mode: "css_select",
+        reason: format!("iterator selector did not parse: {e}"),
+    })?;
+    let inner_sel = Selector::parse(inner_selector).map_err(|e| ApplyError::Extraction {
+        mode: "css_select",
+        reason: format!("inner selector did not parse: {e}"),
+    })?;
+
+    let outer_matches: Vec<scraper::ElementRef<'_>> = doc.select(&iter_sel).collect();
+    if outer_matches.is_empty() {
+        return Err(ApplyError::Extraction {
+            mode: "css_select",
+            reason: format!(
+                "iterator selector {iter_selector:?} matched no elements"
+            ),
+        });
+    }
+
+    // Inner must match within at least one outer scope. We don't
+    // require *every* outer match to host an inner match — the
+    // runtime tolerates a per-card miss as a per-record extraction
+    // error and continues. The minimum authoring contract is "this
+    // selector pair would produce at least one record."
+    let any_inner_hit = outer_matches
+        .iter()
+        .any(|m| m.select(&inner_sel).next().is_some());
+    if !any_inner_hit {
+        return Err(ApplyError::Extraction {
+            mode: "css_select",
+            reason: format!(
+                "inner selector {inner_selector:?} matched no elements within \
+                 any of the {} iterator matches — the iterator selector found \
+                 cards but none of them contained the value the inner selector \
+                 addresses. Likely cause: the inner selector is hallucinated \
+                 against markup the prefetch did not return.",
+                outer_matches.len()
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2622,5 +2794,170 @@ C 4
             }
             other => panic!("expected Observation, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_recipe_against_bytes — Session 41 items 4–6
+    //
+    // These tests pin the contract that authoring-time validation
+    // mirrors apply-time extraction. Each test pairs a recipe with
+    // bytes and asserts the validator's verdict matches what the
+    // runtime would return at apply time.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_recipe_pdf_table_against_lithium_fixture_accepts_in_range_coords() {
+        // Coordinate the fixture supports (page 2 contains the
+        // Country/Production table; row 2 col 1 is "49000" — Chile's
+        // production figure). Validator must agree with the runtime
+        // that this would extract.
+        let recipe = recipe_with(ExtractionSpec::PdfTable {
+            page: 2,
+            table_index: 0,
+            row: 2,
+            col: 1,
+        });
+        validate_recipe_against_bytes(&recipe, LITHIUM_PDF)
+            .expect("in-range pdf_table coordinates must validate");
+    }
+
+    #[test]
+    fn validate_recipe_pdf_table_against_lithium_fixture_rejects_out_of_range_row() {
+        // The lithium MCS class of failure from Session 40: LLM
+        // counted rows by visual inspection of the page text and
+        // authored row=11 against a detected table that has 2 rows.
+        // The validator catches this at authoring time so the recipe
+        // is never persisted.
+        let recipe = recipe_with(ExtractionSpec::PdfTable {
+            page: 2,
+            table_index: 0,
+            row: 99,
+            col: 0,
+        });
+        let err = validate_recipe_against_bytes(&recipe, LITHIUM_PDF).unwrap_err();
+        match err {
+            ApplyError::Extraction { mode: "pdf_table", reason } => {
+                assert!(
+                    reason.contains("row 99 out of range"),
+                    "validator should surface the runtime's exact error \
+                     so the operator sees the same message at authoring \
+                     time as they would at apply time; got: {reason}"
+                );
+            }
+            other => panic!(
+                "expected Extraction error from pdf_table, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn validate_recipe_css_select_rejects_selector_that_matches_nothing() {
+        // The Session 40 Fed H.4.1 class of failure: LLM authors
+        // `table#balance-sheet td.value` against markup that doesn't
+        // contain a #balance-sheet table. The validator catches it
+        // before the recipe is persisted.
+        let html = b"<html><body><table id=\"data\"><tr><td>1</td></tr></table></body></html>";
+        let recipe = recipe_with(ExtractionSpec::CssSelect {
+            selector: "table#balance-sheet td.value".into(),
+            attribute: None,
+        });
+        match validate_recipe_against_bytes(&recipe, html).unwrap_err() {
+            ApplyError::Extraction { mode: "css_select", reason } => {
+                assert!(
+                    reason.contains("matched no elements"),
+                    "validator should report no-match in the runtime's wording; got: {reason}"
+                );
+            }
+            other => panic!("expected Extraction error from css_select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_recipe_css_select_accepts_selector_that_matches() {
+        let html = b"<html><body><div class=\"value\">42</div></body></html>";
+        let recipe = recipe_with(ExtractionSpec::CssSelect {
+            selector: ".value".into(),
+            attribute: None,
+        });
+        validate_recipe_against_bytes(&recipe, html)
+            .expect("matching css_select selector must validate");
+    }
+
+    #[test]
+    fn validate_recipe_css_iterator_accepts_when_outer_and_inner_match() {
+        // Iterator path: outer selects cards, inner selects headlines.
+        // Both match in the fixture — validator says ok.
+        let html = b"\
+            <html><body>\
+            <div class=\"card\"><h3>First</h3></div>\
+            <div class=\"card\"><h3>Second</h3></div>\
+            </body></html>";
+        let recipe = iterator_event_recipe(".card", "h3");
+        validate_recipe_against_bytes(&recipe, html)
+            .expect("matching iterator + inner selectors must validate");
+    }
+
+    #[test]
+    fn validate_recipe_css_iterator_rejects_when_outer_matches_but_inner_does_not() {
+        // Outer cards exist; inner targets markup not present inside
+        // any card. Validator should reject — the recipe would
+        // produce zero records at apply.
+        let html = b"\
+            <html><body>\
+            <div class=\"card\"><span>First</span></div>\
+            <div class=\"card\"><span>Second</span></div>\
+            </body></html>";
+        let recipe = iterator_event_recipe(".card", "h3.headline");
+        match validate_recipe_against_bytes(&recipe, html).unwrap_err() {
+            ApplyError::Extraction { mode: "css_select", reason } => {
+                assert!(
+                    reason.contains("inner selector"),
+                    "validator should attribute the failure to the inner \
+                     selector specifically; got: {reason}"
+                );
+            }
+            other => panic!("expected Extraction error from css_select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_recipe_css_iterator_rejects_when_outer_matches_nothing() {
+        let html = b"<html><body><p>no cards here</p></body></html>";
+        let recipe = iterator_event_recipe(".card", "h3");
+        match validate_recipe_against_bytes(&recipe, html).unwrap_err() {
+            ApplyError::Extraction { mode: "css_select", reason } => {
+                assert!(
+                    reason.contains("iterator selector"),
+                    "validator should attribute the failure to the iterator \
+                     selector specifically; got: {reason}"
+                );
+            }
+            other => panic!("expected Extraction error from css_select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_recipe_json_path_inherits_runtime_null_skip_contract() {
+        // Item 6 lands in the JSON patch (Session 41 patch 3); the
+        // dispatch through `extract` already exercises
+        // `extract_json_path`'s null-skip and no-match behaviour.
+        // This pin documents that wiring up json_path validation will
+        // not require new code in `validate_recipe_against_bytes` —
+        // the dispatch is mode-agnostic by construction.
+        let bytes = br#"{"data": [{"v": 1}, {"v": 2}]}"#;
+        let recipe = recipe_with(ExtractionSpec::JsonPath {
+            path: "$.data[*].v".into(),
+        });
+        validate_recipe_against_bytes(&recipe, bytes)
+            .expect("matching json_path must validate via the same dispatch");
+
+        let recipe_no_match = recipe_with(ExtractionSpec::JsonPath {
+            path: "$.does_not_exist".into(),
+        });
+        let err = validate_recipe_against_bytes(&recipe_no_match, bytes).unwrap_err();
+        assert!(
+            matches!(err, ApplyError::Extraction { mode: "json_path", .. }),
+            "no-match json_path should surface as Extraction; got {err:?}"
+        );
     }
 }

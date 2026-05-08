@@ -166,22 +166,33 @@ error-shaped output (see the schema) rather than inventing a mode.
   instead. See "Type honesty" below for the failure shape this
   avoids.
 - `css_select` — for HTML pages. Fields: `selector` (CSS selector),
-  optional `attribute` (pull an attribute rather than text).
+  optional `attribute` (pull an attribute rather than text). Author
+  the selector against the elements listed under
+  `--- HTML structure (parsed by scraper) ---` in the prefetch
+  excerpt: those are the elements `scraper` actually parsed out, and
+  the runtime queries the same parser at apply time. The
+  `Repeating element classes` subsection lists `tag.class` selectors
+  that occur more than once — those are iterator-eligible. The
+  visible-text section under the structure summary lets you decide
+  *which* listed element holds the value you want.
 - `csv_cell` — for CSV/TSV. Fields: `column` (header name), optional
   `row_filter` (`equals` on a column, or `labeled_as` for pivoted
   tables).
 - `pdf_table` — for PDFs whose tables tokenize cleanly (each cell's
   value is a single whitespace-free token like `45000`, `Australia`,
-  `2024-Q1`). Fields: `page` (1-indexed, matches the `[PDF page N]`
-  marker shown in the prefetch excerpt for PDF sources),
-  `table_index` (0-indexed within the page), `row` (0-indexed,
-  header row is typically 0), `col` (0-indexed).
+  `2024-Q1`). Fields: `page` (1-indexed, matches the
+  `[PDF page N, table M]` header shown in the prefetch excerpt for
+  PDF sources), `table_index` (0-indexed, the M in the same header),
+  `row` (0-indexed, the row number listed in that header's body —
+  the framed excerpt shows you exactly which rows the runtime
+  detected), `col` (0-indexed, within the column range declared in
+  the header).
 - `regex_capture` — last resort, for unstructured text. Fields:
   `pattern` (Rust regex syntax), `group` (1-indexed capture group).
 
-Use `pdf_table` for stable tabular PDFs whose layout you can read
-off the page-marker blocks in the prefetch excerpt. Use
-`regex_capture` only when no structured mode works.
+Use `pdf_table` for stable tabular PDFs whose framed-table headers
+appear in the prefetch excerpt. Use `regex_capture` only when no
+structured mode works.
 
 ## When no recipe is honestly possible — the decline path
 
@@ -630,23 +641,45 @@ round trip later.
 
 Some sources publish their content primarily as PDF — annual
 reports, regulatory texts, statistical releases. The closed
-extraction vocabulary's `pdf_table` mode addresses these directly:
-when the prefetch returns PDF bytes, the runtime extracts the page
-text and shows it to you in the excerpt with `[PDF page N]`
-markers preceding each page (1-indexed). Author `pdf_table`
-coordinates against that marker-bounded text — `page` is the
-marker number, `table_index` is the 0-indexed table within that
-page (use 0 when there is one table per page), `row` and `col`
-are 0-indexed positions within the table (header row is typically
-row 0).
+extraction vocabulary's `pdf_table` mode addresses these directly.
+When the prefetch returns PDF bytes, the runtime extracts the page
+text and runs the same table-detection pass it will run again at
+apply time, then frames the result for you in the excerpt:
+
+- Each detected table on each page is announced by a header line
+  `[PDF page N, table M] (R rows × C cols)` followed by one line
+  per row showing the row index, the column range, and the
+  detected cell values in quoted form.
+- Pages where the detector found no table are announced
+  `[PDF page N] (no table detected)` followed by the page's
+  narrative text. Use that text only to decide *whether* the value
+  you need is on this page; do **not** author `pdf_table`
+  coordinates against pages that declare no table — the runtime
+  will see the same nothing the prefetch saw and the validator
+  will reject the recipe.
+
+Because the framed excerpt is produced by the same detector the
+runtime uses, the row and column numbers you read off the headers
+are the row and column numbers the runtime will index into. There
+is no translation step between "what I see on the page" and "what
+the runtime will count" — they are the same numbers, by
+construction.
+
+Author `pdf_table` coordinates against the framed-table headers:
+`page` is `N`, `table_index` is `M`, `row` is the row number
+listed in that table's body (0-indexed; the header row is
+typically `0`), `col` is within the column range declared in the
+header (0-indexed).
 
 `pdf_table` works when each cell's value is a single
 whitespace-free token. Multi-word cells (`United States`,
 `North Sea`) tokenize as multiple columns and shift the column
 indexing — or, when the multi-word cell is a value rather than a
 header, terminate the detected table at the ragged-token-count
-row. If the excerpt shows multi-word cells in the rows you care
-about, prefer a different mode or decline.
+row. If the framed table you care about ends earlier than the
+visible PDF table, that is the detector's contract telling you
+the table is not addressable through `pdf_table`; prefer a
+different mode or decline.
 
 ### Prefer HTML when both formats publish the same data
 
@@ -735,6 +768,19 @@ fetched from the documented endpoint above immediately before this
 prompt was assembled. Read it as evidence of the source's structure:
 field names, table layout, JSON shape, HTML element classes, units of
 measurement.
+
+When the source is a PDF, the excerpt is framed by the same table
+detector the runtime uses at apply time — every detected table is
+listed with its `(rows × cols)` shape so the row and column numbers
+you read off the framed headers are the row and column numbers the
+runtime will index into. When the source is HTML, the excerpt opens
+with a structural digest produced by the same `scraper` parser the
+runtime queries at apply time — every `<table>`, `<ul>`, `<ol>`, and
+repeating `tag.class` selector is listed with its parsed shape so
+you author selectors against elements `scraper` confirmed match real
+markup. In both cases the framing is the runtime's view of the
+bytes, not a separate interpretation: a coordinate or selector you
+read off the excerpt is one the runtime will use unchanged.
 
 **Treat this as a snapshot, not a schema.** Tomorrow's fetch will
 produce structurally similar content with different values. Your
