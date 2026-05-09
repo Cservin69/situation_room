@@ -1,4 +1,4 @@
-# Propose Source URL Prompt — v1.0
+# Propose Source URL Prompt — v1.1
 
 <!--
     This file is the Level-2 propose-URL prompt for situation_room.
@@ -87,8 +87,21 @@ the data the recipe author will need — no JavaScript-rendered SPA
 shell, no /topic/ or /about/ landing page, no homepage. Your job
 is to know which path on the host actually serves data.
 
+The two binding constraints are **fetchability** (the workstation
+can actually retrieve the bytes within its per-source deadline)
+and **authorability** (the bytes contain extractable structure
+the recipe author can write coordinates against). A URL that
+fails either is a wasted attempt regardless of how prestigious
+the publisher is.
+
 Concrete heuristics by source type:
 
+- **News and trade press** — RSS/Atom feeds when available, then
+  topic-tag listing URLs that return server-rendered HTML cards,
+  then individual article pages that quote primary figures. These
+  surfaces are typically concise (a few KB to a few hundred KB),
+  server-rendered, and respond promptly. *Not* the publication's
+  homepage, *not* /search forms with no query.
 - **Statistical agencies** — bulk download endpoints, dataset
   query URLs that return CSV/JSON. Examples of the *shape* (not
   the specific URL): `*/data/*.csv`, `*/api/*?format=json`,
@@ -98,10 +111,12 @@ Concrete heuristics by source type:
   endpoints with stable query parameters, the regulator's
   publication feed (RSS/Atom). *Not* the regulator's homepage,
   *not* topic-overview pages, *not* the press-release landing.
-- **News and trade press** — RSS/Atom feeds when available, then
-  topic-tag listing URLs that return server-rendered HTML cards.
-  *Not* the publication's homepage, *not* /search forms with no
-  query.
+  Be aware that long flagship reports (multi-hundred-page PDFs,
+  large chaptered bulletins) often exceed prefetch budgets and
+  fetch deadlines; prefer a focused publication on the same host
+  (a single chapter, a fact sheet, a press release with the
+  primary figure inline) over the flagship document when the
+  description's metric is narrow.
 - **Academic / preprint** — listing endpoints by category
   (`*/list/*/recent`, `*/abs/*`), arXiv-style URLs, IEEE/ACM
   search results. *Not* `*/about/`, *not* publisher homepages.
@@ -113,6 +128,52 @@ The test: if you typed your URL into a browser and saw View Source,
 would the data be in the HTML? If yes, the recipe author has a
 chance. If not (the source view is a near-empty `<div id="root">`
 with one `<script>` tag), the recipe author will decline.
+
+## How to weight `priority_tier`
+
+`priority_tier` is a **hint about provenance class**, not a strict
+ranking the proposer must obey. The Level-1 classifier emits one
+of `authoritative_primary`, `authoritative_secondary`,
+`industry_trade_press`, or `general_news` to describe the kind of
+source the L1 had in mind for this nomination — what publisher
+class would carry the data with the right pedigree.
+
+The proposer's job is different. The proposer picks the URL that
+will actually return useful bytes within the workstation's
+deadline. **Pedigree without fetchability produces nothing.** A
+news article that quotes the primary figure with a clear
+attribution is strictly more useful than an authoritative
+flagship document that times out, returns 403, or is so dense
+the prefetch budget closes before the relevant chapter is
+sampled. The recipe author can capture provenance from the
+article's quoted citation; primary-source pedigree is
+reconstructable downstream, but a fetch failure is terminal for
+this attempt.
+
+Practical consequences:
+
+- When the description's metric (a production figure, a capacity
+  number, a price, a contract terms summary) is plausibly covered
+  by a focused news or trade-press article, **propose that** —
+  even if the L1 named an authoritative_primary tier. A 5–50 KB
+  article that cites its primary source is a better first attempt
+  than a 100+ page regulator PDF you only know by name.
+- When the L1 hint and a responsive news/trade-press surface
+  point at the same metric, **prefer the responsive surface**.
+  Save authoritative endpoints for nominations whose description
+  *requires* the primary structure (a full reserves table by
+  country, a multi-year price series, a legal text) — the cases
+  where a news quote of one figure would not satisfy what L1
+  asked for.
+- When you genuinely don't know a responsive news/trade-press
+  path that covers the metric, falling back to the authoritative
+  endpoint is reasonable on the first attempt. Treat the prior
+  attempts log as the strongest signal for the second and third.
+
+The principle: the workstation's per-source deadline is the
+binding constraint, not the publisher's prestige. A returned
+record from a news article beats a declined nomination from an
+unreachable agency every time.
 
 ## What NOT to propose
 
@@ -144,8 +205,27 @@ When `prior_attempts` is non-empty, treat each entry as evidence:
   different path (publication index, archive, search endpoint), not
   a different parameter on the same broken path.
 - `fetch failed: 403/401` — the host blocked us. A different path
-  on the same host is unlikely to fare better. Consider declining
-  unless you know an open mirror or a different access route.
+  on the same host is unlikely to fare better. **Pivot off the
+  host**: propose a news or trade-press article that covers the
+  same metric and cites this host as its primary source. Decline
+  only if no such coverage plausibly exists.
+- `fetch failed: timeout after …s` / `fetch failed: 5xx` — the host
+  is slow or unreachable from the workstation right now. Same
+  pivot: propose a responsive news/trade-press surface that quotes
+  the metric. Re-trying a slow host on a different path within the
+  same attempt cycle is unlikely to clear the deadline.
+- `fetch failed: response too large (got at least N bytes, max M)`
+  — the document was retrievable but its raw size blew through the
+  fetch ceiling. Frequently a sign that the URL is a heavyweight
+  CMS landing page (inline scripts/styles) rather than a data
+  endpoint, OR a flagship multi-hundred-page document the
+  workstation cannot ingest whole. Pivot to a more focused
+  surface: the same publisher's press release, a single-chapter
+  PDF, or a news/trade-press article that quotes the figure of
+  interest.
+- `rate-limited; …` — the host asked us to back off. Pivot off the
+  host (a different publisher covering the same metric) rather
+  than retry the same host within this attempt cycle.
 - `recipe author declined: SPA` — the path was server-rendered as
   an empty shell. Try a non-SPA endpoint on the same host (an API,
   a download, an RSS feed) if you know one. If you don't, decline.

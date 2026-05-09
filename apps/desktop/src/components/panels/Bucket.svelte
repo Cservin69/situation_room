@@ -29,6 +29,18 @@
   whether it should appear depends on the records-loaded sentinel
   (`plans.records !== null`), which only the parent has visibility
   into.
+
+  ## Body height cap (Session 51)
+
+  The body is height-capped with internal vertical scroll so a tall
+  bucket (e.g. a Document panel with seven nominations and long
+  descriptions, or any bucket once its records section is populated)
+  cannot stretch the row of the six-bucket CSS grid and visually
+  overflow into the panels below (RecipeOutcomesHeatmap, Sources
+  Memory, etc.). The cap sits on the bucket body — not on the bucket
+  itself — so the header (title + count) stays in view as the body
+  scrolls. The cap applies uniformly to all six bucket types
+  (closed-vocabulary discipline: no source-specific routing).
 -->
 <script lang="ts">
   import type { Snippet } from 'svelte';
@@ -99,6 +111,38 @@
     flex-direction: column;
     gap: 8px;
     font-size: 12px;
+    /*
+      Session 51: cap the body height with internal scroll so a
+      tall bucket (long expectations list, populated records
+      section) does not stretch the six-bucket grid row and push
+      sibling panels (RecipeOutcomesHeatmap, SourcesMemoryPanel)
+      down the page. The clamp scales with viewport so wide
+      monitors get more density without losing the cap on small
+      windows.
+
+      `scrollbar-gutter: stable` reserves space for the scrollbar
+      so a tall bucket's content doesn't shift horizontally
+      relative to sibling buckets that fit without scrolling.
+      `scrollbar-width: thin` + `scrollbar-color` styles the
+      Firefox scrollbar against the existing theme tokens; the
+      `::-webkit-scrollbar` rules below do the same for
+      Chromium/WebKit. No hex literals; design-token-only.
+    */
+    max-height: clamp(180px, 36vh, 420px);
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-subtle) transparent;
+  }
+  .body::-webkit-scrollbar {
+    width: 6px;
+  }
+  .body::-webkit-scrollbar-thumb {
+    background: var(--border-subtle);
+    border-radius: 3px;
+  }
+  .body::-webkit-scrollbar-track {
+    background: transparent;
   }
   .empty {
     margin: 0;
