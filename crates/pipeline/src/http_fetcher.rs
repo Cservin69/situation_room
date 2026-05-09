@@ -59,6 +59,25 @@
 //! the operator had no way to know whether the chip was authoritative
 //! or guessed.
 //!
+//! ## Session 45 — typed timeout surfacing
+//!
+//! Pre-Session-45 the `From<HttpError>` impl flattened
+//! `HttpError::Timeout(Duration)` into the catch-all `FetchError::Http`
+//! variant alongside every other non-429 shape. That worked for the
+//! recipe-failure-message path (the operator sees the same string
+//! regardless of source) but blocked the per-host backoff layer from
+//! distinguishing "timeout — adapt" from "404 — don't adapt." Session
+//! 45 lifts `HttpError::Timeout` into [`FetchError::Timeout`], mirroring
+//! the Track-D treatment of 429: the variants the host-backoff state
+//! machine reacts to are typed, the rest collapse into the generic arm.
+//!
+//! The new variant is consumed by
+//! [`crate::fetch_backoff::BackoffFetcher`] (Session 45) which records
+//! a per-host backoff signal whenever a request returns `Timeout` or
+//! `RateLimited`. The fetch-executor adds one new match-arm in
+//! `fetch_recipe_bytes` to surface the timeout reason in the
+//! per-recipe failure message.
+//!
 //! Session 32 adds [`HttpFetcher::fetch_bytes_with_meta`], returning
 //! [`FetchedBytes`] which carries the raw `Content-Type` value
 //! alongside the body. The trait method has a default impl that
@@ -78,6 +97,8 @@
 //! `BackoffOutcome::Bytes` so it lands in the
 //! `recipe_fetch_attempts.response_content_type` column for the
 //! chip to consume.
+
+use std::time::Duration;
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -106,6 +127,22 @@ pub enum FetchError {
     #[error("rate-limited (retry_after_seconds={retry_after_seconds:?})")]
     RateLimited { retry_after_seconds: Option<u64> },
 
+    /// The request didn't complete within the configured total
+    /// timeout. Session 45 — see the module-level "typed timeout
+    /// surfacing" section. Carries the configured timeout so the
+    /// failure message can name what the request was budgeted for
+    /// rather than just "request failed".
+    ///
+    /// The host-backoff layer
+    /// ([`crate::fetch_backoff::BackoffFetcher`]) reacts to this
+    /// variant the same way it reacts to a 429 with no
+    /// `Retry-After`: increment the per-host failure counter and
+    /// extend `next_allowed_at` by the uniform exponential backoff.
+    /// The variant is the *signal*; the per-host adaptation is the
+    /// *policy*; both stay generic.
+    #[error("timed out after {0:?}")]
+    Timeout(Duration),
+
     /// Test/mock implementations use this for "no fixture for this
     /// URL". The real `SecureHttpClient` impl never returns this.
     #[error("no fixture configured for url: {0}")]
@@ -114,18 +151,21 @@ pub enum FetchError {
 
 impl From<HttpError> for FetchError {
     fn from(e: HttpError) -> Self {
-        // 429 with headers gets lifted to RateLimited; other shapes
-        // collapse to the generic Http variant the codebase has had
-        // since Session 8. Preserves backward-compat for every
-        // non-429 caller.
-        if let HttpError::StatusWithHeaders { status, headers } = &e {
-            if *status == 429 {
-                return FetchError::RateLimited {
+        // 429 with headers gets lifted to RateLimited; Timeout gets
+        // lifted to FetchError::Timeout (Session 45 — the host-backoff
+        // layer needs to distinguish timeout from generic failure).
+        // Other shapes collapse to the generic Http variant the
+        // codebase has had since Session 8. Preserves backward-compat
+        // for every non-rate-limited, non-timeout caller.
+        match &e {
+            HttpError::StatusWithHeaders { status, headers } if *status == 429 => {
+                FetchError::RateLimited {
                     retry_after_seconds: headers.retry_after_seconds(),
-                };
+                }
             }
+            HttpError::Timeout(d) => FetchError::Timeout(*d),
+            _ => FetchError::Http(e.to_string()),
         }
-        FetchError::Http(e.to_string())
     }
 }
 
@@ -267,6 +307,13 @@ pub mod testing {
         /// simulate "server told us text/html when the recipe
         /// expected JSON."
         content_types: Mutex<HashMap<String, String>>,
+        /// Per-URL configured timeout — when present, both
+        /// `fetch_bytes` and `fetch_bytes_with_meta` return
+        /// `FetchError::Timeout(duration)` for the configured URL.
+        /// Session 45 — used by the `BackoffFetcher` tests in
+        /// `fetch_backoff` to verify the per-host adaptation reacts
+        /// to typed Timeouts.
+        timeouts: Mutex<HashMap<String, Duration>>,
     }
 
     impl Default for StaticFetcher {
@@ -281,6 +328,7 @@ pub mod testing {
                 fixtures: Mutex::new(HashMap::new()),
                 rate_limited_urls: Mutex::new(HashMap::new()),
                 content_types: Mutex::new(HashMap::new()),
+                timeouts: Mutex::new(HashMap::new()),
             }
         }
 
@@ -316,6 +364,19 @@ pub mod testing {
                 .insert(url.to_string(), retry_after_seconds);
             self
         }
+
+        /// Configure a URL to return [`FetchError::Timeout`] with the
+        /// given duration. Session 45 — used by the per-host backoff
+        /// tests to verify `BackoffFetcher` records timeouts as
+        /// host-adaptation signals.
+        #[allow(dead_code)]
+        pub fn timeout(mut self, url: &str, after: Duration) -> Self {
+            self.timeouts
+                .get_mut()
+                .unwrap()
+                .insert(url.to_string(), after);
+            self
+        }
     }
 
     #[async_trait]
@@ -335,6 +396,18 @@ pub mod testing {
                 });
             }
             drop(rl);
+
+            // Session 45: typed-Timeout fixtures, same precedence
+            // pattern as rate-limited. If both are configured for
+            // the same URL, rate-limit wins (defined order above).
+            let to = self
+                .timeouts
+                .lock()
+                .map_err(|e| FetchError::Http(format!("test fixture lock poisoned: {e}")))?;
+            if let Some(d) = to.get(url) {
+                return Err(FetchError::Timeout(*d));
+            }
+            drop(to);
 
             let map = self
                 .fixtures
@@ -360,6 +433,55 @@ pub mod testing {
                 .get(url)
                 .cloned();
             Ok(FetchedBytes { body, content_type })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the `From<HttpError>` lift. The trait, blanket
+    //! impl on `SecureHttpClient`, and `StaticFetcher` are exercised
+    //! by integration-shaped tests elsewhere in the crate (the
+    //! fetch_executor and fetch_backoff modules); these tests pin the
+    //! conversion shape so a future refactor doesn't silently
+    //! collapse a typed variant back into the catch-all.
+    //!
+    //! Note: the 429 → `RateLimited` arm requires constructing a
+    //! `SecureHeaderMap`, which is `pub(crate)` in the secure crate
+    //! by design (ADR 0009 §"The rule" extended in Session 25).
+    //! That arm is exercised end-to-end by the live integration tests
+    //! that hit a real 429-emitting server through `SecureHttpClient`
+    //! — we don't reach across the boundary to test it here.
+
+    use super::*;
+
+    /// Session 45. The typed `HttpError::Timeout(Duration)` lifts to
+    /// `FetchError::Timeout(Duration)` rather than collapsing into the
+    /// catch-all `Http(String)` variant. The host-backoff layer
+    /// depends on this lift to distinguish "host is timing out"
+    /// from "404, don't adapt."
+    #[test]
+    fn timeout_lifts_to_typed_variant_session_45() {
+        let dur = Duration::from_secs(42);
+        let lifted = FetchError::from(situation_room_secure::http::HttpError::Timeout(dur));
+        match lifted {
+            FetchError::Timeout(d) => assert_eq!(d, dur),
+            other => panic!("expected FetchError::Timeout, got {other:?}"),
+        }
+    }
+
+    /// Session 45. Non-Timeout, non-429 shapes still flatten to the
+    /// generic `Http` variant — the existing 5xx / 4xx / DNS path
+    /// is unchanged. This is what keeps every pre-Session-45
+    /// match-arm honest.
+    #[test]
+    fn other_http_errors_still_collapse_to_http_variant_session_45() {
+        let lifted = FetchError::from(situation_room_secure::http::HttpError::Status(503));
+        match lifted {
+            FetchError::Http(msg) => {
+                assert!(msg.contains("503"), "message should name the status (got {msg:?})");
+            }
+            other => panic!("expected FetchError::Http, got {other:?}"),
         }
     }
 }

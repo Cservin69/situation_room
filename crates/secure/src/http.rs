@@ -78,7 +78,31 @@ pub struct SecureHttpConfig {
     pub max_response_bytes: usize,
     /// Maximum number of redirects to follow.
     pub max_redirects: usize,
-    /// User-Agent header to send. Required by some APIs (SEC EDGAR).
+    /// User-Agent header to send on every request.
+    ///
+    /// **Default (Session 45).** A build-time identifier of the shape
+    /// `SituationRoom/<version> (+<repo-url>)` — version comes from
+    /// `CARGO_PKG_VERSION`, contact comes from `CARGO_PKG_REPOSITORY`
+    /// (the workspace `repository` field). The `+` prefix is the
+    /// long-standing convention (Googlebot et al.) for "the URL that
+    /// follows is the contact for this client." Both pieces are
+    /// embedded at compile time, so the binary always has a non-empty
+    /// UA without needing runtime configuration.
+    ///
+    /// **Why a non-empty default matters.** Some endpoints reject any
+    /// request whose UA is empty or matches a known bot/library
+    /// signature (notably `data.sec.gov`, which 403s an empty UA).
+    /// Shipping a real default closes that failure mode generically
+    /// instead of asking each caller to remember a per-host quirk.
+    /// The default is **not** SEC-shaped — it's the project's own
+    /// identifier, applicable to every host. SEC is one caller among
+    /// many.
+    ///
+    /// **Per-fetcher override.** Every consumer can construct a
+    /// non-default `SecureHttpConfig` with its own `user_agent`
+    /// string — the field is `pub`, no builder gymnastics needed.
+    /// LLM providers that want to advertise their identity (xAI,
+    /// Anthropic) can do so without touching the secure crate.
     pub user_agent: String,
     /// Allow HTTP/2? (We allow it for performance; HTTP/2 server push is
     /// disabled separately in the builder.)
@@ -92,7 +116,16 @@ impl Default for SecureHttpConfig {
             total_timeout: Duration::from_secs(300),
             max_response_bytes: 32 * 1024 * 1024, // 32 MB
             max_redirects: 5,
-            user_agent: format!("situation_room/{} (+https://github.com/situation_room)", env!("CARGO_PKG_VERSION")),
+            // Session 45: build-time identifier sourced from the
+            // workspace's `version` and `repository` fields. See the
+            // field-level rustdoc above for the principle (default
+            // works for every host, SEC is one caller among many,
+            // not a SEC-specific bake-in).
+            user_agent: format!(
+                "SituationRoom/{} (+{})",
+                env!("CARGO_PKG_VERSION"),
+                env!("CARGO_PKG_REPOSITORY")
+            ),
             allow_http2: true,
         }
     }
@@ -511,5 +544,73 @@ impl SecureHttpClient {
         } else {
             HttpError::Request(e.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Session 45. The default UA is the build-time identifier
+    /// — `SituationRoom/<version> (+<repo-url>)` — for every request.
+    /// The shape is the principle answer the Session-45 handoff named
+    /// (D-1 sub-item): a generic project identifier, not a SEC contact
+    /// email. This test pins the shape so a future "let's just put
+    /// `SituationRoom-fetcher` in there" PR has to delete the test
+    /// and explain why.
+    ///
+    /// We assert on shape (prefix, parenthesised contact, non-empty
+    /// version) rather than the literal string so a workspace
+    /// `version` bump doesn't need a parallel edit here.
+    #[test]
+    fn default_user_agent_is_build_time_identifier_session_45() {
+        let ua = SecureHttpConfig::default().user_agent;
+
+        assert!(
+            ua.starts_with("SituationRoom/"),
+            "default UA must start with the project identifier (got {ua:?})"
+        );
+        assert!(
+            ua.contains(" (+"),
+            "default UA must include a parenthesised `+contact` token (got {ua:?})"
+        );
+        assert!(
+            ua.ends_with(')'),
+            "default UA must close the contact parenthesis (got {ua:?})"
+        );
+        // The version segment must be non-empty (CARGO_PKG_VERSION
+        // is always populated by Cargo for any build that compiles
+        // this crate at all, but a typo in the workspace `version`
+        // field could in principle leave it blank — assert anyway).
+        let version = ua
+            .strip_prefix("SituationRoom/")
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or("");
+        assert!(
+            !version.is_empty(),
+            "default UA's version segment must be non-empty (got {ua:?})"
+        );
+    }
+
+    /// Session 45. The `user_agent` field is part of the public
+    /// `SecureHttpConfig` struct; per-fetcher override is just
+    /// constructing a non-default config. This test pins the override
+    /// path so a future refactor that walls off the field behind a
+    /// builder method must update the test (and explain why the
+    /// builder is preferable to direct field access).
+    #[test]
+    fn user_agent_override_threads_through_config_session_45() {
+        let mut cfg = SecureHttpConfig::default();
+        cfg.user_agent = "MyCaller/0.1 (+https://example.test/contact)".to_string();
+        assert_eq!(
+            cfg.user_agent,
+            "MyCaller/0.1 (+https://example.test/contact)"
+        );
+        // Construction must succeed with the override applied —
+        // `SecureHttpClient::new` consumes the config and uses the UA
+        // for every request. We don't make a real request here
+        // (network bound); the round-trip is exercised by the
+        // workspace's integration tests.
+        let _client = SecureHttpClient::new(cfg).expect("client builds with overridden UA");
     }
 }

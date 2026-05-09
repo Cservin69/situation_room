@@ -2401,6 +2401,19 @@ async fn fetch_recipe_bytes(
             stage: FailureStage::Fetch,
             message: msg,
         }),
+        BackoffOutcome::Failed(HttpFetchError::Timeout(d)) => Err(RecipeOutcome::Failed {
+            // Session 45: the typed Timeout variant lets the per-host
+            // backoff layer (`BackoffFetcher`) react before this arm
+            // fires; by the time the executor sees it, the host's
+            // `next_allowed_at` has already been pushed out. We surface
+            // the configured timeout in the message so the operator
+            // sees what the request was budgeted for, not just "fetch
+            // failed".
+            recipe_id: recipe.id,
+            source_id: recipe.source_id.clone(),
+            stage: FailureStage::Fetch,
+            message: format!("timed out after {d:?}"),
+        }),
         BackoffOutcome::Failed(HttpFetchError::NoFixture(url)) => Err(RecipeOutcome::Failed {
             recipe_id: recipe.id,
             source_id: recipe.source_id.clone(),

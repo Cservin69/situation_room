@@ -47,6 +47,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use situation_room_llm::{LlmProvider, ModelTier};
+use situation_room_pipeline::fetch_backoff::{BackoffFetcher, HostBackoff};
 use situation_room_pipeline::fetch_executor::{
     run_fetch_for_plan as run_fetch_for_plan_impl, ExecutorContext, FetchExecutorError,
 };
@@ -121,6 +122,14 @@ pub struct AppState {
     /// it.
     pub provider: Arc<dyn LlmProvider + Send + Sync>,
     pub http: Arc<SecureHttpClient>,
+    /// Per-host backoff state shared across every fetch the executor
+    /// runs. Session 45 — see [`HostBackoff`]'s module-level rationale
+    /// in `crates/pipeline/src/fetch_backoff.rs`. Lives in `AppState`
+    /// (not built per-`run_fetch_for_plan` call) so observed signals
+    /// like a 429 from a host during a prefetch carry over to the
+    /// runtime fetch in the same session, and across sessions until
+    /// the binary restarts.
+    pub host_backoff: Arc<HostBackoff>,
     pub classifier_prompt: &'static str,
     pub recipe_author_prompt: &'static str,
     /// The Session-39 propose-URL prompt — consumed by the fetch
@@ -166,6 +175,14 @@ impl AppState {
             store,
             provider,
             http,
+            // Session 45: a fresh empty `HostBackoff` per binary boot.
+            // The composition root does not need to thread this in —
+            // there are no per-deployment knobs (the policy is
+            // uniform; runtime adapts on observed signals). Keeping
+            // the field internal also means future tweaks to the
+            // backoff schedule don't ripple through the binary
+            // signatures.
+            host_backoff: Arc::new(HostBackoff::new()),
             classifier_prompt,
             recipe_author_prompt,
             propose_url_prompt,
@@ -841,9 +858,18 @@ pub async fn run_fetch_for_plan(
 
     info!(plan_id = %parsed, "run_fetch_for_plan command invoked");
 
+    // Session 45: wrap the raw `SecureHttpClient` in the per-host
+    // backoff decorator before handing it to the executor. The
+    // wrapped fetcher applies pre-flight `next_allowed_at` waits and
+    // records observed signals (429, `Retry-After`, timeouts) into
+    // the shared `HostBackoff` state — see
+    // `crates/pipeline/src/fetch_backoff.rs` for the policy. The
+    // wrapper has scope-bound lifetime; `host_backoff` lives in
+    // `AppState` so state survives across `run_fetch_for_plan` calls.
+    let backoff_fetcher = BackoffFetcher::new(state.http.as_ref(), state.host_backoff.clone());
     let ctx = ExecutorContext {
         store: state.store.as_ref(),
-        http: state.http.as_ref(),
+        http: &backoff_fetcher,
         provider: state.provider.as_ref(),
         recipe_author_prompt: state.recipe_author_prompt,
         propose_url_prompt: state.propose_url_prompt,
