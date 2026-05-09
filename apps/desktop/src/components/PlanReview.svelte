@@ -67,6 +67,8 @@
   import RecipesPanel from '$components/RecipesPanel.svelte';
   import RecipeOutcomesHeatmap from '$components/RecipeOutcomesHeatmap.svelte';
   import ExpectationCoverage from '$components/ExpectationCoverage.svelte';
+  import HostBackoffStatus from '$components/HostBackoffStatus.svelte';
+  import SourcesMemoryPanel from '$components/SourcesMemoryPanel.svelte';
   import RejectDialog from '$components/dialogs/RejectDialog.svelte';
 
   interface Props {
@@ -189,6 +191,17 @@
       <span class="kv"><span class="k">window</span><span class="v">{plan.historical_window_days}d</span></span>
     </div>
   </header>
+
+  <!-- Host-backoff status strip (Session 48, piece B). Slots at the
+       top of the review pane so observed network-layer signals from
+       the most recent fetch run (or any fetch run this session) are
+       visible alongside the plan body, not buried under the bucket
+       grid. The component renders an explicit empty state when no
+       host signals have been observed yet, so the strip is dim
+       (rather than hidden) on a fresh-boot review. The polling
+       lifecycle (5s cadence while a plan is selected) lives in the
+       store; this component only reads. -->
+  <HostBackoffStatus />
 
   <!-- Trust paragraph -->
   <section class="trust">
@@ -476,6 +489,17 @@
        which is the legitimate state for a freshly-classified plan
        that hasn't been fetched yet. -->
   <RecipesPanel />
+
+  <!-- Classifier sources-memory panel (Session 48, piece C). Mirrors
+       what the classifier sees under `{{SOURCES_MEMORY}}` —
+       recency-sorted top-30 (URL, source_id) pairs that have at
+       least one successful fetch attempt across all plans. Surfacing
+       it alongside the recipes panel closes the long-standing
+       grounding-visibility gap noted across the 46/47/48 handoffs:
+       the classifier's grounding is now operator-visible, not just
+       log-visible. The component renders an explicit cold-start
+       empty state when no successes have landed yet. -->
+  <SourcesMemoryPanel />
 </article>
 
 {#if rejectDialogOpen}

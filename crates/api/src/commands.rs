@@ -75,8 +75,9 @@ use uuid::Uuid;
 
 use crate::types_export::{
     ExpectationCoverageRecipeDto, ExpectationCoverageRowDto, FetchReportDto, FetchRunSummaryDto,
-    PlanStatusDto, PlanSummary, RecipeDto, RecipeFeedbackDto, RecipeFetchAttemptDto,
-    RecipeOutcomesHistoryEntryDto, ResearchPlanDto, SourceDescriptorDto,
+    HostBackoffSnapshotDto, PlanStatusDto, PlanSummary, RecipeDto, RecipeFeedbackDto,
+    RecipeFetchAttemptDto, RecipeOutcomesHistoryEntryDto, ResearchPlanDto, SourceDescriptorDto,
+    SourcesMemoryEntryDto,
 };
 
 // ---------------------------------------------------------------------------
@@ -1774,6 +1775,99 @@ fn build_expectation_coverage(
 }
 
 // ---------------------------------------------------------------------------
+// Command 15 — host_backoff_state (Session 48, piece B)
+// ---------------------------------------------------------------------------
+
+/// Per-host backoff snapshot — what the network layer has observed
+/// during this binary's session. Pure read; no LLM call, no fetch.
+///
+/// One entry per host the adaptation layer has ever recorded a signal
+/// for. Hosts whose only history is success appear with
+/// `consecutive_failures = 0` and `wait_seconds_remaining = 0` — the
+/// row's existence is itself the signal that the host has been touched
+/// at least once. The frontend distinguishes three states:
+///
+///   - `consecutive_failures = 0, wait_seconds_remaining = 0` → clean.
+///     The host has succeeded at least once, no failure pressure.
+///   - `consecutive_failures > 0, wait_seconds_remaining = 0` →
+///     recovering. The schedule has expired so the next request fires
+///     immediately, but the failure history is still in effect for the
+///     next observed failure.
+///   - `consecutive_failures > 0, wait_seconds_remaining > 0` →
+///     blocked. The next request to this host will sleep at least the
+///     remaining wait before firing.
+///
+/// **No source-specific routing.** The host string is a runtime key,
+/// not a config knob — see the Session 45 `HostBackoff` module rationale
+/// in `crates/pipeline/src/fetch_backoff.rs`. This command surfaces
+/// what the adaptation layer has *observed*; it does not configure
+/// behaviour.
+///
+/// Errors: none of the input-validation kinds (no inputs); pure read
+/// over `state.host_backoff.snapshot()`. The accessor itself is
+/// infallible.
+#[tauri::command]
+pub async fn host_backoff_state(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<HostBackoffSnapshotDto>, CommandError> {
+    Ok(state
+        .host_backoff
+        .snapshot()
+        .into_iter()
+        .map(HostBackoffSnapshotDto::from_typed)
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Command 16 — sources_memory (Session 48, piece C)
+// ---------------------------------------------------------------------------
+
+/// Operator projection of the sources-memory listing — the same rows
+/// the classifier consumes via `{{SOURCES_MEMORY}}`. Pure read; no LLM
+/// call.
+///
+/// ## Why this surface earns its weight
+///
+/// The classifier prompt is taught to "stamp `known_id` when your
+/// emitted URL corresponds to a memory entry" and to "fall back to
+/// training knowledge when memory is empty." Before this command the
+/// memory was invisible to the operator: a classifier that didn't pick
+/// up an obvious-to-the-operator past success looked broken from
+/// outside, but the underlying cause might have been a stale
+/// `last_attempted_at` (the URL succeeded long ago but the recency-
+/// sort dropped it past the top-30 cap) or a topic-tag mismatch.
+/// Surfacing the memory makes both diagnosable.
+///
+/// ## What the operator sees vs. what the classifier sees
+///
+/// Identical row contents. The operator sees the rows in the same
+/// recency-sorted order the classifier reads, and the surface
+/// presents the same fields (URL, source_id, success count, last
+/// success timestamp, associated topics). The cap matches
+/// [`situation_room_storage::SOURCES_MEMORY_LIMIT`] so the operator
+/// view doesn't drift from the classifier view.
+///
+/// **No source-specific routing.** ADR 0007 §"runtime path": the
+/// memory is *summary of past successes*, not a registry; the surface
+/// reads what storage holds, no filtering or curation in this command.
+///
+/// Errors:
+///   - `Storage` — DB-level failure.
+#[tauri::command]
+pub async fn sources_memory(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<SourcesMemoryEntryDto>, CommandError> {
+    let typed = state
+        .store
+        .sources_memory(situation_room_storage::SOURCES_MEMORY_LIMIT)
+        .map_err(CommandError::from)?;
+    Ok(typed
+        .into_iter()
+        .map(SourcesMemoryEntryDto::from_typed)
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2077,5 +2171,264 @@ mod tests {
         // Only the good recipe contributed a chip.
         assert_eq!(prod.recipes.len(), 1);
         assert_eq!(prod.recipes[0].source_id, "pubs.usgs.gov");
+    }
+
+    // -----------------------------------------------------------------
+    // Session 48 — host-backoff state + sources-memory wire mapping
+    // -----------------------------------------------------------------
+    //
+    // The commands themselves take `tauri::State<'_, AppState>`, which
+    // can't be cheaply constructed in a unit test without a Tauri
+    // `mock_builder` runtime. The mapping logic is the part worth
+    // pinning: each command lifts a typed value into a wire DTO with
+    // no other transformation. These tests exercise the mapping using
+    // the same accessor / Store the commands use, then assert the DTOs
+    // come out correctly. If a future refactor adds filtering or
+    // aggregation to the commands, the tests would catch it; today
+    // they're a regression net for "the wire shape is what the operator
+    // / classifier expects."
+
+    #[test]
+    fn host_backoff_state_maps_snapshot_into_dtos_session_48() {
+        // Two hosts: one with a Retry-After-honoring 429, one with a
+        // timeout. The mapping order isn't load-bearing (HashMap
+        // iteration is unspecified) so the test asserts on a per-host
+        // lookup rather than a positional shape.
+        let backoff = situation_room_pipeline::fetch_backoff::HostBackoff::new();
+        backoff.record_rate_limited(
+            "throttled.example.com",
+            Some(std::time::Duration::from_secs(15)),
+        );
+        backoff.record_timeout("slow.example.com");
+
+        let dtos: Vec<HostBackoffSnapshotDto> = backoff
+            .snapshot()
+            .into_iter()
+            .map(HostBackoffSnapshotDto::from_typed)
+            .collect();
+        assert_eq!(dtos.len(), 2);
+
+        let throttled = dtos
+            .iter()
+            .find(|d| d.host == "throttled.example.com")
+            .expect("throttled host present");
+        assert_eq!(throttled.consecutive_failures, 1);
+        assert!(
+            (14..=15).contains(&throttled.wait_seconds_remaining),
+            "Retry-After honored verbatim (got {}s)",
+            throttled.wait_seconds_remaining
+        );
+
+        let slow = dtos
+            .iter()
+            .find(|d| d.host == "slow.example.com")
+            .expect("slow host present");
+        assert_eq!(slow.consecutive_failures, 1);
+        // First timeout schedule is ~1s; collapse to whole seconds
+        // gives 0 or 1 depending on jitter. Both are valid.
+        assert!(
+            slow.wait_seconds_remaining <= 1,
+            "first timeout produces ~1s wait (got {}s)",
+            slow.wait_seconds_remaining
+        );
+    }
+
+    #[test]
+    fn host_backoff_state_empty_snapshot_yields_empty_vec_session_48() {
+        let backoff = situation_room_pipeline::fetch_backoff::HostBackoff::new();
+        let dtos: Vec<HostBackoffSnapshotDto> = backoff
+            .snapshot()
+            .into_iter()
+            .map(HostBackoffSnapshotDto::from_typed)
+            .collect();
+        assert!(
+            dtos.is_empty(),
+            "fresh-boot snapshot is empty until the first signal"
+        );
+    }
+
+    #[test]
+    fn sources_memory_command_maps_storage_rows_into_dtos_session_48() {
+        // Round-trip a single (URL, source_id) pair through the same
+        // path the command uses. Ensures the DTO carries the renamed
+        // wire fields (`url`, `last_succeeded_at`) and the storage
+        // query's filtering (only-successes, recency-sorted) reaches
+        // the wire intact.
+        use chrono::TimeZone;
+        use uuid::Uuid;
+
+        let store = Store::open_in_memory().expect("open in-memory store");
+        store.migrate().expect("migrate");
+
+        // Plan
+        let plan_id = Uuid::now_v7();
+        let plan_row = situation_room_storage::ResearchPlanRow {
+            id: plan_id,
+            topic: "lithium supply chain".into(),
+            interpretation: "test".into(),
+            topic_tags_json: serde_json::to_string(&["lithium"]).unwrap(),
+            geographic_scope_json: "[]".into(),
+            historical_window_days: 730,
+            expectations_json: "{}".into(),
+            classified_by: "test".into(),
+            created_at: chrono::Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
+            status: situation_room_storage::PlanStatus::Accepted,
+            rejection_reason: None,
+            reclassified_from: None,
+        };
+        store
+            .insert_research_plan(&plan_row)
+            .expect("insert plan");
+
+        // Recipe
+        let recipe_id = Uuid::now_v7();
+        let recipe_row = situation_room_storage::RecipeRow {
+            id: recipe_id,
+            dedup_key: Some(format!("{plan_id}:wb")),
+            plan_id,
+            source_id: "world_bank_indicators".into(),
+            source_url: "https://api.worldbank.org/v2/foo".into(),
+            extraction_json: r#"{"mode":"json_path","path":"$.value"}"#.into(),
+            produces_json: "[]".into(),
+            authored_at: chrono::Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
+            authored_by: "test".into(),
+            version: 1,
+            static_payload: None,
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
+            iterator: None,
+        };
+        store.insert_recipe(&recipe_row).expect("insert recipe");
+
+        // Successful attempt — without this the HAVING clause filters
+        // the row out (only-successes contract).
+        let attempt_row = situation_room_storage::RecipeFetchAttemptRow {
+            id: Uuid::now_v7(),
+            recipe_id,
+            run_id: Uuid::now_v7(),
+            attempted_at: chrono::Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap(),
+            succeeded: true,
+            failure_message: None,
+            bytes_excerpt: None,
+            response_content_type: None,
+        };
+        store
+            .insert_recipe_fetch_attempt(&attempt_row)
+            .expect("insert attempt");
+
+        // The command body, minus the tauri State wrapper.
+        let typed = store
+            .sources_memory(situation_room_storage::SOURCES_MEMORY_LIMIT)
+            .expect("sources_memory");
+        let dtos: Vec<SourcesMemoryEntryDto> = typed
+            .into_iter()
+            .map(SourcesMemoryEntryDto::from_typed)
+            .collect();
+
+        assert_eq!(dtos.len(), 1);
+        assert_eq!(dtos[0].url, "https://api.worldbank.org/v2/foo");
+        assert_eq!(dtos[0].source_id, "world_bank_indicators");
+        assert_eq!(dtos[0].successful_attempts, 1);
+        assert_eq!(
+            dtos[0].last_succeeded_at,
+            chrono::Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap()
+        );
+        assert_eq!(dtos[0].associated_topics, vec!["lithium".to_string()]);
+    }
+
+    #[test]
+    fn sources_memory_command_empty_store_yields_empty_vec_session_48() {
+        let store = Store::open_in_memory().expect("open in-memory store");
+        store.migrate().expect("migrate");
+
+        let typed = store
+            .sources_memory(situation_room_storage::SOURCES_MEMORY_LIMIT)
+            .expect("sources_memory on fresh store");
+        let dtos: Vec<SourcesMemoryEntryDto> = typed
+            .into_iter()
+            .map(SourcesMemoryEntryDto::from_typed)
+            .collect();
+        assert!(
+            dtos.is_empty(),
+            "fresh installation has no successful sources to surface"
+        );
+    }
+
+    #[test]
+    fn sources_memory_command_filters_to_successes_only_session_48() {
+        // Same posture as the storage layer's
+        // `returns_only_sources_with_at_least_one_success` test, but
+        // exercising the wire-DTO mapping the command performs. A
+        // recipe with only failed attempts must not surface to the
+        // operator panel — same contract the classifier sees.
+        use chrono::TimeZone;
+        use uuid::Uuid;
+
+        let store = Store::open_in_memory().expect("open in-memory store");
+        store.migrate().expect("migrate");
+
+        let plan_id = Uuid::now_v7();
+        store
+            .insert_research_plan(&situation_room_storage::ResearchPlanRow {
+                id: plan_id,
+                topic: "test".into(),
+                interpretation: "test".into(),
+                topic_tags_json: "[\"t\"]".into(),
+                geographic_scope_json: "[]".into(),
+                historical_window_days: 365,
+                expectations_json: "{}".into(),
+                classified_by: "test".into(),
+                created_at: chrono::Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
+                status: situation_room_storage::PlanStatus::Accepted,
+                rejection_reason: None,
+                reclassified_from: None,
+            })
+            .unwrap();
+        let recipe_id = Uuid::now_v7();
+        store
+            .insert_recipe(&situation_room_storage::RecipeRow {
+                id: recipe_id,
+                dedup_key: Some(format!("{plan_id}:fail")),
+                plan_id,
+                source_id: "always_fails".into(),
+                source_url: "https://broken.example.com/x".into(),
+                extraction_json: r#"{"mode":"json_path","path":"$.value"}"#.into(),
+                produces_json: "[]".into(),
+                authored_at: chrono::Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
+                authored_by: "test".into(),
+                version: 1,
+                static_payload: None,
+                authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+                prior_recipe_id: None,
+                reauthor_reason: None,
+                iterator: None,
+            })
+            .unwrap();
+        store
+            .insert_recipe_fetch_attempt(
+                &situation_room_storage::RecipeFetchAttemptRow {
+                    id: Uuid::now_v7(),
+                    recipe_id,
+                    run_id: Uuid::now_v7(),
+                    attempted_at: chrono::Utc.with_ymd_and_hms(2026, 5, 1, 1, 0, 0).unwrap(),
+                    succeeded: false,
+                    failure_message: Some("404".into()),
+                    bytes_excerpt: None,
+                    response_content_type: None,
+                },
+            )
+            .unwrap();
+
+        let dtos: Vec<SourcesMemoryEntryDto> = store
+            .sources_memory(situation_room_storage::SOURCES_MEMORY_LIMIT)
+            .unwrap()
+            .into_iter()
+            .map(SourcesMemoryEntryDto::from_typed)
+            .collect();
+        assert!(
+            dtos.is_empty(),
+            "failed-only sources must not surface to the operator panel"
+        );
     }
 }

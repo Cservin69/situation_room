@@ -57,6 +57,8 @@ import {
   recordsForPlan as apiRecordsForPlan,
   recipeOutcomesHistory as apiRecipeOutcomesHistory,
   expectationCoverage as apiExpectationCoverage,
+  hostBackoffState as apiHostBackoffState,
+  sourcesMemory as apiSourcesMemory,
   asCommandError,
 } from '$lib/api/client';
 import type { PlanSummary } from '$lib/api/types/PlanSummary';
@@ -70,6 +72,8 @@ import type { RecipeFeedbackDto } from '$lib/api/types/RecipeFeedbackDto';
 import type { RecordsByPlanDto } from '$lib/api/types/RecordsByPlanDto';
 import type { RecipeOutcomesHistoryEntryDto } from '$lib/api/types/RecipeOutcomesHistoryEntryDto';
 import type { ExpectationCoverageRowDto } from '$lib/api/types/ExpectationCoverageRowDto';
+import type { HostBackoffSnapshotDto } from '$lib/api/types/HostBackoffSnapshotDto';
+import type { SourcesMemoryEntryDto } from '$lib/api/types/SourcesMemoryEntryDto';
 
 export type StatusFilter = PlanStatusDto | 'all';
 
@@ -160,6 +164,31 @@ interface PlansState {
    * `records`).
    */
   expectationCoverage: ExpectationCoverageRowDto[] | null;
+  /**
+   * Per-host backoff snapshot (Session 48, piece B). One entry per
+   * host the network adaptation layer has recorded a signal for in
+   * this binary's session. Empty until the first signal lands; the
+   * panel polls on a 5s cadence while a plan is selected so that
+   * observed signals during a fetch run surface in near-real-time
+   * without waiting for the synchronous run-fetch handler to return.
+   *
+   * Polling teardown is gated on plan selection: `selectPlan` starts
+   * the timer, `clearSelection` stops it. The state itself is global
+   * (host backoff lives on AppState, not on a plan); we treat the
+   * panel's lifecycle as "tied to looking at any plan" for the same
+   * reason the fetch-run history strip is — the operator's review
+   * pane is the only surface that consumes it.
+   */
+  hostBackoff: HostBackoffSnapshotDto[];
+  /**
+   * Sources-memory listing (Session 48, piece C). The same rows the
+   * classifier consumes under `{{SOURCES_MEMORY}}`. Loaded once on
+   * plan selection and held until selection clears; the data only
+   * changes when a fetch run lands a new success or a recipe re-
+   * fetches an existing URL, so refreshing it alongside `runFetch`
+   * is sufficient.
+   */
+  sourcesMemory: SourcesMemoryEntryDto[];
   error: CommandErrorDto | null;
 }
 
@@ -180,8 +209,31 @@ export const plans: PlansState = $state({
   records: null,
   outcomesHistory: [],
   expectationCoverage: null,
+  hostBackoff: [],
+  sourcesMemory: [],
   error: null,
 });
+
+/**
+ * Polling cadence (ms) for the host-backoff status surface (Session
+ * 48, piece B). Five seconds is fast enough that observed signals
+ * during a synchronous fetch run surface to the operator before the
+ * run finishes (the run typically takes 10–60s end-to-end across
+ * recipes), and slow enough that the panel doesn't generate measurable
+ * IPC overhead. The constant lives at the store level (rather than
+ * inside the component) so a future change can be tested against the
+ * helper functions without touching component lifecycle hooks.
+ */
+export const HOST_BACKOFF_POLL_INTERVAL_MS = 5000;
+
+/**
+ * The active polling timer handle for `hostBackoff`. `null` when no
+ * plan is selected (the timer is mounted by `selectPlan` and torn
+ * down by `clearSelection`). Module-level so the timer survives
+ * component re-mounts within the same selection (Svelte 5's
+ * `$effect.root` lifetime is the component's, not the selection's).
+ */
+let hostBackoffPollTimer: ReturnType<typeof setInterval> | null = null;
 
 function filterToWire(f: StatusFilter): PlanStatusDto | null {
   return f === 'all' ? null : f;
@@ -303,6 +355,16 @@ export async function selectPlan(id: string): Promise<void> {
     // non-fatal.
     void refreshOutcomesHistory(id).catch(() => {});
     void refreshExpectationCoverage(id).catch(() => {});
+    // Session 48: load both operator-introspection surfaces.
+    // `hostBackoff` is process-state, not plan-state, so we load
+    // it on selection and start a 5s poll so signals observed
+    // during a fetch run surface without an explicit user action.
+    // `sourcesMemory` is global too but changes only when fetches
+    // land successes; loading it on selection + after each
+    // `runFetch` is sufficient.
+    void refreshHostBackoff().catch(() => {});
+    void refreshSourcesMemory().catch(() => {});
+    startHostBackoffPolling();
   } catch (e) {
     plans.error = asCommandError(e);
   } finally {
@@ -313,6 +375,9 @@ export async function selectPlan(id: string): Promise<void> {
 /**
  * Clear the current selection without making a network call. The
  * listing remains; the review pane returns to its empty state.
+ *
+ * Session 48: tears down the host-backoff poll timer so a closed
+ * review pane doesn't continue to fire IPC every 5s.
  */
 export function clearSelection(): void {
   plans.selected = null;
@@ -323,6 +388,9 @@ export function clearSelection(): void {
   plans.records = null;
   plans.outcomesHistory = [];
   plans.expectationCoverage = null;
+  plans.hostBackoff = [];
+  plans.sourcesMemory = [];
+  stopHostBackoffPolling();
 }
 
 /**
@@ -532,6 +600,13 @@ export async function runFetch(): Promise<boolean> {
     // matrix so the panels reflect what just happened.
     void refreshOutcomesHistory(current.id).catch(() => {});
     void refreshExpectationCoverage(current.id).catch(() => {});
+    // Session 48: a fetch run can change both surfaces — successful
+    // fetches add (URL, source_id) pairs to the sources memory and
+    // observed signals during the run can update host-backoff state.
+    // The poll timer is already running, but kicking a refresh here
+    // surfaces the change without waiting for the next 5s tick.
+    void refreshHostBackoff().catch(() => {});
+    void refreshSourcesMemory().catch(() => {});
     return true;
   } catch (e) {
     plans.error = asCommandError(e);
@@ -806,5 +881,70 @@ export async function reauthorRecipe(
     return false;
   } finally {
     plans.mutating = false;
+  }
+}
+
+/**
+ * Refresh the per-host backoff snapshot (Session 48, piece B). Pure
+ * read; safe to call freely. Like the other background refreshes
+ * this doesn't toggle a spinner.
+ *
+ * Failure preserves the previous list rather than blanking it on a
+ * transient blip — the panel is informational, not load-bearing for
+ * any decision.
+ */
+export async function refreshHostBackoff(): Promise<void> {
+  try {
+    plans.hostBackoff = await apiHostBackoffState();
+  } catch (e) {
+    plans.error = asCommandError(e);
+  }
+}
+
+/**
+ * Refresh the sources-memory listing (Session 48, piece C). Pure
+ * read; the same data the classifier consumes under
+ * `{{SOURCES_MEMORY}}`. Loaded on plan selection and after each
+ * successful `runFetch`.
+ *
+ * Failure preserves the previous list — same posture as
+ * `refreshHostBackoff`.
+ */
+export async function refreshSourcesMemory(): Promise<void> {
+  try {
+    plans.sourcesMemory = await apiSourcesMemory();
+  } catch (e) {
+    plans.error = asCommandError(e);
+  }
+}
+
+/**
+ * Start polling the host-backoff snapshot on
+ * `HOST_BACKOFF_POLL_INTERVAL_MS` cadence. Idempotent: a second call
+ * while the timer is already running is a no-op (we don't stack
+ * multiple intervals).
+ *
+ * The cadence is chosen so observed signals during a synchronous
+ * fetch run surface in near-real-time (a fetch typically takes
+ * 10–60s end-to-end across recipes; a 5s tick lands at least one
+ * mid-run snapshot under the typical case).
+ */
+export function startHostBackoffPolling(): void {
+  if (hostBackoffPollTimer !== null) return;
+  hostBackoffPollTimer = setInterval(() => {
+    void refreshHostBackoff().catch(() => {});
+  }, HOST_BACKOFF_POLL_INTERVAL_MS);
+}
+
+/**
+ * Stop the host-backoff poll timer. Called from `clearSelection` so
+ * a closed review pane doesn't continue to fire IPC every 5s, and
+ * available for explicit teardown if a future caller (e.g. window
+ * blur) wants to pause polling without clearing the selection.
+ */
+export function stopHostBackoffPolling(): void {
+  if (hostBackoffPollTimer !== null) {
+    clearInterval(hostBackoffPollTimer);
+    hostBackoffPollTimer = null;
   }
 }

@@ -183,6 +183,19 @@ fn main() -> Result<()> {
             // expectations. Both are pure reads; no LLM call.
             situation_room_api::commands::recipe_outcomes_history,
             situation_room_api::commands::expectation_coverage,
+            // Session 48 — operator-introspection surfaces over
+            // network-layer + classifier-grounding state. Both are
+            // pure reads; no LLM call, no fetch. `host_backoff_state`
+            // surfaces what the per-host adaptation layer has observed
+            // this binary session (Session 45's HostBackoff). The
+            // accessor lives on AppState; the command lifts each
+            // typed `HostBackoffSnapshot` into the wire DTO.
+            // `sources_memory` surfaces the same rows the classifier
+            // consumes under `{{SOURCES_MEMORY}}` — closes the
+            // grounding-visibility gap noted across the 46/47/48
+            // handoffs.
+            situation_room_api::commands::host_backoff_state,
+            situation_room_api::commands::sources_memory,
             // Session 22 added the records-rendering join (storage
             // query + DTO + #[tauri::command] function), but the
             // command wasn't added to this macro list — so Tauri

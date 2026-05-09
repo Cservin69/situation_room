@@ -25,6 +25,8 @@ import type { RecipeFetchAttemptDto } from './types/RecipeFetchAttemptDto';
 import type { RecordsByPlanDto } from './types/RecordsByPlanDto';
 import type { RecipeOutcomesHistoryEntryDto } from './types/RecipeOutcomesHistoryEntryDto';
 import type { ExpectationCoverageRowDto } from './types/ExpectationCoverageRowDto';
+import type { HostBackoffSnapshotDto } from './types/HostBackoffSnapshotDto';
+import type { SourcesMemoryEntryDto } from './types/SourcesMemoryEntryDto';
 
 /**
  * Run Level-1 classification on a topic. Persists the resulting plan
@@ -364,6 +366,55 @@ export async function expectationCoverage(
   return invoke<ExpectationCoverageRowDto[]>('expectation_coverage', {
     planId,
   });
+}
+
+/**
+ * Per-host backoff snapshot — what the network adaptation layer has
+ * observed during this binary's session (Session 48, piece B). Pure
+ * read; no LLM call, no fetch.
+ *
+ * Returns one entry per host the layer has ever recorded a signal
+ * for. Hosts whose only history is success appear with
+ * `consecutive_failures = 0` and `wait_seconds_remaining = 0` — the
+ * row's existence is itself the signal that the host has been
+ * touched.
+ *
+ * Three operator-readable states from the same fields:
+ *   - clean     → counter == 0, wait == 0
+ *   - recovering → counter > 0, wait == 0  (schedule expired but
+ *     failure history is still in effect for the next signal)
+ *   - blocked   → counter > 0, wait > 0
+ *
+ * The state is process-local: restarting the binary clears it. There
+ * is no underlying persistence; the snapshot reflects what *this*
+ * session has observed.
+ *
+ * No source-specific routing — the host string is a runtime key, not
+ * a config knob. See `HostBackoff`'s module-level rationale in the
+ * pipeline crate (Session 45).
+ */
+export async function hostBackoffState(): Promise<HostBackoffSnapshotDto[]> {
+  return invoke<HostBackoffSnapshotDto[]>('host_backoff_state');
+}
+
+/**
+ * The same rows the classifier consumes under `{{SOURCES_MEMORY}}`
+ * (Session 48, piece C). Pure read; no LLM call.
+ *
+ * Recency-sorted top-N (currently 30) of distinct (URL, source_id)
+ * pairs that have at least one successful fetch attempt across all
+ * plans. Carries the URL, the recipe-recorded source_id, the success
+ * count, the timestamp of the most recent success, and the union of
+ * topic tags from the plans the URL has appeared in.
+ *
+ * Empty list is the legitimate state for a fresh installation — the
+ * classifier prompt teaches the cold-start pattern (emit URLs from
+ * training knowledge alone). The panel renders an explicit empty
+ * state in that case so the operator sees the surface but
+ * understands why it's empty.
+ */
+export async function sourcesMemory(): Promise<SourcesMemoryEntryDto[]> {
+  return invoke<SourcesMemoryEntryDto[]>('sources_memory');
 }
 
 /**

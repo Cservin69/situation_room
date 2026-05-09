@@ -1359,6 +1359,80 @@ impl HostBackoffSnapshotDto {
 }
 
 // ---------------------------------------------------------------------------
+// Session 48 — sources-memory panel DTO (piece C)
+// ---------------------------------------------------------------------------
+
+/// One row in the sources-memory listing surfaced to the operator.
+///
+/// Mirrors [`situation_room_storage::MemorySource`] one-for-one. The
+/// classifier consumes the same underlying data via
+/// `ClassificationContext::sources_memory`; this DTO is the operator
+/// projection of *exactly what the classifier sees* under the
+/// `{{SOURCES_MEMORY}}` placeholder. Surfacing the same rows on the
+/// operator side closes the principle-cleanness gap noted in the
+/// Session 46 / 47 / 48 handoffs: the classifier's grounding was
+/// previously invisible.
+///
+/// ## Why a parallel DTO rather than re-exporting
+///
+/// `MemorySource` lives in the storage crate and uses the storage
+/// vocabulary (no `#[derive(TS)]`); the API crate's job is to project
+/// storage types into wire DTOs. The naming difference between
+/// `endpoint_url` (storage) and `url` (wire) is intentional — the
+/// storage column is named after how it was historically populated;
+/// the wire field is named after how it's read.
+///
+/// ## Why `last_succeeded_at` rather than `last_attempted_at`
+///
+/// `MemorySource::last_attempted_at` is in fact the timestamp of the
+/// most-recent *successful* attempt (the SQL aggregates with
+/// `MAX(CASE WHEN succeeded THEN attempted_at END)`). The storage
+/// field's name predates the HAVING clause that filters to
+/// success-only rows. The wire name `last_succeeded_at` is what the
+/// number actually means; a future storage rename can follow.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct SourcesMemoryEntryDto {
+    /// The URL the recipe fetched against successfully. Same string
+    /// the classifier reads under `{{SOURCES_MEMORY}}`.
+    pub url: String,
+    /// The recipe's `source_id` — registry-shaped pre-Session-37
+    /// (e.g. `world_bank_indicators`), host-derived or LLM-stamped
+    /// post-Session-37 (e.g. `api.worldbank.org`). Both shapes coexist;
+    /// the classifier doesn't distinguish them and neither does this
+    /// surface.
+    pub source_id: String,
+    /// Total `recipe_fetch_attempts` rows where `succeeded = true` for
+    /// this (URL, source_id) pair. The HAVING clause means this is
+    /// always ≥ 1 — sources with no successes don't appear at all.
+    pub successful_attempts: u32,
+    /// Timestamp of the most recent successful fetch attempt for the
+    /// pair. Ordering key on the storage side; recency-sort drives the
+    /// "top 30 by recency" surface the classifier sees.
+    pub last_succeeded_at: DateTime<Utc>,
+    /// Topic-tag strings drawn from every plan whose recipes fetched
+    /// this URL successfully, deduplicated and alphabetised. 0..N
+    /// entries; bounded in practice by the plan count touching the URL.
+    pub associated_topics: Vec<String>,
+}
+
+impl SourcesMemoryEntryDto {
+    /// Lift a typed [`situation_room_storage::MemorySource`] into wire
+    /// shape. Rename `endpoint_url` → `url` and
+    /// `last_attempted_at` → `last_succeeded_at`; everything else
+    /// passes through unchanged.
+    pub fn from_typed(s: situation_room_storage::MemorySource) -> Self {
+        Self {
+            url: s.endpoint_url,
+            source_id: s.source_id,
+            successful_attempts: s.successful_attempts,
+            last_succeeded_at: s.last_attempted_at,
+            associated_topics: s.associated_topics,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2250,5 +2324,115 @@ mod tests {
         };
         let dto = RecipeDto::from_stored(stored);
         assert_eq!(dto.authored_from, AuthoredFromDto::Unknown);
+    }
+
+    // ----------------------------------------------------------------
+    // Session 48 — sources-memory DTO
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn sources_memory_entry_dto_renames_storage_fields_session_48() {
+        use chrono::TimeZone;
+        // The wire shape's `url` and `last_succeeded_at` fields hide
+        // the storage-side names (`endpoint_url`,
+        // `last_attempted_at`); pin the renames so a future field-
+        // shuffle on the storage side doesn't silently break the
+        // operator surface.
+        let typed = situation_room_storage::MemorySource {
+            endpoint_url: "https://api.worldbank.org/v2/foo".into(),
+            source_id: "world_bank_indicators".into(),
+            successful_attempts: 3,
+            last_attempted_at: chrono::Utc
+                .with_ymd_and_hms(2026, 5, 1, 12, 0, 0)
+                .unwrap(),
+            associated_topics: vec!["lithium".into(), "battery_supply_chain".into()],
+        };
+        let dto = SourcesMemoryEntryDto::from_typed(typed);
+        assert_eq!(dto.url, "https://api.worldbank.org/v2/foo");
+        assert_eq!(dto.source_id, "world_bank_indicators");
+        assert_eq!(dto.successful_attempts, 3);
+        assert_eq!(
+            dto.last_succeeded_at,
+            chrono::Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap()
+        );
+        assert_eq!(
+            dto.associated_topics,
+            vec!["lithium".to_string(), "battery_supply_chain".to_string()]
+        );
+    }
+
+    #[test]
+    fn sources_memory_entry_dto_serializes_with_renamed_fields_session_48() {
+        use chrono::TimeZone;
+        // Ensure the JSON form carries the wire names (not the
+        // storage names) — the frontend reads `url` and
+        // `last_succeeded_at`; if serde ever picked up a `rename`
+        // attribute that flipped this, the panel would silently
+        // populate undefined values.
+        let typed = situation_room_storage::MemorySource {
+            endpoint_url: "https://example.com/x".into(),
+            source_id: "example".into(),
+            successful_attempts: 1,
+            last_attempted_at: chrono::Utc
+                .with_ymd_and_hms(2026, 5, 1, 0, 0, 0)
+                .unwrap(),
+            associated_topics: vec![],
+        };
+        let dto = SourcesMemoryEntryDto::from_typed(typed);
+        let json = serde_json::to_value(&dto).unwrap();
+        assert!(json.get("url").is_some(), "wire field is `url`");
+        assert!(
+            json.get("last_succeeded_at").is_some(),
+            "wire field is `last_succeeded_at`"
+        );
+        assert!(
+            json.get("endpoint_url").is_none(),
+            "storage field name must not leak"
+        );
+        assert!(
+            json.get("last_attempted_at").is_none(),
+            "storage field name must not leak"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Session 48 — host-backoff snapshot DTO conversion
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn host_backoff_snapshot_dto_collapses_duration_to_seconds_session_48() {
+        // Pin the `Duration` → `u64 secs` collapse so the wire shape
+        // doesn't accidentally widen when ts-rs adds Duration support.
+        // Sub-second precision is dropped on purpose; values < 1s
+        // should round to 0.
+        let typed = situation_room_pipeline::fetch_backoff::HostBackoffSnapshot {
+            host: "api.example.com".into(),
+            consecutive_failures: 2,
+            wait_remaining: std::time::Duration::from_millis(15_500),
+        };
+        let dto = HostBackoffSnapshotDto::from_typed(typed);
+        assert_eq!(dto.host, "api.example.com");
+        assert_eq!(dto.consecutive_failures, 2);
+        assert_eq!(
+            dto.wait_seconds_remaining, 15,
+            "Duration::from_millis(15_500) collapses to 15s"
+        );
+    }
+
+    #[test]
+    fn host_backoff_snapshot_dto_zero_wait_recovering_state_session_48() {
+        // The "recovering" state — counter > 0, wait == 0 — is the
+        // operator-visible signal that a host had failures earlier
+        // and is now eligible for the next request without delay.
+        // Pin both fields so a future change can't blur the
+        // distinction.
+        let typed = situation_room_pipeline::fetch_backoff::HostBackoffSnapshot {
+            host: "recovering.example.com".into(),
+            consecutive_failures: 3,
+            wait_remaining: std::time::Duration::ZERO,
+        };
+        let dto = HostBackoffSnapshotDto::from_typed(typed);
+        assert_eq!(dto.consecutive_failures, 3);
+        assert_eq!(dto.wait_seconds_remaining, 0);
     }
 }
