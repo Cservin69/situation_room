@@ -1223,16 +1223,20 @@ async fn author_for_nomination(
 
         // Step 2: fetch the proposed URL. Routes through
         // SecureHttpClient and honours the rate-limit backoff. On
-        // failure, record + retry with a different URL.
+        // failure, classify into [`PrefetchFailure`] and record a
+        // status-class-aware reason on the prior-attempts history;
+        // the next propose-URL call's prompt receives the
+        // classified shape in its `{{PRIOR_ATTEMPTS}}` block.
+        // Session 49 — see `format_prefetch_failure_for_proposer`'s
+        // doc-block for the wire-stability discipline.
         let (excerpt, prefetched_bytes) =
             match prefetch_excerpt(ctx, &proposed_url, &candidate_source_id).await {
-                Some(real) => real,
-                None => {
-                    let reason =
-                        "fetch failed (network error, bad status, or oversized response — see warn-level log above)";
+                Ok(real) => real,
+                Err(failure) => {
+                    let reason = format_prefetch_failure_for_proposer(&failure);
                     prior_attempts.push(PriorAttempt {
                         url: proposed_url.to_string(),
-                        reason: reason.to_string(),
+                        reason,
                     });
                     continue;
                 }
@@ -1492,7 +1496,7 @@ async fn prefetch_excerpt(
     ctx: &ExecutorContext<'_>,
     url: &url::Url,
     source_id: &str,
-) -> Option<(String, Vec<u8>)> {
+) -> Result<(String, Vec<u8>), PrefetchFailure> {
     // Operator-visible "we're now fetching X" log. The Session 13
     // run had a 1m25s silent stretch that included the time spent
     // pre-fetching; this turns it into a visible step rather than a
@@ -1508,6 +1512,13 @@ async fn prefetch_excerpt(
     // important here as it is at runtime — otherwise the operator
     // sees "authoring failed" with no hint that the cause was
     // throttling rather than a malformed source.
+    //
+    // Session 49: failures classify into [`PrefetchFailure`] so the
+    // caller (the propose-URL retry loop) can format a status-class-
+    // aware reason into the prior-attempts history. The pre-Session-49
+    // behaviour collapsed every failure into the literal "fetch failed
+    // (network error, bad status, or oversized response)" string,
+    // which the propose-URL prompt's v1.0 vocabulary cannot route on.
     let bytes = match fetch_with_backoff(ctx.http, url.as_str(), "prefetch").await {
         // Session 32: prefetch builds an excerpt for the LLM author;
         // the response Content-Type isn't part of that excerpt's
@@ -1523,7 +1534,9 @@ async fn prefetch_excerpt(
                 summary = %format_retry_after(retry_after_seconds),
                 "endpoint_hint pre-fetch rate-limited; authoring will fall back to stub excerpt"
             );
-            return None;
+            return Err(PrefetchFailure::RateLimited {
+                retry_after_seconds,
+            });
         }
         BackoffOutcome::Failed(e) => {
             warn!(
@@ -1532,7 +1545,7 @@ async fn prefetch_excerpt(
                 error = %e,
                 "endpoint_hint pre-fetch failed; authoring will fall back to stub excerpt"
             );
-            return None;
+            return Err(PrefetchFailure::from_fetch_error(e));
         }
     };
 
@@ -1705,7 +1718,151 @@ async fn prefetch_excerpt(
     // caller can hand them to authoring-time validation. The bytes
     // were already in scope for excerpt rendering; adding them to
     // the return type is the minimum plumbing change.
-    Some((excerpt, bytes))
+    //
+    // Session 49: success arm is `Ok(...)`; the failure paths above
+    // return classified `PrefetchFailure` variants the caller maps
+    // into the propose-URL prior-attempts history.
+    Ok((excerpt, bytes))
+}
+
+/// Classified pre-fetch failure. Session 49.
+///
+/// Returned by [`prefetch_excerpt`] when the URL the proposer just
+/// committed to could not be fetched into bytes the authoring step
+/// could see. The caller — [`author_for_nomination`]'s outer retry
+/// loop — projects each variant into a propose-URL prior-attempts
+/// reason via [`format_prefetch_failure_for_proposer`]; that string
+/// is what the next propose-URL call's prompt receives in its
+/// `{{PRIOR_ATTEMPTS}}` section.
+///
+/// **Why classified, not stringly-typed.** Pre-Session-49 the
+/// prefetch path emitted the literal `"fetch failed (network error,
+/// bad status, or oversized response — see warn-level log above)"`
+/// for every failure, regardless of whether the underlying signal was
+/// a 404 (wrong path), a 403/401 (host blocking us), a slow timeout
+/// (host adapting), an oversized response (host shipping a giant
+/// landing page), or a DNS failure (we can't even reach the host).
+/// The propose-URL prompt v1.0's vocabulary explicitly distinguishes
+/// these — see its "Reading prior attempts" section. Without
+/// classification at the boundary, every failure read the same and
+/// the proposer either re-tried the same host blindly or declined
+/// after two attempts that contributed no new information.
+///
+/// **No source-specific routing.** This enum lives at the network
+/// layer; nothing in `PrefetchFailure` mentions a host, scheme, or
+/// publisher. It carries the response shape and lets the LLM decide
+/// on policy. The closed-vocabulary discipline rule's
+/// "network-layer truth (UA, timeouts) with no LLM path" allowance.
+#[derive(Debug, Clone)]
+pub(crate) enum PrefetchFailure {
+    /// Server returned a non-429 4xx/5xx status. Carries the code so
+    /// the propose-URL prompt input can render `fetch failed: 403`,
+    /// `fetch failed: 404`, etc. — wording that matches the prompt's
+    /// `Reading prior attempts` heuristic block verbatim.
+    Status(u16),
+    /// Server took longer than the configured total timeout. Carries
+    /// the configured timeout so the prompt input names what the
+    /// request was budgeted for.
+    Timeout(Duration),
+    /// Server returned 429. The host-backoff layer has already
+    /// recorded the signal; this variant exists so the propose-URL
+    /// prompt input describes the failure honestly (the proposer
+    /// might want to choose a different host on the next attempt
+    /// rather than wait for the same host to stop throttling).
+    RateLimited { retry_after_seconds: Option<u64> },
+    /// Response body exceeded the configured ceiling. Carries the
+    /// numbers so the prompt input can name them. A common case for
+    /// "wrong URL" — landing pages on heavyweight CMSes can run to
+    /// hundreds of KiB of inline scripts/styles, while the data
+    /// endpoint the proposer should have chosen is a small CSV/JSON.
+    TooLarge { max: usize, got: usize },
+    /// Everything else: DNS resolution failures, TLS handshake
+    /// failures, redirect rejections, URL-guard rejections caught at
+    /// fetch time, generic transport errors. Carries the underlying
+    /// message verbatim so the LLM's general-knowledge fallback has
+    /// something to work with; the prompt has no host-class heuristic
+    /// for these, so a single "Other" bucket is the honest shape.
+    Other(String),
+}
+
+impl PrefetchFailure {
+    /// Classify a [`HttpFetchError`] returned from
+    /// [`fetch_with_backoff`]'s `Failed` arm. The lifted variants
+    /// (`Status`, `Timeout`, `TooLarge`, `RateLimited`) map directly;
+    /// the catch-all `Http` and the test-only `NoFixture` collapse
+    /// into [`PrefetchFailure::Other`].
+    pub(crate) fn from_fetch_error(e: HttpFetchError) -> Self {
+        match e {
+            HttpFetchError::Status(code) => Self::Status(code),
+            HttpFetchError::Timeout(d) => Self::Timeout(d),
+            HttpFetchError::RateLimited { retry_after_seconds } => Self::RateLimited {
+                retry_after_seconds,
+            },
+            HttpFetchError::TooLarge { max, got } => Self::TooLarge { max, got },
+            HttpFetchError::Http(msg) => Self::Other(msg),
+            HttpFetchError::NoFixture(url) => {
+                // Production never reaches this — the SecureHttpClient
+                // impl never returns NoFixture. Tests use this variant
+                // when configuring a `StaticFetcher` without a
+                // matching URL. The LLM doesn't need to distinguish
+                // it from a generic transport failure; classifying as
+                // Other keeps the boundary honest about that.
+                Self::Other(format!("no fixture configured for url: {url}"))
+            }
+        }
+    }
+}
+
+/// Format a [`PrefetchFailure`] into the propose-URL prompt's
+/// prior-attempts vocabulary. Session 49.
+///
+/// **Wire stability.** The propose-URL prompt (v1.0,
+/// `config/prompts/propose_source_url.md`) explicitly names these
+/// shapes in its "Reading prior attempts" heuristic block:
+///
+/// - `fetch failed: 404` — wrong path on this host.
+/// - `fetch failed: 403/401` — host is blocking us.
+///
+/// The format strings here match those exemplars verbatim so the
+/// prompt's instructions read literally against the prior-attempts
+/// section the LLM actually receives. Other shapes (timeout, too-
+/// large, generic) follow the same `fetch failed: ...` prefix so the
+/// LLM's general-knowledge fallback has a consistent surface to
+/// route on. Tests below pin the exact strings.
+///
+/// **No host or scheme in the format.** The string is generated from
+/// the failure shape only; the URL and source_id travel separately
+/// in the prior-attempts history (the `url` field of `PriorAttempt`).
+/// Closed-vocabulary discipline.
+pub(crate) fn format_prefetch_failure_for_proposer(failure: &PrefetchFailure) -> String {
+    match failure {
+        PrefetchFailure::Status(code) => format!("fetch failed: {code}"),
+        PrefetchFailure::Timeout(d) => {
+            // Whole-seconds rendering: prompt-friendly (the LLM
+            // doesn't gain anything from sub-second precision) and
+            // matches the `format_duration` helper used by the
+            // recipe-runtime path's rate-limit messages.
+            let secs = d.as_secs();
+            format!("fetch failed: timeout after {secs}s")
+        }
+        PrefetchFailure::RateLimited {
+            retry_after_seconds,
+        } => match retry_after_seconds {
+            Some(secs) => format!("rate-limited; retry after {secs}s"),
+            None => "rate-limited; no Retry-After provided".to_string(),
+        },
+        PrefetchFailure::TooLarge { max, got } => {
+            format!("fetch failed: response too large (got at least {got} bytes, max {max})")
+        }
+        PrefetchFailure::Other(msg) => {
+            // The catch-all bucket. Trim the redundant `http error: `
+            // prefix that `FetchError::Http`'s Display contributes,
+            // because the proposer's prior-attempts history already
+            // says "fetch failed" — doubling up reads as noise.
+            let trimmed = msg.strip_prefix("http error: ").unwrap_or(msg);
+            format!("fetch failed: {trimmed}")
+        }
+    }
 }
 
 /// `true` iff `bytes` looks like a PDF: starts with the literal
@@ -2716,6 +2873,35 @@ async fn fetch_recipe_bytes(
             stage: FailureStage::Fetch,
             message: format!("timed out after {d:?}"),
         }),
+        BackoffOutcome::Failed(HttpFetchError::Status(code)) => Err(RecipeOutcome::Failed {
+            // Session 49: the typed Status variant exists for the
+            // prefetch-failed path's propose-URL prior-attempts
+            // formatting. At runtime fetch (here), the operator
+            // surface stays the same as pre-Session-49 — we project
+            // the status into the failure message so the recipe-row's
+            // tooltip names what HTTP code we got. The host-backoff
+            // layer does not react to `Status` (only to RateLimited
+            // and Timeout), so behaviour is byte-equivalent to the
+            // pre-Session-49 catch-all `Http` path.
+            recipe_id: recipe.id,
+            source_id: recipe.source_id.clone(),
+            stage: FailureStage::Fetch,
+            message: format!("status error: {code}"),
+        }),
+        BackoffOutcome::Failed(HttpFetchError::TooLarge { max, got }) => {
+            // Session 49: same posture as the Status arm above. The
+            // numbers travel into the message; the host-backoff layer
+            // does not adapt (a single oversized response is not a
+            // throttling signal).
+            Err(RecipeOutcome::Failed {
+                recipe_id: recipe.id,
+                source_id: recipe.source_id.clone(),
+                stage: FailureStage::Fetch,
+                message: format!(
+                    "response too large: got at least {got} bytes, max {max}"
+                ),
+            })
+        }
         BackoffOutcome::Failed(HttpFetchError::NoFixture(url)) => Err(RecipeOutcome::Failed {
             recipe_id: recipe.id,
             source_id: recipe.source_id.clone(),
@@ -6965,5 +7151,325 @@ mod tests {
             assert_eq!(b, expected_bucket);
             assert_eq!(i, expected_index);
         }
+    }
+
+    // ====================================================================
+    // Session 49 — classified prefetch failure → propose-URL prompt input
+    // ====================================================================
+    //
+    // The Session-48 live run on the lithium plan exposed that the
+    // prefetch-failed branch of the propose-URL retry loop was
+    // erasing the failure class before it reached the prompt. The
+    // propose-URL prompt v1.0's vocabulary distinguishes
+    // `fetch failed: 404` from `fetch failed: 403/401` from generic
+    // failure, but the executor was emitting one literal string for
+    // every shape. These tests pin the wire format the LLM now
+    // receives.
+    //
+    // No source-specific routing is exercised: the format function is
+    // a pure shape projection, no host or scheme appears in any
+    // assertion. Every test names the closed-vocabulary discipline
+    // boundary it pins.
+
+    #[test]
+    fn prefetch_failure_classifies_status_codes_session_49() {
+        // The propose-URL prompt v1.0 names `fetch failed: 404` and
+        // `fetch failed: 403/401` verbatim. The format string must
+        // match those exemplars so the prompt's instructions read
+        // literally against the prior-attempts entry the LLM sees.
+        for code in [400u16, 401, 403, 404, 410, 451, 500, 502, 503] {
+            let f = PrefetchFailure::from_fetch_error(HttpFetchError::Status(code));
+            match f {
+                PrefetchFailure::Status(c) => assert_eq!(c, code),
+                other => panic!("Status({code}) must classify, got {other:?}"),
+            }
+            let s = format_prefetch_failure_for_proposer(&f);
+            assert_eq!(
+                s,
+                format!("fetch failed: {code}"),
+                "format must match prompt v1.0 vocabulary"
+            );
+        }
+    }
+
+    #[test]
+    fn prefetch_failure_classifies_timeout_with_seconds_session_49() {
+        // Whole-seconds rendering matches `format_duration` (which the
+        // recipe-runtime path uses for rate-limit messages). Sub-
+        // second precision adds nothing the LLM can act on.
+        let f = PrefetchFailure::from_fetch_error(HttpFetchError::Timeout(
+            Duration::from_secs(300),
+        ));
+        match f {
+            PrefetchFailure::Timeout(d) => assert_eq!(d, Duration::from_secs(300)),
+            other => panic!("Timeout must classify, got {other:?}"),
+        }
+        let s =
+            format_prefetch_failure_for_proposer(&PrefetchFailure::Timeout(Duration::from_secs(
+                300,
+            )));
+        assert_eq!(s, "fetch failed: timeout after 300s");
+    }
+
+    #[test]
+    fn prefetch_failure_classifies_rate_limited_with_and_without_header_session_49() {
+        // The format mirrors the existing `format_retry_after`
+        // helper used by the recipe-runtime fetch path's
+        // `RecipeOutcome::RateLimited` rendering, so the propose-
+        // URL prompt input and the runtime outcome reads use the
+        // same rate-limit vocabulary.
+        let with_hdr =
+            PrefetchFailure::RateLimited { retry_after_seconds: Some(45) };
+        assert_eq!(
+            format_prefetch_failure_for_proposer(&with_hdr),
+            "rate-limited; retry after 45s"
+        );
+
+        let no_hdr =
+            PrefetchFailure::RateLimited { retry_after_seconds: None };
+        assert_eq!(
+            format_prefetch_failure_for_proposer(&no_hdr),
+            "rate-limited; no Retry-After provided"
+        );
+    }
+
+    #[test]
+    fn prefetch_failure_classifies_too_large_with_byte_counts_session_49() {
+        let f = PrefetchFailure::from_fetch_error(HttpFetchError::TooLarge {
+            max: 32 * 1024 * 1024,
+            got: 50 * 1024 * 1024,
+        });
+        match f {
+            PrefetchFailure::TooLarge { max, got } => {
+                assert_eq!(max, 32 * 1024 * 1024);
+                assert_eq!(got, 50 * 1024 * 1024);
+            }
+            other => panic!("TooLarge must classify, got {other:?}"),
+        }
+        let s = format_prefetch_failure_for_proposer(&PrefetchFailure::TooLarge {
+            max: 1000,
+            got: 5000,
+        });
+        assert_eq!(
+            s,
+            "fetch failed: response too large (got at least 5000 bytes, max 1000)"
+        );
+    }
+
+    #[test]
+    fn prefetch_failure_classifies_other_with_message_session_49() {
+        // The `Http(_)` catch-all collapses DNS failures, TLS
+        // handshake errors, redirect rejections, and URL guard
+        // rejections into a single bucket. The format strips the
+        // redundant `http error: ` prefix from the underlying
+        // FetchError::Http Display so the proposer's prior-attempts
+        // entry doesn't read "fetch failed: http error: ..." (the
+        // double-mention).
+        let f = PrefetchFailure::from_fetch_error(HttpFetchError::Http(
+            "http error: dns resolution failed".to_string(),
+        ));
+        match &f {
+            PrefetchFailure::Other(msg) => {
+                assert!(msg.contains("dns"), "underlying detail must travel: {msg:?}")
+            }
+            other => panic!("Http must classify as Other, got {other:?}"),
+        }
+        let s = format_prefetch_failure_for_proposer(&f);
+        assert_eq!(s, "fetch failed: dns resolution failed");
+    }
+
+    #[test]
+    fn prefetch_failure_classifies_no_fixture_as_other_session_49() {
+        // Production never sees `NoFixture` (only the test-only
+        // `StaticFetcher` returns it). Pin that the test path doesn't
+        // panic and the format reads honestly — a future production
+        // path that accidentally surfaces NoFixture would land here
+        // instead of crashing the executor.
+        let f = PrefetchFailure::from_fetch_error(HttpFetchError::NoFixture(
+            "https://test.invalid/x".to_string(),
+        ));
+        match &f {
+            PrefetchFailure::Other(msg) => {
+                assert!(msg.contains("test.invalid"), "url must travel: {msg:?}")
+            }
+            other => panic!("NoFixture must classify as Other, got {other:?}"),
+        }
+        let s = format_prefetch_failure_for_proposer(&f);
+        assert!(
+            s.starts_with("fetch failed: "),
+            "every Other rendering must use the standard prefix: {s:?}"
+        );
+        assert!(s.contains("test.invalid"));
+    }
+
+    #[test]
+    fn prefetch_failure_other_strips_redundant_http_error_prefix_session_49() {
+        // `FetchError::Http`'s Display contributes `"http error: <inner>"`.
+        // The proposer's prior-attempts bullet already prefixes with
+        // "fetch failed: " — doubling reads as noise. Pin the strip.
+        let with_prefix = PrefetchFailure::Other("http error: 999 unrecognized".to_string());
+        assert_eq!(
+            format_prefetch_failure_for_proposer(&with_prefix),
+            "fetch failed: 999 unrecognized"
+        );
+        // A message that does NOT start with the prefix is left as-is.
+        let without_prefix = PrefetchFailure::Other("connection refused".to_string());
+        assert_eq!(
+            format_prefetch_failure_for_proposer(&without_prefix),
+            "fetch failed: connection refused"
+        );
+    }
+
+    #[test]
+    fn prefetch_failure_classifies_lifted_rate_limited_passthrough_session_49() {
+        // `BackoffOutcome::RateLimited` short-circuits before the
+        // `from_fetch_error` path; this test exercises the defensive
+        // arm for the (in practice unreachable) case where
+        // `BackoffOutcome::Failed(FetchError::RateLimited { ... })`
+        // does land. The classification preserves the
+        // `retry_after_seconds` value so the proposer's prompt input
+        // reads identically regardless of which path produced the
+        // signal.
+        let f = PrefetchFailure::from_fetch_error(HttpFetchError::RateLimited {
+            retry_after_seconds: Some(60),
+        });
+        match f {
+            PrefetchFailure::RateLimited {
+                retry_after_seconds: Some(60),
+            } => {}
+            other => panic!("RateLimited must classify with header, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_fetch_for_plan_threads_status_class_into_proposer_history_session_49() {
+        // Integration shape: the prefetch path returns 404 on the
+        // first proposed URL and the test verifies the propose-URL
+        // prompt on the SECOND attempt receives the prior-attempts
+        // entry with `fetch failed: 404` — the prompt-vocabulary-
+        // matching string the LLM can route on. This is the
+        // user-visible behaviour Session-49's lift was for: the
+        // proposer learns from network-layer truth.
+        //
+        // No source-specific routing: the test fixture's URLs are
+        // host-agnostic; the propose-URL provider just emits two
+        // distinct URLs in sequence, regardless of host.
+
+        use std::sync::Mutex;
+
+        struct StatusWatchingProvider {
+            propose_calls: Mutex<u32>,
+            second_propose_prompt: Mutex<Option<String>>,
+        }
+        #[async_trait]
+        impl LlmProvider for StatusWatchingProvider {
+            fn id(&self) -> &'static str {
+                "status_watching"
+            }
+            fn supported_tiers(&self) -> &[ModelTier] {
+                &[ModelTier::Cheap, ModelTier::Workhorse]
+            }
+            async fn complete(
+                &self,
+                tier: ModelTier,
+                req: CompletionRequest,
+            ) -> Result<CompletionResponse, LlmError> {
+                if matches!(tier, ModelTier::Cheap) {
+                    let mut n = self.propose_calls.lock().unwrap();
+                    *n += 1;
+                    let nth = *n;
+                    let url = if nth == 1 {
+                        // First propose: a URL the test fixture will
+                        // 404 on.
+                        "https://example.test/missing.csv"
+                    } else if nth == 2 {
+                        *self.second_propose_prompt.lock().unwrap() =
+                            Some(req.user.clone());
+                        // Second propose: an empty URL — decline. The
+                        // executor surfaces this as a nomination-level
+                        // decline reason that includes the prior-attempts
+                        // history. The TEST asserts on the prompt the
+                        // proposer SAW, not the decline reason itself.
+                        ""
+                    } else {
+                        ""
+                    };
+                    let canned = serde_json::json!({
+                        "url": url,
+                        "rationale": "fixture",
+                    });
+                    return Ok(CompletionResponse {
+                        text: serde_json::to_string(&canned).unwrap(),
+                        structured: Some(canned),
+                        provider: "status_watching".into(),
+                        model: "test".into(),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                }
+                // Workhorse — recipe author. Should not be reached
+                // (the proposer's first URL 404s, the second declines).
+                Ok(CompletionResponse {
+                    text: "{}".into(),
+                    structured: Some(serde_json::json!({})),
+                    provider: "status_watching".into(),
+                    model: "test".into(),
+                    input_tokens: None,
+                    output_tokens: None,
+                })
+            }
+        }
+
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        // Configure the StaticFetcher to return 404 on the first
+        // proposed URL; the second URL is "" so it never reaches
+        // the fetcher.
+        let fetcher = StaticFetcher::new()
+            .status("https://example.test/missing.csv", 404);
+        let provider = StatusWatchingProvider {
+            propose_calls: Mutex::new(0),
+            second_propose_prompt: Mutex::new(None),
+        };
+        let sources: Vec<SourceDescriptor> = vec![];
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: "unused — first propose 404s, second declines",
+            propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
+            sources: &sources,
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+        // The nomination ends as Declined (proposer ran out of URLs);
+        // exactly one outcome row.
+        assert_eq!(
+            report.outcomes.len(),
+            1,
+            "one nomination, one outcome (the nomination-level Declined)"
+        );
+
+        // The second propose-URL call must have received the
+        // status-class string in its prior-attempts section.
+        let second_prompt = provider
+            .second_propose_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second propose call must have happened");
+        assert!(
+            second_prompt.contains("fetch failed: 404"),
+            "second propose-URL prompt must carry the status-class \
+             prior-attempts entry; got prompt:\n{second_prompt}"
+        );
+        // And the literal pre-Session-49 catch-all string must NOT
+        // appear — that string is what we replaced.
+        assert!(
+            !second_prompt.contains("see warn-level log above"),
+            "pre-Session-49 catch-all reason must not appear in the \
+             post-Session-49 prompt; got prompt:\n{second_prompt}"
+        );
     }
 }

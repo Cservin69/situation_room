@@ -44,8 +44,10 @@
 //! parsed-out `Retry-After` (if any). The blanket impl on
 //! `SecureHttpClient` distinguishes 429 specifically and reads the
 //! header via the new [`SecureHttpClient::get_with_headers`] surface.
-//! Other status errors keep the legacy `FetchError::Http` shape so
-//! existing match-arms continue to compile unchanged.
+//! Other status errors kept the legacy `FetchError::Http` shape at
+//! the time so existing match-arms continued to compile unchanged.
+//! Session 49 lifts those out into [`FetchError::Status`] — see the
+//! "typed status surfacing" section below.
 //!
 //! ## Session 32 — Content-Type surfacing
 //!
@@ -77,6 +79,45 @@
 //! `RateLimited`. The fetch-executor adds one new match-arm in
 //! `fetch_recipe_bytes` to surface the timeout reason in the
 //! per-recipe failure message.
+//!
+//! ## Session 49 — typed status surfacing
+//!
+//! The third typed lift after `RateLimited` (Session 25) and `Timeout`
+//! (Session 45). Pre-Session-49, every non-429, non-timeout
+//! [`HttpError`] variant collapsed into [`FetchError::Http(String)`] —
+//! including the status-coded ones. The Session-48 live run on the
+//! lithium plan exposed the cost: the fetch executor's `prefetch_excerpt`
+//! path discarded the failure class entirely when it wrote the
+//! "fetch failed" entry into a nomination's prior-attempts history. The
+//! propose-URL prompt (v1.0) explicitly distinguishes
+//! `fetch failed: 404` (wrong path on this host — try a different
+//! path) from `fetch failed: 403/401` (host is blocking us — try a
+//! different host or decline) from a generic timeout (slow host —
+//! adapt or move on). Without the status code reaching the prompt,
+//! every prefetch failure read the same and the proposer either
+//! re-tried the same host blindly or declined too quickly.
+//!
+//! Session 49 lifts:
+//!
+//! - [`FetchError::Status(u16)`] — every non-429 4xx/5xx response,
+//!   regardless of whether the underlying [`HttpError`] was the
+//!   body-only `Status` or the headers-aware `StatusWithHeaders`.
+//! - [`FetchError::TooLarge { max, got }`] — the response exceeded
+//!   `SecureHttpConfig::max_response_bytes`. The numbers travel
+//!   through so the executor can name them in the prompt input
+//!   (`fetch failed: response too large (got at least N, max M)`)
+//!   without re-parsing the Display string.
+//!
+//! Other shapes (DNS, TLS, redirect-rejected, URL-guard-rejected,
+//! generic `Request(_)`) continue to collapse to the generic
+//! [`FetchError::Http`] arm; the prompt has no host-class heuristic
+//! for them and the message-string-as-reason carries enough detail
+//! for the LLM's general knowledge to route around. Widening the
+//! lift further is its own design decision.
+//!
+//! Both new variants follow the Session 45 pattern: typed because
+//! callers need to react differently, not because the operator surface
+//! benefits from a richer Display string.
 //!
 //! Session 32 adds [`HttpFetcher::fetch_bytes_with_meta`], returning
 //! [`FetchedBytes`] which carries the raw `Content-Type` value
@@ -143,6 +184,33 @@ pub enum FetchError {
     #[error("timed out after {0:?}")]
     Timeout(Duration),
 
+    /// The server returned a non-429 4xx/5xx HTTP status. Session 49
+    /// — see the module-level "typed status surfacing" section. The
+    /// host-backoff layer ([`crate::fetch_backoff::BackoffFetcher`])
+    /// does **not** react to this variant: a 404 says "wrong path,"
+    /// not "this host is asking us to slow down." The variant exists
+    /// so the prefetch-failed path can record a status-coded reason
+    /// in the propose-URL prior-attempts history; that history is
+    /// what the prompt's v1.0 distinct-handling-by-status-class
+    /// heuristics consume.
+    ///
+    /// 429 specifically still routes through [`Self::RateLimited`]
+    /// (Session 25) — the From<HttpError> match arm checks for 429
+    /// before falling through to this variant.
+    #[error("status error: {0}")]
+    Status(u16),
+
+    /// The response body exceeded
+    /// [`situation_room_secure::http::SecureHttpConfig::max_response_bytes`].
+    /// Session 49 — typed alongside `Status` so the executor can
+    /// render the numbers without re-parsing the Display string.
+    /// Callers presenting this to the propose-URL prompt may use the
+    /// numbers to ask for a smaller endpoint (paginated API, daily
+    /// rather than annual export); the prompt's vocabulary handles
+    /// the case generically through the "fetch failed: ..." idiom.
+    #[error("response too large: got at least {got} bytes, max {max}")]
+    TooLarge { max: usize, got: usize },
+
     /// Test/mock implementations use this for "no fixture for this
     /// URL". The real `SecureHttpClient` impl never returns this.
     #[error("no fixture configured for url: {0}")]
@@ -153,10 +221,18 @@ impl From<HttpError> for FetchError {
     fn from(e: HttpError) -> Self {
         // 429 with headers gets lifted to RateLimited; Timeout gets
         // lifted to FetchError::Timeout (Session 45 — the host-backoff
-        // layer needs to distinguish timeout from generic failure).
-        // Other shapes collapse to the generic Http variant the
-        // codebase has had since Session 8. Preserves backward-compat
-        // for every non-rate-limited, non-timeout caller.
+        // layer needs to distinguish timeout from generic failure);
+        // Session 49 lifts non-429 status codes and oversized
+        // responses out of the generic `Http(String)` arm so the
+        // prefetch-failed path can build status-class-aware reasons
+        // without string-parsing the Display.
+        //
+        // Other shapes (DNS, TLS, redirect-rejected, URL-guard,
+        // generic `Request(_)`) collapse to the generic Http variant
+        // the codebase has had since Session 8. The propose-URL
+        // prompt has no host-class heuristic for those; the message-
+        // -as-reason carries enough detail for the LLM's general
+        // knowledge to route around.
         match &e {
             HttpError::StatusWithHeaders { status, headers } if *status == 429 => {
                 FetchError::RateLimited {
@@ -164,6 +240,23 @@ impl From<HttpError> for FetchError {
                 }
             }
             HttpError::Timeout(d) => FetchError::Timeout(*d),
+            // Session 49: lift non-429 status codes (both the body-only
+            // `Status` and the headers-aware `StatusWithHeaders`
+            // shapes). The 429 arm above wins on order; for any other
+            // status code we surface the typed variant.
+            HttpError::Status(code) => FetchError::Status(*code),
+            HttpError::StatusWithHeaders { status, .. } => FetchError::Status(*status),
+            // Session 49: lift the oversized-response shape so the
+            // numbers travel verbatim. The Display string is bounded
+            // and human-readable, but the executor benefits from
+            // typed access for prompt-input formatting and for any
+            // future host-adaptation policy that wants to react
+            // differently to "the host is shipping a 100MB landing
+            // page" vs. "wrong path."
+            HttpError::ResponseTooLarge { max, got } => FetchError::TooLarge {
+                max: *max,
+                got: *got,
+            },
             _ => FetchError::Http(e.to_string()),
         }
     }
@@ -314,6 +407,18 @@ pub mod testing {
         /// `fetch_backoff` to verify the per-host adaptation reacts
         /// to typed Timeouts.
         timeouts: Mutex<HashMap<String, Duration>>,
+        /// Per-URL configured non-429 status — when present, both
+        /// `fetch_bytes` and `fetch_bytes_with_meta` return
+        /// `FetchError::Status(code)` for the configured URL.
+        /// Session 49 — used by the executor tests to verify the
+        /// prefetch-failed branch maps each status class into the
+        /// propose-URL prompt's vocabulary.
+        statuses: Mutex<HashMap<String, u16>>,
+        /// Per-URL configured oversized-response — when present, both
+        /// `fetch_bytes` and `fetch_bytes_with_meta` return
+        /// `FetchError::TooLarge { max, got }` for the configured URL.
+        /// Session 49.
+        too_large: Mutex<HashMap<String, (usize, usize)>>,
     }
 
     impl Default for StaticFetcher {
@@ -329,6 +434,8 @@ pub mod testing {
                 rate_limited_urls: Mutex::new(HashMap::new()),
                 content_types: Mutex::new(HashMap::new()),
                 timeouts: Mutex::new(HashMap::new()),
+                statuses: Mutex::new(HashMap::new()),
+                too_large: Mutex::new(HashMap::new()),
             }
         }
 
@@ -377,6 +484,35 @@ pub mod testing {
                 .insert(url.to_string(), after);
             self
         }
+
+        /// Configure a URL to return [`FetchError::Status`] with the
+        /// given non-429 status code. Session 49. The `code == 429`
+        /// case is intentionally excluded — that path goes through
+        /// [`Self::rate_limited`] so the typed `RateLimited` shape
+        /// surfaces correctly.
+        #[allow(dead_code)]
+        pub fn status(mut self, url: &str, code: u16) -> Self {
+            assert_ne!(
+                code, 429,
+                "use rate_limited(...) for 429 — the typed RateLimited variant carries Retry-After"
+            );
+            self.statuses
+                .get_mut()
+                .unwrap()
+                .insert(url.to_string(), code);
+            self
+        }
+
+        /// Configure a URL to return [`FetchError::TooLarge`] with the
+        /// given (max, got) byte counts. Session 49.
+        #[allow(dead_code)]
+        pub fn too_large(mut self, url: &str, max: usize, got: usize) -> Self {
+            self.too_large
+                .get_mut()
+                .unwrap()
+                .insert(url.to_string(), (max, got));
+            self
+        }
     }
 
     #[async_trait]
@@ -408,6 +544,31 @@ pub mod testing {
                 return Err(FetchError::Timeout(*d));
             }
             drop(to);
+
+            // Session 49: typed-Status fixtures. Defined precedence
+            // is rate-limited → timeout → status → too-large → bytes;
+            // tests configure exactly one shape per URL in practice.
+            let st = self
+                .statuses
+                .lock()
+                .map_err(|e| FetchError::Http(format!("test fixture lock poisoned: {e}")))?;
+            if let Some(code) = st.get(url) {
+                return Err(FetchError::Status(*code));
+            }
+            drop(st);
+
+            // Session 49: typed-TooLarge fixtures.
+            let tl = self
+                .too_large
+                .lock()
+                .map_err(|e| FetchError::Http(format!("test fixture lock poisoned: {e}")))?;
+            if let Some((max, got)) = tl.get(url) {
+                return Err(FetchError::TooLarge {
+                    max: *max,
+                    got: *got,
+                });
+            }
+            drop(tl);
 
             let map = self
                 .fixtures
@@ -470,18 +631,113 @@ mod tests {
         }
     }
 
-    /// Session 45. Non-Timeout, non-429 shapes still flatten to the
-    /// generic `Http` variant — the existing 5xx / 4xx / DNS path
-    /// is unchanged. This is what keeps every pre-Session-45
-    /// match-arm honest.
+    /// Session 49. The typed `HttpError::Status(u16)` (body-only path)
+    /// lifts to `FetchError::Status(u16)` rather than collapsing into
+    /// the catch-all `Http(String)` variant. The prefetch-failed path
+    /// in `fetch_executor::author_for_nomination` depends on this lift
+    /// to record a status-coded reason in the propose-URL prior-
+    /// attempts history; the prompt's v1.0 vocabulary distinguishes
+    /// `fetch failed: 404` from `fetch failed: 403/401`.
     #[test]
-    fn other_http_errors_still_collapse_to_http_variant_session_45() {
-        let lifted = FetchError::from(situation_room_secure::http::HttpError::Status(503));
-        match lifted {
-            FetchError::Http(msg) => {
-                assert!(msg.contains("503"), "message should name the status (got {msg:?})");
+    fn status_lifts_to_typed_variant_session_49() {
+        for code in [400u16, 401, 403, 404, 410, 451, 500, 502, 503] {
+            let lifted = FetchError::from(situation_room_secure::http::HttpError::Status(code));
+            match lifted {
+                FetchError::Status(s) => assert_eq!(s, code, "status code must round-trip"),
+                other => panic!("expected FetchError::Status({code}), got {other:?}"),
             }
-            other => panic!("expected FetchError::Http, got {other:?}"),
+        }
+    }
+
+    /// Session 49. The 429-with-headers arm in `From<HttpError>` is
+    /// checked before the catch-all status lift — Track-D's
+    /// `RateLimited` path stays intact even after the new typed
+    /// `Status` lift was added below it. The headers-aware
+    /// `StatusWithHeaders` variant carries the `SecureHeaderMap` the
+    /// `RateLimited` arm needs to parse `Retry-After`; we don't
+    /// reach across the secure-crate boundary to construct one here
+    /// (see this module's tests-section docstring), so this test
+    /// asserts the body-only `Status(429)` path — which has no
+    /// header to parse — lifts to the typed `Status(429)`. The
+    /// production flow goes through `StatusWithHeaders` and continues
+    /// to land in `RateLimited`; that arm is exercised by the live
+    /// integration tests.
+    #[test]
+    fn body_only_429_lifts_to_status_session_49() {
+        let lifted = FetchError::from(situation_room_secure::http::HttpError::Status(429));
+        match lifted {
+            FetchError::Status(429) => {
+                // The honest shape for "server said 429 but we have
+                // no header to parse." The executor's prefetch-failed
+                // path renders this as "fetch failed: 429" into the
+                // propose-URL prior-attempts history. The host-
+                // backoff layer doesn't react: it only adapts on
+                // `RateLimited` (with parsed Retry-After) and
+                // `Timeout`. A header-less 429 is treated as a
+                // generic upstream error rather than a fresh
+                // throttling signal — the right call when the server
+                // told us nothing about when to retry.
+            }
+            other => panic!("body-only 429 must lift to Status(429), got {other:?}"),
+        }
+    }
+
+    /// Session 49. The typed `HttpError::ResponseTooLarge { max, got }`
+    /// lifts to `FetchError::TooLarge { max, got }` with both numbers
+    /// preserved verbatim. The prefetch-failed path renders these into
+    /// the propose-URL prompt input.
+    #[test]
+    fn too_large_lifts_to_typed_variant_session_49() {
+        let lifted =
+            FetchError::from(situation_room_secure::http::HttpError::ResponseTooLarge {
+                max: 32 * 1024 * 1024,
+                got: 50 * 1024 * 1024,
+            });
+        match lifted {
+            FetchError::TooLarge { max, got } => {
+                assert_eq!(max, 32 * 1024 * 1024);
+                assert_eq!(got, 50 * 1024 * 1024);
+            }
+            other => panic!("expected FetchError::TooLarge, got {other:?}"),
+        }
+    }
+
+    /// Session 49. Non-typed shapes (DNS failure, TLS handshake,
+    /// redirect rejection, malformed-URL) continue to collapse into
+    /// the generic `Http(String)` arm. The propose-URL prompt has no
+    /// status-class heuristic for these; the message-as-reason carries
+    /// enough detail for the LLM's general knowledge.
+    ///
+    /// This test replaces the pre-Session-49
+    /// `other_http_errors_still_collapse_to_http_variant_session_45`
+    /// (which used `HttpError::Status(503)` — that case now lifts to
+    /// the typed `Status` variant per the Session-49 module docs).
+    #[test]
+    fn dns_and_tls_errors_still_collapse_to_http_variant_session_49() {
+        let dns = FetchError::from(situation_room_secure::http::HttpError::Request(
+            "dns resolution failed".to_string(),
+        ));
+        match dns {
+            FetchError::Http(msg) => {
+                assert!(
+                    msg.contains("dns"),
+                    "message should preserve the underlying detail (got {msg:?})"
+                );
+            }
+            other => panic!("DNS errors must still flatten to Http (got {other:?})"),
+        }
+
+        let tls = FetchError::from(situation_room_secure::http::HttpError::Tls(
+            "handshake aborted".to_string(),
+        ));
+        match tls {
+            FetchError::Http(msg) => {
+                assert!(
+                    msg.contains("handshake") || msg.contains("tls"),
+                    "TLS message must surface (got {msg:?})"
+                );
+            }
+            other => panic!("TLS errors must still flatten to Http (got {other:?})"),
         }
     }
 }
