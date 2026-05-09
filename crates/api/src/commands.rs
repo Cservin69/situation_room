@@ -74,8 +74,9 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::types_export::{
-    FetchReportDto, FetchRunSummaryDto, PlanStatusDto, PlanSummary, RecipeDto,
-    RecipeFeedbackDto, RecipeFetchAttemptDto, ResearchPlanDto, SourceDescriptorDto,
+    ExpectationCoverageRecipeDto, ExpectationCoverageRowDto, FetchReportDto, FetchRunSummaryDto,
+    PlanStatusDto, PlanSummary, RecipeDto, RecipeFeedbackDto, RecipeFetchAttemptDto,
+    RecipeOutcomesHistoryEntryDto, ResearchPlanDto, SourceDescriptorDto,
 };
 
 // ---------------------------------------------------------------------------
@@ -161,6 +162,13 @@ impl AppState {
     /// generous; a value at the limit indicates a misconfigured plan,
     /// not normal use. ADR 0013.
     pub const MAX_RECIPE_FEEDBACK_LISTING: usize = 100;
+    /// Session 46: how many runs the recipe-success heatmap can show
+    /// in one column-axis. The heatmap renders runs left-to-right; at
+    /// 50 columns the strip stays scannable on a 1280px-wide review
+    /// pane. Anything beyond this would compress cells past
+    /// usability; the operator can pick a tighter window if they want
+    /// to focus on recent history.
+    pub const MAX_OUTCOMES_HISTORY_RUNS: usize = 50;
 
     pub fn new(
         store: Arc<Store>,
@@ -1513,6 +1521,259 @@ pub async fn reauthor_recipe(
 }
 
 // ---------------------------------------------------------------------------
+// Command 13 — recipe_outcomes_history (Session 46)
+// ---------------------------------------------------------------------------
+
+/// Per-(recipe-or-source) outcome history across the plan's recent
+/// runs. Pure read; no LLM call, no fetch.
+///
+/// The frontend's recipe-success heatmap calls this on plan
+/// selection. Each returned entry is one row in the heatmap; each
+/// `runs[i]` is one column-cell. Cells are ordered oldest-first so
+/// the frontend renders runs left-to-right without sorting; entries
+/// arrive in insertion order (the order they first appeared in the
+/// run history) which keeps the recipe rows visually stable across
+/// renders.
+///
+/// `run_limit` clamps the **runs** dimension — only outcomes from the
+/// most recent N runs are returned. Older runs fall off the front of
+/// the heatmap; recipes that only appear in older runs are dropped
+/// from the result entirely. Defaults to a sensible ceiling
+/// ([`AppState::MAX_OUTCOMES_HISTORY_RUNS`]).
+///
+/// Errors:
+///   - `InvalidInput { field: "plan_id" }` — plan_id isn't a UUID.
+///   - `Storage` — DB-level failure.
+#[tauri::command]
+pub async fn recipe_outcomes_history(
+    plan_id: String,
+    run_limit: usize,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<RecipeOutcomesHistoryEntryDto>, CommandError> {
+    let parsed: Uuid = plan_id
+        .parse()
+        .map_err(|e: uuid::Error| CommandError::InvalidInput {
+            field: "plan_id".into(),
+            message: format!("not a valid UUID: {e}"),
+        })?;
+    let clamped = run_limit.clamp(1, AppState::MAX_OUTCOMES_HISTORY_RUNS);
+
+    let stored = state
+        .store
+        .recipe_outcomes_history_for_plan(parsed, clamped)
+        .map_err(CommandError::from)?;
+
+    Ok(stored
+        .into_iter()
+        .map(RecipeOutcomesHistoryEntryDto::from_stored)
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Command 14 — expectation_coverage (Session 46)
+// ---------------------------------------------------------------------------
+
+/// Plan-expectation coverage matrix: which recipes target which
+/// expectations, plus an explicit row per uncovered expectation.
+/// Pure read; no LLM call.
+///
+/// The recipe-author prompt's coverage discipline (v1.14
+/// §"Coverage discipline — bindings vs expectations") deliberately
+/// accepts narrow honest coverage — one recipe targeting one
+/// expectation index when the source structurally yields one
+/// scalar. This command surfaces that coverage so the operator sees
+/// it instead of having to read recipe JSON.
+///
+/// Returns one row per (bucket, index) the plan declares, plus zero
+/// or more recipes per row that bind to it. Uncovered rows surface
+/// with `recipes` empty.
+///
+/// Buckets covered: `observation_metric`, `event_type`,
+/// `entity_kind`, `relation_kind`. Document and Assertion
+/// expectations are not addressed by recipe `produces` bindings —
+/// they're surfaced through other surfaces and not part of this
+/// matrix.
+///
+/// Errors:
+///   - `InvalidInput { field: "plan_id" }` — plan_id isn't a UUID.
+///   - `NotFound` — plan with this id isn't in the store.
+///   - `Storage` — DB-level failure.
+#[tauri::command]
+pub async fn expectation_coverage(
+    plan_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<ExpectationCoverageRowDto>, CommandError> {
+    let parsed: Uuid = plan_id
+        .parse()
+        .map_err(|e: uuid::Error| CommandError::InvalidInput {
+            field: "plan_id".into(),
+            message: format!("not a valid UUID: {e}"),
+        })?;
+
+    // Load the plan so we know the full expectation matrix shape.
+    // Without it we couldn't surface uncovered expectations.
+    let stored_plan = state
+        .store
+        .get_research_plan(parsed)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::NotFound {
+            id: plan_id.clone(),
+        })?;
+    let plan = ResearchPlanDto::from_stored(stored_plan).map_err(|e| CommandError::Storage {
+        message: format!("plan deserialization: {e}"),
+    })?;
+
+    // Load the recipes so we know which (bucket, index) pairs each
+    // recipe binds to.
+    let recipes = state
+        .store
+        .recipes_for_plan(parsed)
+        .map_err(CommandError::from)?;
+
+    Ok(build_expectation_coverage(&plan, &recipes))
+}
+
+/// Walk the plan's expectations and the recipes' `produces` bindings
+/// to assemble the coverage matrix. Pure function; no I/O.
+///
+/// The function lives at module scope (rather than inside the
+/// command) so it's testable against a synthetic plan + recipe pair
+/// without spinning up a Store.
+///
+/// ## Bucket vocabulary
+///
+/// The `expectation.list` strings in `produces` bindings come from
+/// the recipe-author prompt's closed vocabulary:
+/// `observation_metric` | `event_type` | `entity_kind` |
+/// `relation_kind`. Document and Assertion expectations don't have
+/// bindings — they're carried by other surfaces.
+fn build_expectation_coverage(
+    plan: &ResearchPlanDto,
+    recipes: &[situation_room_storage::StoredRecipe],
+) -> Vec<ExpectationCoverageRowDto> {
+    // 1. Index each recipe's bindings by (bucket, index).
+    //
+    //    The `produces` JSON shape (recipe_author.md §"What to
+    //    produce") is an array of objects:
+    //
+    //        [{
+    //          "record_type": "observation",
+    //          "expectation": { "list": "observation_metric", "index": 0 },
+    //          ...
+    //        }, ...]
+    //
+    //    We parse it leniently — a recipe with a malformed produces
+    //    column is still listed as "no coverage" rather than
+    //    crashing the whole matrix. Same posture `RecipeDto`'s
+    //    `from_stored` takes on parse failure.
+    let mut by_key: std::collections::HashMap<(String, u32), Vec<ExpectationCoverageRecipeDto>> =
+        std::collections::HashMap::new();
+
+    for recipe in recipes {
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&recipe.produces_json);
+        let bindings = match parsed.as_ref().ok().and_then(|v| v.as_array()) {
+            Some(arr) => arr.clone(),
+            None => continue,
+        };
+
+        for binding in bindings {
+            let bucket = binding
+                .get("expectation")
+                .and_then(|e| e.get("list"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let index = binding
+                .get("expectation")
+                .and_then(|e| e.get("index"))
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32);
+            let record_type = binding
+                .get("record_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if let (Some(bucket), Some(index)) = (bucket, index) {
+                by_key.entry((bucket, index)).or_default().push(
+                    ExpectationCoverageRecipeDto {
+                        recipe_id: recipe.id.to_string(),
+                        source_id: recipe.source_id.clone(),
+                        record_type,
+                    },
+                );
+            }
+        }
+    }
+
+    // 2. Walk the plan's four binding-addressable buckets in a
+    //    stable order, emitting one row per (bucket, index) the plan
+    //    declares.
+    let mut rows: Vec<ExpectationCoverageRowDto> = Vec::new();
+
+    for (i, m) in plan.expectations.observation_metrics.iter().enumerate() {
+        let key = ("observation_metric".to_string(), i as u32);
+        let recipes = by_key.remove(&key).unwrap_or_default();
+        rows.push(ExpectationCoverageRowDto {
+            bucket: key.0,
+            index: key.1,
+            label: m.name.clone(),
+            recipes,
+        });
+    }
+    for (i, e) in plan.expectations.event_types.iter().enumerate() {
+        let key = ("event_type".to_string(), i as u32);
+        let recipes = by_key.remove(&key).unwrap_or_default();
+        rows.push(ExpectationCoverageRowDto {
+            bucket: key.0,
+            index: key.1,
+            label: e.event_type.clone(),
+            recipes,
+        });
+    }
+    for (i, e) in plan.expectations.entity_kinds.iter().enumerate() {
+        let key = ("entity_kind".to_string(), i as u32);
+        let recipes = by_key.remove(&key).unwrap_or_default();
+        rows.push(ExpectationCoverageRowDto {
+            bucket: key.0,
+            index: key.1,
+            label: e.kind.clone(),
+            recipes,
+        });
+    }
+    for (i, r) in plan.expectations.relation_kinds.iter().enumerate() {
+        let key = ("relation_kind".to_string(), i as u32);
+        let recipes = by_key.remove(&key).unwrap_or_default();
+        rows.push(ExpectationCoverageRowDto {
+            bucket: key.0,
+            index: key.1,
+            label: r.kind.clone(),
+            recipes,
+        });
+    }
+
+    // 3. Any leftover bindings in `by_key` reference an
+    //    (bucket, index) the plan no longer declares. This can
+    //    happen if a plan was edited in storage between recipe
+    //    authoring and this query, or if a recipe targets an index
+    //    out of range. Surface them as orphan rows with `label = ""`
+    //    so the operator sees the inconsistency rather than the
+    //    matrix silently dropping the binding. Sort the leftovers by
+    //    bucket then index for stable output.
+    let mut orphans: Vec<((String, u32), Vec<ExpectationCoverageRecipeDto>)> =
+        by_key.into_iter().collect();
+    orphans.sort_by(|a, b| a.0.cmp(&b.0));
+    for ((bucket, index), recipes) in orphans {
+        rows.push(ExpectationCoverageRowDto {
+            bucket,
+            index,
+            label: String::new(),
+            recipes,
+        });
+    }
+
+    rows
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1585,5 +1846,236 @@ mod tests {
         assert!(json.contains(r#""kind":"reauthor_failed""#));
         assert!(json.contains(r#""prior_recipe_id":"019dee9a-ba75-7533-aa4f-ee673f03fece""#));
         assert!(json.contains("no captured fetch attempt"));
+    }
+
+    // -----------------------------------------------------------------
+    // Session 46 — build_expectation_coverage
+    // -----------------------------------------------------------------
+
+    use crate::types_export::{
+        DocumentSourceEntryDto, EntityKindExpectationDto, EventTypeExpectationDto,
+        MetricExpectationDto, RecordExpectationsDto, RelationKindExpectationDto, ResearchPlanDto,
+    };
+
+    fn coverage_plan_with_obs_metrics(names: &[&str]) -> ResearchPlanDto {
+        let observation_metrics = names
+            .iter()
+            .map(|n| MetricExpectationDto {
+                name: (*n).to_string(),
+                rationale: format!("test rationale for {n}"),
+                unit_hint: "t".into(),
+            })
+            .collect::<Vec<_>>();
+        ResearchPlanDto {
+            id: "019e0b21-525e-7013-9dbe-ca5416ca014b".into(),
+            topic: "lithium global supply chain".into(),
+            interpretation: "test plan".into(),
+            topic_tags: vec!["lithium".into()],
+            geographic_scope: vec![],
+            historical_window_days: 730,
+            expectations: RecordExpectationsDto {
+                observation_metrics,
+                event_types: vec![EventTypeExpectationDto {
+                    event_type: "mine_opened".into(),
+                    rationale: "test".into(),
+                }],
+                entity_kinds: vec![EntityKindExpectationDto {
+                    kind: "company".into(),
+                    rationale: "test".into(),
+                    exemplars: vec![],
+                }],
+                relation_kinds: vec![RelationKindExpectationDto {
+                    kind: "supplies_to".into(),
+                    rationale: "test".into(),
+                }],
+                document_sources: Vec::<DocumentSourceEntryDto>::new(),
+                assertion_guidance: None,
+            },
+            status: PlanStatusDto::Accepted,
+            created_at: chrono::Utc::now(),
+            rejection_reason: String::new(),
+            reclassified_from: String::new(),
+        }
+    }
+
+    fn coverage_recipe_targeting(
+        plan_id: uuid::Uuid,
+        bucket: &str,
+        index: u32,
+        source_id: &str,
+        record_type: &str,
+    ) -> situation_room_storage::StoredRecipe {
+        let produces = serde_json::json!([{
+            "record_type": record_type,
+            "expectation": { "list": bucket, "index": index },
+            "field_mappings": [
+                { "path": "value", "source": { "kind": "extracted" } },
+            ],
+        }]);
+        situation_room_storage::StoredRecipe {
+            id: uuid::Uuid::now_v7(),
+            dedup_key: Some(format!("{plan_id}:{source_id}:{bucket}:{index}")),
+            plan_id,
+            source_id: source_id.into(),
+            source_url: format!("https://{source_id}/x"),
+            extraction_json: r#"{"mode":"json_path","path":"$.value"}"#.into(),
+            produces_json: produces.to_string(),
+            authored_at: chrono::Utc::now(),
+            authored_by: "xai".into(),
+            version: 1,
+            static_payload: None,
+            iterator: None,
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
+        }
+    }
+
+    /// Plan declares 4 obs metrics; one recipe binds to index 0 only.
+    /// Three rows surface as uncovered.
+    #[test]
+    fn coverage_marks_unbound_expectations_uncovered_session_46() {
+        let plan = coverage_plan_with_obs_metrics(&[
+            "production",
+            "reserves",
+            "refining_capacity",
+            "spot_price",
+        ]);
+        let plan_id: uuid::Uuid = plan.id.parse().unwrap();
+        let recipes = vec![coverage_recipe_targeting(
+            plan_id,
+            "observation_metric",
+            0,
+            "pubs.usgs.gov",
+            "observation",
+        )];
+
+        let rows = build_expectation_coverage(&plan, &recipes);
+
+        // Four obs rows + one event + one entity + one relation = 7.
+        let obs_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.bucket == "observation_metric")
+            .collect();
+        assert_eq!(obs_rows.len(), 4);
+        assert_eq!(obs_rows[0].label, "production");
+        assert_eq!(obs_rows[0].recipes.len(), 1);
+        assert_eq!(obs_rows[0].recipes[0].source_id, "pubs.usgs.gov");
+        assert_eq!(obs_rows[0].recipes[0].record_type, "observation");
+
+        for unbound in &obs_rows[1..] {
+            assert!(
+                unbound.recipes.is_empty(),
+                "expected uncovered: {} (label {})",
+                unbound.index,
+                unbound.label
+            );
+        }
+
+        // The other buckets are also uncovered (no recipes target
+        // them); the matrix surfaces each row regardless.
+        assert!(rows.iter().any(|r| r.bucket == "event_type"));
+        assert!(rows.iter().any(|r| r.bucket == "entity_kind"));
+        assert!(rows.iter().any(|r| r.bucket == "relation_kind"));
+    }
+
+    /// Multiple recipes targeting the same expectation surface as
+    /// multiple chips on the same row.
+    #[test]
+    fn coverage_groups_multiple_recipes_under_one_row_session_46() {
+        let plan = coverage_plan_with_obs_metrics(&["production"]);
+        let plan_id: uuid::Uuid = plan.id.parse().unwrap();
+        let recipes = vec![
+            coverage_recipe_targeting(
+                plan_id,
+                "observation_metric",
+                0,
+                "pubs.usgs.gov",
+                "observation",
+            ),
+            coverage_recipe_targeting(
+                plan_id,
+                "observation_metric",
+                0,
+                "industry.gov.au",
+                "observation",
+            ),
+        ];
+
+        let rows = build_expectation_coverage(&plan, &recipes);
+        let prod_row = rows
+            .iter()
+            .find(|r| r.bucket == "observation_metric" && r.index == 0)
+            .expect("production row present");
+        assert_eq!(prod_row.recipes.len(), 2);
+        let sources: std::collections::HashSet<&str> = prod_row
+            .recipes
+            .iter()
+            .map(|c| c.source_id.as_str())
+            .collect();
+        assert!(sources.contains("pubs.usgs.gov"));
+        assert!(sources.contains("industry.gov.au"));
+    }
+
+    /// Recipes whose `expectation.index` references a position the
+    /// plan no longer declares surface as orphan rows with empty
+    /// `label`. The matrix still includes them so the operator sees
+    /// the inconsistency.
+    #[test]
+    fn coverage_surfaces_orphan_bindings_with_empty_label_session_46() {
+        // Plan declares one obs metric; recipe references index 9.
+        let plan = coverage_plan_with_obs_metrics(&["production"]);
+        let plan_id: uuid::Uuid = plan.id.parse().unwrap();
+        let recipes = vec![coverage_recipe_targeting(
+            plan_id,
+            "observation_metric",
+            9,
+            "rogue.example.com",
+            "observation",
+        )];
+
+        let rows = build_expectation_coverage(&plan, &recipes);
+        let orphan = rows
+            .iter()
+            .find(|r| r.bucket == "observation_metric" && r.index == 9)
+            .expect("orphan row present");
+        assert_eq!(orphan.label, "", "orphan rows have empty label");
+        assert_eq!(orphan.recipes.len(), 1);
+        assert_eq!(orphan.recipes[0].source_id, "rogue.example.com");
+    }
+
+    /// Recipes whose `produces_json` is malformed don't crash the
+    /// matrix — they simply contribute no chips. Matches the
+    /// parse-on-error fallback `RecipeDto::from_stored` already
+    /// uses for the same column.
+    #[test]
+    fn coverage_skips_recipes_with_malformed_produces_json_session_46() {
+        let plan = coverage_plan_with_obs_metrics(&["production"]);
+        let plan_id: uuid::Uuid = plan.id.parse().unwrap();
+        let mut bad_recipe = coverage_recipe_targeting(
+            plan_id,
+            "observation_metric",
+            0,
+            "broken.example.com",
+            "observation",
+        );
+        bad_recipe.produces_json = "not valid json".into();
+
+        let good_recipe = coverage_recipe_targeting(
+            plan_id,
+            "observation_metric",
+            0,
+            "pubs.usgs.gov",
+            "observation",
+        );
+
+        let rows = build_expectation_coverage(&plan, &[bad_recipe, good_recipe]);
+        let prod = rows
+            .iter()
+            .find(|r| r.bucket == "observation_metric" && r.index == 0)
+            .unwrap();
+        // Only the good recipe contributed a chip.
+        assert_eq!(prod.recipes.len(), 1);
+        assert_eq!(prod.recipes[0].source_id, "pubs.usgs.gov");
     }
 }

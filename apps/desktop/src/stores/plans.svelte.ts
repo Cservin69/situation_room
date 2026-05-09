@@ -55,6 +55,8 @@ import {
   listRecipeFeedbackForPlan as apiListRecipeFeedbackForPlan,
   reauthorRecipe as apiReauthorRecipe,
   recordsForPlan as apiRecordsForPlan,
+  recipeOutcomesHistory as apiRecipeOutcomesHistory,
+  expectationCoverage as apiExpectationCoverage,
   asCommandError,
 } from '$lib/api/client';
 import type { PlanSummary } from '$lib/api/types/PlanSummary';
@@ -66,6 +68,8 @@ import type { FetchRunSummaryDto } from '$lib/api/types/FetchRunSummaryDto';
 import type { RecipeDto } from '$lib/api/types/RecipeDto';
 import type { RecipeFeedbackDto } from '$lib/api/types/RecipeFeedbackDto';
 import type { RecordsByPlanDto } from '$lib/api/types/RecordsByPlanDto';
+import type { RecipeOutcomesHistoryEntryDto } from '$lib/api/types/RecipeOutcomesHistoryEntryDto';
+import type { ExpectationCoverageRowDto } from '$lib/api/types/ExpectationCoverageRowDto';
 
 export type StatusFilter = PlanStatusDto | 'all';
 
@@ -136,6 +140,26 @@ interface PlansState {
    * `selectPlan`.
    */
   records: RecordsByPlanDto | null;
+  /**
+   * Per-(recipe-or-source) outcome history across the plan's recent
+   * fetch runs (Session 46). Drives the recipe-success heatmap.
+   * Empty until the first roundtrip lands; refreshed alongside
+   * `selectPlan` and after each successful `runFetch`. Cleared on
+   * `selectPlan` and `clearSelection` so a stale plan's history
+   * doesn't bleed across selections.
+   */
+  outcomesHistory: RecipeOutcomesHistoryEntryDto[];
+  /**
+   * Plan-expectation coverage matrix (Session 46). One row per
+   * (bucket, index) the plan declares — observation_metric,
+   * event_type, entity_kind, relation_kind — with the recipes that
+   * bind to each. Surfaces the recipe-author prompt's "narrow
+   * honest coverage" discipline so the operator sees which
+   * expectations are uncovered without reading recipe JSON. `null`
+   * means we haven't asked yet (the load is plan-status-gated like
+   * `records`).
+   */
+  expectationCoverage: ExpectationCoverageRowDto[] | null;
   error: CommandErrorDto | null;
 }
 
@@ -154,6 +178,8 @@ export const plans: PlansState = $state({
   recipes: [],
   recipeFeedback: {},
   records: null,
+  outcomesHistory: [],
+  expectationCoverage: null,
   error: null,
 });
 
@@ -242,6 +268,8 @@ export async function selectPlan(id: string): Promise<void> {
   plans.recipes = [];
   plans.recipeFeedback = {};
   plans.records = null;
+  plans.outcomesHistory = [];
+  plans.expectationCoverage = null;
   try {
     const plan = await getPlan(id);
     plans.selected = plan;
@@ -267,6 +295,14 @@ export async function selectPlan(id: string): Promise<void> {
     if (plan.status !== 'pending') {
       void refreshRecords(id).catch(() => {});
     }
+    // Session 46: load the heatmap history and the expectation
+    // coverage matrix alongside the rest of the plan's surfaces.
+    // Both are pure reads against existing rows; both render an
+    // explicit empty state when there's nothing yet (no fetches
+    // run; no recipes authored; etc.) so failure to load is
+    // non-fatal.
+    void refreshOutcomesHistory(id).catch(() => {});
+    void refreshExpectationCoverage(id).catch(() => {});
   } catch (e) {
     plans.error = asCommandError(e);
   } finally {
@@ -285,6 +321,8 @@ export function clearSelection(): void {
   plans.recipes = [];
   plans.recipeFeedback = {};
   plans.records = null;
+  plans.outcomesHistory = [];
+  plans.expectationCoverage = null;
 }
 
 /**
@@ -489,6 +527,11 @@ export async function runFetch(): Promise<boolean> {
     // The records command is safe at this point — the plan must
     // have been Accepted for the fetch to have run.
     void refreshRecords(current.id).catch(() => {});
+    // Session 46: a successful fetch writes outcome rows and may
+    // author new recipes; refresh both heatmap history and coverage
+    // matrix so the panels reflect what just happened.
+    void refreshOutcomesHistory(current.id).catch(() => {});
+    void refreshExpectationCoverage(current.id).catch(() => {});
     return true;
   } catch (e) {
     plans.error = asCommandError(e);
@@ -701,6 +744,42 @@ export async function clearRecipeFeedback(sourceId: string): Promise<boolean> {
  * that state, but the guard makes the function safe to call
  * defensively).
  */
+/**
+ * Refresh the recipe-success heatmap's outcome history (Session 46).
+ * Pure read; safe to call freely. Like the other background
+ * refreshes this doesn't toggle a spinner — the panel renders its
+ * own empty state until the call returns.
+ *
+ * Failure surfaces as an error banner; the previous
+ * `plans.outcomesHistory` is preserved so a transient network blip
+ * doesn't blank a populated heatmap.
+ */
+export async function refreshOutcomesHistory(planId: string): Promise<void> {
+  try {
+    plans.outcomesHistory = await apiRecipeOutcomesHistory(planId, 20);
+  } catch (e) {
+    plans.error = asCommandError(e);
+  }
+}
+
+/**
+ * Refresh the expectation-coverage matrix (Session 46). Pure read;
+ * called alongside `selectPlan` and after each successful
+ * `runFetch` (because the first run authors the recipes that fill
+ * the matrix; subsequent runs may extend coverage if the plan was
+ * extended).
+ *
+ * Failure preserves the previous matrix so transient network blips
+ * don't blank a populated coverage panel.
+ */
+export async function refreshExpectationCoverage(planId: string): Promise<void> {
+  try {
+    plans.expectationCoverage = await apiExpectationCoverage(planId);
+  } catch (e) {
+    plans.error = asCommandError(e);
+  }
+}
+
 export async function reauthorRecipe(
   recipeId: string,
   operatorNote: string | null = null,

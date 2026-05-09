@@ -99,7 +99,10 @@ use uuid::Uuid;
 use situation_room_llm::{LlmProvider, ModelTier};
 use situation_room_secure::bounds::Bounds;
 use situation_room_storage::{
-    fetch_runs::FetchRunRow, research_plans::PlanStatus, Store,
+    fetch_run_outcomes::{FetchRunOutcomeKind, FetchRunOutcomeRow},
+    fetch_runs::FetchRunRow,
+    research_plans::PlanStatus,
+    Store,
 };
 
 use std::time::{Duration, Instant};
@@ -491,7 +494,21 @@ pub async fn run_fetch_for_plan(
         outcomes.push(outcome);
     }
 
-    // 5. Close the run row with final counters.
+    // 5a. Persist per-outcome rows for the heatmap surface (Session
+    //     46). One row per RecipeOutcome captures the (run, recipe-or-
+    //     source, kind) tuple the FetchReport carries synchronously
+    //     to the UI; persisting it makes the same data legible across
+    //     sessions and lets the recipe-success heatmap render history
+    //     without re-running fetches.
+    //
+    //     Storage failures here are non-fatal: we log loudly and
+    //     continue. The user-visible report is unchanged; only the
+    //     persisted history loses these rows. Same posture as the
+    //     `update_fetch_run` write below — the run's work is preserved
+    //     even when an auxiliary write fails.
+    persist_run_outcomes(ctx.store, plan_id, run_id, &outcomes);
+
+    // 5b. Close the run row with final counters.
     run_row.finished_at = Some(Utc::now());
     run_row.recipes_attempted = recipes_attempted;
     run_row.recipes_succeeded = recipes_succeeded;
@@ -2509,6 +2526,153 @@ fn record_apply_failure_attempt(
     }
 }
 
+/// Persist one `fetch_run_outcomes` row per `RecipeOutcome` produced
+/// by a run. Session 46 — the row backbone for the recipe-success
+/// heatmap surface.
+///
+/// Each outcome lifts into a single row with `outcome_kind` matching
+/// the `RecipeOutcomeDto::kind` string the IPC boundary already
+/// uses. `Declined` and `LegacyPlanCannotAuthor` produce rows with
+/// `recipe_id = None` because no recipe was authored; the heatmap
+/// groups those by `source_id` instead. See migration 0016 and
+/// `crates/storage/src/fetch_run_outcomes.rs` for the table shape and
+/// per-variant payload conventions.
+///
+/// Per-row storage failures are warn-logged and skipped — losing one
+/// heatmap cell is strictly better than failing the whole run for an
+/// auxiliary persistence write. The user-facing `FetchReport` is
+/// untouched.
+fn persist_run_outcomes(
+    store: &Store,
+    plan_id: Uuid,
+    run_id: Uuid,
+    outcomes: &[RecipeOutcome],
+) {
+    let now = Utc::now();
+    for outcome in outcomes {
+        let row = match outcome {
+            RecipeOutcome::Succeeded {
+                recipe_id,
+                source_id,
+                records_produced,
+            } => FetchRunOutcomeRow {
+                id: Uuid::now_v7(),
+                run_id,
+                plan_id,
+                recipe_id: Some(*recipe_id),
+                source_id: source_id.clone(),
+                outcome_kind: FetchRunOutcomeKind::Succeeded,
+                records_produced: Some(*records_produced),
+                retry_after_seconds: None,
+                failure_stage: None,
+                message: None,
+                attempted_at: now,
+            },
+            RecipeOutcome::Skipped {
+                recipe_id,
+                source_id,
+                reason,
+            } => FetchRunOutcomeRow {
+                id: Uuid::now_v7(),
+                run_id,
+                plan_id,
+                recipe_id: Some(*recipe_id),
+                source_id: source_id.clone(),
+                outcome_kind: FetchRunOutcomeKind::Skipped,
+                records_produced: None,
+                retry_after_seconds: None,
+                failure_stage: None,
+                message: Some(reason.clone()),
+                attempted_at: now,
+            },
+            RecipeOutcome::Failed {
+                recipe_id,
+                source_id,
+                stage,
+                message,
+            } => FetchRunOutcomeRow {
+                id: Uuid::now_v7(),
+                run_id,
+                plan_id,
+                recipe_id: Some(*recipe_id),
+                source_id: source_id.clone(),
+                outcome_kind: FetchRunOutcomeKind::Failed,
+                records_produced: None,
+                retry_after_seconds: None,
+                failure_stage: Some(failure_stage_as_str(*stage).to_string()),
+                message: Some(message.clone()),
+                attempted_at: now,
+            },
+            RecipeOutcome::RateLimited {
+                recipe_id,
+                source_id,
+                retry_after_seconds,
+            } => FetchRunOutcomeRow {
+                id: Uuid::now_v7(),
+                run_id,
+                plan_id,
+                recipe_id: Some(*recipe_id),
+                source_id: source_id.clone(),
+                outcome_kind: FetchRunOutcomeKind::RateLimited,
+                records_produced: None,
+                retry_after_seconds: *retry_after_seconds,
+                failure_stage: None,
+                message: None,
+                attempted_at: now,
+            },
+            RecipeOutcome::Declined { source_id, reason } => FetchRunOutcomeRow {
+                id: Uuid::now_v7(),
+                run_id,
+                plan_id,
+                recipe_id: None,
+                source_id: source_id.clone(),
+                outcome_kind: FetchRunOutcomeKind::Declined,
+                records_produced: None,
+                retry_after_seconds: None,
+                failure_stage: None,
+                message: Some(reason.clone()),
+                attempted_at: now,
+            },
+            RecipeOutcome::LegacyPlanCannotAuthor { source_id } => FetchRunOutcomeRow {
+                id: Uuid::now_v7(),
+                run_id,
+                plan_id,
+                recipe_id: None,
+                source_id: source_id.clone(),
+                outcome_kind: FetchRunOutcomeKind::LegacyPlanCannotAuthor,
+                records_produced: None,
+                retry_after_seconds: None,
+                failure_stage: None,
+                message: None,
+                attempted_at: now,
+            },
+        };
+
+        if let Err(e) = store.insert_fetch_run_outcome(&row) {
+            warn!(
+                plan_id = %plan_id,
+                run_id = %run_id,
+                source_id = %row.source_id,
+                outcome_kind = %row.outcome_kind,
+                error = %e,
+                "failed to persist fetch_run_outcome row; the heatmap will \
+                 lack this cell but the report itself is preserved"
+            );
+        }
+    }
+}
+
+/// Wire-form string for [`FailureStage`] — same snake_case convention
+/// as the serde default. Kept as a free function rather than a method
+/// so it stays adjacent to [`persist_run_outcomes`]'s call site.
+fn failure_stage_as_str(stage: FailureStage) -> &'static str {
+    match stage {
+        FailureStage::Fetch => "fetch",
+        FailureStage::Apply => "apply",
+        FailureStage::Insert => "insert",
+    }
+}
+
 /// CSV runtime path: fetch → apply → insert.
 async fn run_csv_recipe(
     ctx: &ExecutorContext<'_>,
@@ -3379,6 +3543,92 @@ mod tests {
         assert_eq!(runs[0].records_produced, 1);
         assert!(runs[0].finished_at.is_some());
         assert!(runs[0].error_summary.is_none());
+
+        // Session 46: the per-outcome row is persisted alongside the
+        // fetch_runs summary so the recipe-success heatmap can render
+        // the (recipe, run) cell without re-running the fetch. The
+        // shape mirrors the FetchReport's outcome verbatim.
+        let outcome_rows = store.fetch_run_outcomes_for_plan(plan.id).unwrap();
+        assert_eq!(outcome_rows.len(), 1);
+        assert_eq!(outcome_rows[0].run_id, report.run_id);
+        assert_eq!(
+            outcome_rows[0].outcome_kind,
+            situation_room_storage::fetch_run_outcomes::FetchRunOutcomeKind::Succeeded
+        );
+        assert_eq!(outcome_rows[0].records_produced, Some(1));
+        assert_eq!(outcome_rows[0].source_id, recipe.source_id);
+        assert!(outcome_rows[0].failure_stage.is_none());
+        assert!(outcome_rows[0].message.is_none());
+    }
+
+    /// Session 46 — declined-shape outcome row persistence. The decline
+    /// originates in `load_or_author_recipes` (no recipe authored), so
+    /// the outcome row carries `recipe_id = None` and the LLM's reason
+    /// in `message`. The heatmap groups declines by `source_id`
+    /// because there's no recipe to key on.
+    ///
+    /// We exercise the path by constructing a plan with a legacy entry
+    /// — the only shape the executor currently emits without an LLM
+    /// authoring call — which surfaces as `LegacyPlanCannotAuthor`.
+    /// Mirrors the no-recipe-id branch declines take, with the
+    /// distinguishing kind preserved.
+    #[tokio::test]
+    async fn run_fetch_persists_legacy_plan_outcome_row_with_no_recipe_id_session_46() {
+        // Build a plan with one Legacy document_source. The pre-
+        // Session-37 hint shape (description + preferred_source_ids)
+        // surfaces as `LegacyPlanCannotAuthor` per source_id; that's
+        // the closest in-scope shape to a Declined outcome (no
+        // recipe, source_id only) without standing up an LLM mock.
+        let mut plan = sample_plan();
+        plan.expectations.document_sources = vec![DocumentSourceEntry::Legacy(
+            DocumentSourceHint {
+                description: "session-46 legacy persistence smoke".into(),
+                preferred_source_ids: vec!["world_bank_indicators".into()],
+            },
+        )];
+        let store = make_store_with_accepted_plan(&plan);
+
+        let fetcher = StaticFetcher::new();
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            provider: &provider,
+            recipe_author_prompt: "unused — legacy entries are not authored",
+            propose_url_prompt: "",
+            sources: &[],
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+        // At least one legacy outcome surfaced.
+        assert!(
+            report
+                .outcomes
+                .iter()
+                .any(|o| matches!(o, RecipeOutcome::LegacyPlanCannotAuthor { .. })),
+            "expected at least one LegacyPlanCannotAuthor outcome, got {:?}",
+            report.outcomes,
+        );
+
+        let outcome_rows = store.fetch_run_outcomes_for_plan(plan.id).unwrap();
+        let legacy_rows: Vec<_> = outcome_rows
+            .iter()
+            .filter(|r| {
+                r.outcome_kind
+                    == situation_room_storage::fetch_run_outcomes::FetchRunOutcomeKind::LegacyPlanCannotAuthor
+            })
+            .collect();
+        assert!(
+            !legacy_rows.is_empty(),
+            "legacy outcome row was not persisted"
+        );
+        for row in legacy_rows {
+            assert!(
+                row.recipe_id.is_none(),
+                "legacy_plan_cannot_author rows must have recipe_id = None"
+            );
+            assert!(!row.source_id.is_empty());
+        }
     }
 
     /// ADR 0016 Phase 1 — end-to-end iterator path. One HTML body,

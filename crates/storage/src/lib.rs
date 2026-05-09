@@ -18,6 +18,7 @@ pub mod documents;
 pub mod entities;
 pub mod envelope_io;
 pub mod events;
+pub mod fetch_run_outcomes;
 pub mod fetch_runs;
 pub mod migrate;
 pub mod observations;
@@ -31,6 +32,10 @@ pub mod research_plans;
 pub mod sources_memory;
 
 pub use connection::Store;
+pub use fetch_run_outcomes::{
+    FetchRunOutcomeKind, FetchRunOutcomeRow, RecipeOutcomeHistoryEntry,
+    RecipeOutcomeHistoryRunRow, StoredFetchRunOutcome,
+};
 pub use fetch_runs::{FetchRunRow, StoredFetchRun};
 pub use queries::{RecordsByPlan, TopicUsage};
 pub use recipe_feedback::{RecipeFeedbackRow, StoredRecipeFeedback};

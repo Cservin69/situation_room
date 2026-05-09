@@ -1161,6 +1161,204 @@ impl RecipeFetchAttemptDto {
 }
 
 // ---------------------------------------------------------------------------
+// Session 46 — recipe-success heatmap DTOs
+// ---------------------------------------------------------------------------
+
+/// One per-run cell inside a [`RecipeOutcomesHistoryEntryDto`]. Mirrors
+/// [`situation_room_storage::fetch_run_outcomes::RecipeOutcomeHistoryRunRow`]
+/// one-for-one with two tweaks for the wire:
+/// - `run_id` becomes a string (matches the rest of the DTO surface).
+/// - `outcome_kind` is a [`RecipeOutcomeDto::kind`]-shaped string
+///   chosen from the same closed set the live `FetchReportDto` uses,
+///   so the frontend's existing `outcomeTone` helper can render
+///   history cells identically to the live outcomes list.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct RecipeOutcomesHistoryRunCellDto {
+    pub run_id: String,
+    pub attempted_at: DateTime<Utc>,
+    /// One of `succeeded` | `skipped` | `failed` | `rate_limited` |
+    /// `declined` | `legacy_plan_cannot_author` — the same closed set
+    /// `RecipeOutcomeDto::kind` uses. Stored as a string for ts-rs
+    /// simplicity; the frontend's `outcomeTone` helper takes a full
+    /// `RecipeOutcomeDto` so we synthesise one client-side from the
+    /// kind + payload fields below.
+    pub outcome_kind: String,
+    /// `Some(n)` when `outcome_kind == "succeeded"`. `None` otherwise.
+    pub records_produced: Option<u32>,
+    /// `Some(n)` when `outcome_kind == "rate_limited"` and the server
+    /// supplied a Retry-After. `None` otherwise.
+    pub retry_after_seconds: Option<u64>,
+    /// `Some("fetch" | "apply" | "insert")` when `outcome_kind ==
+    /// "failed"`. `None` otherwise.
+    pub failure_stage: Option<String>,
+    /// Human-readable detail: failure message, skip reason, or LLM
+    /// decline reason. `None` for `succeeded` / `rate_limited` /
+    /// `legacy_plan_cannot_author`.
+    pub message: Option<String>,
+}
+
+/// One row in the recipe-success heatmap.
+///
+/// Identifies the (recipe-or-source, source) pair the row groups by:
+/// - `recipe_id = Some(uuid)` for `succeeded` / `skipped` / `failed`
+///   / `rate_limited` outcomes (the recipe was authored).
+/// - `recipe_id = None` for `declined` / `legacy_plan_cannot_author`
+///   outcomes (no recipe was authored; group key is `source_id`
+///   alone).
+///
+/// `runs` is the per-run cell vec ordered oldest-first, so the
+/// frontend renders runs left-to-right without sorting.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct RecipeOutcomesHistoryEntryDto {
+    pub recipe_id: Option<String>,
+    pub source_id: String,
+    pub runs: Vec<RecipeOutcomesHistoryRunCellDto>,
+}
+
+impl RecipeOutcomesHistoryEntryDto {
+    /// Lift a typed
+    /// [`situation_room_storage::fetch_run_outcomes::RecipeOutcomeHistoryEntry`]
+    /// into wire shape. Pure renaming + UUID stringification; the
+    /// kind enum is serialised through its `as_str` form so the wire
+    /// strings match `RecipeOutcomeDto::kind` exactly.
+    pub fn from_stored(
+        e: situation_room_storage::fetch_run_outcomes::RecipeOutcomeHistoryEntry,
+    ) -> Self {
+        Self {
+            recipe_id: e.recipe_id.map(|id| id.to_string()),
+            source_id: e.source_id,
+            runs: e
+                .runs
+                .into_iter()
+                .map(|r| RecipeOutcomesHistoryRunCellDto {
+                    run_id: r.run_id.to_string(),
+                    attempted_at: r.attempted_at,
+                    outcome_kind: r.outcome_kind.as_str().to_string(),
+                    records_produced: r.records_produced,
+                    retry_after_seconds: r.retry_after_seconds,
+                    failure_stage: r.failure_stage,
+                    message: r.message,
+                })
+                .collect(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session 46 — expectation-coverage matrix DTOs
+// ---------------------------------------------------------------------------
+
+/// One row in the plan-expectation coverage matrix.
+///
+/// For each plan expectation (identified by `bucket` + `index`), the
+/// matrix lists which recipes target it via their `produces[].expectation`
+/// references. Uncovered buckets surface explicitly: the entry is
+/// returned with `recipes` empty so the frontend renders a "uncovered"
+/// marker rather than silently dropping the row.
+///
+/// The plan's `interpretation` paragraph and topic_tags are out of
+/// scope here — they're carried by `ResearchPlanDto` already.
+///
+/// ## Why per-(bucket, index) rows rather than per-bucket
+///
+/// A bucket can have multiple expectations (e.g. plan 019e0b21's
+/// observation_metrics has 4: production, reserves, refining_capacity,
+/// spot_price). The recipe-author prompt's coverage discipline
+/// (v1.14 §"Coverage discipline — bindings vs expectations")
+/// deliberately accepts narrow honest coverage where one recipe
+/// targets one expectation index. Surfacing per-index rows is what
+/// makes that narrowness legible — a per-bucket roll-up would
+/// collapse "production covered, reserves and refining_capacity not"
+/// into a single "1 of 4" cell that obscures *which* of the four.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct ExpectationCoverageRowDto {
+    /// One of `observation_metric` | `event_type` | `entity_kind` |
+    /// `relation_kind`. The same string the recipe's
+    /// `produces[].expectation.list` uses. (Document and Assertion
+    /// expectations are not addressed by recipe `produces` bindings;
+    /// they're surfaced through other surfaces and not part of this
+    /// matrix.)
+    pub bucket: String,
+    /// 0-indexed position within the bucket. Matches the recipe's
+    /// `produces[].expectation.index`.
+    pub index: u32,
+    /// The expectation's primary identifier as the user would read it
+    /// in the bucket panel — `metric.name` for observation,
+    /// `event.event_type` for event, etc. Empty string if the bucket
+    /// has fewer entries than `index`, which would only happen if the
+    /// plan's expectations changed between recipe authoring and this
+    /// query (rare but defensive).
+    pub label: String,
+    /// Recipes whose `produces[].expectation` reference points at this
+    /// (bucket, index). Empty Vec for uncovered expectations.
+    pub recipes: Vec<ExpectationCoverageRecipeDto>,
+}
+
+/// One recipe in the per-expectation `recipes` list.
+///
+/// Carries enough to render a chip: the recipe's id (for linking back
+/// to the recipe panel) and the source it fetches from.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct ExpectationCoverageRecipeDto {
+    pub recipe_id: String,
+    pub source_id: String,
+    /// The `record_type` of the binding ("observation" | "event" |
+    /// "relation"). Useful when a recipe binds to multiple
+    /// expectations in different buckets — the chip shows the type so
+    /// the operator can confirm the recipe targets the bucket they're
+    /// looking at.
+    pub record_type: String,
+}
+
+// ---------------------------------------------------------------------------
+// Session 46 — per-host backoff snapshot DTO (drive-by; piece B)
+// ---------------------------------------------------------------------------
+
+/// One per-host row from the backoff layer's [`snapshot`] accessor.
+///
+/// `wait_seconds_remaining` is `0` when the host is currently
+/// unblocked. Distinguish "0 wait + counter > 0" (recovering — the
+/// schedule expired but the failure history is still in effect for
+/// the next signal) from "0 wait + counter == 0" (clean state — the
+/// row exists only because a prior failure was reset by a successful
+/// fetch).
+///
+/// Today no IPC command exposes this DTO — it's carried as a
+/// drive-by for piece B. Mounting an IPC command on top of it is a
+/// one-screen change once piece B lands.
+///
+/// [`snapshot`]: situation_room_pipeline::fetch_backoff::HostBackoff::snapshot
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct HostBackoffSnapshotDto {
+    pub host: String,
+    pub consecutive_failures: u32,
+    pub wait_seconds_remaining: u64,
+}
+
+impl HostBackoffSnapshotDto {
+    /// Lift a typed
+    /// [`situation_room_pipeline::fetch_backoff::HostBackoffSnapshot`]
+    /// into wire shape. The wait `Duration` collapses to whole
+    /// seconds — sub-second precision isn't useful at the
+    /// presentation layer, and the `Duration` type isn't part of
+    /// ts-rs's default surface.
+    pub fn from_typed(
+        s: situation_room_pipeline::fetch_backoff::HostBackoffSnapshot,
+    ) -> Self {
+        Self {
+            host: s.host,
+            consecutive_failures: s.consecutive_failures,
+            wait_seconds_remaining: s.wait_remaining.as_secs(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -414,6 +414,54 @@ impl HostBackoff {
         };
         map.get(host).map(|s| s.consecutive_failures).unwrap_or(0)
     }
+
+    /// Enumerate the per-host state. Pure read; one entry per host the
+    /// adaptation layer has ever recorded a signal for. Hosts whose
+    /// only history is success (zero failures, no future block) are
+    /// included with `wait_remaining = Duration::ZERO` and
+    /// `consecutive_failures = 0` — the counter resets on success
+    /// rather than evicting the row, so the row's existence is itself
+    /// a signal that the host has been touched at least once this
+    /// session.
+    ///
+    /// Session 46 — added as a drive-by to unblock the per-host
+    /// backoff status surface (handoff piece B). Today no caller
+    /// reads it; the API crate's introspection IPC will land on top
+    /// of this.
+    ///
+    /// Returns owned strings rather than borrowed slices because the
+    /// caller (a Tauri command marshalling into a Vec<DTO>) needs
+    /// 'static-lifetime data and locking the Mutex for borrow
+    /// duration would defeat the snapshot's purpose.
+    pub fn snapshot(&self) -> Vec<HostBackoffSnapshot> {
+        let map = match self.state.lock() {
+            Ok(m) => m,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = Instant::now();
+        map.iter()
+            .map(|(host, s)| HostBackoffSnapshot {
+                host: host.clone(),
+                consecutive_failures: s.consecutive_failures,
+                wait_remaining: s.next_allowed_at.saturating_duration_since(now),
+            })
+            .collect()
+    }
+}
+
+/// One per-host row from [`HostBackoff::snapshot`].
+///
+/// `wait_remaining` is `Duration::ZERO` when the host is currently
+/// unblocked (its `next_allowed_at` is in the past). Callers
+/// presenting this to operators should distinguish "zero wait but
+/// counter > 0" (the host is recovering — backoff window expired but
+/// the failure history is still in effect for the next failure) from
+/// "zero wait and counter == 0" (clean state).
+#[derive(Debug, Clone)]
+pub struct HostBackoffSnapshot {
+    pub host: String,
+    pub consecutive_failures: u32,
+    pub wait_remaining: Duration,
 }
 
 impl Default for HostBackoff {
@@ -842,6 +890,66 @@ mod tests {
             wait >= Duration::from_secs(HOST_BACKOFF_MAX_SECS - 2),
             "wait should still be in the cap band (got {wait:?})"
         );
+    }
+
+    // -- Session 46: snapshot accessor --------------------------------------
+
+    #[test]
+    fn host_backoff_snapshot_is_empty_on_fresh_state_session_46() {
+        let hb = HostBackoff::new();
+        let snap = hb.snapshot();
+        assert!(snap.is_empty(), "fresh state has no snapshot rows");
+    }
+
+    #[test]
+    fn host_backoff_snapshot_reports_recorded_failures_session_46() {
+        let hb = HostBackoff::new();
+        hb.record_rate_limited("a.example.com", Some(Duration::from_secs(15)));
+        hb.record_timeout("b.example.com");
+
+        let snap = hb.snapshot();
+        assert_eq!(snap.len(), 2);
+
+        let a = snap.iter().find(|r| r.host == "a.example.com").unwrap();
+        let b = snap.iter().find(|r| r.host == "b.example.com").unwrap();
+
+        assert_eq!(a.consecutive_failures, 1);
+        // Honored Retry-After: ~15s remaining (allow slop).
+        assert!(
+            a.wait_remaining <= Duration::from_secs(15)
+                && a.wait_remaining >= Duration::from_secs(14),
+            "a wait should be ~15s, got {:?}",
+            a.wait_remaining
+        );
+
+        assert_eq!(b.consecutive_failures, 1);
+        // Timeout schedule: ~1s.
+        assert!(
+            b.wait_remaining <= Duration::from_secs(1),
+            "b wait should be ~1s, got {:?}",
+            b.wait_remaining
+        );
+    }
+
+    #[test]
+    fn host_backoff_snapshot_keeps_row_after_success_with_zero_counter_session_46() {
+        // Counter resets on success but the row is preserved so the
+        // operator can see "this host had failures earlier and is now
+        // recovered." Pinning the behaviour explicitly here.
+        //
+        // We seed with `Some(Duration::ZERO)` rather than `None` so
+        // `next_allowed_at` is set to ~now (not now + 1s from the
+        // exponential schedule), keeping `wait_remaining` testable
+        // without time-virtualisation.
+        let hb = HostBackoff::new();
+        hb.record_rate_limited("recovered.example.com", Some(Duration::ZERO));
+        hb.record_success("recovered.example.com");
+
+        let snap = hb.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].host, "recovered.example.com");
+        assert_eq!(snap[0].consecutive_failures, 0);
+        assert_eq!(snap[0].wait_remaining, Duration::ZERO);
     }
 
     #[test]

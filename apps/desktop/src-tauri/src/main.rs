@@ -175,6 +175,14 @@ fn main() -> Result<()> {
             // in the same commit as the command per the hard rule.
             situation_room_api::commands::latest_attempt_for_recipe,
             situation_room_api::commands::reauthor_recipe,
+            // Session 46 — operator-introspection surfaces over data
+            // the runtime already produces. The heatmap reads
+            // `fetch_run_outcomes` (migration 0016, populated by the
+            // executor at run completion); coverage reads
+            // `recipes.produces_json` joined against the plan's
+            // expectations. Both are pure reads; no LLM call.
+            situation_room_api::commands::recipe_outcomes_history,
+            situation_room_api::commands::expectation_coverage,
             // Session 22 added the records-rendering join (storage
             // query + DTO + #[tauri::command] function), but the
             // command wasn't added to this macro list — so Tauri

@@ -103,6 +103,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "recipes.iterator column (ADR 0016)",
         sql: include_str!("../../../migrations/0015_recipes_iterator.sql"),
     },
+    Migration {
+        version: 16,
+        description: "fetch_run_outcomes table",
+        sql: include_str!("../../../migrations/0016_fetch_run_outcomes.sql"),
+    },
 ];
 
 /// Apply every migration whose version is not yet in

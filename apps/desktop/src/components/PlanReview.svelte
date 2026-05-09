@@ -65,6 +65,8 @@
   import RunFetchButton from '$components/RunFetchButton.svelte';
   import FetchReport from '$components/FetchReport.svelte';
   import RecipesPanel from '$components/RecipesPanel.svelte';
+  import RecipeOutcomesHeatmap from '$components/RecipeOutcomesHeatmap.svelte';
+  import ExpectationCoverage from '$components/ExpectationCoverage.svelte';
   import RejectDialog from '$components/dialogs/RejectDialog.svelte';
 
   interface Props {
@@ -445,6 +447,26 @@
   {#if plans.fetchReport || plans.fetchRuns.length > 0}
     <FetchReport />
   {/if}
+
+  <!-- Recipe-success heatmap (Session 46). Slots between the live
+       fetch report (above) and the recipes inspection panel (below)
+       so the operator's vertical scan reads:
+         "what just happened" → "history of what happened" → "the
+         recipes themselves."
+
+       Renders an empty hint when no fetch_run_outcomes rows exist
+       yet (pre-Session-46 plans, or freshly-accepted plans before
+       their first fetch); see RecipeOutcomesHeatmap.svelte for the
+       empty-state taxonomy. -->
+  <RecipeOutcomesHeatmap />
+
+  <!-- Expectation-coverage matrix (Session 46). Slots above the
+       recipes panel. Surfaces the recipe-author prompt's "narrow
+       honest coverage" discipline: for each plan expectation, list
+       the recipes that bind to it, or mark it explicitly uncovered.
+       The component renders nothing when the coverage matrix
+       hasn't loaded (pending plan; pre-acceptance render). -->
+  <ExpectationCoverage />
 
   <!-- Recipes panel (Session 11 P2.5). Renders the Level-2 authored
        recipes for the selected plan so the user can read what URL

@@ -23,6 +23,8 @@ import type { RecipeDto } from './types/RecipeDto';
 import type { RecipeFeedbackDto } from './types/RecipeFeedbackDto';
 import type { RecipeFetchAttemptDto } from './types/RecipeFetchAttemptDto';
 import type { RecordsByPlanDto } from './types/RecordsByPlanDto';
+import type { RecipeOutcomesHistoryEntryDto } from './types/RecipeOutcomesHistoryEntryDto';
+import type { ExpectationCoverageRowDto } from './types/ExpectationCoverageRowDto';
 
 /**
  * Run Level-1 classification on a topic. Persists the resulting plan
@@ -310,6 +312,58 @@ export async function reauthorRecipe(
  */
 export async function recordsForPlan(id: string): Promise<RecordsByPlanDto> {
   return invoke<RecordsByPlanDto>('records_for_plan', { id });
+}
+
+/**
+ * Per-(recipe-or-source) outcome history across the plan's recent
+ * fetch runs. Pure read; safe to call on plan selection.
+ *
+ * Each returned entry is one row in the recipe-success heatmap; each
+ * `runs[i]` is one column-cell. Cells arrive ordered oldest-first so
+ * the frontend renders runs left-to-right without sorting; entries
+ * arrive in insertion order so recipe rows stay visually stable
+ * across renders.
+ *
+ * `runLimit` clamps the runs (column) dimension. The backend caps it
+ * at `AppState::MAX_OUTCOMES_HISTORY_RUNS` (currently 50).
+ *
+ * Throws `{ kind: 'invalid_input' }` if `planId` isn't a UUID.
+ */
+export async function recipeOutcomesHistory(
+  planId: string,
+  runLimit = 20,
+): Promise<RecipeOutcomesHistoryEntryDto[]> {
+  return invoke<RecipeOutcomesHistoryEntryDto[]>('recipe_outcomes_history', {
+    planId,
+    runLimit,
+  });
+}
+
+/**
+ * Plan-expectation coverage matrix: which recipes target which
+ * expectations, plus an explicit row per uncovered expectation. Pure
+ * read; safe to call on plan selection.
+ *
+ * Returns one row per (bucket, index) the plan declares across the
+ * four binding-addressable buckets — `observation_metric`,
+ * `event_type`, `entity_kind`, `relation_kind`. Document and
+ * Assertion expectations aren't part of this matrix because they
+ * aren't addressed by recipe `produces` bindings.
+ *
+ * Uncovered expectations surface with `recipes` empty so the
+ * frontend can render an explicit "uncovered" marker rather than
+ * silently dropping the row.
+ *
+ * Throws:
+ *   - `{ kind: 'invalid_input' }` — `planId` isn't a UUID.
+ *   - `{ kind: 'not_found' }` — plan with this id isn't in the store.
+ */
+export async function expectationCoverage(
+  planId: string,
+): Promise<ExpectationCoverageRowDto[]> {
+  return invoke<ExpectationCoverageRowDto[]>('expectation_coverage', {
+    planId,
+  });
 }
 
 /**
