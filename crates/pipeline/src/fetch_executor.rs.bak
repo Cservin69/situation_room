@@ -4382,7 +4382,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
             propose_url_prompt: "",
@@ -4462,7 +4461,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "unused — legacy entries are not authored",
             propose_url_prompt: "",
@@ -4535,7 +4533,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
             propose_url_prompt: "",
@@ -4607,7 +4604,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "unused — recipe already authored",
             propose_url_prompt: "",
@@ -4645,7 +4641,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
@@ -4676,7 +4671,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
@@ -4712,7 +4706,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
@@ -4786,7 +4779,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
             propose_url_prompt: "",
@@ -4838,7 +4830,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
@@ -4879,7 +4870,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
             propose_url_prompt: "",
@@ -4935,7 +4925,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
@@ -4974,7 +4963,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
             propose_url_prompt: "",
@@ -5038,7 +5026,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
@@ -5084,7 +5071,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
@@ -5168,7 +5154,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
@@ -5245,7 +5230,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
             propose_url_prompt: "",
@@ -5304,7 +5288,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
@@ -5345,7 +5328,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
@@ -5541,7 +5523,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &http,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "unused — recipe pre-authored",
             propose_url_prompt: "",
@@ -5664,7 +5645,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &http,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "unused — recipe pre-authored",
             propose_url_prompt: "",
@@ -5823,7 +5803,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
@@ -5890,7 +5869,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
@@ -5957,7 +5935,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
@@ -6022,7 +5999,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
@@ -6196,7 +6172,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &http,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "unused — recipe pre-authored",
             propose_url_prompt: "",
@@ -6338,7 +6313,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &http,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "unused — recipe pre-authored",
             propose_url_prompt: "",
@@ -6563,418 +6537,6 @@ mod tests {
             result.is_err() || matches!(&result, Ok(s) if s.is_empty() || s.starts_with("(PDF parsed")),
             "malformed PDF bytes should surface as an error or a \
              zero-page parse, not silently produce a random success; got {result:?}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Session 50 — topic-aware PDF page selection (Class B)
-    //
-    // The pre-Session-50 path emitted every PDF page in document order
-    // until [`PREFETCH_EXCERPT_BUDGET`] truncated. On long densely-
-    // tabulated regulatory PDFs (USGS MCS, EUR-Lex annexes) the
-    // budget exhausted before the relevant chapter — the lithium MCS
-    // run on 2026-05-09 hit this on page 110. Session 50 introduces
-    // a topic-relevance vocabulary built from
-    // `plan.topic_tags + nomination.description + plan.geographic_scope`
-    // and uses it to score per-page framed text. The selection keeps
-    // a small head-of-document orientation block plus the highest-
-    // scoring pages; gaps between selected pages emit an explicit
-    // skip marker so the LLM sees the truncation rather than
-    // silently receiving a partial document.
-    //
-    // Tests below drive the helper functions directly without going
-    // through `pdf_extract` — `render_pdf_pages_with_tables` is pure
-    // over a `&[String]` of page texts, so we can build synthetic
-    // fixtures inline. The real PDF-driven path is covered by
-    // `render_pdf_text_with_tables_against_lithium_fixture_emits_framed_tables`
-    // above (and continues to pin the no-relevance behaviour because
-    // the wrapper passes `None`).
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn prefetch_relevance_builds_vocab_from_plan_and_nomination_session_50() {
-        // The vocabulary is a token-overlap surface; the test pins
-        // the projection from plan + nomination into the lowercase
-        // distinct-token list. Stop-words ("data", "annual",
-        // "report") and short tokens (< 4 chars) are filtered.
-        let mut plan = sample_plan();
-        plan.topic_tags = vec![Topic::new("lithium_supply").unwrap()];
-        plan.geographic_scope = vec![GeoScope {
-            code: "CL".to_string(),
-            display: "Chile".to_string(),
-        }];
-        let nomination = DocumentSourceNomination {
-            nomination_id: Uuid::now_v7(),
-            description:
-                "USGS Mineral Commodity Summaries — annual lithium chapter, mine production in tonnes by country"
-                    .to_string(),
-            priority_tier: PriorityTier::AuthoritativePrimary,
-        };
-
-        let rel = PrefetchRelevance::from_plan_and_nomination(&plan, &nomination);
-
-        // Substantive tokens present. Note: snake_case / hyphenated
-        // topic tags are split on the underscore/hyphen by the
-        // tokenizer (those characters fail the `is_ascii_alphanumeric`
-        // word-boundary check), so the topic tag `lithium_supply`
-        // contributes both `lithium` and `supply` rather than the
-        // underscore-bearing whole. PDFs almost never contain
-        // underscores in surface text, so splitting matches the
-        // surface form a real document would carry.
-        for needle in ["lithium", "supply", "chile", "production", "country", "summaries", "mineral", "commodity", "tonnes", "chapter", "mine"] {
-            assert!(
-                rel.vocab.iter().any(|t| t == needle),
-                "expected vocab to contain {needle:?}; got {:?}",
-                rel.vocab
-            );
-        }
-        // Stopwords filtered out.
-        for forbidden in ["annual", "data", "report", "page", "table", "year", "this", "that", "with"] {
-            assert!(
-                !rel.vocab.iter().any(|t| t == forbidden),
-                "vocab should not contain stopword {forbidden:?}; got {:?}",
-                rel.vocab
-            );
-        }
-        // Short tokens (< 4 chars) filtered out.
-        for forbidden in ["of", "the", "by", "in", "cl"] {
-            assert!(
-                !rel.vocab.iter().any(|t| t == forbidden),
-                "vocab should not contain short token {forbidden:?}; got {:?}",
-                rel.vocab
-            );
-        }
-        // Pure-numeric tokens filtered out.
-        assert!(
-            !rel.vocab.iter().any(|t| t.chars().all(|c| c.is_ascii_digit())),
-            "vocab should not contain pure-numeric tokens; got {:?}",
-            rel.vocab
-        );
-    }
-
-    #[test]
-    fn prefetch_relevance_empty_when_plan_and_nomination_yield_no_substantive_tokens_session_50() {
-        // A plan with no topic tags + a nomination whose description
-        // is all stopwords + no geographic scope yields an empty
-        // vocabulary. The caller treats empty as "no signal — fall
-        // back to document-order emission" (see
-        // `render_pdf_pages_with_tables`).
-        let mut plan = sample_plan();
-        plan.topic_tags = vec![];
-        plan.geographic_scope = vec![];
-        let nomination = DocumentSourceNomination {
-            nomination_id: Uuid::now_v7(),
-            description: "this report data annual table".to_string(),
-            priority_tier: PriorityTier::AuthoritativePrimary,
-        };
-
-        let rel = PrefetchRelevance::from_plan_and_nomination(&plan, &nomination);
-        assert!(
-            rel.vocab.is_empty(),
-            "stopwords-only description with empty plan should yield empty vocab; got {:?}",
-            rel.vocab
-        );
-    }
-
-    #[test]
-    fn score_text_against_vocab_counts_substring_occurrences_session_50() {
-        let vocab = vec!["lithium".to_string(), "production".to_string()];
-        let text =
-            "Lithium production rose 12%. The lithium-ion battery share of \
-             production climbed sharply.";
-        // "lithium" appears 2× (case-folded), "production" appears 2×.
-        // Total: 4.
-        assert_eq!(score_text_against_vocab(text, &vocab), 4);
-    }
-
-    #[test]
-    fn score_text_against_vocab_returns_zero_for_empty_vocab_session_50() {
-        let text = "Lithium production rose.";
-        assert_eq!(score_text_against_vocab(text, &[]), 0);
-    }
-
-    #[test]
-    fn render_pdf_pages_falls_back_to_document_order_with_no_relevance_session_50() {
-        // No relevance context: every page emits in document order
-        // — the pre-Session-50 behaviour preserved through the
-        // wrapper. Pin it so a future change to the helper doesn't
-        // silently change the no-relevance path.
-        let pages = vec![
-            "title page".to_string(),
-            "page two narrative".to_string(),
-            "page three narrative".to_string(),
-        ];
-        let out = render_pdf_pages_with_tables(&pages, None, PREFETCH_EXCERPT_BUDGET);
-        assert!(out.contains("[PDF page 1] (no table detected)"));
-        assert!(out.contains("[PDF page 2] (no table detected)"));
-        assert!(out.contains("[PDF page 3] (no table detected)"));
-        assert!(
-            !out.contains("[... ") && !out.contains("skipped"),
-            "no-relevance path must not emit skip markers; got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn render_pdf_pages_falls_back_to_document_order_when_all_scores_zero_session_50() {
-        // Vocab present but no page text matches it — selection
-        // returns all indices, emit-step produces document-order
-        // output. The fallback is what makes this safe to apply
-        // unconditionally: even if the vocabulary is wrong-shaped
-        // for the document at hand, the LLM still sees the document.
-        let pages = vec![
-            "title page".to_string(),
-            "page two".to_string(),
-            "page three".to_string(),
-        ];
-        let rel = PrefetchRelevance {
-            vocab: vec!["lithium".to_string(), "production".to_string()],
-        };
-        let out = render_pdf_pages_with_tables(&pages, Some(&rel), PREFETCH_EXCERPT_BUDGET);
-        for n in 1..=3 {
-            assert!(
-                out.contains(&format!("[PDF page {n}] (no table detected)")),
-                "all-zero-score path should emit every page; missing page {n} in:\n{out}"
-            );
-        }
-        assert!(
-            !out.contains("skipped"),
-            "all-zero-score fallback must not emit skip markers; got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn render_pdf_pages_selects_high_score_pages_and_emits_skip_marker_session_50() {
-        // Synthetic 8-page document: head pages (1..=3) carry
-        // orientation prose; pages 4–7 carry irrelevant filler;
-        // page 8 carries vocabulary-matching text. Selection should
-        // include head pages + page 8, with a skip marker covering
-        // pages 4–7.
-        //
-        // Note: pages without detected tables score against vocab
-        // via the framed marker line only ("[PDF page N] (no table
-        // detected)") — so vocab tokens must appear in framed
-        // output. To get a non-zero score on page 8, we need either
-        // a detected table or vocab tokens visible in the framed
-        // text. Since `detect_pdf_tables` requires multi-line
-        // multi-cell shapes that don't form here, we score page 8
-        // by simulating a "page with vocab inside the page text"
-        // pattern that survives framing. We'll construct page 8 as
-        // narrative; the framed output is just the marker, which
-        // doesn't contain vocab. To make the test exercise the
-        // selection path, we use the helper's score function
-        // directly on the raw page text and verify the selection
-        // picks page 8. The helper currently scores against framed
-        // text — so we set a synthetic budget tight enough to
-        // exclude all pages and verify selection emits only head
-        // pages with no-relevance fallback. Skip-marker assertion
-        // is covered by `emit_selected_pdf_pages_emits_skip_marker_*`
-        // below.
-        let pages: Vec<String> = (1..=8)
-            .map(|n| format!("page {n}: irrelevant filler"))
-            .collect();
-        let rel = PrefetchRelevance {
-            // The framed text for a no-table page is "[PDF page N]
-            // (no table detected)" — none of these vocab tokens
-            // will hit, exercising the all-zero fallback.
-            vocab: vec!["lithium".to_string(), "production".to_string()],
-        };
-        let out = render_pdf_pages_with_tables(&pages, Some(&rel), PREFETCH_EXCERPT_BUDGET);
-        // All-zero fallback: every page present, no skip marker.
-        for n in 1..=8 {
-            assert!(
-                out.contains(&format!("[PDF page {n}]")),
-                "page {n} should be emitted in the all-zero fallback; missing in:\n{out}"
-            );
-        }
-    }
-
-    #[test]
-    fn select_pdf_pages_includes_head_and_high_score_session_50() {
-        // Drive `select_pdf_pages_by_relevance` directly with a
-        // hand-built `framed` slice so we can score against
-        // synthesised text. Pages 0..=2 are the head; page 7 carries
-        // the vocab match. Selection should be {0, 1, 2, 7}.
-        let framed: Vec<String> = (0..8)
-            .map(|i| {
-                if i == 7 {
-                    "[PDF page 8, table 0] (2 rows × 2 cols)\n  row 0: \"country\"  \"production\"\n  row 1: \"chile\"  \"lithium\"".to_string()
-                } else {
-                    format!("[PDF page {}] (no table detected)", i + 1)
-                }
-            })
-            .collect();
-        let vocab = vec![
-            "lithium".to_string(),
-            "production".to_string(),
-            "chile".to_string(),
-        ];
-        let selected = select_pdf_pages_by_relevance(&framed, &vocab, PREFETCH_EXCERPT_BUDGET);
-        assert_eq!(
-            selected,
-            vec![0, 1, 2, 7],
-            "expected head pages 0..=2 plus high-score page 7; got {selected:?}"
-        );
-    }
-
-    #[test]
-    fn select_pdf_pages_respects_budget_session_50() {
-        // Budget is small enough to fit only head pages + one
-        // additional page; selection must stop at the budget rather
-        // than greedily adding all positive-score pages.
-        let framed: Vec<String> = (0..6)
-            .map(|i| {
-                // Each page's framed text carries the vocab token
-                // so every page scores positive — without a budget
-                // gate the selection would include all of them.
-                format!(
-                    "[PDF page {}, table 0] (2 rows × 2 cols)\n  row 0: \"country\"  \"production\"\n  row 1: \"chile\"  \"lithium\"",
-                    i + 1
-                )
-            })
-            .collect();
-        let vocab = vec!["lithium".to_string()];
-        // Sum of head pages + sep + one extra page + sep is the
-        // budget; anything tighter forces head-only.
-        let head_size: usize = framed[0..3].iter().map(|s| s.len()).sum::<usize>() + 2 * 2;
-        let one_extra = framed[3].len() + 2;
-        let budget = head_size + one_extra; // exactly room for head + one
-        let selected = select_pdf_pages_by_relevance(&framed, &vocab, budget);
-        assert_eq!(
-            selected.len(),
-            4,
-            "budget allows head pages + one extra; got {} selected: {selected:?}",
-            selected.len()
-        );
-    }
-
-    #[test]
-    fn emit_selected_pdf_pages_emits_skip_marker_for_gaps_session_50() {
-        // Selection {0, 1, 2, 7} on an 8-page doc: emit step joins
-        // contiguous pages with `\n\n`, gaps with an explicit skip
-        // marker naming the count. The marker is closed-vocab clean
-        // — no source-specific text, just "low topic relevance".
-        let framed: Vec<String> = (0..8)
-            .map(|i| format!("[PDF page {}] frame", i + 1))
-            .collect();
-        let out = emit_selected_pdf_pages(&framed, &[0, 1, 2, 7]);
-        assert!(out.contains("[PDF page 1] frame"));
-        assert!(out.contains("[PDF page 2] frame"));
-        assert!(out.contains("[PDF page 3] frame"));
-        assert!(out.contains("[PDF page 8] frame"));
-        assert!(
-            out.contains("[... 4 pages skipped (low topic relevance) ...]"),
-            "expected 4-page skip marker between page 3 and page 8; got:\n{out}"
-        );
-        // Pages 4–7 must not appear in the emitted output.
-        for n in 4..=7 {
-            assert!(
-                !out.contains(&format!("[PDF page {n}] frame")),
-                "page {n} should be skipped; found it in:\n{out}"
-            );
-        }
-    }
-
-    #[test]
-    fn emit_selected_pdf_pages_no_marker_when_contiguous_session_50() {
-        let framed: Vec<String> = (0..3)
-            .map(|i| format!("[PDF page {}] frame", i + 1))
-            .collect();
-        let out = emit_selected_pdf_pages(&framed, &[0, 1, 2]);
-        assert!(!out.contains("skipped"));
-        assert!(out.contains("[PDF page 1] frame"));
-        assert!(out.contains("[PDF page 2] frame"));
-        assert!(out.contains("[PDF page 3] frame"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Session 50 — separate prefetch HTTP client (Class C)
-    //
-    // The executor's `prefetch_excerpt` routes through
-    // `ctx.prefetch_http.unwrap_or(ctx.http)`. Tests below pin the
-    // routing: when `prefetch_http` is `Some(_)`, that fetcher is
-    // used; when `None`, the shared `http` is used. The actual
-    // `total_timeout` value (60s) lives in the binary's composition
-    // root and is not unit-testable without a live network — the
-    // contract this suite pins is the routing, not the wall-clock
-    // behaviour.
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn prefetch_excerpt_routes_through_prefetch_http_when_set_session_50() {
-        // Two fetchers: `main_fetcher` answers for the URL, but the
-        // test asserts the prefetch path NEVER reads from it.
-        // `prefetch_fetcher` is the one that should serve the
-        // request. We probe by configuring main_fetcher with a
-        // different body and asserting the rendered excerpt
-        // matches the prefetch fetcher's body.
-        let url_str = "https://example.test/data.csv";
-        let url = url::Url::parse(url_str).unwrap();
-        let main_body = b"main,fetcher,body\n1,2,3\n";
-        let prefetch_body = b"prefetch,fetcher,body\n4,5,6\n";
-        let main_fetcher = StaticFetcher::new().with(url_str, main_body);
-        let prefetch_fetcher = StaticFetcher::new().with(url_str, prefetch_body);
-
-        let plan = sample_plan();
-        let store = make_store_with_accepted_plan(&plan);
-        let provider = UnreachableProvider;
-        let ctx = ExecutorContext {
-            store: &store,
-            http: &main_fetcher,
-            prefetch_http: Some(&prefetch_fetcher),
-            provider: &provider,
-            recipe_author_prompt: "",
-            propose_url_prompt: "",
-            sources: &[],
-        };
-
-        let (excerpt, bytes) =
-            prefetch_excerpt(&ctx, &url, "example.test", None).await.unwrap();
-        assert_eq!(
-            bytes.as_slice(),
-            &prefetch_body[..],
-            "prefetch_excerpt must read from ctx.prefetch_http when Some(_) is set"
-        );
-        assert!(
-            excerpt.contains("prefetch,fetcher,body"),
-            "rendered excerpt must contain prefetch fetcher's body; got:\n{excerpt}"
-        );
-        assert!(
-            !excerpt.contains("main,fetcher,body"),
-            "rendered excerpt must NOT contain main fetcher's body — \
-             that would mean the prefetch routing is broken; got:\n{excerpt}"
-        );
-    }
-
-    #[tokio::test]
-    async fn prefetch_excerpt_falls_back_to_http_when_prefetch_http_none_session_50() {
-        // Pre-Session-50 callers (and tests that pass `None`)
-        // continue to use `ctx.http` — the unwrap_or fallback. Pin
-        // the fallback so a future refactor doesn't silently drop
-        // the None-handling path.
-        let url_str = "https://example.test/data.csv";
-        let url = url::Url::parse(url_str).unwrap();
-        let body = b"shared,client\n1,2\n";
-        let main_fetcher = StaticFetcher::new().with(url_str, body);
-
-        let plan = sample_plan();
-        let store = make_store_with_accepted_plan(&plan);
-        let provider = UnreachableProvider;
-        let ctx = ExecutorContext {
-            store: &store,
-            http: &main_fetcher,
-            prefetch_http: None,
-            provider: &provider,
-            recipe_author_prompt: "",
-            propose_url_prompt: "",
-            sources: &[],
-        };
-
-        let (_excerpt, bytes) =
-            prefetch_excerpt(&ctx, &url, "example.test", None).await.unwrap();
-        assert_eq!(
-            bytes.as_slice(),
-            &body[..],
-            "prefetch_excerpt with None must fall back to ctx.http"
         );
     }
 
@@ -7487,7 +7049,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
@@ -7614,7 +7175,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
@@ -7754,7 +7314,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
@@ -8274,7 +7833,6 @@ mod tests {
         let ctx = ExecutorContext {
             store: &store,
             http: &fetcher,
-            prefetch_http: None,
             provider: &provider,
             recipe_author_prompt: "unused — first propose 404s, second declines",
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,

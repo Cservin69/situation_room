@@ -89,12 +89,53 @@
   Lifting the dialog state into the runes store would be the cleaner
   next-step refactor when a third panel needs it; the local pattern
   matches RecipesPanel's existing shape and keeps this patch surgical.
+
+  Session 50 — running-now scaffold
+  ---------------------------------
+
+  Pre-Session-50 the panel rendered nothing during a run: the user
+  hit "run", `plans.fetching` flipped true, the run-fetch IPC call
+  ran for 5–15 minutes, and only when it returned did a populated
+  report show up. That was 20+ sessions of staring at a void
+  (operator's words). Session 50 adds a running-now scaffold that
+  pre-populates the nomination list from `plans.selected.expectations.
+  document_sources` the moment the run starts. Each row reads
+  "queued" because the existing `run_fetch_for_plan` IPC command is
+  synchronous and returns one big `FetchReportDto` at the end; we
+  don't yet have a per-nomination event stream to flip rows from
+  "queued" to "fetching" to "authoring" to "outcome" live.
+
+  The deferred Right path — a Tauri event channel
+  (`fetch_run_progress`) emitting per-nomination stage transitions
+  the executor already has internal state for — is documented in
+  the Session 50 patch doc as the Session 51+ thread. The right
+  shape requires a new IPC surface, a new DTO that mirrors the
+  executor's stage taxonomy without becoming a parallel state
+  surface that drifts from `RecipeOutcome`, and channel-lifecycle
+  decisions (backpressure, disconnect, replay-on-reconnect). Worth
+  its own session.
 -->
 <script lang="ts">
   import { plans, flagRecipe } from '$stores/plans.svelte';
   import type { FetchRunSummaryDto } from '$lib/api/types/FetchRunSummaryDto';
+  import type { PriorityTierDto } from '$lib/api/types/PriorityTierDto';
   import { outcomeTone, outcomeLabel, outcomeDetail, outcomeKey } from '$lib/outcomes';
   import RecipeFlagDialog from '$components/dialogs/RecipeFlagDialog.svelte';
+
+  // Session 50: a tight label for the running-now nomination list's
+  // tier badge. The full PriorityTierDto strings are too long for
+  // the inline column slot the running-list reserves; a 4-char abbr
+  // matches the existing badge convention in PlanReview's source-
+  // priority chips.
+  function tierShortLabel(t: PriorityTierDto): string {
+    switch (t) {
+      case 'authoritative_primary': return 'P1';
+      case 'authoritative_secondary': return 'P2';
+      case 'industry_trade_press': return 'TP';
+      case 'general_news': return 'GN';
+      default: return '??';
+    }
+  }
 
   function shortId(id: string): string {
     // UUIDv7s are too long for inline display; first 8 chars are
@@ -150,6 +191,73 @@
 </script>
 
 <section class="fetch-report">
+  {#if plans.fetching && plans.selected}
+    <!--
+      Session 50 — running-now scaffold. Pre-populates the nomination
+      list from the selected plan's `document_sources` the instant
+      `plans.fetching` flips true, so the operator sees what the
+      pipeline is iterating instead of a blank panel.
+
+      Each row reads "queued" because the existing
+      `run_fetch_for_plan` IPC command returns one bundled report at
+      the end of the run. Per-nomination stage transitions — what
+      would let rows flip from "queued" to "fetching" / "authoring"
+      live — require a new event channel (Session 51 thread).
+
+      The previous run's report (if any) keeps rendering below this
+      block while a new run is in flight. That preserves the
+      operator's at-a-glance "did this plan ever produce records"
+      context during multi-run sessions.
+    -->
+    {@const docs = plans.selected.expectations.document_sources}
+    <div class="running-now">
+      <header class="head">
+        <span class="label">running now</span>
+        <span class="summary">
+          <span class="kv">
+            <span class="k">nominations</span>
+            <span class="v">{docs.length}</span>
+          </span>
+          <span class="running-pulse" aria-hidden="true">working…</span>
+        </span>
+      </header>
+      {#if docs.length === 0}
+        <p class="running-empty">
+          this plan declares no document_sources — the executor will
+          return an empty report. (Re-classify if you expect document
+          coverage.)
+        </p>
+      {:else}
+        <ul class="running-list">
+          {#each docs as entry, i (entry.kind === 'nomination' ? entry.nomination_id : `legacy-${i}`)}
+            <li class="running-row">
+              <span class="row-marker">queued</span>
+              {#if entry.kind === 'nomination'}
+                <span class="priority-tier" data-tier={entry.priority_tier}>
+                  {tierShortLabel(entry.priority_tier)}
+                </span>
+                <span class="description" title={entry.description}>
+                  {entry.description}
+                </span>
+              {:else}
+                <span class="priority-tier" data-tier="legacy">LEG</span>
+                <span class="description">
+                  legacy entry — re-classify the plan to make this
+                  nomination authorable
+                </span>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
+      <p class="running-explainer">
+        Each nomination runs propose-URL (up to 3 attempts) followed
+        by recipe authoring against any URL that prefetches. Per-row
+        stage isn't surfaced live yet — Session 51 thread.
+      </p>
+    </div>
+  {/if}
+
   {#if plans.fetchReport}
     {@const report = plans.fetchReport}
     <header class="head">
@@ -580,5 +688,91 @@
     color: var(--signal-negative);
     font-weight: 600;
     cursor: help;
+  }
+
+  /* Session 50 — running-now scaffold. Visually distinct from the
+     final-report block so the operator sees at a glance that this
+     panel reflects "what's being worked on right now" vs. "what came
+     back from the most recent run". The dashed border-left mirrors
+     the run-history strip's pending state for a consistent visual
+     dialect of "in-flight". */
+  .running-now {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 8px 10px;
+    border-left: 2px dashed var(--signal-info, var(--border-accent));
+    background: var(--bg-panel-alt);
+    border-radius: 2px;
+  }
+  .running-pulse {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--fg-tertiary);
+    letter-spacing: 0.06em;
+    /* No CSS animation — keeping it static avoids motion noise for
+       operators who prefer reduced motion, and a static label is
+       enough to convey "this is working" alongside the dashed
+       border which already signals in-flight status. */
+  }
+  .running-empty {
+    margin: 0;
+    color: var(--fg-tertiary);
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .running-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .running-row {
+    display: grid;
+    grid-template-columns: 60px 32px 1fr;
+    column-gap: 10px;
+    align-items: baseline;
+    padding: 3px 6px;
+    font-size: 12px;
+    font-family: var(--font-mono);
+  }
+  .row-marker {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--fg-quaternary);
+  }
+  .priority-tier {
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    color: var(--fg-tertiary);
+    text-align: center;
+    padding: 1px 3px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 2px;
+    align-self: center;
+  }
+  .priority-tier[data-tier="authoritative_primary"]   { border-color: var(--signal-positive); }
+  .priority-tier[data-tier="authoritative_secondary"] { border-color: var(--signal-info, var(--border-accent)); }
+  .priority-tier[data-tier="industry_trade_press"]    { border-color: var(--fg-quaternary); }
+  .priority-tier[data-tier="general_news"]            { border-color: var(--border-subtle); }
+  .priority-tier[data-tier="legacy"]                  { border-color: var(--signal-warning); }
+  .description {
+    color: var(--fg-secondary);
+    /* Long nomination descriptions are common; truncate-then-tooltip
+       keeps the row scannable without losing the full text. */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .running-explainer {
+    margin: 0;
+    color: var(--fg-quaternary);
+    font-size: 10px;
+    line-height: 1.5;
+    font-style: italic;
   }
 </style>

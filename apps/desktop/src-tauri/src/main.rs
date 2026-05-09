@@ -105,6 +105,40 @@ fn main() -> Result<()> {
     let http = SecureHttpClient::new(SecureHttpConfig::default())
         .context("building secure http client")?;
     let http_arc = Arc::new(http.clone());
+
+    // Session 50 (Class C): separate HTTP client for the propose-URL
+    // retry loop's prefetch step, with a tighter `total_timeout` so a
+    // slow host fails fast and leaves room for retries inside the
+    // per-source authoring deadline (240s — see
+    // `pipeline::fetch_executor::PER_SOURCE_DEADLINE_SECS`).
+    //
+    // **Why 60s.** The 2026-05-09 lithium MCS run (live-run obs doc,
+    // class C) caught the failure mode on `industry.gov.au`: a
+    // single 300s prefetch consumed the entire deadline, starving
+    // the retry loop. 60s is large enough for a normal-shape PDF or
+    // HTML response (most legitimate prefetches land in 5-25s), tight
+    // enough that even 4× consecutive timeouts (240s) fit inside the
+    // deadline if every attempt's host happens to be slow. The LLM
+    // provider client (`http`) keeps the default 300s ceiling for
+    // legitimately long completions; only the prefetch path tightens.
+    //
+    // The two clients share no state (each owns its own
+    // `reqwest::Client`); the per-host backoff state lives in
+    // `AppState::host_backoff` and decorates both via the
+    // `BackoffFetcher` wrapper at the executor's call site (see
+    // `crates/api/src/commands.rs::run_fetch_for_plan`). That keeps
+    // observed throttling signals symmetric across LLM and prefetch
+    // hosts — important because both clients hit the same host
+    // population (the LLM call goes through the provider's API host;
+    // the prefetch hits arbitrary publisher hosts).
+    let prefetch_http_config = SecureHttpConfig {
+        total_timeout: std::time::Duration::from_secs(60),
+        ..SecureHttpConfig::default()
+    };
+    let prefetch_http = SecureHttpClient::new(prefetch_http_config)
+        .context("building secure prefetch http client")?;
+    let prefetch_http_arc = Arc::new(prefetch_http);
+
     let provider = pick_provider(http)?;
 
     // --- Source descriptors -----------------------------------------
@@ -129,6 +163,7 @@ fn main() -> Result<()> {
         store,
         provider,
         http_arc,
+        prefetch_http_arc,
         CLASSIFIER_PROMPT,
         RECIPE_AUTHOR_PROMPT,
         PROPOSE_URL_PROMPT,

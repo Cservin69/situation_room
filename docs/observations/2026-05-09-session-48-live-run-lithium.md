@@ -192,4 +192,51 @@ names the cases the prompt input now reaches it with.
 - Session 48 patch — operator-introspection surfaces (host-backoff
   status panel, sources-memory panel) over the post-Session-47
   pipeline (`SESSION_48_PATCH_1.md`).
-- Session 49 patch 1 — this patch (`SESSION_49_PATCH_1.md`).
+- Session 49 patch 1 — Class A fix
+  (`SESSION_49_PATCH_1.md`): typed `FetchError::Status` /
+  `TooLarge` lifts, `PrefetchFailure` classification at the
+  prefetch boundary, prompt-vocabulary strings into the propose-URL
+  retry loop's prior-attempts history.
+- Session 50 patch 1 — Class B + C fixes plus runtime-UI scaffold
+  (`SESSION_50_PATCH_1.md`):
+  - **Class B (PDF excerpt truncated before deep chapters)** —
+    chosen design: topic-aware page selection. The 64 KiB
+    `PREFETCH_EXCERPT_BUDGET` stays; the lever is *which* pages
+    fill it. `PrefetchRelevance` is built once per nomination
+    from `plan.topic_tags + nomination.description +
+    plan.geographic_scope` and scores each page's framed text;
+    selection keeps `PREFETCH_PDF_HEAD_PAGES` (= 3) for
+    orientation plus the highest-scoring pages until the budget
+    fills, with explicit `[... N pages skipped (low topic
+    relevance) ...]` markers between gaps. Closed-vocabulary
+    discipline preserved (no host names, no learned classifiers,
+    no document-class heuristics). The other two designs from
+    this doc — budget bump to 128 KiB, chapter-heading detection
+    — are documented as not-shipped because the constant bump is
+    a sticking-plaster (the next dense PDF blows through 128 the
+    same way) and the heading-detection design requires either a
+    new crate dependency or a hand-rolled `/Outlines` parser
+    fragile against PDFs without outlines.
+  - **Class C (per-source deadline starvation)** — chosen design:
+    separate `SecureHttpClient` instance for prefetch with
+    `total_timeout: 60s`. The LLM-call client keeps the default
+    300s ceiling. Both clients share the per-host backoff state
+    so observed throttling on a host carries over between paths
+    exactly as the pre-Session-50 single-client flow did. 60s is
+    the value chosen because most legitimate prefetches land in
+    5–25s; even four consecutive timeouts (4 × 60s = 240s) fit
+    inside the per-source authoring deadline.
+  - **Runtime-UI scaffold (operator pull, separate from the
+    observation classes)** — `FetchReport.svelte` now pre-renders
+    the plan's `expectations.document_sources` as a "running now"
+    list the moment `plans.fetching` flips true. Each row shows
+    "queued" because the existing `run_fetch_for_plan` IPC
+    command returns one bundled report at the end; per-nomination
+    stage transitions ("queued" → "fetching" → "authoring") would
+    require a Tauri event channel and a parallel state surface
+    (Session 51 thread). The cheap path is enough to remove the
+    "20+ sessions of staring at a void" symptom: the operator
+    sees what the executor is iterating instead of nothing.
+- **Class D (HTML SPA / overview pages)** — no fix needed; the
+  system worked as designed. Documented above as evidence that
+  recipe-author decline routing is sufficient for the SPA case.

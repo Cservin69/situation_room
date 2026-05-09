@@ -124,6 +124,23 @@ pub struct AppState {
     /// it.
     pub provider: Arc<dyn LlmProvider + Send + Sync>,
     pub http: Arc<SecureHttpClient>,
+    /// Tighter-timeout HTTP client used by the fetch executor's
+    /// prefetch step. Session 50 (Class C).
+    ///
+    /// Distinct from `http` so a slow prefetch host fails fast inside
+    /// the per-source authoring deadline (see
+    /// `pipeline::fetch_executor::PER_SOURCE_DEADLINE_SECS`). The LLM
+    /// provider client (`http`) keeps the default 300s ceiling for
+    /// legitimately long completions; this client is built with a
+    /// 60s `total_timeout` so a single prefetch attempt cannot
+    /// consume the entire 240s deadline.
+    ///
+    /// Both clients share the per-host backoff state (`host_backoff`)
+    /// so an observed 429 / Retry-After / timeout on a host during
+    /// prefetch carries over to the runtime fetch and vice versa.
+    /// The split is purely network-layer (timeout shape); nothing
+    /// here mentions a host or scheme.
+    pub prefetch_http: Arc<SecureHttpClient>,
     /// Per-host backoff state shared across every fetch the executor
     /// runs. Session 45 — see [`HostBackoff`]'s module-level rationale
     /// in `crates/pipeline/src/fetch_backoff.rs`. Lives in `AppState`
@@ -175,6 +192,7 @@ impl AppState {
         store: Arc<Store>,
         provider: Arc<dyn LlmProvider + Send + Sync>,
         http: Arc<SecureHttpClient>,
+        prefetch_http: Arc<SecureHttpClient>,
         classifier_prompt: &'static str,
         recipe_author_prompt: &'static str,
         propose_url_prompt: &'static str,
@@ -184,6 +202,7 @@ impl AppState {
             store,
             provider,
             http,
+            prefetch_http,
             // Session 45: a fresh empty `HostBackoff` per binary boot.
             // The composition root does not need to thread this in —
             // there are no per-deployment knobs (the policy is
@@ -876,9 +895,23 @@ pub async fn run_fetch_for_plan(
     // wrapper has scope-bound lifetime; `host_backoff` lives in
     // `AppState` so state survives across `run_fetch_for_plan` calls.
     let backoff_fetcher = BackoffFetcher::new(state.http.as_ref(), state.host_backoff.clone());
+    // Session 50 (Class C): wrap the dedicated prefetch client in
+    // its own backoff decorator. Both wrappers share the same
+    // `host_backoff` state — observed signals (429 / Retry-After
+    // / timeouts) on a host during prefetch carry over to the
+    // runtime fetch's backoff decisions and vice versa, exactly as
+    // the pre-Session-50 single-client flow already did. The
+    // difference is that the prefetch client's tighter
+    // `total_timeout` (60s vs. the 300s LLM ceiling) prevents a
+    // slow host from eating the entire per-source authoring
+    // deadline (PER_SOURCE_DEADLINE_SECS = 240s) on a single
+    // attempt.
+    let backoff_prefetch =
+        BackoffFetcher::new(state.prefetch_http.as_ref(), state.host_backoff.clone());
     let ctx = ExecutorContext {
         store: state.store.as_ref(),
         http: &backoff_fetcher,
+        prefetch_http: Some(&backoff_prefetch),
         provider: state.provider.as_ref(),
         recipe_author_prompt: state.recipe_author_prompt,
         propose_url_prompt: state.propose_url_prompt,
