@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.14
+# Recipe Author Prompt — v1.15
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -126,13 +126,13 @@ populate the fields of the target record type. The `topic_tags` will
 be attached automatically to every produced record — do not include
 them in your mappings.
 
+{{TARGET_EXPECTATION}}
+
 **Before reading the closed vocabulary or the source context
 below, name to yourself:**
 
-- which expectation bucket you intend to populate
-  (`observation_metrics[i]`, `event_types[j]`, etc.),
 - the metric name / event_type / entity_kind / relation_kind from
-  that expectation,
+  the target expectation (named in the section above when present),
 - the unit hint (for observations) or the rationale (for the
   others),
 - the geographic scope codes you'll need to substitute,
@@ -998,6 +998,19 @@ recipe you produce has a `produces` array of bindings. The
 relationship between bucket size and `produces.len()` matters
 for honest coverage.
 
+**Session 47 note — one recipe, one expectation.** When the
+target-expectation section above names a specific expectation,
+every binding in your `produces` array must reference *that
+expectation* — same `list` and same `index`. A binding that
+targets a different expectation will be rejected by the
+validator. The "should I cover other expectations from the
+same bucket?" question does not apply per-recipe under this
+contract: the executor authors one recipe per expectation
+across multiple authoring calls against the same prefetched
+bytes, so each recipe stays narrow and the bucket is covered
+by the *set* of recipes, not by padded `produces` arrays
+inside any single recipe.
+
 **Default cardinality: one scalar per fetch.** A scalar recipe's
 `extraction` step pulls one value out of the fetched bytes (one
 JSONPath result, one CSV cell, one CSS selector match, one
@@ -1219,6 +1232,14 @@ or pick a narrower listing endpoint.
   expectation indices produces three records that all carry the
   same value with different framing — silent partial coverage
   that looks like full coverage. See "Coverage discipline" above.
+- When the target-expectation section names a specific expectation,
+  do not target a different one. Authoring for a different
+  expectation than the one named — even one you judge to be a
+  better fit for the source — is rejected by the validator. The
+  executor will call you again for the other expectation against
+  the same prefetched bytes; trust that path. The decline path
+  exists for the case where the prefetch evidence cannot
+  honestly populate the named expectation; use it.
 - Do not author against an interstitial / chooser excerpt
   (language picker, empty search form, format chooser, redirect
   notice). When the prefetch hands you a chooser, refine the URL
@@ -1260,6 +1281,24 @@ you pick.
 
 ### Changelog
 
+- **v1.15** (2026-05-09) — Session 47 (multi-recipe per
+  nomination). Output contract change: when the new
+  `{{TARGET_EXPECTATION}}` section is non-empty, every binding
+  in `produces` must reference the named expectation; the
+  validator rejects mismatches. The placeholder is empty for
+  the legacy free-choice authoring path (manual re-author),
+  preserving that path's contract; existing recipes do not need
+  re-authoring. The architectural change in the executor is
+  that one nomination now drives one authoring call per
+  expectation against the same prefetched bytes (capped per
+  nomination), so multiple recipes — each narrow to one
+  expectation — can come out of a single source whose
+  prefetch supports multiple expectations (the lithium MCS
+  PDF carrying both production and reserves was the
+  motivating case). The "Coverage discipline" section gained
+  a "one recipe, one expectation" note and the "What NOT to
+  produce" list gained a "do not target a different
+  expectation than the one named" rule.
 - **v1.14** (2026-05-08) — Session 44 (PDF prefetch truncation gap).
   No output contract change; no schema change. Edits the "Strategy
   for PDF sources" section to reflect the Session 44 prefetch

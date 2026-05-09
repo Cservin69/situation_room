@@ -202,10 +202,14 @@ pub enum AuthoringError {
 /// is what lets us bump prompt versions without re-authoring existing
 /// templates, and what lets test-only templates use a tiny subset.
 ///
-/// Substituted placeholders, in the order they appear in the v1.9
+/// Substituted placeholders, in the order they appear in the v1.15
 /// production template:
 ///
 /// - `{{PLAN_JSON}}` — the [`ResearchPlan`], pretty-printed JSON.
+/// - `{{TARGET_EXPECTATION}}` — Session 47 (multi-recipe per
+///   nomination). Names the one expectation this authoring call must
+///   target; empty when the call is unconstrained (manual re-author
+///   path). See [`render_target_expectation`].
 /// - `{{TARGET_RECORD_SCHEMA}}` — Track B (Session 28, ADR 0007
 ///   amendment 4): the schemars-derived JSON Schemas for the three
 ///   authorable record types (Observation, Event, Relation),
@@ -247,6 +251,7 @@ pub fn build_prompt(
     template: &str,
     plan: &ResearchPlan,
     ctx: &AuthoringContext,
+    target_expectation: Option<ExpectationRef>,
 ) -> Result<String, AuthoringError> {
     // Generate a fresh fence nonce per call. The nonce in the closing
     // tag (which is unguessable at the time the operator typed) means
@@ -259,7 +264,7 @@ pub fn build_prompt(
     // the wrong fence the breakout still fails (the closing tag must
     // match the nonce *and* the opening tag's name).
     let fence_id = Uuid::new_v4().simple().to_string();
-    build_prompt_with_fence_id(template, plan, ctx, &fence_id)
+    build_prompt_with_fence_id(template, plan, ctx, target_expectation, &fence_id)
 }
 
 /// Test-only: same as [`build_prompt`] but accepts an explicit fence
@@ -270,6 +275,7 @@ pub fn build_prompt_with_fence_id(
     template: &str,
     plan: &ResearchPlan,
     ctx: &AuthoringContext,
+    target_expectation: Option<ExpectationRef>,
     fence_id: &str,
 ) -> Result<String, AuthoringError> {
     check_string(
@@ -303,9 +309,13 @@ pub fn build_prompt_with_fence_id(
         fence_id,
     );
 
+    let target_expectation_block =
+        render_target_expectation(target_expectation, plan);
+
     let out = template
         .replace("{{PLAN_JSON}}", &plan_json)
         .replace("{{TARGET_RECORD_SCHEMA}}", &schema_block)
+        .replace("{{TARGET_EXPECTATION}}", &target_expectation_block)
         .replace("{{SOURCE_ID}}", &ctx.source_id)
         .replace("{{SOURCE_URL}}", ctx.sample_url.as_str())
         .replace("{{DOCUMENT_EXCERPT}}", &ctx.document_excerpt)
@@ -339,6 +349,7 @@ pub fn build_prompt_with_fence_id(
 /// "we have no bytes to validate against" (test paths, legacy
 /// callers); the validator is skipped and the contract reverts to
 /// the pre-Session-41 structural-only check.
+#[allow(clippy::too_many_arguments)]
 pub async fn author_recipe(
     provider: &dyn LlmProvider,
     tier: ModelTier,
@@ -346,8 +357,14 @@ pub async fn author_recipe(
     plan: &ResearchPlan,
     ctx: &AuthoringContext,
     original_bytes: Option<&[u8]>,
+    // Session 47: when `Some`, the LLM's authored recipe must target
+    // this exact expectation in every binding. When `None`, the LLM
+    // chooses (legacy free-choice path used by the manual re-author
+    // flow). The validator enforces the constraint in
+    // `build_validated_recipe`.
+    target_expectation: Option<ExpectationRef>,
 ) -> Result<FetchRecipe, AuthoringError> {
-    let user = build_prompt(prompt_template, plan, ctx)?;
+    let user = build_prompt(prompt_template, plan, ctx, target_expectation)?;
 
     // Schema derived from RecipeAuthoringOutput — the LLM cannot
     // return shapes the runtime wouldn't understand.
@@ -384,7 +401,7 @@ pub async fn author_recipe(
     let output: RecipeAuthoringOutput = serde_json::from_value(raw)
         .map_err(|e| AuthoringError::OutputParse(e.to_string()))?;
 
-    let recipe = build_validated_recipe(output, plan, &fingerprint)?;
+    let recipe = build_validated_recipe(output, plan, &fingerprint, target_expectation)?;
 
     // Session 41 items 4–6: authoring-time validation against the
     // bytes the LLM saw. We run the runtime's own extraction code
@@ -817,6 +834,15 @@ pub async fn reauthor_recipe(
         plan,
         &auth_ctx,
         Some(fetched_bytes),
+        // Session 47: the manual re-author path is the legacy free-
+        // choice authoring path. The LLM is correcting an existing
+        // recipe whose binding shape is its own contract; we do not
+        // narrow it to one expectation here. The prompt's
+        // `{{TARGET_EXPECTATION}}` placeholder substitutes to the
+        // empty string, the v1.15 prompt's bucket-naming subsection
+        // is silent, and the LLM continues to pick its own
+        // expectation set. Existing reauthor tests pin this.
+        None,
     )
     .await?;
 
@@ -922,6 +948,12 @@ fn build_validated_recipe(
     output: RecipeAuthoringOutput,
     plan: &ResearchPlan,
     authored_by: &str,
+    // Session 47: when `Some(target)`, every binding's expectation
+    // must equal `target`. The legacy free-choice path passes `None`
+    // and skips this check. See [`render_target_expectation`] for the
+    // prompt-side framing the LLM sees, and the v1.15 changelog entry
+    // in `config/prompts/recipe_author.md`.
+    target_expectation: Option<ExpectationRef>,
 ) -> Result<FetchRecipe, AuthoringError> {
     // 0. Decline path: Track B (Session 28, ADR 0007 amendment 4).
     // The LLM uses `decline_reason` to signal "this source does not
@@ -984,6 +1016,40 @@ fn build_validated_recipe(
     let mut produces = Vec::with_capacity(output.produces.len());
     for binding in output.produces {
         produces.push(convert_binding(binding, plan)?);
+    }
+
+    // 4a. Session 47 (multi-recipe per nomination): when the caller
+    // constrained the target expectation, every binding must reference
+    // it. The prompt's v1.15 framing names the constraint explicitly;
+    // a mismatch here means the LLM ignored the named target and
+    // picked a different expectation it judged a better fit. That
+    // judgement is structurally invalid under the new contract — the
+    // executor calls the LLM again for the other expectation against
+    // the same prefetched bytes; the LLM does not get to substitute
+    // expectations on its own.
+    //
+    // Checked before the duplicate-expectation rejection (step 5)
+    // because the constraint failure is the more informative
+    // diagnostic: an LLM that targeted a different expectation
+    // probably authored one binding (not two duplicates), so the
+    // duplicate check would not even fire. The constraint failure
+    // names the target the LLM was supposed to honor.
+    if let Some(target) = target_expectation {
+        for (i, binding) in produces.iter().enumerate() {
+            if binding.expectation != target {
+                return Err(AuthoringError::InvalidRecipe(format!(
+                    "binding[{i}] targets {:?}, but the authoring call \
+                     constrained the target to {:?}. The recipe-author \
+                     prompt's target-expectation section names the one \
+                     expectation the LLM must author for or decline; \
+                     substituting a different one is rejected. If the \
+                     prefetch evidence cannot support the target \
+                     expectation, the LLM should set `decline_reason` \
+                     instead.",
+                    binding.expectation, target
+                )));
+            }
+        }
     }
 
     // 5. Reject recipes that target the same expectation twice.
@@ -1714,6 +1780,150 @@ fn render_operator_guidance(guidance: Option<&str>, fence_id: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Session 47: target-expectation rendering
+// ---------------------------------------------------------------------------
+
+/// Render the `{{TARGET_EXPECTATION}}` substitution.
+///
+/// `None` produces the empty string — the manual re-author path and
+/// any test template that doesn't carry the placeholder substitutes
+/// to nothing. The v1.15 prompt's "before reading the closed
+/// vocabulary" checklist degrades gracefully: with no target named,
+/// the LLM falls back to picking its own expectation as in v1.14.
+///
+/// `Some(target)` produces a markdown subsection naming:
+///
+/// - the bucket (`observation_metric`, `event_type`, `entity_kind`,
+///   `relation_kind`, `document_source`),
+/// - the index inside that bucket,
+/// - the human-readable label (the metric name, the event_type
+///   string, the entity-kind string, etc.) when resolvable from the
+///   plan; the index alone otherwise.
+///
+/// The framing tells the LLM:
+///
+///   1. every binding must reference *this* expectation,
+///   2. authoring for a different expectation is a validator
+///      rejection, not a permitted choice,
+///   3. `decline_reason` is the honest exit when the prefetch
+///      evidence cannot support the named target.
+///
+/// **No source-specific text.** The renderer reads only the plan and
+/// the target reference; nothing in this function knows about
+/// individual sources, hosts, or URL families. The principle holds
+/// the same way it does in the rest of the prompt.
+///
+/// **Out-of-range indices** are not the renderer's concern — the
+/// caller (the executor's authoring loop) builds the target from the
+/// plan it just read, so by construction the index is valid.
+/// `convert_expectation_ref` would catch a hallucinated reference on
+/// the LLM's *output* side; here on the *input* side, an out-of-range
+/// index would be a caller bug, and the renderer renders the index
+/// honestly rather than panicking — the LLM will then decline because
+/// the named target doesn't exist in the plan it sees.
+fn render_target_expectation(
+    target: Option<ExpectationRef>,
+    plan: &ResearchPlan,
+) -> String {
+    let Some(target) = target else {
+        return String::new();
+    };
+    let (bucket, index, label) = match target {
+        ExpectationRef::ObservationMetric { index } => (
+            "observation_metric",
+            index,
+            plan.expectations
+                .observation_metrics
+                .get(index as usize)
+                .map(|m| m.name.clone()),
+        ),
+        ExpectationRef::EventType { index } => (
+            "event_type",
+            index,
+            plan.expectations
+                .event_types
+                .get(index as usize)
+                .map(|e| e.event_type.as_str().to_string()),
+        ),
+        ExpectationRef::EntityKind { index } => (
+            "entity_kind",
+            index,
+            plan.expectations
+                .entity_kinds
+                .get(index as usize)
+                .map(|k| k.kind.clone()),
+        ),
+        ExpectationRef::RelationKind { index } => (
+            "relation_kind",
+            index,
+            plan.expectations
+                .relation_kinds
+                .get(index as usize)
+                .map(|k| k.kind.clone()),
+        ),
+        ExpectationRef::DocumentSource { index } => (
+            "document_source",
+            index,
+            // DocumentSourceEntry is a sum of nomination + legacy hint;
+            // the description is what reads as a label for either
+            // variant. The renderer is best-effort; this is not a load-
+            // bearing path (recipes don't normally target document_source
+            // expectations).
+            plan.expectations
+                .document_sources
+                .get(index as usize)
+                .map(|entry| match entry {
+                    crate::research::DocumentSourceEntry::Nomination(n) => {
+                        n.description.clone()
+                    }
+                    crate::research::DocumentSourceEntry::Legacy(_) => {
+                        "(legacy document_source hint)".to_string()
+                    }
+                }),
+        ),
+    };
+
+    let label_line = match label {
+        Some(name) => format!(
+            "- **Label:** `{}` (look this name up in the plan's \
+             `expectations.{}s` array)\n",
+            name, bucket
+        ),
+        None => "- **Label:** (index out of range in the plan as \
+                  rendered above; if you cannot resolve the target \
+                  from the plan, set `decline_reason` and explain \
+                  what you saw)\n"
+            .to_string(),
+    };
+
+    format!(
+        "## The target expectation for this authoring call\n\
+         \n\
+         The executor calls this prompt once per `(nomination, \
+         expectation)` pair. **This call's target is fixed:**\n\
+         \n\
+         - **Bucket:** `{bucket}`\n\
+         - **Index:** `{index}`\n\
+         {label_line}\
+         \n\
+         Every binding in your `produces` array must reference this \
+         exact expectation — same `list` and same `index`. The \
+         validator rejects mismatches. Authoring for a different \
+         expectation than the one named — even one you judge to be a \
+         better fit for the source — is structurally invalid; the \
+         executor will call you again for the other expectation \
+         against the same prefetched bytes. Trust that path.\n\
+         \n\
+         **If the prefetch evidence cannot honestly populate the \
+         named target,** set `decline_reason` to a one-sentence \
+         explanation of what you saw and why the named expectation \
+         is not addressable from these bytes. Do not stretch the \
+         recipe to compensate, do not silently substitute a different \
+         expectation. The decline path exists for exactly this case.\n"
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1847,7 +2057,7 @@ mod tests {
             url: {{SOURCE_URL}}\n\
             excerpt: {{DOCUMENT_EXCERPT}}\n\
         ";
-        let out = build_prompt(template, &sample_plan(), &sample_context()).unwrap();
+        let out = build_prompt(template, &sample_plan(), &sample_context(), None).unwrap();
 
         assert!(!out.contains("{{PLAN_JSON}}"), "plan placeholder left");
         assert!(!out.contains("{{SOURCE_ID}}"), "source id placeholder left");
@@ -1866,7 +2076,7 @@ mod tests {
     fn build_prompt_rejects_oversized_excerpt() {
         let mut ctx = sample_context();
         ctx.document_excerpt = "x".repeat(Bounds::LLM_PROMPT_BODY + 1);
-        let err = build_prompt("x{{DOCUMENT_EXCERPT}}y", &sample_plan(), &ctx).unwrap_err();
+        let err = build_prompt("x{{DOCUMENT_EXCERPT}}y", &sample_plan(), &ctx, None).unwrap_err();
         assert!(matches!(err, AuthoringError::Prompt(_)), "got {err:?}");
     }
 
@@ -1951,7 +2161,7 @@ mod tests {
 
     #[test]
     fn build_validated_recipe_accepts_good_output() {
-        let recipe = build_validated_recipe(good_output(), &sample_plan(), "xai").unwrap();
+        let recipe = build_validated_recipe(good_output(), &sample_plan(), "xai", None).unwrap();
         assert_eq!(recipe.authored_by, "xai");
         assert_eq!(recipe.version, 1);
         assert_eq!(recipe.produces.len(), 1);
@@ -1971,7 +2181,7 @@ mod tests {
     #[test]
     fn build_validated_recipe_threads_plan_id() {
         let plan = sample_plan();
-        let recipe = build_validated_recipe(good_output(), &plan, "xai").unwrap();
+        let recipe = build_validated_recipe(good_output(), &plan, "xai", None).unwrap();
         assert_eq!(recipe.plan_id, plan.id);
     }
 
@@ -1993,7 +2203,7 @@ mod tests {
         out.decline_reason = "this source is a JS-rendered SPA; the closed \
                               extraction vocabulary cannot address it"
             .into();
-        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         match err {
             AuthoringError::Declined { reason } => {
                 assert!(
@@ -2016,7 +2226,7 @@ mod tests {
         out.source_url = "file:///etc/passwd".into(); // would normally be rejected
         out.produces = vec![]; // would also normally be rejected
         out.decline_reason = "API requires authentication; no public endpoint".into();
-        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         // Must be Declined, NOT BadUrl or InvalidRecipe.
         assert!(matches!(err, AuthoringError::Declined { .. }), "got {err:?}");
     }
@@ -2031,7 +2241,7 @@ mod tests {
         let mut out = good_output();
         out.decline_reason = "   \n\t  ".into();
         // Should fall through to normal validation and succeed.
-        let recipe = build_validated_recipe(out, &sample_plan(), "xai").unwrap();
+        let recipe = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap();
         assert_eq!(recipe.produces.len(), 1);
     }
 
@@ -2046,7 +2256,7 @@ mod tests {
     fn over_bounded_decline_reason_is_invalid_not_declined() {
         let mut out = good_output();
         out.decline_reason = "x".repeat(Bounds::DECLINE_REASON + 1);
-        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         assert!(
             matches!(err, AuthoringError::InvalidRecipe(ref m) if m.contains("decline_reason")),
             "got {err:?}"
@@ -2193,7 +2403,7 @@ mod tests {
                         PREV={{PREVIOUS_FAILURE_REASON}} \
                         GUIDE={{OPERATOR_GUIDANCE}} \
                         SOURCE={{SOURCE_ID}}";
-        let out = build_prompt_with_fence_id(template, &plan, &ctx, "nonce-1234").unwrap();
+        let out = build_prompt_with_fence_id(template, &plan, &ctx, None, "nonce-1234").unwrap();
         // PLAN_JSON
         assert!(out.contains("\"topic\""));
         // TARGET_RECORD_SCHEMA
@@ -2227,7 +2437,7 @@ mod tests {
             operator_guidance: None,
         };
         let template = "PREV={{PREVIOUS_FAILURE_REASON}} GUIDE={{OPERATOR_GUIDANCE}}";
-        let out = build_prompt_with_fence_id(template, &plan, &ctx, "n").unwrap();
+        let out = build_prompt_with_fence_id(template, &plan, &ctx, None, "n").unwrap();
         assert_eq!(out, "PREV= GUIDE=");
     }
 
@@ -2239,7 +2449,7 @@ mod tests {
     fn build_validated_recipe_rejects_non_https_url() {
         let mut out = good_output();
         out.source_url = "file:///etc/passwd".into();
-        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         assert!(matches!(err, AuthoringError::BadUrl(_)), "got {err:?}");
     }
 
@@ -2247,7 +2457,7 @@ mod tests {
     fn build_validated_recipe_rejects_private_ip_url() {
         let mut out = good_output();
         out.source_url = "http://127.0.0.1/".into();
-        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         assert!(matches!(err, AuthoringError::BadUrl(_)), "got {err:?}");
     }
 
@@ -2259,7 +2469,7 @@ mod tests {
     fn build_validated_recipe_rejects_empty_produces() {
         let mut out = good_output();
         out.produces = vec![];
-        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         assert!(matches!(err, AuthoringError::InvalidRecipe(_)), "got {err:?}");
     }
 
@@ -2267,7 +2477,7 @@ mod tests {
     fn build_validated_recipe_rejects_binding_with_no_field_mappings() {
         let mut out = good_output();
         out.produces[0].field_mappings = vec![];
-        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("no field mappings"), "got {msg}");
     }
@@ -2277,7 +2487,7 @@ mod tests {
         let mut out = good_output();
         // Two bindings targeting observation_metrics[0].
         out.produces.push(out.produces[0].clone());
-        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("same expectation"), "got {msg}");
     }
@@ -2286,7 +2496,7 @@ mod tests {
     fn build_validated_recipe_rejects_expectation_index_out_of_range() {
         let mut out = good_output();
         out.produces[0].expectation = AuthoredExpectationRef::ObservationMetric { index: 99 };
-        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("but plan has only"), "got {msg}");
     }
@@ -2300,7 +2510,7 @@ mod tests {
             row: 0,
             col: 0,
         };
-        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         assert!(matches!(err, AuthoringError::InvalidRecipe(_)), "got {err:?}");
     }
 
@@ -2311,7 +2521,7 @@ mod tests {
             pattern: "x".into(),
             group: 0,
         };
-        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         assert!(matches!(err, AuthoringError::InvalidRecipe(_)), "got {err:?}");
     }
 
@@ -2322,7 +2532,7 @@ mod tests {
             selector: "".into(),
             attribute: None,
         };
-        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         assert!(matches!(err, AuthoringError::InvalidRecipe(_)), "got {err:?}");
     }
 
@@ -2341,7 +2551,7 @@ mod tests {
             b.expectation = AuthoredExpectationRef::ObservationMetric { index: i };
             out.produces.push(b);
         }
-        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         let msg = format!("{err}");
         // Either "exceeds limit" (count rule fires first) or
         // "but plan has only" (index rule fires first) — both are
@@ -2357,7 +2567,7 @@ mod tests {
     fn build_validated_recipe_rejects_empty_field_path() {
         let mut out = good_output();
         out.produces[0].field_mappings[0].path = "".into();
-        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("empty field path"), "got {msg}");
     }
@@ -2377,7 +2587,7 @@ mod tests {
     /// authored against an HTML-addressable source should land here.
     #[test]
     fn build_validated_recipe_collapses_empty_static_payload_to_none() {
-        let recipe = build_validated_recipe(good_output(), &sample_plan(), "xai")
+        let recipe = build_validated_recipe(good_output(), &sample_plan(), "xai", None)
             .expect("good_output has empty static_payload — must validate");
         assert!(
             recipe.static_payload.is_none(),
@@ -2394,7 +2604,7 @@ mod tests {
     fn build_validated_recipe_collapses_whitespace_static_payload_to_none() {
         let mut out = good_output();
         out.static_payload = "  \n\t  \n".into();
-        let recipe = build_validated_recipe(out, &sample_plan(), "xai")
+        let recipe = build_validated_recipe(out, &sample_plan(), "xai", None)
             .expect("whitespace-only static_payload must collapse to None");
         assert!(recipe.static_payload.is_none());
     }
@@ -2407,7 +2617,7 @@ mod tests {
         let mut out = good_output();
         let payload = r#"{"date":"2026-03-26","rate":"6.50","direction":"hold"}"#;
         out.static_payload = payload.into();
-        let recipe = build_validated_recipe(out, &sample_plan(), "xai")
+        let recipe = build_validated_recipe(out, &sample_plan(), "xai", None)
             .expect("well-formed JSON static_payload must validate");
         assert_eq!(recipe.static_payload.as_deref(), Some(payload));
     }
@@ -2421,7 +2631,7 @@ mod tests {
     fn build_validated_recipe_rejects_non_empty_static_payload_that_is_not_json() {
         let mut out = good_output();
         out.static_payload = "this is not JSON".into();
-        let err = build_validated_recipe(out, &sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("static_payload must parse as JSON"),
@@ -2490,7 +2700,7 @@ mod tests {
         let ctx = sample_context();
 
         let recipe =
-            author_recipe(&provider, ModelTier::Workhorse, template, &plan, &ctx, None)
+            author_recipe(&provider, ModelTier::Workhorse, template, &plan, &ctx, None, None)
                 .await
                 .expect("live recipe authoring should succeed");
 
@@ -2670,7 +2880,7 @@ mod tests {
         let mut ctx = sample_context();
         ctx.recipe_feedback = Some("wrong endpoint shape".into());
         let out =
-            build_prompt_with_fence_id(template, &sample_plan(), &ctx, "abcd1234").unwrap();
+            build_prompt_with_fence_id(template, &sample_plan(), &ctx, None, "abcd1234").unwrap();
         assert!(!out.contains("{{RECIPE_FEEDBACK}}"));
         assert!(out.contains("wrong endpoint shape"));
         assert!(out.contains("<recipe_feedback id=\"abcd1234\">"));
@@ -2683,7 +2893,7 @@ mod tests {
         let ctx = sample_context();
         assert!(ctx.recipe_feedback.is_none(), "fixture invariant");
         let out =
-            build_prompt_with_fence_id(template, &sample_plan(), &ctx, "abcd1234").unwrap();
+            build_prompt_with_fence_id(template, &sample_plan(), &ctx, None, "abcd1234").unwrap();
         assert_eq!(out, "X  Y");
     }
 
@@ -2696,7 +2906,7 @@ mod tests {
         let mut ctx = sample_context();
         ctx.recipe_feedback = Some("note".into());
         let out =
-            build_prompt_with_fence_id(template, &sample_plan(), &ctx, "abcd1234").unwrap();
+            build_prompt_with_fence_id(template, &sample_plan(), &ctx, None, "abcd1234").unwrap();
         assert_eq!(out, "X no placeholder here Y");
     }
 
@@ -2956,7 +3166,7 @@ mod tests {
         };
 
         let result =
-            author_recipe(&provider, ModelTier::Workhorse, template, &plan, &ctx, None).await;
+            author_recipe(&provider, ModelTier::Workhorse, template, &plan, &ctx, None, None).await;
 
         match result {
             Err(AuthoringError::Declined { reason }) => {
@@ -3060,6 +3270,7 @@ mod tests {
             good_iterator_output(),
             &iterator_sample_plan(),
             "xai",
+            None,
         )
         .expect("congruent iterator-bearing recipe should validate");
         assert!(
@@ -3085,7 +3296,7 @@ mod tests {
         out.extraction = AuthoredExtractionSpec::JsonPath {
             path: "$.title".into(),
         };
-        let err = build_validated_recipe(out, &iterator_sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &iterator_sample_plan(), "xai", None).unwrap_err();
         let msg = match err {
             AuthoringError::InvalidRecipe(m) => m,
             other => panic!("expected InvalidRecipe, got {other:?}"),
@@ -3104,7 +3315,7 @@ mod tests {
     fn iterator_requires_dedup_key_field() {
         let mut out = good_iterator_output();
         out.produces[0].dedup_key_field = None;
-        let err = build_validated_recipe(out, &iterator_sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &iterator_sample_plan(), "xai", None).unwrap_err();
         let msg = match err {
             AuthoringError::InvalidRecipe(m) => m,
             other => panic!("expected InvalidRecipe, got {other:?}"),
@@ -3122,7 +3333,7 @@ mod tests {
     fn dedup_key_field_must_reference_existing_path() {
         let mut out = good_iterator_output();
         out.produces[0].dedup_key_field = Some("not_a_real_path".into());
-        let err = build_validated_recipe(out, &iterator_sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &iterator_sample_plan(), "xai", None).unwrap_err();
         let msg = match err {
             AuthoringError::InvalidRecipe(m) => m,
             other => panic!("expected InvalidRecipe, got {other:?}"),
@@ -3141,7 +3352,7 @@ mod tests {
     fn empty_dedup_key_field_collapses_and_iterator_rejects_it() {
         let mut out = good_iterator_output();
         out.produces[0].dedup_key_field = Some("   ".into());
-        let err = build_validated_recipe(out, &iterator_sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &iterator_sample_plan(), "xai", None).unwrap_err();
         assert!(matches!(err, AuthoringError::InvalidRecipe(m) if m.contains("dedup_key_field")));
     }
 
@@ -3174,7 +3385,7 @@ mod tests {
             }],
             dedup_key_field: Some("value".into()),
         }];
-        let err = build_validated_recipe(out, &iterator_sample_plan(), "xai").unwrap_err();
+        let err = build_validated_recipe(out, &iterator_sample_plan(), "xai", None).unwrap_err();
         let msg = match err {
             AuthoringError::InvalidRecipe(m) => m,
             other => panic!("expected InvalidRecipe, got {other:?}"),
@@ -3194,7 +3405,163 @@ mod tests {
         // good_output() is scalar (iterator: None) and its binding
         // has dedup_key_field: None. If the iterator validator
         // accidentally tightened the scalar path, this fails.
-        let _ = build_validated_recipe(good_output(), &sample_plan(), "xai")
+        let _ = build_validated_recipe(good_output(), &sample_plan(), "xai", None)
             .expect("scalar recipe without dedup_key_field must still validate");
+    }
+
+    // -----------------------------------------------------------------------
+    // Session 47 — target-expectation constraint
+    //
+    // The validator must reject an authored recipe whose binding
+    // targets a different expectation than the one the caller named.
+    // The legacy free-choice path (target_expectation = None) skips
+    // the check, preserving manual-reauthor behavior.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn target_expectation_match_validates_session_47() {
+        // good_output() targets observation_metric[0]. With the same
+        // target as the constraint, the recipe validates.
+        let recipe = build_validated_recipe(
+            good_output(),
+            &sample_plan(),
+            "xai",
+            Some(ExpectationRef::ObservationMetric { index: 0 }),
+        )
+        .expect("matching target should validate");
+        assert_eq!(
+            recipe.produces[0].expectation,
+            ExpectationRef::ObservationMetric { index: 0 }
+        );
+    }
+
+    #[test]
+    fn target_expectation_mismatch_is_rejected_session_47() {
+        // good_output() targets observation_metric[0]; constraint
+        // names observation_metric[1]. The validator must reject.
+        let plan = sample_plan(); // has 2 obs metrics
+        let err = build_validated_recipe(
+            good_output(),
+            &plan,
+            "xai",
+            Some(ExpectationRef::ObservationMetric { index: 1 }),
+        )
+        .expect_err("mismatched target must be rejected");
+        match err {
+            AuthoringError::InvalidRecipe(msg) => {
+                assert!(
+                    msg.contains("constrained the target"),
+                    "InvalidRecipe message must name the constraint; got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidRecipe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn target_expectation_cross_bucket_mismatch_is_rejected_session_47() {
+        // good_output() targets observation_metric[0]; constraint
+        // names event_type[0] (a different bucket). Reject.
+        let err = build_validated_recipe(
+            good_output(),
+            &sample_plan(),
+            "xai",
+            Some(ExpectationRef::EventType { index: 0 }),
+        )
+        .expect_err("cross-bucket mismatch must be rejected");
+        assert!(matches!(err, AuthoringError::InvalidRecipe(_)));
+    }
+
+    #[test]
+    fn target_expectation_none_preserves_free_choice_session_47() {
+        // The legacy reauthor path passes None — every binding is
+        // accepted as long as it references *some* valid plan
+        // expectation. good_output() targets obs_metric[0]; with
+        // target_expectation = None, no constraint check fires.
+        let recipe = build_validated_recipe(
+            good_output(),
+            &sample_plan(),
+            "xai",
+            None,
+        )
+        .expect("None target preserves free-choice authoring");
+        assert_eq!(
+            recipe.produces[0].expectation,
+            ExpectationRef::ObservationMetric { index: 0 }
+        );
+    }
+
+    #[test]
+    fn target_expectation_decline_short_circuits_constraint_session_47() {
+        // A non-empty decline_reason short-circuits before any other
+        // validation. Even a target mismatch elsewhere shouldn't
+        // mask the decline.
+        let mut out = good_output();
+        out.decline_reason = "this source is a JS-rendered SPA".into();
+        let err = build_validated_recipe(
+            out,
+            &sample_plan(),
+            "xai",
+            // Constrain to a target that mismatches what good_output
+            // claims; the decline path runs first.
+            Some(ExpectationRef::EventType { index: 0 }),
+        )
+        .expect_err("decline must short-circuit before constraint check");
+        match err {
+            AuthoringError::Declined { reason } => {
+                assert!(reason.contains("JS-rendered SPA"));
+            }
+            other => panic!("expected Declined, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn target_expectation_renders_into_prompt_session_47() {
+        // The target-expectation section reaches the prompt as a
+        // markdown subsection naming bucket, index, and label.
+        let template = "{{TARGET_EXPECTATION}}";
+        let plan = sample_plan(); // obs_metrics[0].name = "production"
+        let ctx = sample_context();
+        let out = build_prompt(
+            template,
+            &plan,
+            &ctx,
+            Some(ExpectationRef::ObservationMetric { index: 0 }),
+        )
+        .unwrap();
+        assert!(out.contains("The target expectation"));
+        assert!(out.contains("observation_metric"));
+        assert!(out.contains("production"));
+        // Constraint language must appear so the LLM sees the
+        // contract — every binding must reference this expectation.
+        assert!(
+            out.contains("must reference this exact expectation"),
+            "prompt must name the constraint; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn target_expectation_none_renders_empty_session_47() {
+        // The placeholder substitutes empty when no target is named —
+        // the legacy reauthor path is unchanged.
+        let template = "before|{{TARGET_EXPECTATION}}|after";
+        let out = build_prompt(template, &sample_plan(), &sample_context(), None).unwrap();
+        assert_eq!(out, "before||after");
+    }
+
+    #[test]
+    fn target_expectation_event_type_renders_label_session_47() {
+        // Verify the label resolution works for non-obs buckets too.
+        let template = "{{TARGET_EXPECTATION}}";
+        let plan = sample_plan(); // event_types[0].event_type = "mine_opened"
+        let out = build_prompt(
+            template,
+            &plan,
+            &sample_context(),
+            Some(ExpectationRef::EventType { index: 0 }),
+        )
+        .unwrap();
+        assert!(out.contains("event_type"));
+        assert!(out.contains("mine_opened"));
     }
 }

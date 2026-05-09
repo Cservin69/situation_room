@@ -114,9 +114,9 @@ use crate::propose_source_url::{
 };
 use crate::recipe_apply::{apply, ApplyContext, ApplyError};
 use crate::recipe_author::{author_recipe, AuthoringContext, AuthoringError};
-use crate::recipes::{ExtractionSpec, FetchRecipe};
+use crate::recipes::{ExpectationRef, ExtractionSpec, FetchRecipe};
 use crate::recipes_store::{
-    load_latest_recipes_for_plan, load_recipes_for_plan, save_recipe, RecipeStoreError,
+    load_recipes_for_plan, save_recipe, RecipeStoreError,
 };
 use crate::research::{DocumentSourceEntry, DocumentSourceNomination, ResearchPlan};
 use crate::research_classifier::SourceDescriptor;
@@ -667,30 +667,78 @@ async fn load_or_author_recipes(
             description = %nomination.description,
             position,
             total,
-            "authoring nomination via propose-URL retry loop"
+            "authoring nomination via Session-47 multi-expectation flow"
         );
-        match author_one(ctx, plan, nomination).await {
-            Ok(recipe) => {
-                save_recipe(ctx.store, &recipe)?;
-                authored.push(recipe);
-            }
-            Err(FetchExecutorError::Authoring(AuthoringError::Declined { reason })) => {
-                // Session 39: the decline doesn't have an URL host
-                // to derive a source_id from (the retry loop may
-                // have tried 0+ URLs before declining; none was the
-                // final winner). Use the nomination_id as the
-                // source_id surface so the operator-visible decline
-                // entry maps to the nomination it came from.
-                let source_id = derive_source_id_for_decline(nomination);
+        // Session 47: one nomination → up to MAX_AUTHORS_PER_NOMINATION
+        // recipes (one per target expectation the LLM authors against
+        // the same prefetched bytes). The first target drives URL
+        // discovery (the Session-39 retry loop); subsequent targets
+        // re-use the locked URL+bytes via direct authoring calls.
+        match author_for_nomination(ctx, plan, nomination).await {
+            Ok((nomination_recipes, expectation_declines, nomination_decline_reason)) => {
+                // Persist every authored recipe. Each carries its own
+                // dedup_key — `{plan_id}:{nomination_id}:{bucket}:{index}` —
+                // so siblings from the same nomination coexist without
+                // collision (Session 47).
+                let recipe_count = nomination_recipes.len();
+                for recipe in nomination_recipes {
+                    save_recipe(ctx.store, &recipe)?;
+                    authored.push(recipe);
+                }
+                // Per-expectation declines (the LLM declined a
+                // specific (target, locked URL+bytes) combination)
+                // surface with widened source_id so the FetchReport /
+                // heatmap / coverage matrix see them as distinct
+                // rows from the authored siblings of the same
+                // nomination.
+                let per_expectation_count = expectation_declines.len();
+                for d in expectation_declines {
+                    let source_id = derive_source_id_for_decline(
+                        nomination,
+                        Some(d.expectation),
+                    );
+                    info!(
+                        plan_id = %plan.id,
+                        source_id = %source_id,
+                        position,
+                        total,
+                        decline_reason = %d.reason,
+                        "expectation declined; surfacing as RecipeOutcome::Declined"
+                    );
+                    declines.push(RecipeOutcome::Declined {
+                        source_id,
+                        reason: d.reason,
+                    });
+                }
+                // Nomination-level decline (URL discovery failed,
+                // deadline elapsed, or every URL produced no recipe
+                // for any target). Surfaces as one row with the
+                // legacy `nom:{nomination_id}` source_id shape so
+                // the FetchReport's keyed-each + RecipeFlagDialog
+                // wiring continues to operate against the
+                // nomination's standing identity. Session 40
+                // uniqueness invariant preserved.
+                if let Some(reason) = nomination_decline_reason {
+                    let source_id = derive_source_id_for_decline(nomination, None);
+                    info!(
+                        plan_id = %plan.id,
+                        source_id = %source_id,
+                        position,
+                        total,
+                        decline_reason = %reason,
+                        "nomination-level decline; surfacing as RecipeOutcome::Declined"
+                    );
+                    declines.push(RecipeOutcome::Declined { source_id, reason });
+                }
                 info!(
                     plan_id = %plan.id,
-                    source_id = %source_id,
+                    nomination_id = %nomination.nomination_id,
                     position,
                     total,
-                    decline_reason = %reason,
-                    "nomination declined; surfacing as RecipeOutcome::Declined"
+                    recipes = recipe_count,
+                    per_expectation_declines = per_expectation_count,
+                    "nomination authored under multi-expectation flow"
                 );
-                declines.push(RecipeOutcome::Declined { source_id, reason });
             }
             Err(e) => {
                 warn!(
@@ -752,8 +800,142 @@ async fn load_or_author_recipes(
 /// (2,048 chars), so the longer string passes through unchanged.
 /// Log-line scannability is preserved by the existing `position`
 /// + `total` fields the caller logs alongside.
-fn derive_source_id_for_decline(nomination: &DocumentSourceNomination) -> String {
-    format!("nom:{}", nomination.nomination_id)
+fn derive_source_id_for_decline(
+    nomination: &DocumentSourceNomination,
+    target: Option<ExpectationRef>,
+) -> String {
+    // Session 47: per-expectation declines under multi-recipe-per-
+    // nomination need a source_id distinct from the nomination-level
+    // decline so the FetchReport's keyed-each surface, the heatmap's
+    // per-(recipe-or-source, source_id) grouping, and the coverage
+    // matrix's per-(bucket, index) row all see the rows as distinct.
+    //
+    // The widened shape mirrors the dedup_key shape used by authored
+    // recipes (see `dedup_key_for_recipe`): the same coordinate names
+    // the same logical thing whether it ended up authored or
+    // declined. That symmetry is what makes the coverage matrix's
+    // "uncovered" rows meaningful — every expectation the LLM tried
+    // and declined against this nomination has its own surface,
+    // legible to the operator without log scraping.
+    //
+    // `target = None` is the nomination-level decline (no record-
+    // typed expectations to target, or every target's retry loop
+    // exhausted for an unrelated reason). The pre-Session-47 shape
+    // (`nom:{nomination_id}`) is preserved for that case so existing
+    // RecipeFlagDialog wiring continues to operate against the
+    // nomination's standing identity.
+    match target {
+        Some(t) => {
+            let (bucket, index) = expectation_ref_parts(t);
+            format!("nom:{}:{}:{}", nomination.nomination_id, bucket, index)
+        }
+        None => format!("nom:{}", nomination.nomination_id),
+    }
+}
+
+/// Closed lookup of `(bucket_str, index)` for an [`ExpectationRef`].
+///
+/// The bucket strings match the v1.15 recipe-author prompt's
+/// `{{TARGET_EXPECTATION}}` rendering and the
+/// `{plan_id}:{nomination_id}:{bucket}:{index}` dedup-key shape used
+/// by [`dedup_key_for_recipe`]. The same bucket vocabulary is used
+/// by [`derive_source_id_for_decline`] for per-expectation declines
+/// so dedup-key-shaped strings and decline-source_id-shaped strings
+/// share a single naming convention. Session 47.
+fn expectation_ref_parts(r: ExpectationRef) -> (&'static str, u32) {
+    match r {
+        ExpectationRef::ObservationMetric { index } => ("observation_metric", index),
+        ExpectationRef::EventType { index } => ("event_type", index),
+        ExpectationRef::EntityKind { index } => ("entity_kind", index),
+        ExpectationRef::RelationKind { index } => ("relation_kind", index),
+        ExpectationRef::DocumentSource { index } => ("document_source", index),
+    }
+}
+
+/// Build the per-recipe `dedup_key` under Session 47's multi-recipe-
+/// per-nomination shape.
+///
+/// Pre-Session-47 the shape was `{plan_id}:{nomination_id}` — one
+/// recipe per nomination. Session 47 widens to
+/// `{plan_id}:{nomination_id}:{bucket}:{index}` so multiple recipes
+/// from the same nomination (each targeting one expectation against
+/// the same prefetched bytes) coexist without primary-key collision
+/// in the recipes table.
+///
+/// **Re-author lineage stays intact.** A re-author of one of these
+/// recipes still routes through `Store::get_recipe_by_dedup_key`
+/// against the wider key, finds the same row, and bumps the
+/// version. Other nomination-siblings under different expectations
+/// are untouched.
+fn dedup_key_for_recipe(
+    plan_id: Uuid,
+    nomination_id: Uuid,
+    target: ExpectationRef,
+) -> String {
+    let (bucket, index) = expectation_ref_parts(target);
+    format!("{}:{}:{}:{}", plan_id, nomination_id, bucket, index)
+}
+
+/// Build the list of target expectation references the executor should
+/// attempt to author against for one nomination.
+///
+/// **Concatenates the four record-typed buckets in declaration order**
+/// (`observation_metric`, then `event_type`, then `entity_kind`, then
+/// `relation_kind`) and truncates to `max` entries. The plan's own
+/// declaration order is the operator's stated priority — the
+/// classifier emitted them in that order based on the user's topic.
+/// `document_source` is excluded because the nomination *is* a
+/// document_source entry; a recipe targeting that bucket would have
+/// the source authoring a record about itself.
+///
+/// **No source-specific routing.** This function reads only the plan;
+/// it never inspects the nomination's URL host, description, or any
+/// other source identifier. The LLM decides per `(nomination,
+/// expectation)` pair whether the prefetch evidence supports the
+/// named target — see the v1.15 recipe-author prompt's
+/// "target-expectation" section. ADR 0007 / ADR 0015 §"closed-
+/// vocabulary discipline".
+///
+/// Returns an empty Vec when the plan declares no record-typed
+/// expectations. The caller surfaces this as a nomination-level
+/// decline rather than authoring zero recipes silently.
+fn build_target_expectations(plan: &ResearchPlan, max: usize) -> Vec<ExpectationRef> {
+    let mut out: Vec<ExpectationRef> = Vec::new();
+    for i in 0..plan.expectations.observation_metrics.len() {
+        if out.len() >= max {
+            return out;
+        }
+        out.push(ExpectationRef::ObservationMetric { index: i as u32 });
+    }
+    for i in 0..plan.expectations.event_types.len() {
+        if out.len() >= max {
+            return out;
+        }
+        out.push(ExpectationRef::EventType { index: i as u32 });
+    }
+    for i in 0..plan.expectations.entity_kinds.len() {
+        if out.len() >= max {
+            return out;
+        }
+        out.push(ExpectationRef::EntityKind { index: i as u32 });
+    }
+    for i in 0..plan.expectations.relation_kinds.len() {
+        if out.len() >= max {
+            return out;
+        }
+        out.push(ExpectationRef::RelationKind { index: i as u32 });
+    }
+    out
+}
+
+/// One per-expectation decline produced under Session 47's multi-
+/// recipe-per-nomination flow. Returned by [`author_for_nomination`]
+/// alongside the recipes that did succeed; the caller projects each
+/// entry into a [`RecipeOutcome::Declined`] with a per-expectation
+/// `source_id`.
+struct ExpectationDecline {
+    expectation: ExpectationRef,
+    reason: String,
 }
 
 /// Maximum number of bytes from a pre-fetched source document that we
@@ -795,6 +977,31 @@ const PREFETCH_EXCERPT_BUDGET: usize = 64 * 1024;
 /// in practice).
 const MAX_AUTHORING_ATTEMPTS_PER_SOURCE: u32 = 3;
 
+/// Maximum number of authoring calls the multi-recipe-per-nomination
+/// flow will make for one nomination before stopping. Session 47.
+///
+/// One nomination drives up to N independent `author_recipe` calls,
+/// one per target expectation against the same prefetched bytes
+/// (after URL discovery locks). Each authoring call costs a few
+/// seconds and a few thousand tokens; capping bounds the worst-case
+/// LLM bill per nomination.
+///
+/// The cap interacts with [`build_target_expectations`]: that
+/// function concatenates the four record-typed buckets in
+/// declaration order and truncates to this number of entries. So
+/// for a plan with 4 obs metrics + 3 event types + 2 entity kinds,
+/// the executor authors against the first 4 entries of the
+/// concatenation (all four obs metrics in this case); the remainder
+/// is silently uncovered until the operator either re-classifies
+/// (which yields fresh nominations) or raises the cap.
+///
+/// 4 is the conservative compromise: enough to cover a small
+/// research plan's top-priority bucket fully, few enough that a
+/// 7-nomination plan stays under ~30 LLM calls per fetch run for
+/// authoring (one propose-URL retry loop + 4 author calls per
+/// nomination = ~28 calls in the typical case).
+const MAX_AUTHORS_PER_NOMINATION: usize = 4;
+
 /// Per-nomination retry-loop deadline, in seconds. Once `Instant::now`
 /// exceeds `started + this`, the loop stops and surfaces the
 /// nomination as declined regardless of remaining attempts. Session 39.
@@ -805,72 +1012,116 @@ const MAX_AUTHORING_ATTEMPTS_PER_SOURCE: u32 = 3;
 /// bites when the LLM gateway slows down dramatically.
 const PER_SOURCE_DEADLINE_SECS: u64 = 240;
 
-/// Author one recipe for one (plan, nomination) pair via Session 39's
-/// propose-URL retry loop.
+/// Author all recipes for one (plan, nomination) pair under Session
+/// 47's multi-recipe-per-nomination flow.
 ///
-/// ## What changed
+/// **Two interleaved loops.**
 ///
-/// Pre-Session-39, the L1 classifier emitted a URL on each
-/// nomination, the executor pre-fetched it, and the recipe author
-/// either authored or declined. One LLM call per source. URLs were
-/// "set in stone" by L1, and a bad pick (landing page, SPA,
-/// homepage) became a guaranteed decline at L2.
+/// The outer loop runs at most [`MAX_AUTHORING_ATTEMPTS_PER_SOURCE`]
+/// times or until [`PER_SOURCE_DEADLINE_SECS`] elapses, whichever
+/// comes first. Each iteration discovers a candidate URL via
+/// [`propose_source_url`] (Cheap tier) and pre-fetches its bytes
+/// through [`prefetch_excerpt`].
 ///
-/// Post-Session-39, the L1 classifier emits only a description and
-/// a priority tier. URL discovery is a runtime concern handled by
-/// this retry loop:
+/// The inner loop iterates [`build_target_expectations`] (capped at
+/// [`MAX_AUTHORS_PER_NOMINATION`]) and calls [`author_recipe`]
+/// (Workhorse tier) once per target against those bytes. Each
+/// authoring call is constrained to its target via the v1.15
+/// recipe-author prompt's `{{TARGET_EXPECTATION}}` section; the
+/// validator rejects the LLM's output if it tries to substitute a
+/// different expectation.
 ///
-/// 1. Call [`propose_source_url`] (Cheap tier) with the plan,
-///    nomination, and prior-attempts history. Get back a URL or a
-///    decline.
-/// 2. Fetch the URL through `SecureHttpClient`. On fetch failure,
-///    record the URL + reason, go to step 1.
-/// 3. Call [`author_recipe`] (Workhorse tier) with the bytes. On
-///    author decline, record + go to step 1. On author error, bubble.
-/// 4. Stamp metadata and return the recipe.
+/// **URL discovery is target-agnostic; target iteration shares the
+/// fetched bytes.** Pre-Session-47 the executor authored one recipe
+/// per nomination; Session 47 authors up to N. The URL discovery
+/// cost (one propose-URL call + one fetch per attempt) is paid
+/// once per attempt and amortised across every target authored
+/// against those bytes. The cap on `MAX_AUTHORS_PER_NOMINATION`
+/// bounds the per-attempt LLM bill at `1 propose + N author` calls.
 ///
-/// The loop runs at most [`MAX_AUTHORING_ATTEMPTS_PER_SOURCE`] times,
-/// or until [`PER_SOURCE_DEADLINE_SECS`] elapses, whichever comes
-/// first. On exhaustion the function returns
-/// `AuthoringError::Declined` with a reason that summarises every
-/// attempt — the operator sees the full URL-discovery story in the
-/// fetch report, not a generic "no source matched."
+/// **Lock-on-first-success.** Once any target authors against an
+/// attempt's URL+bytes, the function locks that URL — subsequent
+/// targets that decline against those bytes go straight into
+/// [`ExpectationDecline`] entries; we do *not* try a different URL
+/// for them. Re-fetching a different URL per target would risk
+/// stamping siblings of the same nomination with mismatched
+/// `source_id`s, and would multiply the LLM bill without principled
+/// gain (the v1.15 prompt's contract is "either author against
+/// these bytes or decline" — a target that declines was given the
+/// same evidentiary surface another target authored against).
+///
+/// **All-targets-decline retries.** If every target declines
+/// against the URL the proposer suggested for an attempt, that URL
+/// is recorded as a prior attempt and the outer loop retries with a
+/// fresh propose-URL call (which sees the prior-attempts history
+/// and can pick differently).
 ///
 /// ## Identity
 ///
-/// Pre-Session-39, `source_id` was derived from the URL host (or a
-/// `known_id` blessed by host-overlap heuristic) and `dedup_key` was
-/// `{plan_id}:{source_id}`. URLs varying across attempts would have
-/// broken that assumption — `dedup_key` would shift per run.
+/// Pre-Session-47, `dedup_key` was `{plan_id}:{nomination_id}` —
+/// one recipe per nomination. Session 47 widens to
+/// `{plan_id}:{nomination_id}:{bucket}:{index}` so siblings from
+/// the same nomination coexist; see [`dedup_key_for_recipe`].
+/// `source_id` continues to be the URL host of whichever attempt
+/// locked, shared across siblings of the same nomination because
+/// the URL is shared.
 ///
-/// Post-Session-39:
-/// - `source_id` is derived from the URL host of whichever attempt
-///   succeeded. Stays human-readable in logs and in the UI's recipe
-///   inspection panel.
-/// - `dedup_key` is `{plan_id}:{nomination_id}`. The `nomination_id`
-///   is server-stamped at classify time and is stable across
-///   attempts, runs, and re-fetches of the same plan. Re-running the
-///   same plan upserts the recipe by version rather than creating
-///   parallel rows even when the retry loop picks a different URL on
-///   the second run.
-async fn author_one(
+/// ## Returns
+///
+/// `(recipes, expectation_declines, nomination_decline_reason)`:
+///
+/// - **`recipes`** — every recipe authored. Empty when the
+///   nomination decline path was taken.
+/// - **`expectation_declines`** — one entry per target the LLM
+///   declined for *against the locked URL+bytes*. Targets that the
+///   nomination never reached (because no URL ever locked) are
+///   represented under `nomination_decline_reason` instead.
+/// - **`nomination_decline_reason`** — `Some(reason)` when URL
+///   discovery itself failed (propose-URL declined on first
+///   attempt, every attempt's URL fetched but no target authored,
+///   or the deadline elapsed); `None` when at least one URL
+///   locked and at least one target authored against it.
+///
+/// The caller projects these into either:
+///   - one `RecipeOutcome::Declined` with `source_id =
+///     nom:{nomination_id}` when `nomination_decline_reason` is
+///     set, or
+///   - one or more `RecipeOutcome::Declined` rows with widened
+///     `source_id = nom:{nomination_id}:{bucket}:{index}` when
+///     per-target declines surface alongside one or more authored
+///     recipes.
+async fn author_for_nomination(
     ctx: &ExecutorContext<'_>,
     plan: &ResearchPlan,
     nomination: &DocumentSourceNomination,
-) -> Result<FetchRecipe, FetchExecutorError> {
+) -> Result<
+    (Vec<FetchRecipe>, Vec<ExpectationDecline>, Option<String>),
+    FetchExecutorError,
+> {
     let nomination_id = nomination.nomination_id;
-    let stable_dedup_key = format!("{}:{}", plan.id, nomination_id);
+    let targets = build_target_expectations(plan, MAX_AUTHORS_PER_NOMINATION);
+    if targets.is_empty() {
+        // Plan declares no record-typed expectations to author for.
+        // Surface to the caller as a nomination-level decline.
+        return Ok((
+            Vec::new(),
+            Vec::new(),
+            Some(
+                "plan declares no record-typed expectations                  (observation_metric, event_type, entity_kind,                  relation_kind); the multi-recipe-per-nomination                  flow has nothing to target"
+                    .to_string(),
+            ),
+        ));
+    }
+
     let deadline = Instant::now() + Duration::from_secs(PER_SOURCE_DEADLINE_SECS);
 
     // Look up persistent operator feedback once — it doesn't change
     // across attempts within a single retry loop. ADR 0013: feedback
     // is keyed by (plan_id, source_id) at the storage layer; under
-    // Session 39 we use the nomination_id (formatted as a string) as
-    // the source_id key for feedback lookup. It's stable across
-    // attempts and across re-runs of the same plan, which is the
-    // semantic the feedback table actually wants. Pre-Session-39
-    // host-derived source_ids were a leakier proxy for the same
-    // intent.
+    // Session 39 we use the nomination_id as the source_id key for
+    // feedback lookup. All Stage-1 and Stage-2 author calls for one
+    // nomination share the same feedback row, regardless of which
+    // target the call constrains.
     let feedback_key = nomination_id.to_string();
     let recipe_feedback = match ctx
         .store
@@ -889,21 +1140,22 @@ async fn author_one(
         }
     };
 
+    let mut recipes: Vec<FetchRecipe> = Vec::new();
+    let mut declines: Vec<ExpectationDecline> = Vec::new();
     let mut prior_attempts: Vec<PriorAttempt> = Vec::new();
 
     for attempt_num in 1..=MAX_AUTHORING_ATTEMPTS_PER_SOURCE {
-        // Deadline gate before each attempt. Failing fast on the
-        // deadline is preferable to starting a fresh LLM round trip
-        // we know we can't honour.
+        // Deadline gate before each attempt. Failing fast is
+        // preferable to starting a fresh LLM round trip we know we
+        // can't honour.
         if Instant::now() >= deadline {
-            return Err(FetchExecutorError::Authoring(AuthoringError::Declined {
-                reason: format!(
-                    "per-source deadline ({}s) exceeded after {} attempt(s); attempts: {}",
-                    PER_SOURCE_DEADLINE_SECS,
-                    attempt_num - 1,
-                    summarize_attempts(&prior_attempts)
-                ),
-            }));
+            let reason = format!(
+                "per-source deadline ({}s) exceeded after {} attempt(s); attempts: {}",
+                PER_SOURCE_DEADLINE_SECS,
+                attempt_num - 1,
+                summarize_attempts(&prior_attempts)
+            );
+            return Ok((recipes, declines, Some(reason)));
         }
 
         info!(
@@ -912,10 +1164,14 @@ async fn author_one(
             attempt = attempt_num,
             max_attempts = MAX_AUTHORING_ATTEMPTS_PER_SOURCE,
             description = %nomination.description,
-            "proposing URL for nomination"
+            target_count = targets.len(),
+            "proposing URL for nomination (Session 47 multi-target authoring)"
         );
 
-        // Step 1: propose URL.
+        // Step 1: propose URL. Target-agnostic — the propose-URL
+        // prompt sees the plan + nomination + prior-attempts history,
+        // not the target expectation; URL discovery is shared across
+        // every target the inner loop will try against these bytes.
         let proposal = propose_source_url(
             ctx.provider,
             ModelTier::Cheap,
@@ -930,9 +1186,11 @@ async fn author_one(
         let (proposed_url, _proposal_rationale) = match proposal {
             ProposalOutcome::Url { url, rationale } => (url, rationale),
             ProposalOutcome::Declined { reason } => {
-                // Propose-URL declined: it has nothing more to try.
-                // Surface as overall decline immediately rather than
-                // burning the rest of the attempt budget.
+                // Propose-URL has nothing more to try. Per-target
+                // retry against this proposer wouldn't help — the
+                // proposer is target-agnostic. Surface as a single
+                // nomination-level decline so the operator sees one
+                // row in the report, not N identical rows.
                 let attempts_str = summarize_attempts(&prior_attempts);
                 let composed = if prior_attempts.is_empty() {
                     format!("url proposer declined on first attempt: {reason}")
@@ -947,11 +1205,9 @@ async fn author_one(
                     nomination_id = %nomination_id,
                     attempt = attempt_num,
                     decline_reason = %reason,
-                    "url proposer declined"
+                    "url proposer declined; surfacing as nomination-level decline"
                 );
-                return Err(FetchExecutorError::Authoring(AuthoringError::Declined {
-                    reason: composed,
-                }));
+                return Ok((recipes, declines, Some(composed)));
             }
         };
 
@@ -963,21 +1219,17 @@ async fn author_one(
             "URL proposed; pre-fetching"
         );
 
-        // The source_id we'd stamp on the recipe IF this attempt
-        // succeeds. Computed pre-fetch so logging downstream is
-        // consistent.
         let candidate_source_id = derive_source_id_from_url(&proposed_url);
 
-        // Step 2: fetch the proposed URL. Reuses the existing
-        // pre-fetch helper which routes through SecureHttpClient and
-        // honours the rate-limit backoff.
+        // Step 2: fetch the proposed URL. Routes through
+        // SecureHttpClient and honours the rate-limit backoff. On
+        // failure, record + retry with a different URL.
         let (excerpt, prefetched_bytes) =
             match prefetch_excerpt(ctx, &proposed_url, &candidate_source_id).await {
                 Some(real) => real,
                 None => {
-                    // Fetch failed (logged inside prefetch_excerpt).
-                    // Record the failure and try a different URL.
-                    let reason = "fetch failed (network error, bad status, or oversized response — see warn-level log above)";
+                    let reason =
+                        "fetch failed (network error, bad status, or oversized response — see warn-level log above)";
                     prior_attempts.push(PriorAttempt {
                         url: proposed_url.to_string(),
                         reason: reason.to_string(),
@@ -986,90 +1238,123 @@ async fn author_one(
                 }
             };
 
-        // Step 3: author recipe given the URL + bytes.
-        let auth_ctx = AuthoringContext {
-            source_id: candidate_source_id.clone(),
-            sample_url: proposed_url.clone(),
-            document_excerpt: excerpt,
-            recipe_feedback: recipe_feedback.clone(),
-            previous_failure_reason: None,
-            operator_guidance: None,
-        };
+        // Step 3: iterate targets, calling author_recipe per
+        // (target, locked URL+bytes). The first target that authors
+        // locks the URL — subsequent targets that decline surface as
+        // ExpectationDecline entries against the same locked URL.
+        let mut authored_this_attempt: Vec<FetchRecipe> = Vec::new();
+        let mut declined_this_attempt: Vec<(ExpectationRef, String)> = Vec::new();
+        for &target in &targets {
+            let auth_ctx = AuthoringContext {
+                source_id: candidate_source_id.clone(),
+                sample_url: proposed_url.clone(),
+                document_excerpt: excerpt.clone(),
+                recipe_feedback: recipe_feedback.clone(),
+                previous_failure_reason: None,
+                operator_guidance: None,
+            };
 
-        let auth_result = author_recipe(
-            ctx.provider,
-            ModelTier::Workhorse,
-            ctx.recipe_author_prompt,
-            plan,
-            &auth_ctx,
-            // Session 41 items 4–6: the same bytes the LLM saw in
-            // the excerpt flow into authoring-time validation.
-            // `author_recipe` calls
-            // `recipe_apply::validate_recipe_against_bytes` after
-            // `build_validated_recipe` succeeds; a recipe that
-            // wouldn't extract against these bytes is converted to
-            // a Decline at authoring time rather than persisted.
-            Some(&prefetched_bytes),
-        )
-        .await;
+            let auth_result = author_recipe(
+                ctx.provider,
+                ModelTier::Workhorse,
+                ctx.recipe_author_prompt,
+                plan,
+                &auth_ctx,
+                Some(&prefetched_bytes),
+                Some(target),
+            )
+            .await;
 
-        match auth_result {
-            Ok(mut recipe) => {
-                // Stamp identity and return.
-                recipe.source_id = candidate_source_id.clone();
-                recipe.dedup_key = Some(stable_dedup_key.clone());
-                // Session 39: in the retry loop, every successful
-                // authoring is necessarily against fetched bytes.
-                // The stub-excerpt path doesn't reach here — a
-                // failed fetch goes back to the loop with a fresh
-                // proposed URL.
-                recipe.authored_from = situation_room_storage::AuthoredFrom::FetchedBytes;
-                info!(
-                    plan_id = %plan.id,
-                    nomination_id = %nomination_id,
-                    attempt = attempt_num,
-                    source_id = %candidate_source_id,
-                    recipe_id = %recipe.id,
-                    "recipe authored from retry-loop attempt"
-                );
-                return Ok(recipe);
-            }
-            Err(AuthoringError::Declined { reason }) => {
-                let attempt_reason = format!("recipe author declined: {reason}");
-                warn!(
-                    plan_id = %plan.id,
-                    nomination_id = %nomination_id,
-                    attempt = attempt_num,
-                    url = %proposed_url,
-                    decline = %reason,
-                    "recipe author declined this URL; will retry with different URL"
-                );
-                prior_attempts.push(PriorAttempt {
-                    url: proposed_url.to_string(),
-                    reason: attempt_reason,
-                });
-                continue;
-            }
-            Err(other) => {
-                // Hard error — bubble up. Don't waste the rest of
-                // the budget on a failure mode the next attempt
-                // wouldn't recover from (network outage, schema
-                // miss, etc.).
-                return Err(FetchExecutorError::Authoring(other));
+            match auth_result {
+                Ok(mut recipe) => {
+                    recipe.source_id = candidate_source_id.clone();
+                    recipe.dedup_key = Some(dedup_key_for_recipe(
+                        plan.id,
+                        nomination_id,
+                        target,
+                    ));
+                    recipe.authored_from =
+                        situation_room_storage::AuthoredFrom::FetchedBytes;
+                    info!(
+                        plan_id = %plan.id,
+                        nomination_id = %nomination_id,
+                        attempt = attempt_num,
+                        source_id = %candidate_source_id,
+                        recipe_id = %recipe.id,
+                        ?target,
+                        "recipe authored under multi-target flow"
+                    );
+                    authored_this_attempt.push(recipe);
+                }
+                Err(AuthoringError::Declined { reason }) => {
+                    warn!(
+                        plan_id = %plan.id,
+                        nomination_id = %nomination_id,
+                        attempt = attempt_num,
+                        url = %proposed_url,
+                        ?target,
+                        decline = %reason,
+                        "recipe author declined this (URL, target) pair"
+                    );
+                    declined_this_attempt.push((target, reason));
+                }
+                Err(other) => {
+                    // Hard error (LLM outage, schema miss, network
+                    // outage) — bubble up. We don't keep partial
+                    // recipes from this attempt because the outer
+                    // run-level error surface needs to see the
+                    // failure honestly.
+                    return Err(FetchExecutorError::Authoring(other));
+                }
             }
         }
+
+        if !authored_this_attempt.is_empty() {
+            // At least one target authored against this URL — lock
+            // and finish. Surface declined-this-attempt entries as
+            // per-expectation declines.
+            recipes.extend(authored_this_attempt);
+            for (t, r) in declined_this_attempt {
+                declines.push(ExpectationDecline {
+                    expectation: t,
+                    reason: r,
+                });
+            }
+            return Ok((recipes, declines, None));
+        }
+
+        // No target authored against this URL. Record a prior-
+        // attempts entry summarising every target's decline, then
+        // try a different URL on the next iteration.
+        let summary = if declined_this_attempt.is_empty() {
+            "no targets attempted (empty target list — should not reach here)".to_string()
+        } else {
+            declined_this_attempt
+                .iter()
+                .map(|(t, r)| {
+                    let (b, i) = expectation_ref_parts(*t);
+                    format!("[{}:{}] {}", b, i, r)
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        prior_attempts.push(PriorAttempt {
+            url: proposed_url.to_string(),
+            reason: format!("no target authored: {summary}"),
+        });
     }
 
-    // Loop exhausted MAX_AUTHORING_ATTEMPTS_PER_SOURCE without
-    // success. Surface as a decline with the attempt history baked
-    // into the reason.
-    Err(FetchExecutorError::Authoring(AuthoringError::Declined {
-        reason: format!(
-            "exhausted {} attempts without producing a recipe; attempts: {}",
-            MAX_AUTHORING_ATTEMPTS_PER_SOURCE,
-            summarize_attempts(&prior_attempts)
-        ),
-    }))
+    // Outer loop exhausted MAX_AUTHORING_ATTEMPTS_PER_SOURCE without
+    // any URL producing a recipe for any target. Surface as a single
+    // nomination-level decline with the attempt history baked into
+    // the reason — the operator sees the full URL-discovery story
+    // in the fetch report.
+    let composed = format!(
+        "exhausted {} attempts without authoring against any target; attempts: {}",
+        MAX_AUTHORING_ATTEMPTS_PER_SOURCE,
+        summarize_attempts(&prior_attempts)
+    );
+    Ok((recipes, declines, Some(composed)))
 }
 
 /// Translate a [`ProposalError`] into a [`FetchExecutorError`].
@@ -6494,5 +6779,191 @@ mod tests {
             "excerpt header should announce that bytes were parsed \
              as HTML; got prompt:\n{last}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Session 47 — multi-recipe per nomination
+    //
+    // Pure unit tests for the helpers added in Session 47. The
+    // multi-target authoring flow itself is exercised end-to-end by
+    // the existing decline tests (DecliningProvider surfaces a
+    // nomination-level decline regardless of target count) and is
+    // pinned in shape by the new tests below.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_target_expectations_concatenates_buckets_in_declaration_order_session_47() {
+        let plan = sample_plan(); // 1 obs metric + 1 event type + 1 entity kind + 1 relation kind
+        let targets = build_target_expectations(&plan, 10);
+        assert_eq!(
+            targets.len(),
+            4,
+            "all four record-typed buckets should contribute one target each"
+        );
+        // Concatenation order: obs first, then event, then entity, then relation.
+        assert!(matches!(
+            targets[0],
+            ExpectationRef::ObservationMetric { index: 0 }
+        ));
+        assert!(matches!(targets[1], ExpectationRef::EventType { index: 0 }));
+        assert!(matches!(targets[2], ExpectationRef::EntityKind { index: 0 }));
+        assert!(matches!(
+            targets[3],
+            ExpectationRef::RelationKind { index: 0 }
+        ));
+    }
+
+    #[test]
+    fn build_target_expectations_truncates_to_cap_session_47() {
+        let mut plan = sample_plan();
+        // Stuff 6 obs metrics in; cap is 4.
+        plan.expectations.observation_metrics = (0..6)
+            .map(|i| MetricExpectation {
+                name: format!("metric_{i}"),
+                unit_hint: Some(Unit::new("t").unwrap()),
+                rationale: format!("rationale_{i}"),
+            })
+            .collect();
+        let targets = build_target_expectations(&plan, MAX_AUTHORS_PER_NOMINATION);
+        assert_eq!(
+            targets.len(),
+            MAX_AUTHORS_PER_NOMINATION,
+            "cap must bound the per-nomination call count"
+        );
+        // All four are obs metrics 0..3 — the cap fires before
+        // event_type/entity_kind/relation_kind contribute.
+        for (i, t) in targets.iter().enumerate() {
+            assert_eq!(
+                *t,
+                ExpectationRef::ObservationMetric { index: i as u32 },
+                "cap should pull the first {MAX_AUTHORS_PER_NOMINATION} obs metrics"
+            );
+        }
+    }
+
+    #[test]
+    fn build_target_expectations_empty_plan_yields_empty_session_47() {
+        let mut plan = sample_plan();
+        plan.expectations.observation_metrics.clear();
+        plan.expectations.event_types.clear();
+        plan.expectations.entity_kinds.clear();
+        plan.expectations.relation_kinds.clear();
+        let targets = build_target_expectations(&plan, 4);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn build_target_expectations_excludes_document_source_bucket_session_47() {
+        // The plan's document_sources is the nominations vec itself.
+        // A recipe targeting document_source[i] would be a source
+        // authoring a record about itself — circular. Confirm the
+        // helper never returns that bucket.
+        let plan = sample_plan();
+        let targets = build_target_expectations(&plan, 100);
+        for t in &targets {
+            assert!(
+                !matches!(t, ExpectationRef::DocumentSource { .. }),
+                "document_source bucket must not be a target: {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dedup_key_for_recipe_widens_with_bucket_and_index_session_47() {
+        let plan_id = Uuid::now_v7();
+        let nom_id = Uuid::now_v7();
+        let key = dedup_key_for_recipe(
+            plan_id,
+            nom_id,
+            ExpectationRef::ObservationMetric { index: 2 },
+        );
+        let expected = format!("{plan_id}:{nom_id}:observation_metric:2");
+        assert_eq!(key, expected);
+    }
+
+    #[test]
+    fn dedup_key_for_recipe_distinguishes_siblings_under_same_nomination_session_47() {
+        // Two recipes from the same nomination but different
+        // expectations get distinct dedup_keys — the storage layer's
+        // primary key won't collide.
+        let plan_id = Uuid::now_v7();
+        let nom_id = Uuid::now_v7();
+        let a = dedup_key_for_recipe(
+            plan_id,
+            nom_id,
+            ExpectationRef::ObservationMetric { index: 0 },
+        );
+        let b = dedup_key_for_recipe(
+            plan_id,
+            nom_id,
+            ExpectationRef::ObservationMetric { index: 1 },
+        );
+        let c = dedup_key_for_recipe(
+            plan_id,
+            nom_id,
+            ExpectationRef::EventType { index: 0 },
+        );
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+    }
+
+    #[test]
+    fn derive_source_id_for_decline_legacy_shape_when_no_target_session_47() {
+        let nom = DocumentSourceNomination {
+            nomination_id: Uuid::now_v7(),
+            description: "test".into(),
+            priority_tier: PriorityTier::AuthoritativePrimary,
+        };
+        let s = derive_source_id_for_decline(&nom, None);
+        // Legacy shape: nom:<full-uuid>; preserves Session 40
+        // uniqueness invariant for nomination-level declines.
+        assert!(s.starts_with("nom:"));
+        assert_eq!(s.len(), 40);
+    }
+
+    #[test]
+    fn derive_source_id_for_decline_widens_when_target_provided_session_47() {
+        let nom = DocumentSourceNomination {
+            nomination_id: Uuid::now_v7(),
+            description: "test".into(),
+            priority_tier: PriorityTier::AuthoritativePrimary,
+        };
+        let s = derive_source_id_for_decline(
+            &nom,
+            Some(ExpectationRef::ObservationMetric { index: 3 }),
+        );
+        let expected = format!("nom:{}:observation_metric:3", nom.nomination_id);
+        assert_eq!(s, expected);
+        // The shape mirrors `dedup_key_for_recipe`: same bucket
+        // vocabulary, same coordinate naming convention.
+    }
+
+    #[test]
+    fn expectation_ref_parts_round_trips_buckets_session_47() {
+        let cases = [
+            (
+                ExpectationRef::ObservationMetric { index: 5 },
+                ("observation_metric", 5),
+            ),
+            (ExpectationRef::EventType { index: 1 }, ("event_type", 1)),
+            (
+                ExpectationRef::EntityKind { index: 0 },
+                ("entity_kind", 0),
+            ),
+            (
+                ExpectationRef::RelationKind { index: 2 },
+                ("relation_kind", 2),
+            ),
+            (
+                ExpectationRef::DocumentSource { index: 7 },
+                ("document_source", 7),
+            ),
+        ];
+        for (input, (expected_bucket, expected_index)) in cases {
+            let (b, i) = expectation_ref_parts(input);
+            assert_eq!(b, expected_bucket);
+            assert_eq!(i, expected_index);
+        }
     }
 }
