@@ -7,7 +7,15 @@
   high (ADR 0006); clicking the row toggles it.
 
   Optional `aside` slot renders to the right of the label — used for
-  metric unit hints, exemplar counts, preferred-source-id badges.
+  metric unit hints, exemplar counts, preferred-source-id badges,
+  and (Session 52) per-nomination outcome glyphs.
+
+  Optional `extras` slot renders inside the expanded panel below the
+  rationale — used (Session 52) by the Document bucket to surface
+  the cross-run prior-attempts chronology adjacent to each
+  nomination row, so the operator's L1 expectation and the L2
+  fetch outcomes for it are visible together rather than split
+  across the page.
 -->
 <script lang="ts">
   import type { Snippet } from 'svelte';
@@ -15,8 +23,9 @@
     label: string;
     rationale: string;
     aside?: Snippet;
+    extras?: Snippet;
   }
-  let { label, rationale, aside }: Props = $props();
+  let { label, rationale, aside, extras }: Props = $props();
   let expanded = $state(false);
 </script>
 
@@ -28,6 +37,9 @@
   </button>
   {#if expanded}
     <p class="rationale">{rationale}</p>
+    {#if extras}
+      <div class="extras">{@render extras()}</div>
+    {/if}
   {/if}
 </div>
 
@@ -88,5 +100,16 @@
     color: var(--fg-secondary);
     font-size: 11px;
     line-height: 1.5;
+  }
+  .extras {
+    /*
+      Session 52: extras-snippet container. Inset matches the
+      rationale's left padding so per-row supplementary surfaces
+      (NominationAttempts chronology, future per-row diagnostics)
+      align under the row's text column rather than the row's
+      hit area. Bottom padding mirrors `.rationale` so the row's
+      expanded shape stays balanced when both render.
+    */
+    padding: 4px 6px 6px 6px;
   }
 </style>

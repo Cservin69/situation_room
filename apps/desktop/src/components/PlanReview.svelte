@@ -61,6 +61,8 @@
   import StatusPill from '$components/common/StatusPill.svelte';
   import Bucket from '$components/panels/Bucket.svelte';
   import ExpectationRow from '$components/panels/ExpectationRow.svelte';
+  import NominationStatusGlyph from '$components/panels/NominationStatusGlyph.svelte';
+  import NominationAttempts from '$components/panels/NominationAttempts.svelte';
   import RecordCard from '$components/panels/RecordCard.svelte';
   import RunFetchButton from '$components/RunFetchButton.svelte';
   import FetchReport from '$components/FetchReport.svelte';
@@ -385,13 +387,31 @@
             Rendered as: description as the primary line, tier as an
             info chip, nomination_id as a short prefix for
             traceability (matching the recipe-id-prefix convention).
+
+            Session 52 piece A: a NominationStatusGlyph renders to
+            the left of the tier chip in the row aside, surfacing the
+            most recent fetch outcome for this nomination — so the
+            operator's vertical scan of the Document bucket reads
+            "L1 description → outcome glyph → tier" in one line,
+            without scrolling to a separate panel.
+
+            Session 52 piece B: when the row is expanded, the
+            ExpectationRow's `extras` snippet hosts a
+            NominationAttempts chronology — one line per fetch run
+            that touched this nomination, newest first — making the
+            v1.1 propose-URL override's behaviour auditable inline
+            against the L1 expectation it serves.
           -->
           <ExpectationRow
             label={s.description}
             rationale={'nomination ' + s.nomination_id.slice(0, 8)}
           >
             {#snippet aside()}
+              <NominationStatusGlyph nominationId={s.nomination_id} />
               <Chip label={s.priority_tier.replace(/_/g, ' ')} tone="info" />
+            {/snippet}
+            {#snippet extras()}
+              <NominationAttempts nominationId={s.nomination_id} />
             {/snippet}
           </ExpectationRow>
         {:else if s.kind === 'legacy'}
