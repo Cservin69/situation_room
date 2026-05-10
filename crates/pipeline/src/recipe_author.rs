@@ -278,13 +278,6 @@ pub fn build_prompt_with_fence_id(
     target_expectation: Option<ExpectationRef>,
     fence_id: &str,
 ) -> Result<String, AuthoringError> {
-    check_string(
-        "llm_prompt_user",
-        &ctx.document_excerpt,
-        Bounds::LLM_PROMPT_BODY,
-    )
-    .map_err(|e| AuthoringError::Prompt(e.to_string()))?;
-
     let plan_json = serde_json::to_string_pretty(plan)
         .map_err(|e| AuthoringError::Prompt(format!("plan serialization: {e}")))?;
 
@@ -312,20 +305,78 @@ pub fn build_prompt_with_fence_id(
     let target_expectation_block =
         render_target_expectation(target_expectation, plan);
 
-    let out = template
+    // Session 56: budget-aware truncation of the document excerpt.
+    //
+    // Other placeholders (PLAN_JSON, schema, feedback, …) are bounded
+    // upstream; the document excerpt is the unbounded variable that
+    // can come from a large prefetched body — a full PDF, a long HTML
+    // page. Without this guard, a large prefetch pushes the assembled
+    // prompt past LLM_PROMPT_BODY and the post-assembly check below
+    // crashes the entire nomination wholesale. (Session 56 Patch 4
+    // run 2 hit this on `pubs.usgs.gov/.../mcs2024.pdf`: 267,413 >
+    // 262,144.)
+    //
+    // Strategy: replace every other placeholder first, then size the
+    // excerpt against what remains of the LLM_PROMPT_BODY budget.
+    // Truncate at a UTF-8 char boundary and append a marker so the
+    // LLM can see the body was clipped. Truncation is strictly safer
+    // than rejection — the model can still operate on a partial
+    // document, while a wholesale rejection costs the entire
+    // nomination's authoring budget.
+    let prompt = template
         .replace("{{PLAN_JSON}}", &plan_json)
         .replace("{{TARGET_RECORD_SCHEMA}}", &schema_block)
         .replace("{{TARGET_EXPECTATION}}", &target_expectation_block)
         .replace("{{SOURCE_ID}}", &ctx.source_id)
         .replace("{{SOURCE_URL}}", ctx.sample_url.as_str())
-        .replace("{{DOCUMENT_EXCERPT}}", &ctx.document_excerpt)
         .replace("{{RECIPE_FEEDBACK}}", &feedback)
         .replace("{{PREVIOUS_FAILURE_REASON}}", &previous_failure)
         .replace("{{OPERATOR_GUIDANCE}}", &operator_guidance);
 
-    // The assembled prompt can be larger than the individual parts
-    // (template text + inputs). Enforce the overall bound so we fail
-    // fast rather than at the provider.
+    const EXCERPT_PLACEHOLDER: &str = "{{DOCUMENT_EXCERPT}}";
+    // Reserve a small margin for the truncation marker text and any
+    // UTF-8 boundary padding when we cut.
+    const TRUNCATION_SAFETY_MARGIN: usize = 512;
+    // The assembled-static size is `prompt.len()` minus the bytes
+    // currently held by the {{DOCUMENT_EXCERPT}} placeholder(s) — the
+    // excerpt's bytes will replace those bytes one-for-one. In
+    // production the template has exactly one occurrence; the
+    // arithmetic is written defensively for N occurrences so a future
+    // template edit doesn't reintroduce the bug. `.max(1)` keeps the
+    // divisor safe when the placeholder is absent (the truncated
+    // excerpt simply won't be inserted anywhere).
+    let placeholder_count = prompt.matches(EXCERPT_PLACEHOLDER).count().max(1);
+    let static_size = prompt
+        .len()
+        .saturating_sub(placeholder_count * EXCERPT_PLACEHOLDER.len());
+    let excerpt_budget = Bounds::LLM_PROMPT_BODY
+        .saturating_sub(static_size)
+        .saturating_sub(TRUNCATION_SAFETY_MARGIN)
+        / placeholder_count;
+
+    let document_excerpt: std::borrow::Cow<'_, str> =
+        if ctx.document_excerpt.len() <= excerpt_budget {
+            std::borrow::Cow::Borrowed(&ctx.document_excerpt)
+        } else {
+            // Cut at a UTF-8 char boundary at-or-below the budget so
+            // we never split a multi-byte character.
+            let mut cut = excerpt_budget;
+            while cut > 0 && !ctx.document_excerpt.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let total = ctx.document_excerpt.len();
+            std::borrow::Cow::Owned(format!(
+                "{}\n\n[document excerpt truncated to fit prompt budget; original {total} bytes, retained {cut} bytes]",
+                &ctx.document_excerpt[..cut],
+            ))
+        };
+
+    let out = prompt.replace(EXCERPT_PLACEHOLDER, &document_excerpt);
+
+    // Post-assembly bound check stays as a safety net: if the static
+    // portion alone overflows LLM_PROMPT_BODY (a misconfigured plan,
+    // a pathological feedback string), truncation can't recover and
+    // we still want to fail fast rather than at the provider.
     check_string("llm_prompt_user", &out, Bounds::LLM_PROMPT_BODY)
         .map_err(|e| AuthoringError::Prompt(e.to_string()))?;
 
@@ -2084,11 +2135,51 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_rejects_oversized_excerpt() {
+    fn build_prompt_truncates_oversized_excerpt() {
+        // Session 56: an excerpt larger than LLM_PROMPT_BODY used to
+        // crash the nomination wholesale at the post-assembly check.
+        // The new behaviour is to truncate at a UTF-8 boundary so the
+        // model still receives a partial document.
         let mut ctx = sample_context();
-        ctx.document_excerpt = "x".repeat(Bounds::LLM_PROMPT_BODY + 1);
-        let err = build_prompt("x{{DOCUMENT_EXCERPT}}y", &sample_plan(), &ctx, None).unwrap_err();
-        assert!(matches!(err, AuthoringError::Prompt(_)), "got {err:?}");
+        ctx.document_excerpt = "x".repeat(Bounds::LLM_PROMPT_BODY * 2);
+        let out = build_prompt("x{{DOCUMENT_EXCERPT}}y", &sample_plan(), &ctx, None)
+            .expect("oversized excerpt should be truncated, not rejected");
+        assert!(
+            out.len() <= Bounds::LLM_PROMPT_BODY,
+            "truncation must keep assembled prompt within LLM_PROMPT_BODY; got {} > {}",
+            out.len(),
+            Bounds::LLM_PROMPT_BODY
+        );
+        assert!(
+            out.contains("[document excerpt truncated to fit prompt budget"),
+            "truncation marker should be present in output"
+        );
+        assert!(
+            !out.contains("{{DOCUMENT_EXCERPT}}"),
+            "excerpt placeholder should not survive truncation path"
+        );
+    }
+
+    #[test]
+    fn build_prompt_preserves_in_budget_excerpt() {
+        // Sample context excerpt is small (~70 bytes); the truncation
+        // path must NOT fire on a normal-sized document.
+        let ctx = sample_context();
+        let out = build_prompt(
+            "header {{DOCUMENT_EXCERPT}} footer",
+            &sample_plan(),
+            &ctx,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !out.contains("truncated to fit prompt budget"),
+            "small excerpt should not trip the truncation path"
+        );
+        assert!(
+            out.contains("Australia 88,000 tonnes"),
+            "small excerpt should appear verbatim"
+        );
     }
 
     // -----------------------------------------------------------------------
