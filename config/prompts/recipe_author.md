@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.17
+# Recipe Author Prompt — v1.18
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -311,6 +311,107 @@ reasonable extraction — even partial coverage of the plan's
 asks — write the recipe. Decline only when the closed vocabulary
 genuinely cannot address the source.
 
+### Capabilities the runtime gives you — these are NOT decline reasons
+
+The runtime around your recipe absorbs several shapes the LLM
+historically used as decline rationales. Each shape below is
+handled automatically; **do not decline citing any of them**. If
+your only hesitation about authoring is one of these, author the
+recipe and trust the runtime.
+
+- **Comma-thousands separators.** `74,700` parses as `74700`.
+  `1,234,567` parses as `1234567`. `-3,200.5` parses as
+  `-3200.5`. Author the selector against the raw cell.
+- **Currency markers** as a leading or trailing token: `$`, `€`,
+  `£`, `¥`, `USD`, `EUR` (case-insensitive). `$1,234.56` →
+  `1234.56`; `1,234 USD` → `1234`. Author the selector against
+  the raw cell.
+- **Estimate prefixes**: `est. `, `est `, `~`, `≈`, and the bare
+  `e ` (literal-space) form. `est. 1,200` → `1200`; `~5000` →
+  `5000`. Author the selector against the raw cell.
+- **Trailing units** beyond the leading numeric prefix: `49,000 t`
+  → `49000`; `12.5%` → `12.5`. Author the selector targeting the
+  cell whose value tagged a unit on; the parser keeps the leading
+  numeric prefix.
+- **Scientific notation** (`1.5e9` → `1500000000`) parses
+  directly via the standard `f64` path.
+- **Internal whitespace** is collapsed (`1 234.5` → `1234.5`).
+- **Per-row nulls in time-series JSON** (`null` interspersed with
+  real values, common on country-indicator APIs leading the most
+  recent rows). Use a `[?(@.value)]` filter expression in the
+  `json_path`; the runtime is RFC 9535 compliant. The series is
+  authorable; the leading-null pattern is not a decline reason.
+- **2 KB field cap.** A leaf cell whose text fits under 2048
+  bytes is authorable. The cap exists to catch container
+  selectors (which return entire `<body>` / `<table>` elements,
+  10–500 KB), not to limit legitimate scalar values. If your
+  binding's field is a scalar leaf, the cap is invisible.
+- **Listing-shaped sources.** Pages with N items per fetch are
+  addressable via the `iterator` field with `dedup_key_field` on
+  every binding (see "Iterating over listings" below). A listing
+  source is not a "no scalar found" decline; it is an iterator-
+  shaped recipe.
+
+When the prefetch shows comma-thousands, currency markers,
+estimate prefixes, trailing units, mixed nulls in a JSON time-
+series, or a listing of items, the right move is to author the
+recipe and trust these capabilities — never to decline.
+
+The two shapes the runtime does **not** absorb (and where decline
+remains the honest answer) live in "Type honesty" below: EU-
+locale numerics (`1.234,56` — ambiguity gate, parser refuses to
+guess) and strings in a numeric slot (a column whose cells carry
+text into a binding whose content type is `f64`). Both are
+explicit-by-construction decline cases, not capability gaps.
+
+### Decline-conditions checklist — all four must be true
+
+Before you set `decline_reason`, walk these four conditions out
+loud (in your reasoning, not in the JSON). **All four must be
+true** for a decline to be honest. If any one is false, author
+the recipe — the runtime's apply-stage validators, the proposer's
+retry loop, and the operator's review UI exist to catch
+imperfect-but-recoverable recipes; they do not exist to recover
+from a decline that should have been an attempt.
+
+1. **The bytes are not parseable in the prefetch's content-type.**
+   The excerpt header names what arrived. If the bytes are HTML
+   and you can write a `css_select` for any leaf on the page; if
+   the bytes are JSON and you can write a `json_path` for any
+   value; if the bytes are CSV and you can name a column — then
+   the bytes ARE parseable. This condition is true only when the
+   bytes are a JS SPA shell, an empty error stub, a binary blob
+   you cannot interpret, or a content-type that has no mode in
+   the closed vocabulary.
+2. **No peer publisher in the same data class plausibly carries
+   this metric.** The L1 description names a class of source
+   (commodities trade-press, statistical agency, regulator, news
+   wire). Other publishers in that class often carry the same
+   metric. This condition is true only when you have considered
+   the class and concluded no peer would do better — not when you
+   simply don't recognise an alternative on the same exact host.
+3. **The required fields cannot be sourced.** The schema names
+   required fields (e.g. `value` on observation, `event_type` on
+   event). Each must have a `field_mapping` entry: `extracted`
+   from a leaf you targeted, `literal` from a constant the recipe
+   author knows, or `from_plan` from a pointer into the plan.
+   This condition is true only when at least one required field
+   has no honest source by any of those three means — not when
+   the source-anchoring is awkward.
+4. **You can name a specific alternative endpoint that would
+   also fail.** The decline rationale should reference the
+   alternative you considered (a different path on the same
+   host, a different publisher in the same class, the
+   instance-vs-listing pivot) and explain why each would also
+   fail. A decline that cannot name a specific failed
+   alternative is a decline that didn't do the substitution
+   work — author the recipe instead.
+
+A `decline_reason` that does not satisfy all four conditions is
+a wrong decline. The retry loop and the operator's review UI
+exist to recover from imperfect recipes; they cannot recover
+from a missed attempt.
+
 ## What the records you produce look like
 
 The runtime takes your recipe's `produces` bindings and stamps the
@@ -512,31 +613,17 @@ plausible documented endpoint you know of for the named
 
 ### Plan coherence — the URL must serve the plan's subjects
 
-This subsection is a downstream consequence of the top-level rule
-*"The plan is your specification — author from the plan, not
-from the source."* Read that section first; this one is the
-URL-discipline-specific application.
-
-A URL on the source's documented endpoint shape is necessary but
-not sufficient. The URL must also *be about the plan's subjects*.
-
-The pre-fetch you receive is the runtime issuing one HTTP request
-against the source's registered hint. Hints commonly carry
-**illustrative parameter values** — a default country, a default
-indicator code, a default ticker symbol, a default region — chosen
-by the source maintainer to demonstrate the data envelope without
-committing to any one plan's subjects. The bytes you see are bytes
-about *that illustrative subject*, not about the plan. Treating
-the hint as a target rather than a pattern is the same category of
-mistake as echoing a `https://example.invalid/...` placeholder
-(case 2 above): both are fluent-looking URLs that produce
-structurally-wrong fetches forever.
-
-If your `source_url` keeps the illustrative parameters, the
-runtime will fetch the illustrative subject on every refresh,
-regardless of plan. The recipe's extraction may be perfectly
-valid; the data it produces will be structurally about the wrong
-thing.
+The top-level rule *"The plan is your specification — author from
+the plan, not from the source"* (read that section first if you
+haven't) has a URL-specific application: the prefetch hint's
+parameters are illustrative defaults chosen by the source
+maintainer, not the plan's subjects. Echoing the hint verbatim
+produces a recipe whose URL fetches the wrong subject on every
+refresh, even when the extraction path is otherwise sound. The
+hint's path/query *shape* is the API's design (envelope); the
+hint's parameter *values* (country code, indicator code, ticker,
+region) are the placeholders you substitute the plan's subjects
+into.
 
 **Order of operations.** Before you write `source_url`:
 
@@ -943,6 +1030,27 @@ Return a JSON object conforming to the provided schema. Do not
 include any prose outside the JSON. Do not wrap the JSON in a code
 fence. The runtime will parse your response as structured data.
 
+**Schema enforcement is hard.** The runtime parses your output
+through `serde_json` against the `RecipeAuthoringOutput` schema
+the LLM provider already enforces at completion time. Three
+shapes deserialize-fail at parse time and produce zero records
+forever:
+
+- **Unknown fields.** Any key not in the schema causes
+  deserialization failure. The schema's fields are exhaustive;
+  there is no extension slot.
+- **Closed-enum violations.** `period` must be one of `instant`,
+  `daily`, `weekly`, `monthly`, `quarterly`, `annual` (exact
+  spelling). `direction` must be one of `supply_positive`,
+  `supply_negative`, `demand_positive`, `demand_negative`,
+  `context`. `record_type` must be one of `observation`, `event`,
+  `relation`. Any other string fails.
+- **Type mismatches.** A `field_mappings` entry whose `source` is
+  `extracted` and whose target field type is `f64` requires the
+  extraction to yield a number-shaped value (the apply-stage
+  normalizer absorbs the human-readable shapes named in
+  "Capabilities the runtime gives you"; everything else fails).
+
 The top-level shape is:
 
 - `source_url`: string — an HTTPS URL the runtime will fetch. Usually
@@ -1310,33 +1418,24 @@ or pick a narrower listing endpoint.
 ## What NOT to produce
 
 - Do not invent new extraction modes or new `kind` values.
-- Do not produce recipes whose URL is `example.invalid`,
-  `example.com`, `example.org`, or any other synthetic placeholder
-  — see "URL discipline" above.
-- Do not produce recipes whose host is clearly not the source
-  (`source_id: "usgs_mcs"` but URL at `example.com`).
+- Do not produce recipes with synthetic-host URLs
+  (`example.invalid`, `example.com`, `example.org`) or with hosts
+  that are clearly not the named source. See "URL discipline"
+  above; that section is the canonical statement of this rule.
 - Do not produce recipes with more than 20 production bindings or
   more than 50 field mappings per binding — these are real red
   flags for a mis-scoped recipe.
 - Do not produce recipes that target the same expectation with two
   different bindings — split those into separate recipes.
-- Do not interpret the document. You are routing values, not
-  summarizing them. If the document says "production fell sharply
-  in Chile," your recipe should extract Chile's production number,
-  not a narrative observation about a fall.
+- Extract values, do not summarize them. If the document says
+  "production fell sharply in Chile," extract Chile's production
+  number; the narrative-observation form is not a recipe output.
 - Do not use `{"kind": "extracted"}` for closed-enum fields
   (`period`, `direction`). The extracted value will be whatever
   string happens to be in the source (a year, a date, a currency
   code, a heading), and it will fail to deserialize into the
   enum. Always use `{"kind": "literal", "value": "<one of the
   allowed values>"}` for enum fields.
-- Do not lift framing from the plan's `interpretation` paragraph
-  into a `literal` value for any field that is supposed to be
-  per-record (`headline`, `value`, dates, names). The
-  interpretation is for the user, not for the runtime. A recipe
-  that hardcodes a sentence from the interpretation into
-  `headline` produces identical records on every fetch and stops
-  being an extraction.
 - Do not author against an instance URL when the plan's matching
   bucket has two or more expectations of the same record type.
   Instance endpoints describe one item; multi-expectation buckets
@@ -1397,6 +1496,90 @@ you pick.
 
 ### Changelog
 
+- **v1.18** (2026-05-10) — Session 55 Patch 4 (sub-pieces 4A + 4B
+  + 4C + 4D + 4E). No output contract change; no schema change.
+  Prompt-only, motivated by two outside reviews of the v1.17
+  prompt that converged on the same diagnosis: rules buried in
+  prose 1000+ words from the moment of decision underfire, and
+  the model's decline-when-uncertain prior is not addressable by
+  more anti-examples. Patch 4 attacks both at the decision frame
+  rather than by adding more rules.
+
+  Sub-piece 4A (capability exclusions co-located with decline
+  path): new sub-section "Capabilities the runtime gives you —
+  these are NOT decline reasons" inside the decline-path section,
+  explicitly negating the decline rationales the v1.16 normalizer
+  documentation failed to suppress. Lists comma-thousands,
+  currency markers, estimate prefixes, trailing units, scientific
+  notation, internal whitespace, time-series JSON nulls (with the
+  filter-expression syntax pointer), the 2 KB field cap (framed
+  as a container-selector catch, not a scalar limit), and the
+  iterator + dedup_key_field path for listings. Each shape is
+  named as a "do not decline citing this" rule. Motivated by the
+  v1.16 verification gap: Session 53 Patch 2 added the normalizer
+  enumeration to "Type honesty," but the 2026-05-10 06:14 lithium
+  re-run still saw the LLM decline USGS production at recipe-
+  author time citing "comma-formatted numbers and 'e' prefixes" —
+  the rule was 600 lines from the decline decision and didn't
+  fire. 4A re-states the same capabilities adjacent to the
+  decline frame.
+
+  Sub-piece 4B (decline-conditions checklist): new sub-section
+  "Decline-conditions checklist — all four must be true" at the
+  end of the decline path. Forces the LLM to walk four explicit
+  conditions (bytes not parseable in the prefetch's content-type;
+  no peer publisher in the same data class; required fields
+  cannot be sourced; named alternative endpoint that would also
+  fail) and reach all-four-true before declining. Item 4
+  specifically forces the LLM to name the alternative it
+  considered, attacking the "decline without doing the
+  substitution work" failure shape. Does NOT invert the default
+  disposition (recipe authoring's cost arithmetic — recipes run
+  forever — makes the URL-proposer's "default attempt" inversion
+  inappropriate here). Constrains the decline path; the existing
+  "Decline is not the easy way out" framing is preserved.
+
+  Sub-piece 4C (compress plan-coherence prose): the v1.10 "Plan
+  coherence — the URL must serve the plan's subjects" subsection
+  duplicated 600 words of explanation that the v1.11 top-level
+  frame already covered. Compressed the explanatory prose to one
+  paragraph that points back to the top-level frame; preserved
+  the order-of-operations and the Session-33-followup
+  anti-example, which are the load-bearing parts. Net reduction
+  ~400 words from the URL-discipline section without losing the
+  rule.
+
+  Sub-piece 4D (imperative schema constraints in "What to
+  produce"): cheap insurance restating, in imperative voice, the
+  three deserialization-failure shapes (unknown fields, closed-
+  enum violations, type mismatches) immediately above the top-
+  level shape description. We've never seen malformed JSON from
+  grok-4.3 under structured-output mode, but the imperative
+  framing closes the gap between "the schema enforces this" and
+  "I should think about this when I'm authoring."
+
+  Sub-piece 4E (trim quiet anti-example bullets in "What NOT to
+  produce"): collapsed two URL-placeholder bullets into one (the
+  rule lives canonically in URL discipline; the duplicate-bullet
+  framing was a v1.3 holdover). Removed the
+  interpretation-paragraph-lift bullet (covered in the
+  Content type reference > headline section, which is where the
+  failure actually fires). Reframed "Do not interpret the
+  document" as the positive "Extract values, do not summarize
+  them" — small move toward the Wise Man #2 observation that
+  negation is weaker than positive pattern exposure. Net: 14
+  bullets → 11 bullets in the section, no lost rules.
+
+  All five sub-pieces are prompt-only, no Rust changes, no schema
+  changes. Existing recipes are unaffected. The empirical
+  question for the next live-test: does the
+  "you-may-NOT-decline-for-these" framing in 4A actually suppress
+  the comma-thousands / 2-KB-cap / iterator-shape-mistaken
+  declines that v1.16 didn't catch, or is even adjacent placement
+  insufficient against grok-4.3's decline prior? If 4A doesn't
+  fire, the prompt-engineering ceiling is closer than expected
+  and the reasoning-block-before-JSON experiment (handoff-
+  deferred) becomes the next move.
 - **v1.17** (2026-05-10) — Session 55 Patch 3 (sub-pieces A + B + C).
   No output contract change; no schema change. All three sub-pieces
   are prompt-only edits that promote apply-stage validator outcomes
