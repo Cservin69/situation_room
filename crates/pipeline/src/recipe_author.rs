@@ -415,15 +415,26 @@ pub async fn author_recipe(
     // Skipped when `original_bytes` is `None` (test paths, legacy
     // callers without prefetched bytes).
     if let Some(bytes) = original_bytes {
+        // Session 53 Piece B: shape validation runs the runtime's
+        // full extract → build_record path against the prefetched
+        // bytes, not just extract. The shape validator is a strict
+        // superset of the structural validator — it catches the
+        // string-in-numeric-slot and missing-required-field classes
+        // the 2026-05-09 18:12 lithium re-run surfaced (`pubs.usgs.gov`
+        // authored `string "Argentina"` into f64 `value`;
+        // `www.worldbank.org` authored a selector that yielded no
+        // `value` field). Both apply-failed forever; both classes
+        // are now author-time declines that flow into the next
+        // run's prior-attempts log instead of consuming a fetch.
         if let Err(apply_err) =
-            crate::recipe_apply::validate_recipe_against_bytes(&recipe, bytes)
+            crate::recipe_apply::validate_recipe_shape_against_bytes(&recipe, bytes, plan)
         {
             return Err(AuthoringError::Declined {
                 reason: format!(
                     "authoring-time validation against the prefetched bytes failed: \
-                     {apply_err}. The LLM authored a recipe that would not extract a \
-                     value at apply time — declining at authoring rather than \
-                     persisting a recipe whose every fetch would fail."
+                     {apply_err}. The LLM authored a recipe that would not extract \
+                     or assemble a record at apply time — declining at authoring \
+                     rather than persisting a recipe whose every fetch would fail."
                 ),
             });
         }

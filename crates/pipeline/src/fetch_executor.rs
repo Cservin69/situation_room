@@ -96,7 +96,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use situation_room_llm::{LlmProvider, ModelTier};
+use situation_room_llm::{LlmProvider, ModelTier, ReasoningEffort};
 use situation_room_secure::bounds::Bounds;
 use situation_room_storage::{
     fetch_run_outcomes::{FetchRunOutcomeKind, FetchRunOutcomeRow},
@@ -1173,6 +1173,64 @@ async fn author_for_nomination(
     let mut declines: Vec<ExpectationDecline> = Vec::new();
     let mut prior_attempts: Vec<PriorAttempt> = Vec::new();
 
+    // Session 53 Piece C: cross-run apply-stage failures flow into
+    // the next run's prior_attempts log. Pre-Session-53, an
+    // apply-stage shape failure on run N (LLM authored a selector
+    // whose extracted bytes type-checked but didn't shape-match the
+    // binding's content type) was visible in the FetchReport but
+    // NOT in run N+1's proposer prompt — the propose-URL retry
+    // loop reset prior_attempts to empty, the proposer re-proposed
+    // the same URL, the recipe-author wrote the same selector, the
+    // runtime apply-failed identically. The shape validator (Piece B)
+    // catches most of these at authoring time on the SAME run, but
+    // selector behaviour against unseen bytes is unbounded — apply-
+    // stage failures will keep happening. Surface them here so the
+    // proposer pivots.
+    //
+    // Truncate the message head to ~120 chars: enough to read the
+    // failure shape (`observation content: invalid type: string
+    // "Argentina", expected f64`) without bloating the prompt.
+    // Per the v1.2 prompt's `recipe authored but apply failed`
+    // bullet, the proposer pivots on the failure SHAPE (string in
+    // numeric slot, missing required field) rather than the exact
+    // value, so head truncation preserves the actionable signal.
+    match ctx
+        .store
+        .apply_failures_for_nomination(plan.id, nomination_id)
+    {
+        Ok(failures) => {
+            for f in failures {
+                let head: String = f.message_head.chars().take(120).collect();
+                let suffix = if head.chars().count() < f.message_head.chars().count() {
+                    "…"
+                } else {
+                    ""
+                };
+                prior_attempts.push(PriorAttempt {
+                    url: f.source_url,
+                    reason: format!(
+                        "recipe authored but apply failed: {} · {}{}",
+                        f.failure_stage, head, suffix
+                    ),
+                });
+            }
+        }
+        Err(e) => {
+            // A failure to read prior outcomes is non-fatal — the
+            // proposer still gets the within-run prior_attempts; the
+            // operator's mental model degrades gracefully to "the
+            // cross-run signal is unavailable" rather than "the
+            // whole nomination failed because we couldn't read
+            // history."
+            warn!(
+                plan_id = %plan.id,
+                nomination_id = %nomination_id,
+                error = %e,
+                "apply_failures_for_nomination lookup failed; proposer will run without cross-run apply-failure signal"
+            );
+        }
+    }
+
     // Session 50 (Class B): build per-nomination topic-relevance
     // vocabulary once, outside the attempt loop. The vocabulary is
     // stable across attempts (it depends only on the plan + the
@@ -1188,6 +1246,60 @@ async fn author_for_nomination(
     } else {
         Some(&relevance_owned)
     };
+
+    // Session 53 Piece F: reasoning_effort escalation for stuck
+    // nominations. Count this nomination's prior `Declined` outcomes
+    // across the plan's runs once, before the retry loop starts —
+    // the count is a cross-run signal that doesn't change within
+    // one author_for_nomination call. When the count exceeds the
+    // escalation threshold, the propose-URL call site below pins
+    // the cheap-tier reasoning_effort to Medium for THIS
+    // nomination's attempts; the rest of the plan stays at the
+    // default (Low) cost-budget. Per-nomination, not per-plan or
+    // per-host — the escalation is observation-driven, not source-
+    // routed (see ReasoningEffort doc-comment).
+    //
+    // Threshold: ≥3 prior declines → escalate. The Frontier
+    // (High) ceiling is reserved for deliberate operator-driven
+    // re-runs; the automatic ladder stops at Workhorse (Medium)
+    // to avoid budget surprises on a plan with many stuck
+    // nominations (Session 53 handoff Piece F's "intentionally
+    // not in this patch" carve-out).
+    let prior_decline_count = ctx
+        .store
+        .decline_count_for_nomination(plan.id, nomination_id)
+        .unwrap_or_else(|e| {
+            warn!(
+                plan_id = %plan.id,
+                nomination_id = %nomination_id,
+                error = %e,
+                "decline_count_for_nomination lookup failed; effort escalation will fall back to default cheap-tier mapping"
+            );
+            0
+        });
+    let propose_effort_override: Option<ReasoningEffort> =
+        if prior_decline_count >= 3 {
+            Some(ReasoningEffort::Medium)
+        } else {
+            None
+        };
+    if propose_effort_override.is_some() {
+        info!(
+            plan_id = %plan.id,
+            nomination_id = %nomination_id,
+            prior_decline_count,
+            effort = "Medium",
+            "propose-URL effort escalated for stuck nomination (Session 53 Piece F)"
+        );
+    } else {
+        info!(
+            plan_id = %plan.id,
+            nomination_id = %nomination_id,
+            prior_decline_count,
+            effort = "Low",
+            "propose-URL effort at default cheap-tier mapping (Session 53 Piece F)"
+        );
+    }
 
     for attempt_num in 1..=MAX_AUTHORING_ATTEMPTS_PER_SOURCE {
         // Deadline gate before each attempt. Failing fast is
@@ -1224,6 +1336,7 @@ async fn author_for_nomination(
             plan,
             nomination,
             &prior_attempts,
+            propose_effort_override,
         )
         .await
         .map_err(map_proposal_error)?;

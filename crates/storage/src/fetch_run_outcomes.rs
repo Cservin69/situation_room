@@ -199,6 +199,40 @@ pub struct RecipeOutcomeHistoryRunRow {
     pub message: Option<String>,
 }
 
+/// One per-nomination apply-stage failure entry surfaced to the
+/// proposer's `prior_attempts` log on a subsequent run.
+///
+/// Session 53 Piece C. Pre-Session-53, `RecipeOutcome::Failed { stage:
+/// Apply, .. }` rows were visible only in the FetchReport / Bucket
+/// chronology — the propose-URL retry loop on the *next* run for the
+/// same nomination saw a fresh empty `prior_attempts` and proposed
+/// the same URL again. The pivot heuristic for an apply-stage shape
+/// failure (string in numeric slot, missing required field) is the
+/// same as `recipe author declined: no extractable structure` — try
+/// a different path on the same host or pivot off-host — so the
+/// proposer needs the row in its log to act on it.
+///
+/// Carries the recipe's `source_url` (which the proposer sees as
+/// "URL already tried") and a head of the apply-stage error message
+/// (the rationale the proposer reads to decide what shape of pivot
+/// applies here).
+#[derive(Debug, Clone)]
+pub struct ApplyFailureForProposer {
+    /// The URL the recipe was authored against. The proposer reads
+    /// this as "do not retry this exact URL."
+    pub source_url: String,
+    /// The failure_stage the runtime recorded. Today's set is
+    /// `apply` only (this query filters out `fetch` and `insert`).
+    pub failure_stage: String,
+    /// The runtime's apply-stage error message, head-truncated by
+    /// the executor before being threaded into the proposer's
+    /// prompt. The full string is on the `fetch_run_outcomes` row;
+    /// callers truncate at proposer-input composition time so the
+    /// truncation discipline lives next to the prompt-shaping
+    /// code, not at the storage layer.
+    pub message_head: String,
+}
+
 /// One row in the heatmap: a (recipe_or_source) plus its outcomes
 /// across the plan's recent runs.
 ///
@@ -256,6 +290,150 @@ impl Store {
         .map_err(StorageError::DuckDb)?;
 
         Ok(())
+    }
+
+    /// Count of `Declined` outcomes for one nomination across all
+    /// the plan's runs, irrespective of expectation target. Session
+    /// 53 Piece F: the workstation reads this at propose-URL call
+    /// time to decide whether to escalate the cheap-tier reasoning
+    /// effort for stuck nominations.
+    ///
+    /// Counts both `nom:{nomination_id}` (nomination-level decline,
+    /// e.g. URL proposer exhausted) and `nom:{nomination_id}:{bucket}:
+    /// {index}` (per-target decline) — both shapes signal "this
+    /// nomination didn't yield records on its last attempts." The
+    /// escalation rule operates on the union: a nomination that's
+    /// declined twice at the nomination level and once at the per-
+    /// target level is just as stuck as one that declined three
+    /// times at the same level.
+    ///
+    /// **Per-nomination, not per-source.** This count is keyed by
+    /// `nomination_id`, which the L1 classifier emits per source-
+    /// description; it is not keyed by URL host or publisher. The
+    /// closed-vocabulary discipline forbids encoding per-host
+    /// preferences in code; per-nomination escalation is a runtime
+    /// feedback loop on observed attempts, not a source-routing
+    /// rule. See `ReasoningEffort`'s doc-comment for the principle.
+    pub fn decline_count_for_nomination(
+        &self,
+        plan_id: Uuid,
+        nomination_id: Uuid,
+    ) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Other(format!("connection poisoned: {e}")))?;
+
+        // Match both bare `nom:{id}` and `nom:{id}:...` shapes via
+        // a single LIKE with the trailing `%`. `:` is not a regex
+        // metacharacter in SQL LIKE; the % handles either form.
+        let pattern = format!("nom:{nomination_id}%");
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT COUNT(*)
+                 FROM fetch_run_outcomes
+                 WHERE plan_id = ?
+                   AND outcome_kind = 'declined'
+                   AND source_id LIKE ?",
+            )
+            .map_err(StorageError::DuckDb)?;
+
+        let count: i64 = stmt
+            .query_row(params![plan_id, pattern], |row| row.get(0))
+            .map_err(StorageError::DuckDb)?;
+
+        Ok(count.max(0) as usize)
+    }
+
+    /// Cross-run apply-stage failures for one nomination, ordered
+    /// oldest-first and deduplicated by `source_url` (the proposer's
+    /// natural identity for "URL already tried"). One entry per
+    /// distinct URL the nomination authored against where the
+    /// runtime's apply stage rejected the resulting record.
+    ///
+    /// Session 53 Piece C. The proposer's `prior_attempts` log is
+    /// per-nomination; the `recipes.dedup_key` column already encodes
+    /// `{plan_id}:{nomination_id}:{bucket}:{index}` (Session 47), so a
+    /// `LIKE '{plan_id}:{nomination_id}:%'` filter pulls every recipe
+    /// authored under this nomination across runs and across
+    /// expectation siblings. Joining onto `fetch_run_outcomes`
+    /// surfaces the apply-failures the proposer would otherwise
+    /// re-propose into.
+    ///
+    /// `failure_stage = 'apply'` is the discriminating filter:
+    /// `fetch` failures have already been recorded as proposer-
+    /// visible prior attempts (the executor surfaces them via
+    /// `format_prefetch_failure_for_proposer` within the same retry
+    /// loop), and `insert` failures (DuckDB constraint violations
+    /// after a successful apply) tell the proposer nothing
+    /// actionable about the URL — those belong on the operator's
+    /// log, not in the prior-attempts log.
+    pub fn apply_failures_for_nomination(
+        &self,
+        plan_id: Uuid,
+        nomination_id: Uuid,
+    ) -> Result<Vec<ApplyFailureForProposer>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Other(format!("connection poisoned: {e}")))?;
+
+        // The `dedup_key` LIKE pattern: {plan_id}:{nomination_id}:%
+        // Both UUIDs serialize as their canonical hyphenated form, the
+        // same form `dedup_key_for_recipe` uses in the executor.
+        let dedup_prefix = format!("{plan_id}:{nomination_id}:%");
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT r.source_url, o.failure_stage, o.message, o.attempted_at
+                 FROM fetch_run_outcomes o
+                 JOIN recipes r ON r.id = o.recipe_id
+                 WHERE o.plan_id = ?
+                   AND o.outcome_kind = 'failed'
+                   AND o.failure_stage = 'apply'
+                   AND r.dedup_key LIKE ?
+                 ORDER BY o.attempted_at DESC",
+            )
+            .map_err(StorageError::DuckDb)?;
+
+        let mut rows = stmt
+            .query(params![plan_id, dedup_prefix])
+            .map_err(StorageError::DuckDb)?;
+
+        // Dedupe by source_url, keeping the most recent failure per
+        // URL. The proposer cares "did the URL fail apply on the
+        // last run?" — multiple identical entries for repeated runs
+        // would dilute the prior-attempts list with no extra signal.
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut out_desc: Vec<ApplyFailureForProposer> = Vec::new();
+        while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
+            let url: String = row.get(0).map_err(StorageError::DuckDb)?;
+            if !seen.insert(url.clone()) {
+                continue;
+            }
+            let stage: String = row.get(1).map_err(StorageError::DuckDb)?;
+            let message: Option<String> = row.get(2).map_err(StorageError::DuckDb)?;
+            // We surface the message as `message_head`; truncation
+            // (~120 chars per the Session 53 handoff) happens at the
+            // proposer-input composition site so the prompt-shaping
+            // discipline stays in one place. Empty-string fallback
+            // when the stored message is NULL — apply failures
+            // typically carry messages, but the wire shape is
+            // tolerant.
+            out_desc.push(ApplyFailureForProposer {
+                source_url: url,
+                failure_stage: stage,
+                message_head: message.unwrap_or_default(),
+            });
+        }
+
+        // Reverse to oldest-first so the proposer's prior_attempts
+        // log reads in chronological order, matching the within-run
+        // attempts the executor's prefetch-failure path emits.
+        out_desc.reverse();
+        Ok(out_desc)
     }
 
     /// Fetch every outcome row for a plan, newest first. Pure list —
@@ -776,5 +954,497 @@ mod tests {
         let cell = &entries[0].runs[0];
         assert_eq!(cell.outcome_kind, FetchRunOutcomeKind::RateLimited);
         assert_eq!(cell.retry_after_seconds, Some(120));
+    }
+
+    // -- apply_failures_for_nomination — Session 53 Piece C ---------------
+
+    fn insert_recipe_for_nomination(
+        store: &Store,
+        id: Uuid,
+        plan_id: Uuid,
+        nomination_id: Uuid,
+        bucket: &str,
+        index: u32,
+        source_id: &str,
+        source_url: &str,
+    ) {
+        let row = crate::recipes::RecipeRow {
+            id,
+            dedup_key: Some(format!("{plan_id}:{nomination_id}:{bucket}:{index}")),
+            plan_id,
+            source_id: source_id.to_string(),
+            source_url: source_url.to_string(),
+            extraction_json: r#"{"mode":"css_select","selector":".v"}"#.to_string(),
+            produces_json: "[]".to_string(),
+            authored_at: Utc.with_ymd_and_hms(2026, 5, 9, 0, 0, 0).unwrap(),
+            authored_by: "test".to_string(),
+            version: 1,
+            static_payload: None,
+            authored_from: crate::recipes::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
+            iterator: None,
+        };
+        store.insert_recipe(&row).expect("insert recipe");
+    }
+
+    fn sample_apply_failure(
+        plan_id: Uuid,
+        run_id: Uuid,
+        recipe_id: Uuid,
+        message: &str,
+        attempted_at: DateTime<Utc>,
+    ) -> FetchRunOutcomeRow {
+        FetchRunOutcomeRow {
+            id: Uuid::now_v7(),
+            run_id,
+            plan_id,
+            recipe_id: Some(recipe_id),
+            source_id: "pubs.usgs.gov".into(),
+            outcome_kind: FetchRunOutcomeKind::Failed,
+            records_produced: None,
+            retry_after_seconds: None,
+            failure_stage: Some("apply".into()),
+            message: Some(message.into()),
+            attempted_at,
+        }
+    }
+
+    #[test]
+    fn apply_failures_returns_empty_when_no_runs_for_nomination() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let out = store
+            .apply_failures_for_nomination(Uuid::now_v7(), Uuid::now_v7())
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn apply_failures_returns_apply_stage_for_matching_nomination() {
+        // Two nominations on the same plan; one apply-failed, one
+        // succeeded. The query must surface only the failed
+        // nomination's URL — the proposer for nomination_b must not
+        // see nomination_a's URL.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_id = Uuid::now_v7();
+        let nom_a = Uuid::now_v7();
+        let nom_b = Uuid::now_v7();
+        let run_id = Uuid::now_v7();
+
+        let recipe_a = Uuid::now_v7();
+        let recipe_b = Uuid::now_v7();
+        insert_recipe_for_nomination(
+            &store,
+            recipe_a,
+            plan_id,
+            nom_a,
+            "observation_metric",
+            0,
+            "pubs.usgs.gov",
+            "https://pubs.usgs.gov/lithium-2024.pdf",
+        );
+        insert_recipe_for_nomination(
+            &store,
+            recipe_b,
+            plan_id,
+            nom_b,
+            "observation_metric",
+            0,
+            "www.worldbank.org",
+            "https://www.worldbank.org/pink-sheet.xls",
+        );
+
+        store
+            .insert_fetch_run_outcome(&sample_apply_failure(
+                plan_id,
+                run_id,
+                recipe_a,
+                "observation content: invalid type: string \"Argentina\", expected f64",
+                Utc.with_ymd_and_hms(2026, 5, 9, 18, 12, 0).unwrap(),
+            ))
+            .unwrap();
+
+        let out = store
+            .apply_failures_for_nomination(plan_id, nom_a)
+            .unwrap();
+        assert_eq!(out.len(), 1, "exactly one apply-failure for nom_a");
+        assert_eq!(out[0].source_url, "https://pubs.usgs.gov/lithium-2024.pdf");
+        assert_eq!(out[0].failure_stage, "apply");
+        assert!(
+            out[0].message_head.contains("expected f64"),
+            "message_head must surface the runtime's apply error verbatim; got {}",
+            out[0].message_head
+        );
+
+        let out_b = store
+            .apply_failures_for_nomination(plan_id, nom_b)
+            .unwrap();
+        assert!(
+            out_b.is_empty(),
+            "nomination_b had no apply failures; query must not leak nom_a's row"
+        );
+    }
+
+    #[test]
+    fn apply_failures_dedupe_by_source_url_keeps_most_recent() {
+        // Same recipe failed in two consecutive runs. The proposer
+        // wants ONE prior_attempts entry per URL — repeated identical
+        // entries dilute the prompt's signal without adding info.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_id = Uuid::now_v7();
+        let nom = Uuid::now_v7();
+        let recipe = Uuid::now_v7();
+        insert_recipe_for_nomination(
+            &store,
+            recipe,
+            plan_id,
+            nom,
+            "observation_metric",
+            0,
+            "pubs.usgs.gov",
+            "https://pubs.usgs.gov/lithium-2024.pdf",
+        );
+
+        store
+            .insert_fetch_run_outcome(&sample_apply_failure(
+                plan_id,
+                Uuid::now_v7(),
+                recipe,
+                "first run apply failure",
+                Utc.with_ymd_and_hms(2026, 5, 1, 10, 0, 0).unwrap(),
+            ))
+            .unwrap();
+        store
+            .insert_fetch_run_outcome(&sample_apply_failure(
+                plan_id,
+                Uuid::now_v7(),
+                recipe,
+                "second run apply failure",
+                Utc.with_ymd_and_hms(2026, 5, 9, 18, 12, 0).unwrap(),
+            ))
+            .unwrap();
+
+        let out = store
+            .apply_failures_for_nomination(plan_id, nom)
+            .unwrap();
+        assert_eq!(out.len(), 1, "deduped by source_url");
+        assert_eq!(
+            out[0].message_head, "second run apply failure",
+            "kept the most recent failure per URL — that's the one the \
+             proposer should pivot off"
+        );
+    }
+
+    #[test]
+    fn apply_failures_filters_out_fetch_and_insert_stages() {
+        // The proposer-input composition only wants apply-stage
+        // failures (the shape-mismatch class). Fetch-stage failures
+        // are already surfaced via the within-run prefetch path;
+        // insert-stage failures (storage constraint violations) tell
+        // the proposer nothing about the URL.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_id = Uuid::now_v7();
+        let nom = Uuid::now_v7();
+        let recipe = Uuid::now_v7();
+        insert_recipe_for_nomination(
+            &store,
+            recipe,
+            plan_id,
+            nom,
+            "observation_metric",
+            0,
+            "pubs.usgs.gov",
+            "https://pubs.usgs.gov/lithium-2024.pdf",
+        );
+
+        let mut fetch_failure = sample_apply_failure(
+            plan_id,
+            Uuid::now_v7(),
+            recipe,
+            "fetch failed",
+            Utc.with_ymd_and_hms(2026, 5, 9, 10, 0, 0).unwrap(),
+        );
+        fetch_failure.failure_stage = Some("fetch".into());
+        store.insert_fetch_run_outcome(&fetch_failure).unwrap();
+
+        let mut insert_failure = sample_apply_failure(
+            plan_id,
+            Uuid::now_v7(),
+            recipe,
+            "duplicate dedup_key",
+            Utc.with_ymd_and_hms(2026, 5, 9, 11, 0, 0).unwrap(),
+        );
+        insert_failure.failure_stage = Some("insert".into());
+        store.insert_fetch_run_outcome(&insert_failure).unwrap();
+
+        let out = store
+            .apply_failures_for_nomination(plan_id, nom)
+            .unwrap();
+        assert!(
+            out.is_empty(),
+            "fetch and insert stages must not surface here; got {:?}",
+            out.iter()
+                .map(|f| (f.source_url.clone(), f.failure_stage.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // -- decline_count_for_nomination — Session 53 Piece F ---------------
+
+    fn sample_declined_for_nom(
+        plan_id: Uuid,
+        run_id: Uuid,
+        nomination_id: Uuid,
+        suffix: Option<&str>,
+        attempted_at: DateTime<Utc>,
+    ) -> FetchRunOutcomeRow {
+        let source_id = match suffix {
+            Some(s) => format!("nom:{nomination_id}:{s}"),
+            None => format!("nom:{nomination_id}"),
+        };
+        FetchRunOutcomeRow {
+            id: Uuid::now_v7(),
+            run_id,
+            plan_id,
+            recipe_id: None,
+            source_id,
+            outcome_kind: FetchRunOutcomeKind::Declined,
+            records_produced: None,
+            retry_after_seconds: None,
+            failure_stage: None,
+            message: Some("test decline".into()),
+            attempted_at,
+        }
+    }
+
+    #[test]
+    fn decline_count_zero_when_no_declines_recorded() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let count = store
+            .decline_count_for_nomination(Uuid::now_v7(), Uuid::now_v7())
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn decline_count_includes_nomination_level_and_per_target_declines() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_id = Uuid::now_v7();
+        let nom = Uuid::now_v7();
+
+        // Three declines: one nomination-level, two per-target
+        // (different bucket/index siblings).
+        store
+            .insert_fetch_run_outcome(&sample_declined_for_nom(
+                plan_id,
+                Uuid::now_v7(),
+                nom,
+                None,
+                Utc.with_ymd_and_hms(2026, 5, 1, 10, 0, 0).unwrap(),
+            ))
+            .unwrap();
+        store
+            .insert_fetch_run_outcome(&sample_declined_for_nom(
+                plan_id,
+                Uuid::now_v7(),
+                nom,
+                Some("observation_metric:0"),
+                Utc.with_ymd_and_hms(2026, 5, 5, 10, 0, 0).unwrap(),
+            ))
+            .unwrap();
+        store
+            .insert_fetch_run_outcome(&sample_declined_for_nom(
+                plan_id,
+                Uuid::now_v7(),
+                nom,
+                Some("observation_metric:1"),
+                Utc.with_ymd_and_hms(2026, 5, 9, 10, 0, 0).unwrap(),
+            ))
+            .unwrap();
+
+        let count = store.decline_count_for_nomination(plan_id, nom).unwrap();
+        assert_eq!(
+            count, 3,
+            "both nomination-level and per-target declines must \
+             count toward the escalation threshold"
+        );
+    }
+
+    #[test]
+    fn decline_count_filters_by_plan_and_nomination() {
+        // A different nomination on the same plan, and a different
+        // plan with the same nomination_id (UUIDs collide
+        // hypothetically), must not contaminate the count.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_a = Uuid::now_v7();
+        let plan_b = Uuid::now_v7();
+        let nom_a = Uuid::now_v7();
+        let nom_b = Uuid::now_v7();
+
+        for _ in 0..2 {
+            store
+                .insert_fetch_run_outcome(&sample_declined_for_nom(
+                    plan_a,
+                    Uuid::now_v7(),
+                    nom_a,
+                    None,
+                    Utc.with_ymd_and_hms(2026, 5, 9, 10, 0, 0).unwrap(),
+                ))
+                .unwrap();
+        }
+        // Sibling nomination on the same plan.
+        store
+            .insert_fetch_run_outcome(&sample_declined_for_nom(
+                plan_a,
+                Uuid::now_v7(),
+                nom_b,
+                None,
+                Utc.with_ymd_and_hms(2026, 5, 9, 10, 0, 0).unwrap(),
+            ))
+            .unwrap();
+        // Same nom_a id on a different plan.
+        store
+            .insert_fetch_run_outcome(&sample_declined_for_nom(
+                plan_b,
+                Uuid::now_v7(),
+                nom_a,
+                None,
+                Utc.with_ymd_and_hms(2026, 5, 9, 10, 0, 0).unwrap(),
+            ))
+            .unwrap();
+
+        let nom_a_on_plan_a = store
+            .decline_count_for_nomination(plan_a, nom_a)
+            .unwrap();
+        let nom_b_on_plan_a = store
+            .decline_count_for_nomination(plan_a, nom_b)
+            .unwrap();
+        let nom_a_on_plan_b = store
+            .decline_count_for_nomination(plan_b, nom_a)
+            .unwrap();
+
+        assert_eq!(nom_a_on_plan_a, 2);
+        assert_eq!(nom_b_on_plan_a, 1);
+        assert_eq!(nom_a_on_plan_b, 1);
+    }
+
+    #[test]
+    fn decline_count_ignores_non_declined_outcomes() {
+        // Succeeded / Failed / RateLimited outcomes are not declines
+        // and must not inflate the count.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_id = Uuid::now_v7();
+        let nom = Uuid::now_v7();
+
+        // One genuine decline.
+        store
+            .insert_fetch_run_outcome(&sample_declined_for_nom(
+                plan_id,
+                Uuid::now_v7(),
+                nom,
+                None,
+                Utc.with_ymd_and_hms(2026, 5, 9, 10, 0, 0).unwrap(),
+            ))
+            .unwrap();
+
+        // A succeeded run (different source_id, but the count is
+        // keyed by `nom:{nomination_id}` LIKE — succeeded rows
+        // typically use a host-derived source_id, not the
+        // `nom:` prefix).
+        let recipe_id = Uuid::now_v7();
+        store
+            .insert_fetch_run_outcome(&sample_succeeded(
+                plan_id,
+                Uuid::now_v7(),
+                recipe_id,
+            ))
+            .unwrap();
+
+        // A failure on the SAME `nom:` source_id — Failed is
+        // distinct from Declined; this must not be counted.
+        let mut failed = sample_failed(plan_id, Uuid::now_v7(), recipe_id, "apply");
+        failed.source_id = format!("nom:{nom}");
+        store.insert_fetch_run_outcome(&failed).unwrap();
+
+        let count = store.decline_count_for_nomination(plan_id, nom).unwrap();
+        assert_eq!(
+            count, 1,
+            "only Declined outcomes count; Succeeded/Failed must be ignored"
+        );
+    }
+
+    #[test]
+    fn apply_failures_orders_oldest_first_across_distinct_urls() {
+        // Two distinct URLs failed in two distinct runs. The proposer
+        // reads prior_attempts in chronological order (matching the
+        // within-run attempts the prefetch-failure path emits), so
+        // the query must return oldest-first.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_id = Uuid::now_v7();
+        let nom = Uuid::now_v7();
+        let recipe_old = Uuid::now_v7();
+        let recipe_new = Uuid::now_v7();
+        insert_recipe_for_nomination(
+            &store,
+            recipe_old,
+            plan_id,
+            nom,
+            "observation_metric",
+            0,
+            "old.example.com",
+            "https://old.example.com/data",
+        );
+        insert_recipe_for_nomination(
+            &store,
+            recipe_new,
+            plan_id,
+            nom,
+            "observation_metric",
+            1,
+            "new.example.com",
+            "https://new.example.com/data",
+        );
+
+        store
+            .insert_fetch_run_outcome(&sample_apply_failure(
+                plan_id,
+                Uuid::now_v7(),
+                recipe_old,
+                "older failure",
+                Utc.with_ymd_and_hms(2026, 5, 1, 10, 0, 0).unwrap(),
+            ))
+            .unwrap();
+        store
+            .insert_fetch_run_outcome(&sample_apply_failure(
+                plan_id,
+                Uuid::now_v7(),
+                recipe_new,
+                "newer failure",
+                Utc.with_ymd_and_hms(2026, 5, 9, 18, 12, 0).unwrap(),
+            ))
+            .unwrap();
+
+        let out = store
+            .apply_failures_for_nomination(plan_id, nom)
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].source_url, "https://old.example.com/data");
+        assert_eq!(out[1].source_url, "https://new.example.com/data");
     }
 }

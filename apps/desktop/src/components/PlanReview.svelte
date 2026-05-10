@@ -555,14 +555,46 @@
 
   /* Header */
   .head {
+    /*
+      Session 53 Piece E.2: sticky plan header. The bucket grid
+      stacks tall (FetchReport + RecipeOutcomesHeatmap +
+      ExpectationCoverage + RecipesPanel + SourcesMemoryPanel);
+      pre-Session-53 the topic + accept/reject + run-fetch
+      controls scrolled out of view, leaving the operator without
+      orientation while reading the bottom of the page. Pinning
+      the header keeps the topic + actions visible across the
+      whole scroll surface.
+
+      `position: sticky; top: 0` works against the nearest
+      scrolling ancestor (`.review`'s `overflow-y: auto`).
+      `background: var(--bg-panel)` gives the strip a small
+      visual separation from the canvas content scrolling under
+      it; the existing bottom border completes the strip.
+      `z-index: 1` lifts the strip above the bucket grid's
+      hover/focus rings without competing with modal dialogs.
+
+      Padding-top picks up the 16px the parent .review used to
+      provide before sticky pinning; the strip needs its own
+      top buffer so content doesn't crash into the viewport edge.
+    */
+    position: sticky;
+    top: 0;
+    z-index: 1;
     display: grid;
     grid-template-columns: 1fr auto;
     grid-template-rows: auto auto;
     column-gap: 12px;
     row-gap: 6px;
     align-items: start;
+    background: var(--bg-panel);
     border-bottom: 1px solid var(--border-subtle);
-    padding-bottom: 10px;
+    padding: 10px 0;
+    /* Pull the strip flush with the .review padding so the
+       sticky bar spans the full panel width while content
+       beneath retains its 16px gutter. */
+    margin: -16px -16px 0;
+    padding-left: 16px;
+    padding-right: 16px;
   }
   .topic-line {
     grid-column: 1;

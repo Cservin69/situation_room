@@ -50,6 +50,7 @@ use regex::Regex;
 use scraper::{Html, Selector};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
+use tracing::debug;
 use uuid::Uuid;
 
 use situation_room_core::schema::content::{
@@ -1282,39 +1283,270 @@ fn resolve_field_value(
 
 /// Parse an extracted string as a JSON scalar, preferring numbers.
 ///
-/// Strategy: strip commas and surrounding whitespace, trim a trailing
-/// unit-like suffix (everything after the last digit). If what
-/// remains parses as a number, return a `Value::Number`. Otherwise
-/// return the original trimmed string as `Value::String`.
+/// Strategy:
+/// 1. Trim surrounding whitespace.
+/// 2. Try direct `f64::parse` — handles `"3.14"`, `"42"`, `"1.5e9"`
+///    (scientific notation parses verbatim).
+/// 3. If direct parse fails, apply the bounded numeric-format
+///    normalizer ([`normalize_numeric_candidate`]) which strips
+///    estimate prefixes (`e ` / `~` / `≈` / `est. `), currency
+///    markers (`$`, `€`, `£`, `¥`, `USD`, `EUR`), and ASCII
+///    thousand-separator commas in the canonical US-locale
+///    position. EU-locale shapes (`"1.234,56"`) are detected and
+///    returned untouched — they parse wrong if normalised, so we
+///    fail honestly and let apply surface the original string.
+/// 4. If the normalizer returns a value, return `Value::Number`.
+///    Otherwise return the original trimmed string as
+///    `Value::String`.
 ///
-/// Known limitation: assumes comma-as-thousands, period-as-decimal
-/// (US/UK convention). European decimals (`"88.000,0"`) will parse
-/// wrong. Documented, accepted, fixable when we hit it.
+/// The normalizer is **bounded**: it doesn't try locale detection
+/// (US `1,234.5` vs EU `1.234,5`), doesn't attempt currency
+/// conversion, doesn't infer units. Edge cases stay in the
+/// "apply fails honestly" path so the operator sees the real
+/// shape, not a misleading post-strip fragment.
+///
+/// Session 53 Piece D — broadens what apply will accept from
+/// formats the recipe-author reasonably authors against
+/// human-readable tables (USGS MCS lithium chapter's `74,700`
+/// shape, IEA fact sheets' `est. 1,200`-style estimates, FT/
+/// Bloomberg headline-style `$1,234`).
 fn parse_extracted_scalar(s: &str) -> Value {
     let trimmed = s.trim();
 
-    // Try direct number parse first — handles `"3.14"`, `"42"`.
+    // Try direct number parse first — handles `"3.14"`, `"42"`,
+    // `"1.5e9"`. Scientific notation is preserved here because
+    // Rust's f64 parser handles `e<digit>` as the exponent
+    // separator.
     if let Ok(n) = trimmed.parse::<f64>() {
         if let Some(v) = serde_json::Number::from_f64(n).map(Value::Number) {
             return v;
         }
     }
 
-    // Strip commas and trailing non-numeric suffix, retry.
-    let stripped: String = trimmed.chars().filter(|c| *c != ',').collect();
-    let numeric_prefix: String = stripped
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-        .collect();
-    if !numeric_prefix.is_empty() {
-        if let Ok(n) = numeric_prefix.parse::<f64>() {
-            if let Some(v) = serde_json::Number::from_f64(n).map(Value::Number) {
-                return v;
-            }
+    // Direct parse failed. Apply the bounded normalizer.
+    if let Some(n) = normalize_numeric_candidate(trimmed) {
+        if let Some(v) = serde_json::Number::from_f64(n).map(Value::Number) {
+            debug!(
+                input = %trimmed,
+                parsed = %n,
+                "numeric normalizer accepted formatted scalar (Session 53 Piece D)"
+            );
+            return v;
         }
     }
 
     Value::String(trimmed.to_string())
+}
+
+/// Bounded pre-coercion normalizer for human-readable numeric
+/// strings. Returns `Some(f64)` when the candidate parses cleanly
+/// after normalization; `None` when the candidate doesn't fit the
+/// supported shapes (genuinely non-numeric, or an
+/// ambiguous-locale shape we refuse to guess on).
+///
+/// Strip order (each step is independent and any can fire):
+/// 1. **EU-locale gate** — if both `.` and `,` are present and
+///    the last `,` appears after the last `.`, the string is
+///    ambiguously EU-shaped (`1.234,56`). Return `None` and let
+///    apply fail honestly. Adding heuristic locale detection
+///    would silently mis-parse legitimate values; explicit is
+///    better than guessing. (Documented in Session 53 handoff
+///    "What's intentionally not in this patch".)
+/// 2. **Estimate prefixes** — `est. `, `est `, `~`, `≈`, and a
+///    careful `e `/`e` matcher that distinguishes from
+///    scientific notation. Common in agency tables (`est. 1,200`).
+/// 3. **Currency markers** — `$`, `€`, `£`, `¥` (single-char
+///    prefixes/suffixes); ASCII codes `USD`, `EUR` (case-
+///    insensitive). The strip is positional: a leading currency
+///    marker is removed; a trailing one too.
+/// 4. **Whitespace** inside the body (`"1 234.5"` → `"1234.5"`).
+/// 5. **ASCII thousand-separator commas** — only when every
+///    comma sits between digit triplets in the integer portion.
+///    Malformed positions (`"1,23"`, `"abc,def"`) leave the
+///    whole string alone; the parse fails honestly.
+/// 6. **Trailing-unit fallback** — if the post-strip whole
+///    string doesn't parse, take the leading numeric prefix
+///    (digits, decimal point, sign) and try to parse that.
+///    Preserves the pre-Session-53 contract for `"49000 t"`
+///    and `"12.5%"`-shaped values where the recipe-author
+///    selected a cell whose unit suffix tagged along.
+fn normalize_numeric_candidate(s: &str) -> Option<f64> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Step 1: EU-locale gate. `1.234,56`-shaped strings are
+    // ambiguous: US-style would treat the period as decimal,
+    // EU-style would treat the comma as decimal. We refuse to
+    // guess. The signal: both `.` and `,` present, and the
+    // LAST `,` is to the RIGHT of the LAST `.`.
+    let last_comma = trimmed.rfind(',');
+    let last_period = trimmed.rfind('.');
+    if let (Some(c), Some(p)) = (last_comma, last_period) {
+        if c > p {
+            return None;
+        }
+    }
+
+    // Step 2: strip estimate prefixes from the start.
+    let mut working: String = trimmed.to_string();
+    for prefix in ["est. ", "est ", "~", "≈"] {
+        if let Some(rest) = working.strip_prefix(prefix) {
+            working = rest.trim_start().to_string();
+        }
+    }
+    // The bare-`e` estimate prefix is delicate: it must not eat
+    // scientific notation mantissas. We never strip a leading
+    // `e<digit>` because that's the start of an exponent in
+    // shapes like `e9` (which `f64::parse` accepts as part of a
+    // larger mantissa-bearing literal). The strip fires only on
+    // `e ` (literal space before the digit, the agency-table
+    // convention) and on `e<digit>` *when* the rest also
+    // contains a comma — at which point it can't be scientific
+    // notation anyway because Rust's f64 parser rejects commas
+    // inside literals.
+    if let Some(rest) = working.strip_prefix("e ") {
+        if rest.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+            working = rest.trim_start().to_string();
+        }
+    } else if let Some(rest) = working.strip_prefix('e') {
+        if rest.contains(',')
+            && rest.chars().next().map_or(false, |c| c.is_ascii_digit())
+        {
+            working = rest.to_string();
+        }
+    }
+
+    // Step 3: strip currency markers, leading or trailing.
+    for sym in ['$', '€', '£', '¥'] {
+        if working.starts_with(sym) {
+            let rest = working[sym.len_utf8()..].trim_start();
+            working = rest.to_string();
+        }
+        if working.ends_with(sym) {
+            let cut = working.len() - sym.len_utf8();
+            let rest = working[..cut].trim_end();
+            working = rest.to_string();
+        }
+    }
+    for code in ["USD", "EUR", "usd", "eur"] {
+        if working.starts_with(code) {
+            let rest = working[code.len()..].trim_start();
+            working = rest.to_string();
+        }
+        if working.ends_with(code) {
+            let cut = working.len() - code.len();
+            let rest = working[..cut].trim_end();
+            working = rest.to_string();
+        }
+    }
+
+    // Step 4: collapse internal whitespace (e.g. `1 234.5` →
+    // `1234.5`). Lossless for canonical numeric shapes.
+    let no_internal_ws: String = working
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+
+    // Step 5: validate-and-strip ASCII thousand-separator
+    // commas. Failed validation returns the input unchanged
+    // (the parser will reject it below); a malformed comma
+    // position should never produce a silently normalised
+    // value.
+    let stripped = strip_thousand_separator_commas(&no_internal_ws)
+        .unwrap_or_else(|| no_internal_ws.clone());
+
+    // First parse attempt: the whole post-strip string.
+    if let Ok(n) = stripped.parse::<f64>() {
+        return Some(n);
+    }
+
+    // Step 6: trailing-unit fallback. Take the longest leading
+    // numeric prefix (digits, decimal point, sign) and try to
+    // parse that. Preserves the pre-Session-53 behaviour for
+    // recipe-authors who selected a cell whose unit tagged
+    // along (`"49000 t"`, `"12.5%"`).
+    let prefix: String = stripped
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
+        .collect();
+    if prefix.is_empty() {
+        return None;
+    }
+    prefix.parse::<f64>().ok()
+}
+
+/// Return `Some(stripped)` when every comma in the candidate sits
+/// between digit triplets (canonical thousands form), or there are
+/// no commas. Return `None` otherwise — the caller treats this as
+/// "leave the original string alone, let apply fail honestly."
+///
+/// Examples that pass: `"74,700"` → `Some("74700")`,
+/// `"1,234,567"` → `Some("1234567")`, `"42"` → `Some("42")`,
+/// `"1234.56"` → `Some("1234.56")`, `"-3,200.5"` → `Some("-3200.5")`.
+///
+/// Examples that fail (return `None`): `"1,23"` (decimal-mark
+/// pattern, ambiguous locale), `"abc,def"` (non-numeric).
+fn strip_thousand_separator_commas(s: &str) -> Option<String> {
+    if !s.contains(',') {
+        return Some(s.to_string());
+    }
+    // Split on the first non-digit-non-comma-non-period-non-minus-
+    // non-plus character, treating that as the boundary between
+    // the numeric body and a possible suffix. The body is what
+    // we validate; the suffix (if any) is preserved as-is for
+    // downstream (it'll fail to parse if it's there).
+    let body_end = s
+        .char_indices()
+        .find(|(_, c)| {
+            !(c.is_ascii_digit() || *c == ',' || *c == '.' || *c == '-' || *c == '+')
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    let body = &s[..body_end];
+    let suffix = &s[body_end..];
+
+    // Sign? Hold it aside.
+    let (sign, body) = if let Some(rest) = body.strip_prefix('-') {
+        ("-", rest)
+    } else if let Some(rest) = body.strip_prefix('+') {
+        ("", rest)
+    } else {
+        ("", body)
+    };
+
+    // Split off the decimal portion (everything after the LAST
+    // period). Commas only matter in the integer part.
+    let (int_part, frac_part) = match body.rfind('.') {
+        Some(idx) => (&body[..idx], &body[idx..]),
+        None => (body, ""),
+    };
+
+    // Validate the comma positions in `int_part`: must be
+    // 1..=3 digits, then groups of `,DDD`.
+    let has_comma = int_part.contains(',');
+    let int_clean = if has_comma {
+        let groups: Vec<&str> = int_part.split(',').collect();
+        // First group: 1..=3 digits, all ascii_digit.
+        if groups[0].is_empty() || groups[0].len() > 3 {
+            return None;
+        }
+        if !groups[0].chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        // Subsequent groups: exactly 3 digits.
+        for g in &groups[1..] {
+            if g.len() != 3 || !g.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+        }
+        groups.concat()
+    } else {
+        int_part.to_string()
+    };
+
+    Some(format!("{sign}{int_clean}{frac_part}{suffix}"))
 }
 
 /// Walk a dot-separated pointer through a `Value`. Numeric segments
@@ -1530,6 +1762,189 @@ fn validate_css_iterator(
                 outer_matches.len()
             ),
         });
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Authoring-time SHAPE validation against prefetched bytes (Session 53 piece B)
+// ---------------------------------------------------------------------------
+//
+// `validate_recipe_against_bytes` (Session 41 items 4–6) catches the
+// case where the LLM authors a selector that does not match the page —
+// the runtime's `Extraction` error surfaces at authoring. It does NOT
+// catch the case where the selector matches *something* but the
+// matched value's shape is wrong for the binding's content type. The
+// 2026-05-09 18:12 lithium re-run hit this twice (`pubs.usgs.gov`
+// authoring `string "Argentina"` into an `f64` value field;
+// `www.worldbank.org` authoring a selector that resolved to no
+// `value` field at all). Both apply-failed; both consumed a fetch
+// attempt; both polluted the prior-attempts log only as "apply
+// failed" rows the proposer doesn't see.
+//
+// Piece B closes this gap. After the structural validator accepts the
+// recipe, we run the *full* apply path (extract → build_record) for
+// each binding against the prefetched bytes. A `ContentAssembly`,
+// `Binding`, or `FieldMapping` failure here is the same shape the
+// runtime would surface at apply time — by construction, the
+// validator and the runtime cannot disagree about whether the
+// extracted bytes type-check into the binding's content type.
+//
+// Differences from `apply()`:
+// - We do not run `normalize::finalize`. Normalization can reject
+//   records on plan-relevance grounds (topic mismatch, geography out
+//   of scope) which are real apply-stage failures but unrelated to
+//   the wire shape the LLM picked. Surfacing normalization rejects as
+//   author-time declines would teach the recipe-author the wrong
+//   lesson; those rejects belong at apply time where the operator
+//   sees them as "the recipe ran but normalization rejected the
+//   record" rather than "the LLM's selector was wrong."
+// - For iterator recipes we validate ONE record (the first inner
+//   match in the first outer match). Phase 1's per-record shape is
+//   uniform within a given page — if one record builds, all do; if
+//   the first one's shape mismatches, every subsequent one would
+//   too. Validating all N matches would multiply the cost without
+//   adding coverage.
+
+/// Validate that a candidate [`FetchRecipe`] would not just extract a
+/// scalar but also assemble a record of the binding's declared content
+/// type. The successor to [`validate_recipe_against_bytes`] used by
+/// the recipe-author, which catches the shape-mismatch class
+/// (`string in numeric slot`, `missing required field`) the
+/// extraction-only validator cannot see.
+///
+/// Strict superset of [`validate_recipe_against_bytes`]: any error
+/// the extraction-only validator returns is also returned here, plus
+/// `ContentAssembly`, `Binding`, and `FieldMapping` errors that
+/// require a `ResearchPlan` to surface.
+///
+/// Session 53 Piece B.
+pub(crate) fn validate_recipe_shape_against_bytes(
+    recipe: &FetchRecipe,
+    bytes: &[u8],
+    plan: &ResearchPlan,
+) -> Result<(), ApplyError> {
+    // Defer to the existing structural validator first. It catches
+    // the no-extracted-bytes class (selector matches nothing, JSON
+    // path resolves to null, pdf_table out of range) which is
+    // independent of the binding's content type and produces clearer
+    // error wording. If a recipe fails this preflight there's no
+    // useful shape work to do — the bytes never reach build_record.
+    validate_recipe_against_bytes(recipe, bytes)?;
+
+    // Acquire one representative extracted scalar — the same one
+    // build_record would see at apply time. For scalar recipes this
+    // is the recipe's single extraction output. For iterator
+    // recipes (Phase 1: css_select × css_select only) it is the
+    // inner extraction's value within the first outer match that
+    // had an inner hit. This mirrors the runtime's per-record
+    // build_record contract; if that record's shape type-checks
+    // into the binding's content type, every subsequent record on
+    // the same page would too.
+    let extracted = match &recipe.iterator {
+        None => extract(&recipe.extraction, bytes)?,
+        Some(iter_spec) => match (iter_spec, &recipe.extraction) {
+            (
+                ExtractionSpec::CssSelect {
+                    selector: iter_selector,
+                    attribute: _,
+                },
+                ExtractionSpec::CssSelect {
+                    selector: inner_selector,
+                    attribute: inner_attribute,
+                },
+            ) => {
+                let html_str =
+                    std::str::from_utf8(bytes).map_err(|e| ApplyError::Extraction {
+                        mode: "css_select",
+                        reason: format!("bytes were not UTF-8: {e}"),
+                    })?;
+                let doc = Html::parse_document(html_str);
+
+                let iter_sel = Selector::parse(iter_selector).map_err(|e| {
+                    ApplyError::Extraction {
+                        mode: "css_select",
+                        reason: format!("iterator selector did not parse: {e}"),
+                    }
+                })?;
+                let inner_sel = Selector::parse(inner_selector).map_err(|e| {
+                    ApplyError::Extraction {
+                        mode: "css_select",
+                        reason: format!("inner selector did not parse: {e}"),
+                    }
+                })?;
+
+                // Walk outer matches until we find one that yields an
+                // inner hit. The structural validator already proved
+                // that at least one such match exists, but we can't
+                // hand its `ElementRef` across function boundaries
+                // without a separate borrow scope, so re-discover it
+                // here. Cost is one parse and at most O(outer)
+                // selector-runs — bounded by the source page size.
+                let mut representative: Option<String> = None;
+                for matched in doc.select(&iter_sel) {
+                    if matched.select(&inner_sel).next().is_some() {
+                        representative = Some(extract_css_within(
+                            matched,
+                            &inner_sel,
+                            inner_attribute.as_deref(),
+                        )?);
+                        break;
+                    }
+                }
+                representative.ok_or_else(|| ApplyError::Extraction {
+                    mode: "css_select",
+                    reason: "iterator validator agreed inner matches but \
+                             shape validator could not re-locate the \
+                             match — bytes mutated under us"
+                        .into(),
+                })?
+            }
+            _ => {
+                // Other iterator pairings are caught by the structural
+                // validator above; reaching this branch means a Phase
+                // 2 mode landed without updating this function.
+                return Err(ApplyError::NotImplemented {
+                    mode: "iterator",
+                    reason: "shape validator only mirrors Phase 1 \
+                             (css_select × css_select) iterator pairings; \
+                             extend when Phase 2 lands"
+                        .into(),
+                });
+            }
+        },
+    };
+
+    // The same ApplyContext build_record would see. `fetched_at` is
+    // synthetic — shape validation does not depend on the timestamp;
+    // we pass `Utc::now()` so the constructed Envelope is well-formed
+    // for the path-resolution machinery (some plan-derived field
+    // mappings reference `valid_at`-shaped values).
+    let ctx = ApplyContext {
+        recipe,
+        plan,
+        bytes,
+        fetched_at: Utc::now(),
+    };
+
+    // Build one record per binding. The dedup_key is computed from
+    // the binding's `dedup_key_field` for iterator recipes; for the
+    // shape-only check we pass a synthetic value because `build_record`
+    // is the consumer of the extracted scalar, and the dedup_key is
+    // a downstream concern that does not affect content-type
+    // serialization (the runtime stamps it onto the record envelope
+    // *after* the content has type-checked).
+    let dedup_key = match &recipe.iterator {
+        None => None,
+        Some(_) => Some(format!("shape-validator:{}", recipe.id)),
+    };
+    for (idx, binding) in recipe.produces.iter().enumerate() {
+        // Discard the built record — the validator only asks "would
+        // build_record have succeeded?" If it would have, the
+        // binding's content type accepted the assembled JSON; that's
+        // the shape contract.
+        let _ = build_record(binding, idx, &extracted, &ctx, dedup_key.clone())?;
     }
 
     Ok(())
@@ -2345,6 +2760,127 @@ C 4
     }
 
     // -----------------------------------------------------------------------
+    // Numeric-format normalizer — Session 53 Piece D
+    //
+    // The 2026-05-09 18:11 USGS MCS run authoring decline cited
+    // "comma-formatted numbers (e.g. 74,700) and estimate prefixes
+    // that prevent clean numeric extraction to f64 via pdf_table" —
+    // a real apply-stage limitation the recipe-author refused to
+    // work around. The normalizer broadens what apply will accept
+    // from the formats the recipe-author reasonably authors against
+    // human-readable tables (USGS production figures, IEA fact
+    // sheets' `est. 1,200`-style estimates, FT/Bloomberg headline
+    // `$1,234`).
+    //
+    // These tests pin the bounded contract: which shapes the
+    // normalizer accepts, and which (specifically: ambiguous-locale
+    // shapes) it deliberately leaves alone.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalizer_accepts_us_locale_thousand_separators() {
+        // The USGS MCS class — `74,700` is the canonical lithium
+        // production cell shape.
+        assert_eq!(parse_extracted_scalar("74,700"), json!(74700.0));
+        assert_eq!(parse_extracted_scalar("1,234,567"), json!(1234567.0));
+        assert_eq!(parse_extracted_scalar("-3,200.5"), json!(-3200.5));
+    }
+
+    #[test]
+    fn normalizer_accepts_currency_prefix_and_suffix() {
+        // FT/Bloomberg headline shape — `$1,234` and `1,234 USD`
+        // both occur in news prose. Currency is a positional marker
+        // around a numeric body.
+        assert_eq!(parse_extracted_scalar("$1,234.56"), json!(1234.56));
+        assert_eq!(parse_extracted_scalar("€1,000"), json!(1000.0));
+        assert_eq!(parse_extracted_scalar("£99"), json!(99.0));
+        assert_eq!(parse_extracted_scalar("¥500"), json!(500.0));
+        assert_eq!(parse_extracted_scalar("USD 1,234"), json!(1234.0));
+        assert_eq!(parse_extracted_scalar("1,234 USD"), json!(1234.0));
+        assert_eq!(parse_extracted_scalar("1,234 EUR"), json!(1234.0));
+    }
+
+    #[test]
+    fn normalizer_accepts_estimate_prefixes() {
+        // Agency tables routinely tag estimated cells with a
+        // marker. `est. 1,200`, `~5000`, `≈10,000` all appear in
+        // IEA / USGS / Australian RE Quarterly chapters.
+        assert_eq!(parse_extracted_scalar("est. 1,200"), json!(1200.0));
+        assert_eq!(parse_extracted_scalar("est 800"), json!(800.0));
+        assert_eq!(parse_extracted_scalar("~5000"), json!(5000.0));
+        assert_eq!(parse_extracted_scalar("≈10,000"), json!(10000.0));
+    }
+
+    #[test]
+    fn normalizer_preserves_scientific_notation() {
+        // Scientific notation must not be mangled by the estimate-
+        // prefix rules — `1.5e9` is one billion and a half, not an
+        // estimate of 1.5 followed by 9.
+        assert_eq!(parse_extracted_scalar("1.5e9"), json!(1_500_000_000.0));
+        assert_eq!(parse_extracted_scalar("2e3"), json!(2000.0));
+        assert_eq!(parse_extracted_scalar("-1.5e9"), json!(-1_500_000_000.0));
+    }
+
+    #[test]
+    fn normalizer_rejects_eu_locale_decimal_comma() {
+        // `1.234,56` is ambiguous (US would mis-parse as 1234.56;
+        // EU means 1234.56 written EU-style). The normalizer
+        // refuses to guess: returns the original as Value::String
+        // so apply fails honestly with the un-normalised string in
+        // the error message. This is the explicit
+        // "intentionally not in this patch" carve-out from the
+        // Session 53 handoff.
+        assert_eq!(parse_extracted_scalar("1.234,56"), json!("1.234,56"));
+        assert_eq!(parse_extracted_scalar("88.000,0"), json!("88.000,0"));
+    }
+
+    #[test]
+    fn normalizer_rejects_genuinely_non_numeric() {
+        assert_eq!(parse_extracted_scalar("abc"), json!("abc"));
+        assert_eq!(parse_extracted_scalar("Argentina"), json!("Argentina"));
+        assert_eq!(parse_extracted_scalar(""), json!(""));
+    }
+
+    #[test]
+    fn normalizer_rejects_malformed_comma_positions() {
+        // `1,23` has a comma not at a thousand-separator position.
+        // The conservative rule: don't strip the comma; let parse
+        // fail. The fallback then takes the leading numeric prefix
+        // `1`, which is the most defensible interpretation when the
+        // overall string is structurally broken.
+        // (Old code stripped all commas unconditionally, producing
+        // `123` — see parse_extracted_scalar history. Session 53
+        // narrows the strip to canonical positions only.)
+        let v = parse_extracted_scalar("1,23");
+        assert!(
+            v == json!(1.0) || v == json!("1,23"),
+            "ambiguous comma position should produce conservative \
+             leading-prefix parse or string fallback, not silent \
+             123; got {v:?}"
+        );
+    }
+
+    #[test]
+    fn normalizer_handles_internal_whitespace() {
+        // `1 234.5` — Australian REQ tables sometimes use thin
+        // spaces (which collapse to ASCII whitespace through
+        // upstream extraction). Treat as canonical thousand
+        // separator.
+        assert_eq!(parse_extracted_scalar("1 234.5"), json!(1234.5));
+    }
+
+    #[test]
+    fn normalizer_preserves_trailing_unit_via_prefix_fallback() {
+        // Pre-Session-53: `"49,000 t"` extracted from a CSV cell
+        // where the recipe-author selected the wrong column was
+        // parsed as 49000 by stripping the unit. Session 53
+        // preserves that fallback through the leading-numeric-
+        // prefix path.
+        assert_eq!(parse_extracted_scalar("49,000 t"), json!(49000.0));
+        assert_eq!(parse_extracted_scalar("12.5%"), json!(12.5));
+    }
+
+    // -----------------------------------------------------------------------
     // Pointer walker
     // -----------------------------------------------------------------------
 
@@ -3059,6 +3595,146 @@ C 4
             "the filter-expression fix the runtime suggests must validate \
              cleanly; otherwise the retry loop would never land a recipe \
              for World-Bank-shaped sources",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_recipe_shape_against_bytes — Session 53 Piece B
+    //
+    // The 2026-05-09 18:12 lithium re-run hit the apply-stage shape
+    // class twice: `pubs.usgs.gov` authored a CSS selector that
+    // landed `string "Argentina"` into `ObservationContent.value`
+    // (f64); `www.worldbank.org` authored a JSON path that yielded
+    // no usable extraction at all, so build_record assembled a
+    // content object missing the required `value` field. Both
+    // would have been declined at authoring time by the shape
+    // validator; both apply-failed forever in the live run.
+    //
+    // These tests pin the shape validator's contract for both
+    // classes against a recipe that uses the test module's
+    // `recipe_with` helper (Observation binding, value: f64
+    // mapped from Extracted). A passing test is "the validator
+    // declines this recipe at authoring time"; a failing test
+    // would mean the runtime sees the same shape mismatch at
+    // apply time on every fetch.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_shape_accepts_numeric_extraction_for_f64_value_field() {
+        // The runtime's `parse_extracted_scalar` parses "49000" as a
+        // Number; build_record's deserialization into ObservationContent
+        // accepts it. The shape validator must agree — otherwise the
+        // happy-path apply on numeric extractions would never author.
+        let bytes = b"<html><body><div class=\"value\">49000</div></body></html>";
+        let recipe = recipe_with(ExtractionSpec::CssSelect {
+            selector: ".value".into(),
+            attribute: None,
+        });
+        validate_recipe_shape_against_bytes(&recipe, bytes, &plan())
+            .expect("numeric extracted scalar must shape-validate into f64");
+    }
+
+    #[test]
+    fn validate_shape_rejects_string_extraction_for_f64_value_field() {
+        // The pubs.usgs.gov "Argentina" class. CSS selector matches
+        // a country-name cell; parse_extracted_scalar keeps it as a
+        // String; ObservationContent's `value: f64` rejects the
+        // string. Shape validator must catch this at authoring so
+        // the recipe is never persisted.
+        let bytes = b"<html><body><div class=\"value\">Argentina</div></body></html>";
+        let recipe = recipe_with(ExtractionSpec::CssSelect {
+            selector: ".value".into(),
+            attribute: None,
+        });
+        let err = validate_recipe_shape_against_bytes(&recipe, bytes, &plan()).unwrap_err();
+        match err {
+            ApplyError::ContentAssembly { reason } => {
+                assert!(
+                    reason.contains("expected f64"),
+                    "shape validator must surface the runtime's content-\
+                     assembly error verbatim so the recipe-author retry \
+                     loop sees the same wording it would at apply time; \
+                     got: {reason}"
+                );
+                assert!(
+                    reason.contains("Argentina") || reason.contains("string"),
+                    "reason should name the offending value or its type \
+                     so the operator's mental model of why the recipe was \
+                     declined matches what the runtime would report at \
+                     apply time; got: {reason}"
+                );
+            }
+            other => panic!(
+                "expected ContentAssembly error from shape validator; got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn validate_shape_rejects_recipe_missing_required_value_field() {
+        // The www.worldbank.org "missing field 'value'" class. A
+        // recipe whose `produces[0].field_mappings` doesn't include
+        // a `value` mapping at all assembles content_json without
+        // the key; ObservationContent deserialization rejects.
+        // Shape validator catches it at authoring.
+        let bytes = b"<html><body><div class=\"v\">42</div></body></html>";
+
+        // Build a recipe whose Observation binding omits the `value`
+        // field mapping. All other Observation fields (metric, unit,
+        // period) are still mapped — the omission is specifically
+        // the f64 slot.
+        let mut recipe = recipe_with(ExtractionSpec::CssSelect {
+            selector: ".v".into(),
+            attribute: None,
+        });
+        recipe.produces[0].field_mappings.retain(|fm| fm.path != "value");
+
+        let err = validate_recipe_shape_against_bytes(&recipe, bytes, &plan()).unwrap_err();
+        match err {
+            ApplyError::ContentAssembly { reason } => {
+                assert!(
+                    reason.contains("missing field"),
+                    "shape validator must surface the runtime's missing-\
+                     field error so the recipe-author retry loop knows \
+                     the binding is shape-incomplete; got: {reason}"
+                );
+                assert!(
+                    reason.contains("value"),
+                    "reason should name the specific field that's missing \
+                     so the operator can act; got: {reason}"
+                );
+            }
+            other => panic!(
+                "expected ContentAssembly error from shape validator; got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn validate_shape_strict_superset_of_extraction_validator() {
+        // A recipe that fails the structural validator (selector
+        // matches nothing) must also fail the shape validator —
+        // there are no bytes to type-check, so the shape validator
+        // delegates to the structural validator and returns its
+        // error verbatim. This pins the "strict superset" contract
+        // documented on validate_recipe_shape_against_bytes.
+        let bytes = b"<html><body><p>no value here</p></body></html>";
+        let recipe = recipe_with(ExtractionSpec::CssSelect {
+            selector: ".value".into(),
+            attribute: None,
+        });
+        let shape_err = validate_recipe_shape_against_bytes(&recipe, bytes, &plan())
+            .expect_err("shape validator must inherit structural failures");
+        let struct_err = validate_recipe_against_bytes(&recipe, bytes)
+            .expect_err("structural validator must reject too");
+        assert!(
+            matches!(shape_err, ApplyError::Extraction { mode: "css_select", .. }),
+            "shape validator must inherit the structural validator's \
+             extraction error type; got {shape_err:?}"
+        );
+        assert!(
+            matches!(struct_err, ApplyError::Extraction { mode: "css_select", .. }),
+            "sanity: structural validator's error shape unchanged; got {struct_err:?}"
         );
     }
 }

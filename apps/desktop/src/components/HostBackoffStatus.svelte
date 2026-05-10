@@ -135,8 +135,17 @@
 
 {#if plans.hostBackoff.length > 0}
   <section class="backoff">
+    <!--
+      Session 53 Piece E.1: head reads as one continuous strip with
+      a `·` separator between the label and the host count, so the
+      rendered text never wedges as `HOST BACKOFF1 host` on narrow
+      panels. The operator-flagged spacing accident from Session 52
+      was the absence of any visible separator between the
+      uppercase label and the count.
+    -->
     <header class="head">
       <span class="label">host backoff</span>
+      <span class="sep" aria-hidden="true">·</span>
       <span class="hint">
         {plans.hostBackoff.length}
         {plans.hostBackoff.length === 1 ? 'host' : 'hosts'} · this session
@@ -145,10 +154,20 @@
     <ul class="rows">
       {#each sortedRows as row (rowKey(row))}
         <li class="row" data-tone={rowTone(row)}>
+          <!--
+            Session 53 Piece E.1: lift the recovering / blocked /
+            clean tone into a small status dot using the same
+            `--signal-*` tokens FetchReport row borders use.
+            Same dot vocabulary across surfaces, so a glance reads
+            consistently. The text label is preserved on hover via
+            `title` for accessibility.
+          -->
+          <span
+            class="status-dot"
+            aria-label={toneLabel(rowTone(row))}
+            title={toneLabel(rowTone(row))}
+          ></span>
           <span class="host" title={row.host}>{row.host}</span>
-          <span class="state">
-            <span class="state-label">{toneLabel(rowTone(row))}</span>
-          </span>
           <span class="counters">
             <span
               class="counter"
@@ -156,9 +175,22 @@
             >
               fails: <strong>{row.consecutive_failures}</strong>
             </span>
-            <span class="counter" title="seconds until next request may fire">
-              wait: <strong>{formatWait(row.wait_seconds_remaining)}</strong>
-            </span>
+            {#if Number(row.wait_seconds_remaining) > 0}
+              <!--
+                Session 53 Piece E.1: only render the `wait` token
+                when an active backoff is counting down. A
+                recovering host (counter > 0, wait == 0) showed
+                `wait: —` pre-Session-53; the dash carried no
+                actionable info and competed with the meaningful
+                fails counter for visual weight.
+              -->
+              <span
+                class="counter"
+                title="seconds until next request may fire"
+              >
+                wait: <strong>{formatWait(row.wait_seconds_remaining)}</strong>
+              </span>
+            {/if}
           </span>
         </li>
       {/each}
@@ -203,14 +235,18 @@
   .head {
     display: flex;
     align-items: baseline;
-    justify-content: space-between;
-    gap: 12px;
+    gap: 8px;
+    flex-wrap: wrap;
   }
   .label {
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.06em;
     color: var(--fg-tertiary);
+  }
+  .sep {
+    color: var(--fg-quaternary);
+    font-size: 10px;
   }
   .hint {
     font-size: 10px;
@@ -235,8 +271,13 @@
   }
 
   .row {
+    /*
+      Session 53 Piece E.1: status-dot column replaces the text
+      `state` column. 12px is the same width FetchReport uses for
+      its row dot so the strips line up across surfaces.
+    */
     display: grid;
-    grid-template-columns: minmax(160px, 320px) 100px 1fr;
+    grid-template-columns: 12px minmax(160px, 320px) 1fr;
     column-gap: 12px;
     align-items: baseline;
     padding: 4px 6px;
@@ -245,6 +286,30 @@
     font-size: 11px;
     background: var(--bg-panel);
     transition: background var(--duration-ui) var(--ease);
+  }
+
+  .status-dot {
+    /*
+      Tone-driven 8px dot, vertically centred against the row's
+      baseline. The colour mirrors the row's left-border below so
+      the operator's glance picks up the same signal whether they
+      see the dot, the border, or both.
+    */
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--border-subtle);
+    align-self: center;
+  }
+  .row[data-tone='clean'] .status-dot {
+    background: var(--signal-positive);
+  }
+  .row[data-tone='recovering'] .status-dot {
+    background: var(--signal-warning);
+  }
+  .row[data-tone='blocked'] .status-dot {
+    background: var(--signal-negative);
   }
   .row:hover {
     background: var(--bg-panel-alt);
@@ -271,27 +336,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  .state {
-    display: flex;
-    align-items: baseline;
-    gap: 4px;
-  }
-  .state-label {
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--fg-tertiary);
-  }
-  .row[data-tone='clean'] .state-label {
-    color: var(--signal-positive);
-  }
-  .row[data-tone='recovering'] .state-label {
-    color: var(--signal-warning);
-  }
-  .row[data-tone='blocked'] .state-label {
-    color: var(--signal-negative);
   }
 
   .counters {

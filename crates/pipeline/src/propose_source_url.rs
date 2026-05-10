@@ -41,7 +41,9 @@
 
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
-use situation_room_llm::{CompletionRequest, LlmError, LlmProvider, ModelTier};
+use situation_room_llm::{
+    CompletionRequest, LlmError, LlmProvider, ModelTier, ReasoningEffort,
+};
 use situation_room_secure::bounds::{check_string, Bounds};
 use situation_room_secure::url_guard::{UrlGuard, UrlViolation};
 use thiserror::Error;
@@ -118,6 +120,18 @@ pub enum ProposalError {
 /// `prior_attempts` is the per-nomination history accumulated across
 /// earlier propose → fetch → author cycles in the same retry loop.
 /// Empty on the first attempt; populated on subsequent attempts.
+///
+/// `effort_override` is the Session 53 Piece F escalation knob.
+/// `None` (the normal path) means "use the provider's per-tier
+/// mapping for `tier`" — Low on xAI's default cheap mapping.
+/// `Some(e)` pins the request body's effort to `e` for this call
+/// only, regardless of tier. The fetch executor passes
+/// `Some(Medium)` when a nomination has been declined ≥3 times
+/// across the plan's runs; the escalation is per-nomination, not
+/// per-source, and feeds runtime observations back into the
+/// reasoning budget. See `ReasoningEffort`'s doc-comment for the
+/// principle (per-tier and per-runtime-feedback are fine; per-
+/// source name routing is forbidden).
 pub async fn propose_source_url(
     provider: &dyn LlmProvider,
     tier: ModelTier,
@@ -125,6 +139,7 @@ pub async fn propose_source_url(
     plan: &ResearchPlan,
     nomination: &DocumentSourceNomination,
     prior_attempts: &[PriorAttempt],
+    effort_override: Option<ReasoningEffort>,
 ) -> Result<ProposalOutcome, ProposalError> {
     let user = build_prompt(prompt_template, plan, nomination, prior_attempts)?;
 
@@ -148,11 +163,17 @@ pub async fn propose_source_url(
         // knowledge, not generation. Same discipline as recipe
         // authoring.
         temperature: 0.0,
-        // Per-tier reasoning intensity comes from the provider's tier
-        // mapping (cheap → Low on xAI by default — propose-URL is the
-        // canonical cheap-tier call). Per-call/per-source overrides
-        // belong nowhere; see ReasoningEffort doc comment.
-        reasoning_effort: None,
+        // Session 53 Piece F: per-call effort override for stuck
+        // nominations. `None` falls through to the provider's per-
+        // tier mapping (cheap → Low on xAI by default — propose-URL
+        // is the canonical cheap-tier call). `Some(e)` pins the
+        // body field for this call. The escalation decision is
+        // per-nomination and observation-driven (decline count from
+        // fetch_run_outcomes); it is NOT per-host, per-publisher,
+        // or per-URL-string — the closed-vocabulary discipline
+        // forbids those, and ReasoningEffort's doc-comment names
+        // the failure mode.
+        reasoning_effort: effort_override,
     };
 
     let resp = provider.complete(tier, req).await?;

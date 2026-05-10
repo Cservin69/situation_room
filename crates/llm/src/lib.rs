@@ -32,7 +32,7 @@ pub mod prompts;
 pub mod extraction;
 pub mod cache;
 
-pub use providers::{LlmProvider, LlmError, ModelTier, CompletionRequest, CompletionResponse};
+pub use providers::{LlmProvider, LlmError, ModelTier, ReasoningEffort, CompletionRequest, CompletionResponse};
 pub use providers::{XaiProvider, XaiConfig, XAI_API_KEY_ENV};
 pub use providers::{AnthropicProvider, AnthropicConfig, ANTHROPIC_API_KEY_ENV};
 

@@ -33,8 +33,8 @@ pub mod sources_memory;
 
 pub use connection::Store;
 pub use fetch_run_outcomes::{
-    FetchRunOutcomeKind, FetchRunOutcomeRow, RecipeOutcomeHistoryEntry,
-    RecipeOutcomeHistoryRunRow, StoredFetchRunOutcome,
+    ApplyFailureForProposer, FetchRunOutcomeKind, FetchRunOutcomeRow,
+    RecipeOutcomeHistoryEntry, RecipeOutcomeHistoryRunRow, StoredFetchRunOutcome,
 };
 pub use fetch_runs::{FetchRunRow, StoredFetchRun};
 pub use queries::{RecordsByPlan, TopicUsage};
