@@ -1,4 +1,4 @@
-# Propose Source URL Prompt — v1.3
+# Propose Source URL Prompt — v1.4
 
 <!--
     This file is the Level-2 propose-URL prompt for situation_room.
@@ -252,6 +252,44 @@ It is not a license to:
   in `prior_attempts` with a `403/401/timeout` shape is a
   blocked host, not a shot — pivot to a *different*
   publisher (the two-step pivot in "Reading prior attempts").
+
+## The L1 description names a class, not a contract
+
+A nomination description that includes a specific source name —
+*"<Source-X> battery-raw-materials price assessments — daily
+lithium hydroxide and carbonate spot pricing"*, or
+*"<Agency-Y> annual mineral commodities summary — production by
+country"* — names that source as a **provenance hint about the
+data class**, not as a binding contract that the URL must come
+from that exact host. The L1 classifier's job was to identify
+the *kind* of publisher that carries this data with the right
+pedigree; the data class named in the description (commodities
+trade-press spot pricing, statistical-agency annual production
+series, regulator publication index, etc.) is the *contract*.
+The named host is one example of that class — usually the L1's
+preferred example, but not the only acceptable one.
+
+When the named host is unreachable (403 / 401 / 404 / timeout /
+SPA-only / large-doc rejection), the data class is still served
+by the same class of publisher. The reasonable-shot disposition
+above applies unchanged: propose a major coverage publisher's
+standard tag / topic / listing URL for the metric class the
+description names, and the worst case is one wasted attempt
+rather than a decline. A returned record from a peer publisher
+in the same class beats a declined nomination from the
+unreachable named host every time.
+
+Decline rationales that read *"the L1 names this exact source,
+no alternative coverage publisher is appropriate"* misread the
+nomination contract: the contract is the *data class*, not the
+*URL host*. A second publisher in the same class is exactly the
+disposition's default move. (Promoted to its own section in
+v1.4 because the v1.3 reasonable-shot disposition handled the
+generic auth-primary exhaustion case but did not explicitly
+override the LLM's bias to treat a named source in the
+nomination as a contract — a 2026-05-10 06:45:41 lithium-plan
+live-test showed the proposer declining on exactly that
+mistaken read after two 404s on the named host.)
 
 ## What NOT to propose
 

@@ -1376,20 +1376,21 @@ fn normalize_numeric_candidate(s: &str) -> Option<f64> {
         return None;
     }
 
-    // Step 1: EU-locale gate. `1.234,56`-shaped strings are
-    // ambiguous: US-style would treat the period as decimal,
-    // EU-style would treat the comma as decimal. We refuse to
-    // guess. The signal: both `.` and `,` present, and the
-    // LAST `,` is to the RIGHT of the LAST `.`.
-    let last_comma = trimmed.rfind(',');
-    let last_period = trimmed.rfind('.');
-    if let (Some(c), Some(p)) = (last_comma, last_period) {
-        if c > p {
-            return None;
-        }
-    }
-
-    // Step 2: strip estimate prefixes from the start.
+    // Step 1: strip estimate prefixes from the start.
+    //
+    // Done BEFORE the EU-locale gate (Step 2) because the prefix
+    // `"est. "` contains a literal period; if the gate ran on the
+    // un-stripped string, an input like `"est. 1,200"` would see
+    // a `.` at index 3 and a `,` at index 6 — c > p — and the
+    // gate would false-positive on the prefix's punctuation rather
+    // than on the numeric body's locale, returning `None` for a
+    // string the agency-table convention expects to normalise to
+    // `1200`. Stripping first lets the gate see the numeric body
+    // alone and reach the correct verdict (no `.` in `"1,200"`,
+    // gate doesn't fire). Genuine EU-locale inputs such as
+    // `"est. 1.234,56"` still decline cleanly: the prefix is
+    // stripped to `"1.234,56"`, then the gate fires on the
+    // numeric body's `c > p` signal.
     let mut working: String = trimmed.to_string();
     for prefix in ["est. ", "est ", "~", "≈"] {
         if let Some(rest) = working.strip_prefix(prefix) {
@@ -1415,6 +1416,21 @@ fn normalize_numeric_candidate(s: &str) -> Option<f64> {
             && rest.chars().next().map_or(false, |c| c.is_ascii_digit())
         {
             working = rest.to_string();
+        }
+    }
+
+    // Step 2: EU-locale gate. `1.234,56`-shaped strings are
+    // ambiguous: US-style would treat the period as decimal,
+    // EU-style would treat the comma as decimal. We refuse to
+    // guess. The signal: both `.` and `,` present, and the
+    // LAST `,` is to the RIGHT of the LAST `.`. Run against the
+    // post-prefix-strip `working`, not the original `trimmed`,
+    // for the reason given in Step 1.
+    let last_comma = working.rfind(',');
+    let last_period = working.rfind('.');
+    if let (Some(c), Some(p)) = (last_comma, last_period) {
+        if c > p {
+            return None;
         }
     }
 

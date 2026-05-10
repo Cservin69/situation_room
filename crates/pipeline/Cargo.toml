@@ -21,6 +21,10 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+# Session 54 Stage 1: per-target join_all inside author_for_nomination
+# (and Stage 2: FuturesUnordered + Semaphore across nominations).
+# `futures` rides the workspace-pinned 0.3 line.
+futures = { workspace = true }
 async-trait = { workspace = true }
 schemars = { workspace = true }
 url = { workspace = true }

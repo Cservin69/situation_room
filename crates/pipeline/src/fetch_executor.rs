@@ -91,8 +91,11 @@
 //!   later session.
 
 use chrono::Utc;
+use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -106,6 +109,7 @@ use situation_room_storage::{
 };
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::fetch_backoff::{fetch_with_backoff, format_retry_after, BackoffOutcome};
@@ -679,17 +683,59 @@ async fn load_or_author_recipes(
     }
 
     let total = nominations.len();
+
+    // Session 54 Stage 2: cross-nomination parallelism, gated by a
+    // shared LLM-tier semaphore. Cap configurable via
+    // `SR_LLM_CONCURRENCY` env var (default 8). Read once here so the
+    // cap is stable across the run; per-nomination futures clone the
+    // Arc and acquire permits around individual LLM call sites
+    // (propose_source_url and author_recipe). Permits are NOT held
+    // across prefetch (HTTP) or DB writes — only across the LLM
+    // call itself — so the cap reflects in-flight LLM concurrency
+    // rather than overall nomination concurrency.
+    //
+    // Test discipline: cargo test should be invoked with
+    // `SR_LLM_CONCURRENCY=1` when assertions depend on log line
+    // ordering or completion-order outcomes. Plan-level outcomes
+    // (the FetchReport's source_id-keyed entries) are unaffected by
+    // ordering — they're keyed by nomination identity, not insertion
+    // order — so the bulk of the suite is order-independent.
+    let llm_concurrency = std::env::var("SR_LLM_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8)
+        .max(1);
+    let llm_semaphore = Arc::new(Semaphore::new(llm_concurrency));
+
     info!(
         plan_id = %plan.id,
         total_sources = total,
         legacy_entries = legacy_outcomes.len(),
-        "authoring recipes for plan: starting"
+        llm_concurrency,
+        "authoring recipes for plan: starting (Session 54 Stage 2 — cross-nomination FuturesUnordered)"
     );
 
     let mut authored = Vec::new();
     let mut declines: Vec<RecipeOutcome> = legacy_outcomes;
+
+    // Build one future per nomination, then drain via
+    // FuturesUnordered so completed nominations can be persisted as
+    // soon as they finish — overlapping save_recipe / log emission
+    // with later nominations' LLM work. The futures borrow `ctx` and
+    // `plan` (function parameters that outlive the loop) and clone
+    // the Arc<Semaphore> per-future. `nomination` references stay
+    // valid because `nominations: Vec<&DocumentSourceNomination>` is
+    // a local that outlives the await loop below.
+    let mut nomination_futures = FuturesUnordered::new();
     for (idx, nomination) in nominations.iter().enumerate() {
         let position = idx + 1;
+        // Pre-emptive "starting" log fires in nomination order at
+        // future-creation time, before any of them are polled. The
+        // post-completion log fires in completion order. Both lines
+        // carry `nomination_id` for the operator's grep path; the
+        // `position` field continues to mean "source-priority order"
+        // (Session 47's contract) rather than "where am I in the
+        // queue" (which is no longer meaningful under FuturesUnordered).
         info!(
             plan_id = %plan.id,
             nomination_id = %nomination.nomination_id,
@@ -698,17 +744,30 @@ async fn load_or_author_recipes(
             total,
             "authoring nomination via Session-47 multi-expectation flow"
         );
-        // Session 47: one nomination → up to MAX_AUTHORS_PER_NOMINATION
-        // recipes (one per target expectation the LLM authors against
-        // the same prefetched bytes). The first target drives URL
-        // discovery (the Session-39 retry loop); subsequent targets
-        // re-use the locked URL+bytes via direct authoring calls.
-        match author_for_nomination(ctx, plan, nomination).await {
+        let sem = Arc::clone(&llm_semaphore);
+        // `nominations: Vec<&DocumentSourceNomination>`, so
+        // `nomination` from .iter() is `&&DocumentSourceNomination`;
+        // dereference once to get the `&DocumentSourceNomination`
+        // the future stores in its output tuple. Lifetime is tied to
+        // `nominations`, which outlives `nomination_futures`.
+        let nomination_ref: &DocumentSourceNomination = *nomination;
+        nomination_futures.push(async move {
+            let result =
+                author_for_nomination(ctx, plan, nomination_ref, sem).await;
+            (position, nomination_ref, result)
+        });
+    }
+
+    while let Some((position, nomination, author_result)) = nomination_futures.next().await {
+        match author_result {
             Ok((nomination_recipes, expectation_declines, nomination_decline_reason)) => {
                 // Persist every authored recipe. Each carries its own
                 // dedup_key — `{plan_id}:{nomination_id}:{bucket}:{index}` —
                 // so siblings from the same nomination coexist without
-                // collision (Session 47).
+                // collision (Session 47). DuckDB writes serialise
+                // through Store's Mutex<Connection>; under Stage 2
+                // cross-nomination concurrency, completed nominations'
+                // saves interleave but never race.
                 let recipe_count = nomination_recipes.len();
                 for recipe in nomination_recipes {
                     save_recipe(ctx.store, &recipe)?;
@@ -1123,6 +1182,17 @@ async fn author_for_nomination(
     ctx: &ExecutorContext<'_>,
     plan: &ResearchPlan,
     nomination: &DocumentSourceNomination,
+    // Session 54 Stage 2: shared LLM-tier semaphore that gates every
+    // Workhorse-tier `author_recipe` and Cheap-tier
+    // `propose_source_url` call across all concurrently-running
+    // nominations on this plan. The cap is built once in
+    // `load_or_author_recipes` from `SR_LLM_CONCURRENCY` (default 8)
+    // and clone-shared into each nomination's future via Arc. Permits
+    // are held only across the LLM call itself — never across
+    // prefetch, never across DB writes — so the cap reflects in-
+    // flight LLM concurrency rather than overall nomination
+    // concurrency.
+    llm_semaphore: Arc<Semaphore>,
 ) -> Result<
     (Vec<FetchRecipe>, Vec<ExpectationDecline>, Option<String>),
     FetchExecutorError,
@@ -1329,17 +1399,30 @@ async fn author_for_nomination(
         // prompt sees the plan + nomination + prior-attempts history,
         // not the target expectation; URL discovery is shared across
         // every target the inner loop will try against these bytes.
-        let proposal = propose_source_url(
-            ctx.provider,
-            ModelTier::Cheap,
-            ctx.propose_url_prompt,
-            plan,
-            nomination,
-            &prior_attempts,
-            propose_effort_override,
-        )
-        .await
-        .map_err(map_proposal_error)?;
+        //
+        // Stage 2 semaphore gate: the Cheap-tier proposer counts
+        // against the same in-flight LLM cap as the Workhorse-tier
+        // author calls. The permit is held only across the
+        // `propose_source_url` await and dropped at the closing brace
+        // before prefetch begins — prefetch is HTTP, not LLM, and
+        // doesn't need a permit.
+        let proposal = {
+            let _permit = llm_semaphore
+                .acquire()
+                .await
+                .expect("llm_semaphore must not be closed mid-run");
+            propose_source_url(
+                ctx.provider,
+                ModelTier::Cheap,
+                ctx.propose_url_prompt,
+                plan,
+                nomination,
+                &prior_attempts,
+                propose_effort_override,
+            )
+            .await
+            .map_err(map_proposal_error)?
+        };
 
         let (proposed_url, _proposal_rationale) = match proposal {
             ProposalOutcome::Url { url, rationale } => (url, rationale),
@@ -1404,9 +1487,23 @@ async fn author_for_nomination(
         // (target, locked URL+bytes). The first target that authors
         // locks the URL — subsequent targets that decline surface as
         // ExpectationDecline entries against the same locked URL.
+        //
+        // Session 54 Stage 1 — per-target parallelism. The N targets
+        // share immutable inputs (same proposed URL, same prefetched
+        // bytes, same plan, same target-agnostic context) and produce
+        // independent results that subsequent code reads as sets, not
+        // sequences. We run all author_recipe calls concurrently via
+        // `futures::future::join_all` and split the resulting
+        // `Vec<Result<...>>` into the same `authored_this_attempt` /
+        // `declined_this_attempt` shape the sequential code produced.
+        // No `tokio::spawn` — `join_all` keeps the futures on the
+        // current task, so the `&dyn LlmProvider` borrow needs no
+        // `Send` bound. Concurrency cap at this layer is the target
+        // count (≤4 today); the cross-nomination semaphore in Stage 2
+        // gates the global Workhorse-tier in-flight count.
         let mut authored_this_attempt: Vec<FetchRecipe> = Vec::new();
         let mut declined_this_attempt: Vec<(ExpectationRef, String)> = Vec::new();
-        for &target in &targets {
+        let auth_futures = targets.iter().map(|&target| {
             let auth_ctx = AuthoringContext {
                 source_id: candidate_source_id.clone(),
                 sample_url: proposed_url.clone(),
@@ -1415,18 +1512,40 @@ async fn author_for_nomination(
                 previous_failure_reason: None,
                 operator_guidance: None,
             };
+            let provider = ctx.provider;
+            let prompt = ctx.recipe_author_prompt;
+            let bytes_ref = &prefetched_bytes;
+            // Stage 2 semaphore gate: each Workhorse-tier
+            // `author_recipe` call counts against the shared in-
+            // flight LLM cap. The permit is held across the LLM
+            // await only — when the future completes (whether Ok or
+            // Err), the permit is dropped and a parked future from
+            // another nomination can proceed. With cap=8 and 7
+            // nominations × 4 targets = up to 28 simultaneous calls,
+            // the cap is what stops xAI 429s.
+            let sem = Arc::clone(&llm_semaphore);
+            async move {
+                let _permit = sem
+                    .acquire()
+                    .await
+                    .expect("llm_semaphore must not be closed mid-run");
+                let res = author_recipe(
+                    provider,
+                    ModelTier::Workhorse,
+                    prompt,
+                    plan,
+                    &auth_ctx,
+                    Some(bytes_ref),
+                    Some(target),
+                )
+                .await;
+                (target, res)
+            }
+        });
+        let auth_results: Vec<(ExpectationRef, Result<FetchRecipe, AuthoringError>)> =
+            join_all(auth_futures).await;
 
-            let auth_result = author_recipe(
-                ctx.provider,
-                ModelTier::Workhorse,
-                ctx.recipe_author_prompt,
-                plan,
-                &auth_ctx,
-                Some(&prefetched_bytes),
-                Some(target),
-            )
-            .await;
-
+        for (target, auth_result) in auth_results {
             match auth_result {
                 Ok(mut recipe) => {
                     recipe.source_id = candidate_source_id.clone();
@@ -1465,7 +1584,12 @@ async fn author_for_nomination(
                     // outage) — bubble up. We don't keep partial
                     // recipes from this attempt because the outer
                     // run-level error surface needs to see the
-                    // failure honestly.
+                    // failure honestly. The other in-flight futures
+                    // in this `join_all` have already completed by
+                    // the time we get here (join_all awaits them
+                    // all); their results are in `auth_results` and
+                    // are discarded with the early return — no
+                    // dangling tasks, no orphan recipes.
                     return Err(FetchExecutorError::Authoring(other));
                 }
             }

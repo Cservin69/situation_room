@@ -4547,6 +4547,7 @@ dependencies = [
  "chrono",
  "csv",
  "dotenvy",
+ "futures",
  "jsonpath-rust",
  "pdf-extract",
  "regex",

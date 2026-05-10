@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.16
+# Recipe Author Prompt — v1.17
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -202,6 +202,62 @@ Use `pdf_table` for stable tabular PDFs whose framed-table headers
 appear in the prefetch excerpt. Use `regex_capture` only when no
 structured mode works.
 
+## Selecting the mode that fits, and the selector that targets a leaf
+
+Two structural rules close the gap between the closed-vocabulary
+list above and the recipes that actually deserialize at apply time.
+Both are caught by the apply-stage shape validator at authoring
+time, so violating them does not produce a working recipe — it
+produces a decline you could have avoided.
+
+**The mode and the prefetch's content-type must agree.** Each
+extraction mode requires a specific content-type from the fetched
+bytes:
+
+- `css_select` requires HTML (or XML with HTML-compatible parsing).
+- `json_path` requires JSON.
+- `regex_capture` requires text-shaped bytes (HTML, JSON, or plain
+  text).
+- `pdf_table` requires a PDF.
+- `csv_cell` requires CSV.
+
+The prefetch excerpt header names the content-type the bytes
+arrived as. Authoring `json_path` against an HTML page, or
+`css_select` against JSON, is not a selector typo — it is a
+category error the apply runtime will reject every time, with the
+verbatim decline *"json_path: bytes did not parse as JSON: expected
+value at line 1 column 1"* (or the symmetric shape for the other
+mode pairings). When the prefetch's content-type does not fit any
+mode that can populate the plan's expectation, decline.
+
+**Selectors target leaf elements, not containers.** A recipe
+binding produces a single scalar value per field. A selector that
+returns more than ~2 KB of text has matched a wrapper element
+(`<body>`, `<main>`, an outer `<div>`, a whole `<table>`) rather
+than a leaf cell — and the apply layer caps individual field
+values at 2048 bytes, which surfaces as the verbatim decline
+*"selector matches a container element (body, div, table) instead
+of a leaf"*.
+
+Author the selector against the inner-most element whose
+`textContent` is the value you want — typically a `<td>`, `<span>`,
+`<a>`, or a specific `[data-attr]`-bearing element. Never an outer
+container.
+
+Worked-example pair (principle-only; class shapes, no host
+strings):
+
+- *Wrong*: `css_select: "main"` against a report landing page →
+  returns the entire main column, tens to hundreds of KB of mixed
+  prose and markup.
+- *Right*: `css_select: "table.production-by-country tr td:nth-child(3)"`
+  against the same page → returns the production cell of one row.
+
+Treating "the page contains the figure somewhere" as license to
+author a coarse selector produces a recipe that will be declined
+at authoring time by the shape validator. Pick the leaf whose
+text is the value the binding will store.
+
 ## When no recipe is honestly possible — the decline path
 
 The closed vocabulary above does not address every source. Some
@@ -275,6 +331,21 @@ record. If the schema says `period` is one of `instant`, `daily`,
 must be one of those exact strings — guessing "yearly" or
 "per_year" produces a record that fails to deserialize at apply
 time.
+
+**Pre-flight: walk the schema's required fields.** Before you
+submit, list every field the target content type's schema marks as
+required, and confirm each one has a `field_mappings` entry in the
+binding for that record. The validator catches missing required
+fields at apply time as *"content assembly failed: <type> content:
+missing field `<name>`"* — at that point the recipe is
+structurally wrong and the binding never produces a record. If a
+required field cannot be sourced from the prefetched bytes (no
+selector targets it, no `from_plan` pointer fits, no `literal`
+value is honest), the recipe is genuinely not authorable for that
+target — decline. The most common failure shape is an
+`observation` binding whose `field_mappings` cover `metric` and
+`unit` from `from_plan`/`literal` but never bind the required
+`value` field, leaving the apply stage with no number to store.
 
 ## Type honesty
 
@@ -671,6 +742,12 @@ not a signal to ship and hope.
 5. **Type fit.** Does each `field_mapping` produce the type the
    record schema expects (`f64`, `String`, closed enums)? *(See
    "Type honesty — numeric strings where a number was expected".)*
+6. **Required fields.** Walk the target content type's required
+   field list (visible in `{{TARGET_RECORD_SCHEMA}}` above). For
+   each required field, does the binding have a `field_mappings`
+   entry that populates it? *(See "What the records you produce
+   look like" — the pre-flight paragraph at the end of that
+   section.)*
 
 The checklist exists because the rules above are written as prose,
 in the order the LLM reads them, but the LLM commits to
@@ -1320,6 +1397,61 @@ you pick.
 
 ### Changelog
 
+- **v1.17** (2026-05-10) — Session 55 Patch 3 (sub-pieces A + B + C).
+  No output contract change; no schema change. All three sub-pieces
+  are prompt-only edits that promote apply-stage validator outcomes
+  to authoring-time discipline so the LLM declines on the right
+  grounds (or, more often, doesn't have to decline at all).
+
+  Sub-piece A (leaf-not-container): new prose in the new
+  "Selecting the mode that fits, and the selector that targets a
+  leaf" section between the closed extraction vocabulary and the
+  decline path. The rule: a binding produces one scalar per field;
+  a selector that returns more than ~2 KB has matched a container
+  (`<body>`, `<main>`, outer `<div>`, whole `<table>`), not a leaf
+  cell, and the apply layer's 2048-byte field cap rejects it with
+  the verbatim decline *"selector matches a container element …
+  instead of a leaf"*. Worked-example pair principle-only (class
+  shapes, no host strings) per the closed-vocabulary discipline.
+  Motivated by the 2026-05-10 06:42:23 IEA `obs_metric:1` attempt 2
+  live-test failure: a `css_select` returned 112002 bytes; the
+  shape validator declined; pre-Patch-3 the LLM treated "the page
+  contains the figure" as license to author a coarse selector.
+
+  Sub-piece B (mode-vs-content-type coherence): new prose in the
+  same "Selecting the mode that fits…" section. The rule: each
+  extraction mode requires a specific content-type from the fetched
+  bytes (`css_select` → HTML, `json_path` → JSON, `regex_capture`
+  → text, `pdf_table` → PDF, `csv_cell` → CSV); the prefetch
+  excerpt header names what arrived; authoring `json_path` against
+  an HTML page (or any cross-mode mismatch) is a category error
+  the apply runtime rejects every time with the verbatim decline
+  *"json_path: bytes did not parse as JSON: expected value at
+  line 1 column 1"*. Motivated by the 2026-05-10 06:42:40 IEA
+  `obs_metric:3` attempt 2 live-test failure: the LLM authored a
+  `json_path` recipe against an HTML-typed prefetch and Piece B
+  declined accordingly.
+
+  Sub-piece C (required-field discipline): new pre-flight paragraph
+  at the end of "What the records you produce look like" (the
+  schema-awareness section), and a new sixth bullet in the
+  URL-discipline pre-flight checklist. The rule: walk the target
+  content type's required field list (visible in
+  `{{TARGET_RECORD_SCHEMA}}`) and confirm every required field has
+  a `field_mappings` entry; if a required field cannot be sourced
+  from the prefetched bytes, decline. The most common failure
+  shape called out: an `observation` binding whose `field_mappings`
+  cover `metric` and `unit` but never bind the required `value`
+  field. Motivated by the 2026-05-10 06:38–06:40 USGS
+  `obs_metric:2` and World Bank `obs_metric:0` live-test failures:
+  both authored observation recipes whose bindings did not bind
+  `value`; the validator surfaced *"observation content: missing
+  field `value`"* on each.
+
+  No Rust changes, no schema changes. Existing recipes are
+  unaffected; the changes narrow what the LLM is encouraged to
+  author by making three apply-stage-validator outcomes explicit
+  at authoring time.
 - **v1.16** (2026-05-10) — Session 53 Patch 2 (recipe-author
   normalizer awareness). No output contract change; no schema
   change. Edits the "Type honesty" section's
