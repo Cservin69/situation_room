@@ -1,4 +1,4 @@
-# Propose Source URL Prompt — v1.2
+# Propose Source URL Prompt — v1.3
 
 <!--
     This file is the Level-2 propose-URL prompt for situation_room.
@@ -175,43 +175,83 @@ binding constraint, not the publisher's prestige. A returned
 record from a news article beats a declined nomination from an
 unreachable agency every time.
 
-### The "reasonable shot" principle
+## The "reasonable shot" disposition — when prior auth-primary attempts have exhausted
 
-"Don't guess" (see Discipline below) forbids fabricating
-*parameters* on auth-primary endpoints (`?from=2024&to=2025`
-when you don't know the API accepts those params) and *paths*
-on hosts whose routing you don't understand. It does **not**
-forbid proposing a publisher's known coverage URL when prior
-attempts on the auth-primary host have exhausted. A topic-tag
-listing on a major coverage publisher (a commodities desk's
-lithium tag, a financial portal's commodity-prices page) is a
-*reasonable shot* — the publisher covers this metric class in
-their normal editorial flow, and the worst case is a 404 that
-costs one attempt. A wrong URL on a known coverage host costs
-the same as a decline, but the right URL returns a record.
+This is the disposition that decides what you do when the
+authoritative host is unreachable, blocked, or yields no
+extractable structure. Read it as a peer of Discipline below,
+not as a sub-clause of priority-tier weighting. **Promoted to
+top-level in v1.3 because the v1.2 placement (buried inside
+priority-tier guidance) read as advice rather than as the
+default disposition; the live-test on 2026-05-10 showed the
+proposer declining "without fabricating parameters or paths"
+on every auth-primary exhaustion rather than taking the shot.**
+
 When prior attempts have exhausted the auth-primary host,
-taking a reasonable shot at a coverage publisher's tag/topic/
-listing URL is preferred over decline.
+**default to a reasonable shot at a coverage publisher's
+standard tag / topic / listing URL**. Decline is the fallback
+only when no plausible coverage URL exists at all. The cost
+arithmetic: a wrong URL on a known coverage host costs one
+attempt, the same as a decline; the right URL returns a
+record. Decline beats *fabrication*, but a reasonable shot
+at known editorial coverage beats decline.
 
-The distinction in classes:
+The distinction in classes (anchor for the discipline rule
+below):
 
-- **Forbidden guess** — fabricating a path or query parameter
-  on an auth-primary host whose routing you don't understand
-  ("the agency probably exposes the report at `/p/<slug>`"
-  when you don't know that path scheme exists).
+- **Forbidden guess** — fabricating a *path* or *query
+  parameter* on an auth-primary host whose routing you don't
+  understand ("the agency probably exposes the report at
+  `/p/<slug>`" when you don't know that path scheme exists),
+  or inventing query parameters you don't know the API
+  accepts (`?from=2024&to=2025` against an opaque endpoint).
+  These waste an attempt and pollute the prior_attempts log
+  with a path that doesn't exist.
 - **Reasonable shot** — proposing a major coverage
-  publisher's standard tag/topic/listing path for the
-  metric class the description names, on the basis that
-  responsive coverage publishers serve those listings as
-  static server-rendered HTML and routinely cover this
-  class of metric in their normal editorial flow.
+  publisher's standard tag / topic / listing path for the
+  metric class the description names. Responsive coverage
+  publishers serve those listings as static server-rendered
+  HTML and routinely cover this class of metric in their
+  normal editorial flow. The path scheme on a coverage host
+  is generally one of `/tag/<topic>/`, `/topic/<topic>/`,
+  `/markets/<commodity>/`, `/commodity/<commodity>/`, or a
+  similar editorial taxonomy — these are conventions of
+  online publishing, not site-specific guesses.
 
-The "reasonable shot" only applies *after* prior auth-primary
-attempts have exhausted, and only to publishers whose general
-coverage of this metric class is part of their editorial
-identity. It is not a license to propose random URLs, nor
-license to invent paths on a coverage host when you don't
-know the path scheme.
+Worked example pair (principle-only, no specific source
+identity):
+
+- *Forbidden* — auth-primary host returned 403 on its
+  document-browse endpoint. Proposing
+  `https://<auth-primary-host>/api/v3/disclosures?cik=…` on
+  the basis that "the host probably has a v3 API" is
+  fabrication: there is no documentary basis for v3 existing
+  or for that path scheme being correct.
+- *Reasonable shot* — same auth-primary host returned 403.
+  Proposing `https://<major-coverage-publisher>/tag/<topic>/`
+  is the default move: that publisher covers this metric
+  class as editorial routine, the tag scheme is a standard
+  shape on coverage publishers, and the worst case is a 404
+  that costs one attempt. The right case returns server-
+  rendered article cards the recipe-author can author
+  against.
+
+The reasonable-shot disposition applies to every auth-primary
+exhaustion — 403, 401, 404, timeout, 5xx, *and*
+`recipe author declined: no extractable structure`. Bytes
+that don't yield records are not "fetched for the override's
+purposes"; they are exhausted.
+
+It is not a license to:
+
+- Propose a random URL on a host whose editorial coverage
+  of this metric class you don't recognise.
+- Invent a path on a coverage host whose path scheme
+  you don't recognise.
+- Skip the prior-attempts log: a coverage publisher already
+  in `prior_attempts` with a `403/401/timeout` shape is a
+  blocked host, not a shot — pivot to a *different*
+  publisher (the two-step pivot in "Reading prior attempts").
 
 ## What NOT to propose
 
@@ -230,10 +270,15 @@ know the path scheme.
   is a wasted attempt.
 - **Placeholder hosts** — `example.com`, `example.invalid`,
   `localhost`. Decline rather than emit a placeholder.
-- **Synthetic guesses with no grounding.** If you do not actually
-  know that the host you're proposing has a path matching your
-  URL, you are guessing. A wrong guess wastes one of three
-  attempts. Better to decline than to guess from rumor.
+- **Fabricated paths or query parameters on opaque hosts.**
+  If you do not actually know that an auth-primary host has a
+  given path scheme or accepts a given query parameter, do
+  not invent one — that is the *Forbidden guess* class
+  named under "The reasonable shot disposition" above. This
+  rule does **not** forbid proposing a major coverage
+  publisher's standard tag / topic / listing URL on
+  auth-primary exhaustion; that is the *Reasonable shot*
+  class and is the default disposition, not a guess.
 
 ## Reading prior attempts
 
@@ -281,16 +326,42 @@ When `prior_attempts` is non-empty, treat each entry as evidence:
   returned content but it was prose, not structured data. **A
   fetched page that authors no useful bytes is not "fetchable"
   for the override's purposes** — authoring success, not HTTP
-  200, is the relevant signal. When prior attempts on the same
-  host produced a `no extractable structure` decline on an
-  overview / landing / hub page, the host's flagship document
-  was not selected precisely; the pivot is not necessarily
-  off-host. First try a focused publication on the same host (a
-  single-chapter PDF, a press release, a fact sheet, a data-
-  explorer export URL) targeted at the *specific metric* the
-  description names. If a focused on-host surface is not known,
-  then pivot off the host using the news/trade-press rules
-  above.
+  200, is the relevant signal. **The default move is on-host
+  refinement, not off-host pivot.** When prior attempts on the
+  same host produced a `no extractable structure` decline on
+  an overview / landing / hub page, the host's flagship
+  document was not selected precisely; the same host almost
+  certainly serves the data on a more focused surface. Try
+  one of these path shapes on the same host before pivoting
+  off:
+  - **Single-chapter PDF.** A flagship report's overview HTML
+    typically has chapter PDFs at predictable per-chapter
+    paths (`*/<report>/<chapter>.pdf`,
+    `*/chapters/<chapter>.pdf`).
+  - **Fact-sheet PDF.** Many agencies publish a one-pager
+    next to the flagship document (`*/factsheets/<topic>.pdf`,
+    `*/briefs/<topic>.pdf`) that quotes the headline figures
+    inline.
+  - **Press release.** The publisher's own release for the
+    same report typically inlines the top-line numbers
+    (`*/news/<slug>`, `*/press/<slug>`,
+    `*/newsroom/<slug>`).
+  - **Data-explorer export URL.** When the host runs a data
+    explorer (`*/data-and-statistics/...`, `*/data/...`,
+    `*/explorer/...`), the export URL is usually one click
+    away from the visible interactive page and serves the
+    same data in CSV / JSON / XLS shape.
+  - **API endpoint at the documented base.** Hosts that run a
+    public API typically expose it under `*/api/v<n>/...` or
+    `*/services/...` with documented request shapes.
+
+  The two-step principle (next bullet) **does** apply when
+  every plausible focused on-host surface is itself
+  exhausted — at which point pivot off-host using the
+  news/trade-press rules. But do not pivot off-host on the
+  *first* `no extractable structure` decline; that skips the
+  refinement step where most flagship reports actually
+  serve the data.
 - `recipe author declined: navigation-only` — the path was a hub
   page with no leaf data. Try a specific sub-page or feed.
 - `recipe authored but apply failed: <stage> · …` — the recipe-
@@ -314,12 +385,19 @@ When `prior_attempts` is non-empty, treat each entry as evidence:
   don't fabricate query parameters.
 - **HTTPS preferred.** Use `http://` only if you know the host
   doesn't serve HTTPS at all (rare).
-- **Honest decline beats wrong commit.** If you've exhausted what
-  you know, return the decline shape (empty `url`, rationale that
-  names what's exhausted). The operator sees the decline; the
-  workstation learns from it. A confidently wrong URL costs an
-  attempt and pollutes the prior_attempts log for future runs of
-  the same plan.
+- **Honest decline beats fabrication, not coverage shots.**
+  If you've genuinely exhausted what you know — including the
+  reasonable-shot coverage URLs named above — return the
+  decline shape (empty `url`, rationale that names what's
+  exhausted). The operator sees the decline; the workstation
+  learns from it. A *fabricated* URL (forbidden guess class)
+  costs an attempt and pollutes the prior_attempts log; a
+  *reasonable shot* URL on a coverage host (different class)
+  is the default disposition on auth-primary exhaustion and
+  must be preferred over decline. If your decline rationale
+  reads "without fabricating parameters or paths" but you
+  haven't yet tried a coverage-publisher tag/topic listing,
+  you are skipping the disposition — take the shot.
 
 ## Inputs for this proposal
 

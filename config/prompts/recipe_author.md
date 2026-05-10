@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.15
+# Recipe Author Prompt — v1.16
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -308,12 +308,51 @@ modes the runtime catches at apply time:
   When the prefetch excerpt shows mixed real-and-null rows, you
   are in case (a) and a filter expression is the right tool.
 - **Numeric strings where a number was expected.** A CSV column
-  reports `"1,234.5"` — the comma-thousands form. Most extractors
-  return the raw string; `f64` deserialization rejects the comma.
-  Pick a `field_mapping` `path` that targets the field's actual
-  type, or pick an extraction mode that returns the cleaned form
-  (some JSON APIs offer both string and numeric variants of the
-  same field — prefer the numeric one).
+  reports `"1,234.5"` — the comma-thousands form. The apply-time
+  scalar parser **does** normalise the common human-readable
+  numeric shapes before deserialising into the binding's
+  numeric content type, so the selector you author against the
+  raw cell is fine for these forms. Author the selector;
+  apply will accept it. Specifically, the normaliser handles:
+  - **ASCII thousand-separator commas** at canonical positions
+    (`74,700` → `74700`, `1,234,567` → `1234567`, `-3,200.5` →
+    `-3200.5`). Malformed comma positions (`1,23`) fall through
+    untouched.
+  - **Currency markers** as a leading or trailing token: `$`,
+    `€`, `£`, `¥`, and the ASCII codes `USD` / `EUR` (case-
+    insensitive). `$1,234.56` → `1234.56`; `1,234 USD` → `1234`.
+  - **Estimate prefixes**: `est. `, `est `, `~`, `≈`, and the
+    bare `e ` (literal space) form common in agency tables.
+    `est. 1,200` → `1200`; `~5000` → `5000`.
+  - **Trailing units** beyond the leading numeric prefix:
+    `49,000 t` → `49000`; `12.5%` → `12.5`. The selector can
+    target the cell whose value tagged a unit on; the parser
+    keeps the leading numeric prefix.
+  - **Scientific notation** (`1.5e9` → `1500000000`) parses
+    directly via the standard f64 path without normalisation.
+  - **Internal whitespace** is collapsed (`1 234.5` → `1234.5`).
+
+  These shapes are all author-the-selector-and-trust-apply.
+  Don't decline a recipe on the grounds that the cell carries
+  comma-thousands or a currency marker or an `est.` prefix —
+  those are exactly the shapes the normaliser was added to
+  accept.
+
+  Two shapes the normaliser **does not** handle, where decline
+  remains the honest answer:
+  - **EU-locale numbers** (`1.234,56`, `88.000,0`) are
+    ambiguous against US locale and the parser refuses to
+    guess. If the source uses EU-locale numerics throughout
+    and no US-locale alternative exists, decline with the
+    locale named.
+  - **Strings in a numeric slot.** A column whose cells carry
+    text (`"Domestic"`, country names, qualitative grades) into
+    a binding whose content type is `f64` will be caught by the
+    authoring-time shape validator and surfaced as a decline
+    on this attempt. Re-author against a different selector
+    that targets the actual numeric column on the same page,
+    or decline citing "the source's table column at this
+    position carries strings, not numbers."
 
 When the source's type doesn't match the record's type and there
 is no clean translation, the right move is `decline_reason` —
@@ -1281,6 +1320,30 @@ you pick.
 
 ### Changelog
 
+- **v1.16** (2026-05-10) — Session 53 Patch 2 (recipe-author
+  normalizer awareness). No output contract change; no schema
+  change. Edits the "Type honesty" section's
+  *"Numeric strings where a number was expected"* bullet to
+  enumerate the human-readable numeric shapes the apply-stage
+  normaliser (`recipe_apply::normalize_numeric_candidate`,
+  Session 53 Piece D) accepts before deserialising into the
+  binding's numeric content type: ASCII thousand-separator
+  commas, currency markers (`$`, `€`, `£`, `¥`, `USD`, `EUR`),
+  estimate prefixes (`est. `, `~`, `≈`, `e `), trailing units
+  (`t`, `%`), internal whitespace, and scientific notation.
+  Also names two shapes the normaliser refuses: EU-locale
+  numerics (`1.234,56` — ambiguity gate) and strings in a
+  numeric slot (the Piece B shape-validator decline class,
+  observed Session 53 live-test 18:11 as
+  `string "Domestic", expected f64`). Motivated by the
+  2026-05-10 06:14 lithium re-run: the LLM declined USGS MCS
+  production at recipe-author time citing
+  *"comma-formatted numbers and 'e' prefixes preventing clean
+  numeric extraction via pdf_table"* — exactly the shapes
+  Piece D was added to accept. Pre-v1.16 the LLM didn't know
+  the normaliser existed and kept self-rejecting on these
+  forms. Existing recipes are unaffected (the change widens
+  what the LLM is allowed to author, never narrows it).
 - **v1.15** (2026-05-09) — Session 47 (multi-recipe per
   nomination). Output contract change: when the new
   `{{TARGET_EXPECTATION}}` section is non-empty, every binding
