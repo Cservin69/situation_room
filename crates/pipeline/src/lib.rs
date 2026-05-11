@@ -35,6 +35,16 @@ pub mod ingest;
 pub mod normalize;
 pub mod extract;
 pub mod fetch_backoff;
+// Session 57 / ADR 0017 Piece A — class-level vocabulary the URL
+// proposer can reason about ("host_blocked_by_waf",
+// "url_shape_mismatch", …) sitting one layer above
+// `http_fetcher::FetchError`'s wire-shape vocabulary. Read-only:
+// the module classifies, callers react. The host-override map
+// inside the module is the single bake-in of host-specific
+// knowledge in the codebase per ADR 0007's closed-vocabulary
+// discipline; it stays empty until probe evidence justifies
+// entries.
+pub mod fetch_classes;
 pub mod fetch_executor;
 pub mod http_fetcher;
 pub mod promote;

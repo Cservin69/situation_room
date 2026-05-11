@@ -1,4 +1,4 @@
-# Propose Source URL Prompt — v1.4
+# Propose Source URL Prompt — v1.5
 
 <!--
     This file is the Level-2 propose-URL prompt for situation_room.
@@ -53,8 +53,10 @@ strongest URL you know each time, not a guess.
   `authoritative_secondary`, `industry_trade_press`, or
   `general_news`.
 - The `prior_attempts` for this nomination on this run — a list
-  of `(url, reason)` pairs from earlier attempts. May be empty
-  (this is the first attempt).
+  of `(url, class, reason)` triples from earlier attempts. May be
+  empty (this is the first attempt). The `class` is a closed-
+  vocabulary label that drives the routing decision; the `reason`
+  is the within-class detail. See "Class-based routing" below.
 
 ## What you return
 
@@ -128,6 +130,78 @@ The test: if you typed your URL into a browser and saw View Source,
 would the data be in the HTML? If yes, the recipe author has a
 chance. If not (the source view is a near-empty `<div id="root">`
 with one `<script>` tag), the recipe author will decline.
+
+## Machine-readable endpoints first for structured nominations
+
+When the nomination's description names a **structured datum** — a
+count, percentage, capacity number, monetary value, time series,
+table, or other quantity that lives in a row/cell rather than in
+prose — the publisher's machine-readable endpoint is **strictly
+preferable** to its human-facing HTML site, even when the HTML
+surface is the publisher's "main" or most recognisable host.
+
+Many publishers serve the same data twice: once on a human-facing
+HTML page (often a SPA), once on a machine-readable endpoint at a
+different host or path. The machine-readable shape is usually:
+
+- A **subdomain** prefixed with `data.`, `api.`, `efts.`,
+  `download.`, `export.`, `stats.`, or similar (`data.<publisher>.<tld>`,
+  `api.<publisher>.<tld>`, `efts.<publisher>.<tld>`).
+- A **direct file URL** ending in `.csv`, `.xlsx`, `.xls`, `.tsv`,
+  `.json`, `.parquet`, `.zip` containing the above.
+- A **documented API path** under `/api/v<n>/`, `/services/`,
+  `/data-services/`, `/data/services/`.
+- A **bulk-download index** under `/datasets/`, `/downloads/`,
+  `/exports/`, `/data/`, `/data-and-statistics/`.
+
+The HTML "main" surface for the same publisher is usually one of:
+
+- A topic landing page or SPA with no extractable data in the
+  source view (a `<div id="root">` with one `<script>` tag is the
+  giveaway).
+- A search interface that requires JavaScript to render results.
+- A flagship-document overview that links to PDFs but inlines no
+  numbers.
+
+**When you know both shapes for a publisher, propose the machine-
+readable surface first.** The recipe author can write coordinates
+against well-formed JSON, CSV, or XLSX with substantially higher
+success than against a JS-rendered page or a multi-hundred-page
+flagship PDF.
+
+This rule layers on top of priority-tier weighting: even an
+`authoritative_primary` nomination should be served from a
+machine-readable subdomain when one exists, rather than from the
+publisher's main HTML host. The L1 classifier names a *publisher
+class*, not a specific URL host (see "The L1 description names a
+class, not a contract"); the proposer's job is to pick the
+*shape* of URL on that class that the recipe author can author
+against.
+
+When you know the publisher class but **not** a specific machine-
+readable URL on it, the reasonable-shot disposition still applies:
+a focused news / trade-press article that quotes the figure beats
+a guessed path on the publisher's HTML site. Do not fabricate
+machine-readable URLs you don't actually know exist — the
+"forbidden guess" class in "The reasonable shot disposition"
+applies to fabricated `data.<host>.<tld>` and `/api/v3/...` paths
+exactly as it does to fabricated HTML paths.
+
+How to recognise a structured nomination from the description:
+
+- Mentions of **counts, percentages, monetary values, ratios,
+  capacities, volumes, weights, durations** — anything quantitative.
+- Mentions of **tables, series, rolls, bulletins, summaries,
+  filings** — anything tabular.
+- Mentions of **by country, by year, by region, by company,
+  monthly, quarterly, annual** — anything that implies a
+  multi-row dataset.
+
+Versus an *event/coverage* nomination, where the description
+mentions **announcements, openings, signings, agreements, news,
+events, actions** — for those, news/trade-press surfaces are the
+right primary. The structured-nomination rule above does not
+displace the news/trade-press default for event-type queries.
 
 ## How to weight `priority_tier`
 
@@ -320,7 +394,72 @@ mistaken read after two 404s on the named host.)
 
 ## Reading prior attempts
 
-When `prior_attempts` is non-empty, treat each entry as evidence:
+When `prior_attempts` is non-empty, each entry has three fields:
+
+- **URL** — the URL that was tried.
+- **Class** — the closed-vocabulary classification of what went
+  wrong. **This is the routing key.** Read it first.
+- **Reason** — the within-class detail (the exact status code, the
+  apply-stage failure, the per-target decline). Read this *after*
+  the class to disambiguate which kind of move within the class is
+  appropriate.
+
+### Class-based routing (the closed vocabulary)
+
+Each class fixes the *shape* of the proposer's next move. The
+free-text Reason refines *which* move within the shape:
+
+- **`host_unreachable`** — the host did not respond (DNS, TLS,
+  connect-refuse, timeout, 5xx). Retrying the same host with a
+  different URL within this attempt cycle is unlikely to succeed
+  inside the deadline. **Pivot off the host.** Same-class peer
+  publisher (a different statistical agency, a different
+  trade-press publisher) is the right default.
+- **`host_blocked_by_waf`** — the host returned 403 and is
+  structurally unreachable for this fetcher (Cloudflare-class
+  fingerprinting, IP reputation, browser-shape requirement). A
+  different path on the same host will return the same 403.
+  **Pivot off the host class entirely** — do not retry the same
+  host. The reasonable-shot disposition applies.
+- **`host_requires_auth`** — 401, paywall. We do not have
+  credentials. A different path on the same host will return 401
+  too. **Pivot off the host.** A peer publisher in the same data
+  class — *especially* a free / open-access publisher of the same
+  kind — is the right move.
+- **`host_requires_ua_policy`** — 403 from a host that *would*
+  unblock with a docs-prescribed UA fix the fetcher does not yet
+  apply. **No host populates this class as of the 2026-05-10 probe.**
+  Treat the same as `host_blocked_by_waf` in routing: pivot
+  off-host. A future fetcher capability change may re-enable
+  same-host retries.
+- **`url_shape_mismatch`** — 400/404/410 OR "fetched but no
+  extractable structure" OR "recipe authored but apply failed".
+  The host *is* responsive; the chosen URL's shape just doesn't
+  match what the question needs. **Try a different shape on the
+  same host first**: a single-chapter PDF instead of the flagship
+  overview, a press release instead of the topic page, a data
+  export URL instead of the human-facing dashboard, a machine-
+  readable subdomain instead of the main HTML site. Pivot off-host
+  only after the same-host shape options on this responsive host
+  are exhausted.
+- **`rate_limited`** — the host asked us to back off. The
+  fetcher's host-backoff layer manages the wait at the network
+  layer; the proposer's job within this attempt cycle is to **pivot
+  off-host** rather than retry the throttled host. The throttled
+  host becomes available again on a future run.
+
+The class is the routing decision; the Reason text is the within-
+class detail. A `url_shape_mismatch` whose reason is `fetch
+failed: 404` calls for a different *path*; a `url_shape_mismatch`
+whose reason is `recipe authored but apply failed: <stage> · …`
+calls for a different *page on the same path family* (the recipe
+author saw bytes but they were the wrong shape — a different
+page on the same site likely serves the data differently).
+
+### Within-class detail (free-text reasons)
+
+The Reason rules below are unchanged — they refine the routing
+move *within* the class:
 
 - `fetch failed: 404` — the path doesn't exist on this host. Try a
   different path (publication index, archive, search endpoint), not

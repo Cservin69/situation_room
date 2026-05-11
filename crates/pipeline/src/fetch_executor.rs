@@ -112,7 +112,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::fetch_backoff::{fetch_with_backoff, format_retry_after, BackoffOutcome};
+use crate::fetch_backoff::{fetch_with_backoff, format_retry_after, host_of, BackoffOutcome};
+use crate::fetch_classes::FetchOutcomeClass;
 use crate::http_fetcher::{FetchError as HttpFetchError, HttpFetcher};
 use crate::propose_source_url::{
     propose_source_url, PriorAttempt, ProposalError, ProposalOutcome,
@@ -1276,8 +1277,19 @@ async fn author_for_nomination(
                 } else {
                     ""
                 };
+                // Session 57 / ADR 0017 Piece B: an apply-stage
+                // failure means the URL fetched fine and a recipe
+                // was authored, but extraction against the bytes
+                // didn't shape-match. The proposer's right move is
+                // to try a different URL on the same host (the
+                // host is responsive; the chosen page just doesn't
+                // contain the data shape). That's `UrlShapeMismatch`'s
+                // semantics. The free-text reason still carries
+                // the apply-stage detail for any disambiguation
+                // the LLM wants to do beyond the class.
                 prior_attempts.push(PriorAttempt {
                     url: f.source_url,
+                    class: FetchOutcomeClass::UrlShapeMismatch,
                     reason: format!(
                         "recipe authored but apply failed: {} · {}{}",
                         f.failure_stage, head, suffix
@@ -1475,8 +1487,18 @@ async fn author_for_nomination(
                 Ok(real) => real,
                 Err(failure) => {
                     let reason = format_prefetch_failure_for_proposer(&failure);
+                    // Session 57 / ADR 0017 Piece B: classify the
+                    // prefetch failure so the proposer's next pass
+                    // routes on the closed-vocabulary class rather
+                    // than parsing the free-text reason. Host is
+                    // extracted from the proposed URL via the same
+                    // helper the host-backoff layer uses; both
+                    // layers agree on host identity by construction.
+                    let host = host_of(&proposed_url.to_string());
+                    let class = failure.class(&host);
                     prior_attempts.push(PriorAttempt {
                         url: proposed_url.to_string(),
+                        class,
                         reason,
                     });
                     continue;
@@ -1624,8 +1646,19 @@ async fn author_for_nomination(
                 .collect::<Vec<_>>()
                 .join("; ")
         };
+        // Session 57 / ADR 0017 Piece B: the fetch succeeded (we
+        // got bytes) and the recipe author saw them but declined
+        // every target. From the proposer's routing perspective
+        // this is the same shape as an apply-stage failure: the
+        // host is responsive, the URL just isn't the right page
+        // for the question. Class as `UrlShapeMismatch` so the
+        // proposer pivots URL on the same host or moves to a
+        // different host within the same priority tier; the
+        // free-text `summary` carries the per-target decline
+        // reasons for any finer-grained reasoning.
         prior_attempts.push(PriorAttempt {
             url: proposed_url.to_string(),
+            class: FetchOutcomeClass::UrlShapeMismatch,
             reason: format!("no target authored: {summary}"),
         });
     }
@@ -2111,6 +2144,44 @@ impl PrefetchFailure {
                 Self::Other(format!("no fixture configured for url: {url}"))
             }
         }
+    }
+
+    /// Map this prefetch failure to the closed-vocabulary
+    /// [`FetchOutcomeClass`] the propose-URL prompt routes on.
+    /// Session 57 / ADR 0017 Piece B.
+    ///
+    /// `host` is the URL's host component; passed through to
+    /// [`fetch_classes::classify_error`] so the host-class override
+    /// map (currently empty per the 2026-05-10 probe) gets a chance
+    /// to upgrade a 403 to a more specific class. An empty `host`
+    /// disables the override path; the default policy applies.
+    ///
+    /// The translation is variant-by-variant, mirroring
+    /// [`Self::from_fetch_error`]. The `Other` variant collapses to
+    /// `HostUnreachable` because it carries DNS / TLS / generic
+    /// transport failures — the proposer's right move is to pivot
+    /// host, not retry the same URL.
+    pub(crate) fn class(&self, host: &str) -> FetchOutcomeClass {
+        // Re-build a [`HttpFetchError`] shaped like the original
+        // failure and route through the canonical classifier in
+        // `fetch_classes`. Single classification path = single
+        // place to change behaviour when the override map gains
+        // entries.
+        let err = match self {
+            Self::Status(code) => HttpFetchError::Status(*code),
+            Self::Timeout(d) => HttpFetchError::Timeout(*d),
+            Self::RateLimited {
+                retry_after_seconds,
+            } => HttpFetchError::RateLimited {
+                retry_after_seconds: *retry_after_seconds,
+            },
+            Self::TooLarge { max, got } => HttpFetchError::TooLarge {
+                max: *max,
+                got: *got,
+            },
+            Self::Other(msg) => HttpFetchError::Http(msg.clone()),
+        };
+        crate::fetch_classes::classify_error(host, &err)
     }
 }
 

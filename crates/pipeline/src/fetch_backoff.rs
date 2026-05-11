@@ -573,7 +573,14 @@ impl<'a> HttpFetcher for BackoffFetcher<'a> {
 /// Returns `""` on parse failure or when the URL has no host (e.g. a
 /// `data:` URL). Lowercases for case-insensitive matching across
 /// hosts that differ only in case.
-fn host_of(url: &str) -> String {
+///
+/// **Visibility:** `pub(crate)` since Session 57 / ADR 0017 Piece B
+/// — `fetch_executor.rs` reuses this helper to derive the host
+/// passed into `fetch_classes::classify_error` when constructing
+/// `PriorAttempt::class`. Single host-extraction definition keeps
+/// the per-host backoff key and the proposer's class-override key
+/// in lockstep.
+pub(crate) fn host_of(url: &str) -> String {
     Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))

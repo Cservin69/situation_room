@@ -18,6 +18,14 @@ members = [
     "crates/apps_common",
     "apps/desktop/src-tauri",
     "apps/situation_room",
+    # Session 57: non-Tauri composition root that runs N independent
+    # (classify → accept → run_fetch) trials and emits JSONL metrics.
+    # Mirrors the desktop binary's wiring; calls the same
+    # `pipeline::fetch_executor::run_fetch_for_plan` the Tauri command
+    # invokes. See `apps/eval_harness/src/main.rs` for why the harness
+    # exists (Session 56's records-0/1/1/2/3 variance finding) and what
+    # it isolates (per-trial DB + per-trial HostBackoff).
+    "apps/eval_harness",
 ]
 
 [workspace.package]

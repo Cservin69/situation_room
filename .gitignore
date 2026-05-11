@@ -44,6 +44,11 @@ desktop.ini
 *.log
 logs/
 
+# Eval harness output (Session 57). The harness writes one JSONL line
+# per trial under `eval-runs/<topic-slug>-<timestamp>.jsonl`; the
+# files are run artefacts, not source.
+eval-runs/
+
 # Version control
 clean_code.zip
 situation_room_codebase.txt

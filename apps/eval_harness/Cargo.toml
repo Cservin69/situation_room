@@ -1,0 +1,63 @@
+[package]
+name = "situation_room-eval-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "situation_room eval harness — runs N trials of (classify → accept → run_fetch) for one topic and writes JSONL metrics so prompt and runtime experiments can be evaluated against baseline variance instead of single-trial anecdote."
+
+# `cargo run -p situation_room-eval-harness …` should land on the
+# eval harness, not require a `--bin` to disambiguate. The package
+# also ships `host-probe` (the diagnostic for ADR 0017) but that
+# binary is invoked rarely and explicitly via `--bin host-probe`,
+# so the default-run pick is the one operators want by default.
+default-run = "eval-harness"
+
+[[bin]]
+name = "eval-harness"
+path = "src/main.rs"
+
+# Diagnostic probe — issues GET against each URL on the CLI with
+# several User-Agent strings, recording the resulting status code
+# and (on 2xx) a body preview. Fed into the ADR for the
+# "coverage-publisher block wall" pattern (Sessions 56–57). See the
+# binary's module docs for what it does and does not do.
+[[bin]]
+name = "host-probe"
+path = "src/bin/host_probe.rs"
+
+[dependencies]
+# Core workspace crates — same set the desktop binary uses, because
+# the harness is a non-Tauri composition root that mirrors the
+# desktop wiring and calls run_fetch_for_plan_impl directly.
+situation_room-core = { workspace = true }
+situation_room-storage = { workspace = true }
+situation_room-llm = { workspace = true }
+situation_room-pipeline = { workspace = true }
+situation_room-secure = { workspace = true }
+situation_room-apps-common = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Logging — same scrubbed logger the desktop binary uses, written to
+# stderr so stdout stays a clean JSONL channel.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Errors and serialization
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time stamps in the JSONL output
+chrono = { workspace = true }
+
+# UUID for per-run output dirs
+uuid = { workspace = true }
+
+# .env loader — dev convenience; the real environment always wins.
+dotenvy = { workspace = true }

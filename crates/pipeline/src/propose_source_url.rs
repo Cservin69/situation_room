@@ -49,6 +49,7 @@ use situation_room_secure::url_guard::{UrlGuard, UrlViolation};
 use thiserror::Error;
 use url::Url;
 
+use crate::fetch_classes::FetchOutcomeClass;
 use crate::research::{DocumentSourceNomination, PriorityTier, ResearchPlan};
 
 // ---------------------------------------------------------------------------
@@ -58,13 +59,30 @@ use crate::research::{DocumentSourceNomination, PriorityTier, ResearchPlan};
 /// One prior attempt against this nomination. Used as input to the
 /// next propose-URL call so the LLM can avoid repeating URLs that
 /// already failed.
+///
+/// **Session 57 / ADR 0017 Piece B:** the `class` field is the
+/// closed-vocabulary classification of what went wrong with this
+/// attempt. The proposer prompt routes on the class (pivot host vs.
+/// pivot URL on same host vs. wait for backoff) without needing
+/// to parse the free-text `reason`. The `reason` survives so the
+/// LLM has the human-readable detail when the class isn't
+/// sufficient (e.g. distinguishing a 404 from a 410 within
+/// `UrlShapeMismatch`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PriorAttempt {
     /// The URL that was tried.
     pub url: String,
+    /// Closed-vocabulary class of the failure. Read by the
+    /// propose-URL prompt's class-routing rules; see
+    /// [`FetchOutcomeClass`] for the variant semantics and
+    /// `crates/pipeline/src/fetch_classes.rs` for the host-class
+    /// override map.
+    pub class: FetchOutcomeClass,
     /// Short human-readable reason — the executor's classification of
     /// what went wrong: `"fetch failed: 404"`, `"recipe author
-    /// declined: SPA"`, etc.
+    /// declined: SPA"`, etc. Travels alongside `class` so the LLM
+    /// can read both: the class drives routing, the reason
+    /// disambiguates within a class.
     pub reason: String,
 }
 
@@ -296,10 +314,24 @@ fn render_prior_attempts(attempts: &[PriorAttempt]) -> String {
     if attempts.is_empty() {
         return "(none — this is the first attempt)".to_string();
     }
+    // Session 57 / ADR 0017 Piece B: emit the class label on its own
+    // line above the reason. The label is the closed-vocabulary key
+    // the propose-URL prompt's class-routing rules read; the reason
+    // is the free-text disambiguator. Putting class first means the
+    // LLM's eye lands on the routing-relevant signal before any
+    // detail that might encourage it to reason about the URL string.
     attempts
         .iter()
         .enumerate()
-        .map(|(i, a)| format!("{}. URL: `{}`\n   Reason: {}", i + 1, a.url, a.reason))
+        .map(|(i, a)| {
+            format!(
+                "{}. URL: `{}`\n   Class: {}\n   Reason: {}",
+                i + 1,
+                a.url,
+                a.class.label(),
+                a.reason
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -429,10 +461,12 @@ mod tests {
         let s = render_prior_attempts(&[
             PriorAttempt {
                 url: "https://www.fao.org/fishery/en/topic/166235".into(),
+                class: FetchOutcomeClass::UrlShapeMismatch,
                 reason: "recipe author declined: JS-rendered SPA".into(),
             },
             PriorAttempt {
                 url: "https://www.fao.org/topic/sustainable-fisheries".into(),
+                class: FetchOutcomeClass::UrlShapeMismatch,
                 reason: "fetch failed: 404".into(),
             },
         ]);
@@ -440,6 +474,54 @@ mod tests {
         assert!(s.contains("2."));
         assert!(s.contains("topic/166235"));
         assert!(s.contains("404"));
+    }
+
+    #[test]
+    fn render_prior_attempts_includes_class_label_on_its_own_line() {
+        // Session 57 / ADR 0017 Piece B: each attempt renders with a
+        // dedicated `Class: <label>` line so the propose-URL prompt
+        // can route on the closed-vocabulary class without parsing
+        // the free-text reason.
+        let s = render_prior_attempts(&[PriorAttempt {
+            url: "https://www.example.com/auth-walled".into(),
+            class: FetchOutcomeClass::HostRequiresAuth,
+            reason: "fetch failed: 401".into(),
+        }]);
+        assert!(s.contains("Class: host_requires_auth"));
+        assert!(s.contains("Reason: fetch failed: 401"));
+        // Class line precedes Reason line — the prompt's routing
+        // rules read the class first.
+        let class_idx = s.find("Class: ").unwrap();
+        let reason_idx = s.find("Reason: ").unwrap();
+        assert!(class_idx < reason_idx);
+    }
+
+    #[test]
+    fn render_prior_attempts_emits_distinct_class_labels_per_variant() {
+        // Walks every variant the proposer could see in the wild and
+        // confirms its label appears on the rendered line. Locks in
+        // the label-to-prompt-routing-rule binding: a future rename
+        // that breaks the binding will fail compilation here.
+        let cases = [
+            FetchOutcomeClass::HostUnreachable,
+            FetchOutcomeClass::HostBlockedByWaf,
+            FetchOutcomeClass::HostRequiresAuth,
+            FetchOutcomeClass::HostRequiresUaPolicy,
+            FetchOutcomeClass::UrlShapeMismatch,
+            FetchOutcomeClass::RateLimited,
+        ];
+        for class in cases {
+            let s = render_prior_attempts(&[PriorAttempt {
+                url: "https://example.test/".into(),
+                class,
+                reason: "synthetic test row".into(),
+            }]);
+            assert!(
+                s.contains(&format!("Class: {}", class.label())),
+                "class {:?} did not render its label",
+                class
+            );
+        }
     }
 
     #[test]

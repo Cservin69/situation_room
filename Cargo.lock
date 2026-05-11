@@ -4522,6 +4522,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "situation_room-eval-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "serde",
+ "serde_json",
+ "situation_room-apps-common",
+ "situation_room-core",
+ "situation_room-llm",
+ "situation_room-pipeline",
+ "situation_room-secure",
+ "situation_room-storage",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "situation_room-llm"
 version = "0.1.0"
 dependencies = [
