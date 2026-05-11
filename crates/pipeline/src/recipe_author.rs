@@ -729,6 +729,22 @@ pub enum AuthoredFieldValueSource {
     Extracted,
     Literal { value: Value },
     FromPlan { pointer: String },
+    /// ADR 0019 Phase 2A (Session 61). A per-field extraction sub-spec
+    /// evaluated against the binding's outer per-match scope. The
+    /// sub-spec's mode must equal the recipe's outer `extraction.mode`
+    /// (mode-congruence rule, mirroring ADR 0016's iterator-vs-extraction
+    /// check). Used for multi-leaf records — events with headline +
+    /// date, relations with from + to, entity-attributes with key +
+    /// value — where one row carries multiple fields the record needs.
+    ///
+    /// **Per-binding contract.** A binding either uses the legacy
+    /// single-scalar `Extracted` source (with literals/plan vars for
+    /// the rest) or N `ExtractedInner` sub-specs (with literals/plan
+    /// vars for the rest). Mixing `Extracted` and `ExtractedInner` in
+    /// one binding is rejected by `build_validated_recipe` because
+    /// the runtime would otherwise have to resolve "the outer
+    /// extraction" vs. "an inner sub-spec" ambiguously.
+    ExtractedInner { spec: AuthoredExtractionSpec },
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,6 +1144,120 @@ fn build_validated_recipe(
         }
     }
 
+    // 5b. ADR 0019 Phase 2A: per-FieldMap extraction sub-spec
+    //     validation. Four invariants:
+    //
+    //       (i)  Mode congruence — every `ExtractedInner.spec.mode`
+    //            must equal the recipe's outer `extraction.mode`.
+    //            Cross-mode (a `css_select` inner inside a `json_path`
+    //            outer) has no defined per-match scope and is
+    //            rejected, mirroring ADR 0016's iterator-vs-extraction
+    //            mode-congruence rule.
+    //
+    //       (ii) Mutual exclusion per binding — a binding either uses
+    //            the legacy single-scalar `Extracted` source (with
+    //            literals/plan vars for the rest) or N `ExtractedInner`
+    //            sub-specs (with literals/plan vars for the rest).
+    //            Mixing the two in one binding is rejected: the
+    //            runtime would have to resolve "the outer extraction"
+    //            vs. "an inner sub-spec" ambiguously, and v1.19's
+    //            prompt teaches one shape per binding.
+    //
+    //       (iii) At least one extraction reaches the bytes — every
+    //             binding must bind at least one field from the
+    //             source via `Extracted` or `ExtractedInner`. A
+    //             binding with zero of either is degenerate: it
+    //             would emit a constant record on every fetch,
+    //             which static_payload exists to handle at the
+    //             recipe level instead.
+    //
+    //       (iv) Phase 2A runtime support — Session 61's runtime
+    //            implements `ExtractedInner` for the same iterator
+    //            paths Phase 1 wires (currently css_select × css_select)
+    //            and for scalar recipes in css_select / json_path
+    //            modes. csv_cell / pdf_table / regex_capture defer to
+    //            Phase 2B (separate session). Rejecting unsupported
+    //            modes at authoring time is cheaper than discovering
+    //            them at apply time on every fetch.
+    let outer_mode = extraction_mode_name(&extraction);
+    for (i, binding) in produces.iter().enumerate() {
+        let any_extracted = binding
+            .field_mappings
+            .iter()
+            .any(|fm| matches!(fm.source, FieldValueSource::Extracted));
+        let inner_specs: Vec<&ExtractionSpec> = binding
+            .field_mappings
+            .iter()
+            .filter_map(|fm| match &fm.source {
+                FieldValueSource::ExtractedInner { spec } => Some(spec),
+                _ => None,
+            })
+            .collect();
+        let any_inner = !inner_specs.is_empty();
+
+        // (i) mode congruence.
+        for inner_spec in &inner_specs {
+            let inner_mode = extraction_mode_name(inner_spec);
+            if inner_mode != outer_mode {
+                return Err(AuthoringError::InvalidRecipe(format!(
+                    "binding[{i}]: ExtractedInner sub-spec mode {inner_mode:?} \
+                     does not match the recipe's outer extraction mode \
+                     {outer_mode:?}. Inner and outer must use the same mode \
+                     (ADR 0019 §\"Validation rules\" rule 1): css_select pairs \
+                     with css_select, json_path pairs with json_path, etc."
+                )));
+            }
+        }
+
+        // (ii) mutual exclusion.
+        if any_extracted && any_inner {
+            return Err(AuthoringError::InvalidRecipe(format!(
+                "binding[{i}]: mixes FieldValueSource::Extracted and \
+                 FieldValueSource::ExtractedInner in one binding (ADR 0019 \
+                 §\"Validation rules\" rule 2). Pick one shape per binding: \
+                 either the legacy single-scalar `extracted` (with the rest \
+                 as literals/plan vars) or N `extracted_inner` sub-specs \
+                 (with the rest as literals/plan vars)."
+            )));
+        }
+
+        // (iii) at least one extraction reaches the bytes.
+        if !any_extracted && !any_inner {
+            return Err(AuthoringError::InvalidRecipe(format!(
+                "binding[{i}]: no FieldMap has source `extracted` or \
+                 `extracted_inner` — every field is `literal` or `from_plan` \
+                 (ADR 0019 §\"Validation rules\" rule 3). A binding that \
+                 never reads the fetched bytes would emit a constant record \
+                 on every fetch; this shape belongs at the recipe level as \
+                 `static_payload`, not as a binding."
+            )));
+        }
+
+        // (iv) Phase 2A runtime-support gate. Inner-spec modes that
+        //      the Session 61 runtime does not implement are rejected
+        //      with a precise pointer to Phase 2B.
+        for inner_spec in &inner_specs {
+            match inner_spec {
+                ExtractionSpec::CssSelect { .. } | ExtractionSpec::JsonPath { .. } => {}
+                ExtractionSpec::CsvCell { .. }
+                | ExtractionSpec::PdfTable { .. }
+                | ExtractionSpec::RegexCapture { .. } => {
+                    let inner_mode = extraction_mode_name(inner_spec);
+                    return Err(AuthoringError::InvalidRecipe(format!(
+                        "binding[{i}]: ExtractedInner sub-spec mode \
+                         {inner_mode:?} is not implemented in Phase 2A. \
+                         Session 61 wires css_select and json_path; \
+                         csv_cell, pdf_table, and regex_capture defer to \
+                         Phase 2B (ADR 0019 §\"Two-phase rollout\"). Until \
+                         then, recipes against listing-shaped sources of \
+                         those modes should use single-leaf `extracted` \
+                         bindings or decline."
+                    )));
+                }
+            }
+        }
+    }
+
     // 6. static_payload: collapse empty/whitespace to None;
     // require non-empty values to parse as JSON. The wire form is
     // empty-string-as-absent (xAI structured-output schema rejects
@@ -1310,13 +1440,7 @@ fn check_iterator_mode_congruence(
         AuthoredExtractionSpec::PdfTable { .. } => "pdf_table",
         AuthoredExtractionSpec::RegexCapture { .. } => "regex_capture",
     };
-    let inner_mode = match inner {
-        ExtractionSpec::JsonPath { .. } => "json_path",
-        ExtractionSpec::CssSelect { .. } => "css_select",
-        ExtractionSpec::CsvCell { .. } => "csv_cell",
-        ExtractionSpec::PdfTable { .. } => "pdf_table",
-        ExtractionSpec::RegexCapture { .. } => "regex_capture",
-    };
+    let inner_mode = extraction_mode_name(inner);
     if iter_mode != inner_mode {
         return Err(AuthoringError::InvalidRecipe(format!(
             "iterator mode {iter_mode:?} does not match extraction mode \
@@ -1327,6 +1451,23 @@ fn check_iterator_mode_congruence(
         )));
     }
     Ok(())
+}
+
+/// Tag a closed-vocabulary mode with its serde-canonical name. Used
+/// by the iterator and ADR 0019 ExtractedInner congruence checks.
+/// Centralised so the strings can't drift from the
+/// `serde(rename_all = "snake_case")` discriminator on
+/// [`ExtractionSpec`]. Mirrors `recipe_apply::mode_name` but lives
+/// here because the validator is the layer that surfaces the
+/// strings to operators.
+fn extraction_mode_name(spec: &ExtractionSpec) -> &'static str {
+    match spec {
+        ExtractionSpec::JsonPath { .. } => "json_path",
+        ExtractionSpec::CssSelect { .. } => "css_select",
+        ExtractionSpec::CsvCell { .. } => "csv_cell",
+        ExtractionSpec::PdfTable { .. } => "pdf_table",
+        ExtractionSpec::RegexCapture { .. } => "regex_capture",
+    }
 }
 
 fn convert_extraction(
@@ -1514,6 +1655,18 @@ fn convert_field_map(fm: AuthoredFieldMap) -> Result<FieldMap, AuthoringError> {
                 ));
             }
             FieldValueSource::FromPlan { pointer }
+        }
+        // ADR 0019 Phase 2A: structural conversion of the inner spec
+        // reuses `convert_extraction`'s bounds checks (non-empty
+        // selector / path / pattern, pdf_table page ≥ 1, regex
+        // group ≥ 1). Mode-congruence with the recipe's outer
+        // extraction is enforced at the binding-aggregate level in
+        // `build_validated_recipe` — convert_field_map sees one
+        // FieldMap in isolation and doesn't have visibility into the
+        // outer mode.
+        AuthoredFieldValueSource::ExtractedInner { spec } => {
+            let inner = convert_extraction(spec)?;
+            FieldValueSource::ExtractedInner { spec: inner }
         }
     };
     Ok(FieldMap {
@@ -2739,6 +2892,220 @@ mod tests {
             msg.contains("static_payload must parse as JSON"),
             "expected JSON-parse error, got: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR 0019 Phase 2A — ExtractedInner validator rules
+    //
+    // Four invariants enforced by `build_validated_recipe` step 5b:
+    //   (i)   inner-spec mode == outer extraction mode
+    //   (ii)  Extracted and ExtractedInner are mutually exclusive per binding
+    //   (iii) every binding has ≥1 Extracted or ExtractedInner FieldMap
+    //   (iv)  Phase 2A runtime supports inner specs only for css_select
+    //         and json_path; csv_cell / pdf_table / regex_capture defer
+    //         to Phase 2B.
+    // -----------------------------------------------------------------------
+
+    /// Multi-field binding fixture: outer extraction is the iterator
+    /// table-scope (`table.storms`), the iterator selects `tr.storm-row`
+    /// (set by callers that need the iterator-path test), and the
+    /// binding emits an Event with `headline` and `valid_at` extracted
+    /// via inner css_select sub-specs, plus `event_type` and
+    /// `direction` as literals. Mirrors the ADR 0019 worked example.
+    fn multi_field_storm_row_output() -> RecipeAuthoringOutput {
+        // sample_plan_with_events declares one event_type at index 0
+        // (`mine_opened` carried from sample_plan). The plan's
+        // expectation list is structurally compatible — the LLM-side
+        // wire form references list:event_type, index:0.
+        RecipeAuthoringOutput {
+            source_url: "https://www.nhc.noaa.gov/data/tcr/index.php".into(),
+            extraction: AuthoredExtractionSpec::CssSelect {
+                selector: "table.storms".into(),
+                attribute: None,
+            },
+            produces: vec![AuthoredProductionBinding {
+                record_type: AuthoredRecordType::Event,
+                expectation: AuthoredExpectationRef::EventType { index: 0 },
+                field_mappings: vec![
+                    AuthoredFieldMap {
+                        path: "event_type".into(),
+                        source: AuthoredFieldValueSource::Literal {
+                            value: serde_json::json!("mine_opened"),
+                        },
+                    },
+                    AuthoredFieldMap {
+                        path: "headline".into(),
+                        source: AuthoredFieldValueSource::ExtractedInner {
+                            spec: AuthoredExtractionSpec::CssSelect {
+                                selector: "td.storm-name".into(),
+                                attribute: None,
+                            },
+                        },
+                    },
+                    AuthoredFieldMap {
+                        path: "valid_at".into(),
+                        source: AuthoredFieldValueSource::ExtractedInner {
+                            spec: AuthoredExtractionSpec::CssSelect {
+                                selector: "td.storm-date".into(),
+                                attribute: None,
+                            },
+                        },
+                    },
+                    AuthoredFieldMap {
+                        path: "direction".into(),
+                        source: AuthoredFieldValueSource::Literal {
+                            value: serde_json::json!("supply_negative"),
+                        },
+                    },
+                ],
+                // Scalar fixture by default; iterator-path tests
+                // override the recipe's `iterator` field plus this
+                // field together.
+                dedup_key_field: Some("headline".into()),
+            }],
+            static_payload: String::new(),
+            decline_reason: String::new(),
+            iterator: None,
+        }
+    }
+
+    #[test]
+    fn build_validated_recipe_accepts_multi_field_css_binding_adr_0019() {
+        // Happy path: a scalar-mode recipe with one Extracted-inner-
+        // bearing binding passes when the outer extraction mode and
+        // the inner sub-spec modes agree (both css_select).
+        let out = multi_field_storm_row_output();
+        let recipe =
+            build_validated_recipe(out, &sample_plan(), "xai", None).expect("happy path");
+        assert_eq!(recipe.produces.len(), 1);
+        assert_eq!(recipe.produces[0].field_mappings.len(), 4);
+        // Spot-check: the ExtractedInner FieldMaps round-trip through
+        // the convert layer.
+        let inner_count = recipe.produces[0]
+            .field_mappings
+            .iter()
+            .filter(|fm| {
+                matches!(
+                    fm.source,
+                    crate::recipes::FieldValueSource::ExtractedInner { .. }
+                )
+            })
+            .count();
+        assert_eq!(inner_count, 2);
+    }
+
+    #[test]
+    fn build_validated_recipe_rejects_inner_mode_mismatch_adr_0019_rule_i() {
+        // Outer is css_select; inner is json_path → reject with a
+        // mode-congruence error pointing at ADR 0019 rule 1.
+        let mut out = multi_field_storm_row_output();
+        out.produces[0].field_mappings[1].source =
+            AuthoredFieldValueSource::ExtractedInner {
+                spec: AuthoredExtractionSpec::JsonPath {
+                    path: "$.headline".into(),
+                },
+            };
+        let err =
+            build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not match the recipe's outer extraction mode"),
+            "expected mode-congruence error, got: {msg}"
+        );
+        assert!(msg.contains("ADR 0019"));
+    }
+
+    #[test]
+    fn build_validated_recipe_rejects_extracted_and_extracted_inner_mixed_adr_0019_rule_ii() {
+        // Mix one Extracted FieldMap with the existing ExtractedInner
+        // ones → reject the binding with a mutual-exclusion error.
+        let mut out = multi_field_storm_row_output();
+        // Replace the literal `direction` with `Extracted`. Now the
+        // binding has 1× Extracted + 2× ExtractedInner + 1× Literal.
+        out.produces[0].field_mappings[3].source = AuthoredFieldValueSource::Extracted;
+        let err =
+            build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("mixes FieldValueSource::Extracted and \
+                          FieldValueSource::ExtractedInner"),
+            "expected mutual-exclusion error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_validated_recipe_rejects_all_literal_or_plan_binding_adr_0019_rule_iii() {
+        // Replace every extraction-bearing FieldMap with a literal/
+        // plan-var. The binding never reads the bytes → reject.
+        let mut out = multi_field_storm_row_output();
+        out.produces[0].field_mappings = vec![
+            AuthoredFieldMap {
+                path: "event_type".into(),
+                source: AuthoredFieldValueSource::Literal {
+                    value: serde_json::json!("mine_opened"),
+                },
+            },
+            AuthoredFieldMap {
+                path: "headline".into(),
+                source: AuthoredFieldValueSource::FromPlan {
+                    pointer: "topic".into(),
+                },
+            },
+            AuthoredFieldMap {
+                path: "direction".into(),
+                source: AuthoredFieldValueSource::Literal {
+                    value: serde_json::json!("supply_negative"),
+                },
+            },
+        ];
+        // dedup_key_field on a no-extraction binding is unusual;
+        // clear it so the iterator-path validator (which is not the
+        // rule under test here) doesn't preempt rule (iii).
+        out.produces[0].dedup_key_field = None;
+        let err =
+            build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no FieldMap has source `extracted` or `extracted_inner`"),
+            "expected no-extraction-bytes error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_validated_recipe_rejects_phase_2b_mode_in_extracted_inner_adr_0019_rule_iv() {
+        // Inner sub-spec is csv_cell — defers to Phase 2B; Phase 2A
+        // runtime does not support it. Reject at authoring time
+        // rather than fail-on-apply forever.
+        let mut out = multi_field_storm_row_output();
+        // Switch outer extraction to csv_cell so mode-congruence
+        // (rule i) passes — the csv_cell inner spec is the rule-iv
+        // target.
+        out.extraction = AuthoredExtractionSpec::CsvCell {
+            column: "row".into(),
+            row_filter: None,
+        };
+        out.produces[0].field_mappings[1].source =
+            AuthoredFieldValueSource::ExtractedInner {
+                spec: AuthoredExtractionSpec::CsvCell {
+                    column: "headline".into(),
+                    row_filter: None,
+                },
+            };
+        out.produces[0].field_mappings[2].source =
+            AuthoredFieldValueSource::ExtractedInner {
+                spec: AuthoredExtractionSpec::CsvCell {
+                    column: "date".into(),
+                    row_filter: None,
+                },
+            };
+        let err =
+            build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not implemented in Phase 2A"),
+            "expected Phase-2A runtime-support gate error, got: {msg}"
+        );
+        assert!(msg.contains("Phase 2B"));
     }
 
     // -----------------------------------------------------------------------

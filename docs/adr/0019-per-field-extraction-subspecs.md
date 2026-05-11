@@ -1,7 +1,9 @@
 # ADR 0019 — Per-field extraction sub-specs: ADR 0016 Phase 2 for multi-leaf record types
 
-**Status**: Proposed
-**Date**: 2026-05-11
+**Status**: Proposed (Session 60) — Phase 2A implementation landed
+in Session 61 but **unexercised live**; remains Proposed pending
+live-data validation in Session 62+
+**Date**: 2026-05-11 (proposed); 2026-05-11 (Phase 2A implementation landed)
 **Related**: ADR 0003 (six record types as governance boundary), ADR
 0007 (research function: two-level LLM architecture and the
 closed-extraction-vocabulary discipline), ADR 0016 (extraction
@@ -459,11 +461,103 @@ is open.
 
 ## Status
 
-**Proposed** (2026-05-11, Session 60). Implementation deferred to
-Session 61 per the kickoff discipline that this session ships no
-code. Sequencing: ADR 0018's bucket-fair dispatch lands first
-(opens the path); ADR 0019 Phase 2A lands second (adds the
-expressive power); the dashboard pill row's events panel becomes
-populatable after both.
+**Proposed** (2026-05-11, Session 60). **Phase 2A implementation
+landed in Session 61** — type, validator, runtime, and prompt are
+all in place and tested. The ADR remains **Proposed** rather than
+Accepted because the live-data validation criterion ("≥3 Event
+records per trial on NHC sources, each with distinct `headline`
+and `valid_at` extracted leaves") is **unmet**: across 10 trials
+(5 hurricanes + 5 lithium) under the v1.19 prompt, the LLM
+authored zero recipes using `extracted_inner`. Promotion to
+Accepted is gated on a future session's live-validated multi-leaf
+record extraction.
+
+### What Phase 2A shipped (Session 61)
+
+- **Type layer** (`crates/pipeline/src/recipes.rs`):
+  `FieldValueSource::ExtractedInner { spec: ExtractionSpec }`
+  variant added, serde-tagged as `"kind":"extracted_inner"` with
+  the nested spec serialising as the same five-mode closed enum
+  used everywhere else. Round-trip tests pin the wire shape.
+- **Validator layer** (`crates/pipeline/src/recipe_author.rs`):
+  Four rules added to `build_validated_recipe` — (i) inner-spec
+  mode congruence with outer extraction, (ii) Extracted /
+  ExtractedInner mutual exclusion per binding, (iii) at-least-one
+  extraction per binding, (iv) Phase-2A runtime-support gate
+  (css_select / json_path only; csv_cell / pdf_table /
+  regex_capture remain Phase 2B). Five validator tests cover the
+  happy path and each rejection path.
+- **Runtime layer** (`crates/pipeline/src/recipe_apply.rs`):
+  `compute_inner_extractions_css/json` helpers, `extract_json_within`
+  for per-scope JSONPath evaluation, `apply_json_iterator` for the
+  new (JsonPath, JsonPath) iterator pair, scalar+multi-leaf
+  resolution via `scalar_inner_extractions`. The shape validator
+  (`validate_recipe_shape_against_bytes`) extended to evaluate
+  inner sub-specs against the real per-match scope rather than a
+  stub. Three runtime tests cover css iterator + multi-leaf, json
+  iterator + multi-leaf, and legacy iterator backwards compat.
+- **Prompt layer** (`config/prompts/recipe_author.md` v1.19):
+  New "Multi-leaf records — when one row carries several fields"
+  section between "Selecting the mode" and the decline-path
+  section. Two worked examples — relations from an ownership-table
+  listing (CSS) and events from a JSON listing API (JSONPath).
+  Five new "What NOT to produce" entries flag the four validator
+  rejection modes plus the all-literal binding case.
+
+### Why the LLM didn't reach for `extracted_inner` yet
+
+The Session 61 hurricane / lithium re-run is the first real
+contact between the v1.19 prompt and live sources. Observed
+patterns across 10 trials:
+
+- **The recipe-author rejected the multi-leaf framing on every
+  source touched.** On NHC sources, the LLM either declined the
+  EventType target outright ("source provides aggregate statistics
+  not extractable per-storm events") or authored a legacy
+  single-leaf iterator+inner-selector recipe that subsequently
+  failed at apply ("inner selector matched no elements within
+  iterator match" — twice across the hurricane trials, same shape
+  Session 60 documented). The v1.19 prompt's multi-leaf worked
+  example uses synthetic class names (`tr.storm-row`,
+  `td.storm-name`) but no live source the LLM encountered carried
+  cleanly identifiable per-row classes.
+- **Validator rule (iii) caught three separate all-literal
+  bindings** — the LLM authored bindings whose every FieldMap was
+  Literal or FromPlan (a degenerate shape that would emit a
+  constant record on every fetch). These would have run forever
+  pre-fix; ADR 0019's validator now rejects them at authoring
+  time. So Phase 2A has a real safety effect even before the
+  positive case lands.
+- **Phase 2B modes (csv_cell, pdf_table, regex_capture) are
+  closed off cleanly.** The validator's rule (iv) explicitly
+  rejects ExtractedInner with these modes, so the LLM doesn't
+  silently land on unsupported shapes — the gate is consistent
+  with what the runtime implements.
+
+### Session 62's path to Accepted
+
+Two non-orthogonal directions:
+
+1. **Prompt iteration.** v1.20 elevates the multi-leaf section's
+   prominence (currently it sits between "mode selection" and
+   "decline path"; promoting it to a top-level subsection and
+   adding an inline "is this row multi-leaf?" rubric near the
+   binding-shape decision point). Add a NHC-shaped worked example
+   that aligns with the actual TCR index page's class structure
+   (operator-supplied per inspection). Re-run the hurricane 5-
+   trial after v1.20 lands.
+2. **Direct exercise.** Hand-author a multi-leaf recipe against a
+   known multi-field listing (e.g. a fixture-served HTML page
+   structured as the v1.19 worked example), apply it through the
+   apply pipeline, and confirm the runtime produces multi-leaf
+   records end-to-end. This is the structural smoke test the
+   runtime tests already cover at the unit level; a fixture-based
+   integration test extends the coverage to the apply-stage
+   normalize layer.
+
+The recipe-iteration loop on FetchReport (Session 60's A) becomes
+the operator's lever once a multi-leaf recipe has an apply-stage
+failure to re-author against. Session 61 surfaced no such failure
+because no `extracted_inner` recipe was authored at all.
 
 End of ADR.

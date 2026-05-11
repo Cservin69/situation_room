@@ -448,8 +448,9 @@ pub struct FieldMap {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FieldValueSource {
-    /// The value from the recipe's extraction step. For a recipe
-    /// that extracts a single scalar, this is the common case.
+    /// The value from the recipe's outer extraction step. For a
+    /// single-scalar recipe (or an iterator recipe where each match
+    /// carries exactly one extracted leaf), this is the common case.
     Extracted,
 
     /// A literal constant baked into the recipe. For fields the
@@ -461,6 +462,27 @@ pub enum FieldValueSource {
     /// `Observation::metric` (the canonical metric name lives in the
     /// plan's expectations).
     FromPlan { pointer: String },
+
+    /// ADR 0019 (Phase 2A, Session 61). A per-field extraction sub-spec
+    /// evaluated against the same per-match scope the binding's outer
+    /// extraction operates on, producing one leaf per [`FieldMap`] per
+    /// match. The sub-spec's mode must equal the recipe's outer
+    /// `extraction.mode` (mode-congruence rule, enforced by the
+    /// recipe-author validator and mirroring ADR 0016's
+    /// iterator-vs-inner-selector check).
+    ///
+    /// Use this variant when one row (or one JSON object, etc.)
+    /// carries several fields the record needs (e.g. an NHC storm-row
+    /// with `td.storm-name` → headline and `td.storm-date` → date;
+    /// a Relation row with `td.from` and `td.to` slugs). The recipe
+    /// author commits to either the legacy single-scalar contract
+    /// (one `Extracted` FieldMap, the rest literals/plan vars) or the
+    /// multi-leaf contract (N `ExtractedInner` FieldMaps, the rest
+    /// literals/plan vars) per binding; mixing `Extracted` and
+    /// `ExtractedInner` in one binding is a validator error because
+    /// the runtime would have to resolve "the outer extraction" vs.
+    /// "an inner sub-spec" ambiguously.
+    ExtractedInner { spec: ExtractionSpec },
 }
 
 // ---------------------------------------------------------------------------
@@ -633,12 +655,36 @@ mod tests {
             FieldValueSource::FromPlan {
                 pointer: "topic_tags.0".into(),
             },
+            // ADR 0019 Phase 2A: ExtractedInner round-trips through
+            // its own serde tag plus the nested ExtractionSpec's tag.
+            FieldValueSource::ExtractedInner {
+                spec: ExtractionSpec::CssSelect {
+                    selector: "td.storm-name".into(),
+                    attribute: None,
+                },
+            },
+            FieldValueSource::ExtractedInner {
+                spec: ExtractionSpec::JsonPath {
+                    path: "$.headline".into(),
+                },
+            },
         ];
         for v in vs {
             let json = serde_json::to_string(&v).unwrap();
             let back: FieldValueSource = serde_json::from_str(&json).unwrap();
             assert_eq!(v, back);
         }
+        // Spot-check the wire shape — both the outer `kind` and the
+        // inner `mode` tags must be present and serde-canonical.
+        let json = serde_json::to_string(&FieldValueSource::ExtractedInner {
+            spec: ExtractionSpec::CssSelect {
+                selector: ".x".into(),
+                attribute: None,
+            },
+        })
+        .unwrap();
+        assert!(json.contains("\"kind\":\"extracted_inner\""));
+        assert!(json.contains("\"mode\":\"css_select\""));
     }
 
     #[test]

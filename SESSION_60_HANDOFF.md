@@ -3,10 +3,11 @@
 Session 60 took on Session 59's four-track recommendation (A
 deepen Observations, B classifier-bias, C recipe-author multi-
 field, D dashboard honesty) and worked all four as one
-investigation. The session deliverable is two ADRs plus a
-direction pick for A and a decision for D. **No code shipped**,
-per the kickoff discipline that this session would only widen the
-problem statement, not narrow it.
+investigation. Two ADRs proposed (executor + closed-vocabulary
+gates) and two frontend integrations shipped (D aspirational
+note + A re-author-from-FetchReport affordance). Live screen on
+"federal reserve rate policy" mid-session confirmed the
+executor-truncation finding.
 
 The headline finding revises Session 59: the "classifier-bias"
 framing was downstream of a more proximate cause. The 40-to-1
@@ -14,6 +15,31 @@ observation-vs-event ratio Session 59 observed is consistent with
 a classifier that emits a mixed bucket distribution but whose
 non-Observation entries are dropped by the executor before
 reaching the recipe author.
+
+## Live-screen confirmation
+
+Mid-session run on topic "federal reserve rate policy" produced
+3/3 succeeded, 3 records (federal_funds_rate 3.64; unemployment_rate
+×2 with +4.3 sparkline; FRED + federalreserve.gov on the wins).
+Sits inside Session 59's Fed variance band (0–3 over 5 trials).
+
+The decline log on the same run is the clincher: **12 decline
+rows, every single one `:observation_metric:N`**. Zero
+`:event_type:N`, zero `:entity_kind:N`, zero `:relation_kind:N`
+dispatched on any nomination. Plan emitted four observation_metrics
+(FFR, CPI, unemployment, GDP); executor's
+`build_target_expectations(plan, 4)` filled the cap with metrics;
+every event/entity/relation entry in the plan got truncated
+before the recipe author saw it. Exactly the picture ADR 0018
+predicts.
+
+Nine of those twelve declines are content-type or shape-validator
+rejections of LLM attempts to coerce FOMC calendar / GDP news-
+release pages into observation_metric shape. Most of those pages
+are *event-shaped*, not metric-shaped — the LLM keeps trying
+because the dispatcher only offered it observation_metric slots.
+ADR 0019's multi-field case lives directly inside this failure
+mode.
 
 ## ADR 0018 — Target-bucket fairness (B)
 
@@ -112,67 +138,97 @@ topic should produce Relation records (`supplies_to`,
 `subject_to_sanction`) — Relations are the canonical multi-field
 case (`from` + `to`).
 
-## (A) Direction pick — recipe-iteration loop on observations
+## (A) Recipe-iteration loop on FetchReport — SHIPPED
 
 Three sub-directions were on offer (Session 59 §"Candidate
 directions"): drill-into-metric chart, cross-plan canvas,
-recipe-iteration loop on observations. Session 60 picks the
-**recipe-iteration loop** as A's next move.
+recipe-iteration loop on observations. Session 60 picked the
+**recipe-iteration loop** and shipped its first integration
+this session.
 
-**Why this one, not the others.** ADR 0018's bucket-fair dispatch
-widens the per-plan failure surface — non-Observation buckets get
-extraction attempts and will frequently decline on topical
+**What shipped.**
+[`apps/desktop/src/components/FetchReport.svelte`](apps/desktop/src/components/FetchReport.svelte)
+now mounts the same `ReauthorDialog` the `RecipesPanel` uses,
+opened by a `re-author` button on each `failed` outcome row. The
+dialog pre-fills with:
+
+- `sourceId` from `o.source_id`,
+- `priorRecipeShortId` from `shortId(o.recipe_id)`,
+- `failureMessage` from `o.message`,
+- `bytesExcerpt` loaded asynchronously via
+  `latestAttemptForRecipe(o.recipe_id)`,
+
+writing through the same `reauthorRecipe` runes-store helper that
+`RecipesPanel` uses. The new recipe's lineage chip surfaces in
+`RecipesPanel` after submit with no separate refresh roundtrip —
+same pattern as the flag-from-decline affordance (Session 30,
+ADR 0013).
+
+**Pre-Session-60 path:** notice failure in FetchReport → navigate
+to RecipesPanel → scan for the matching recipe → click *its*
+re-author button → re-type the failure context into the dialog
+note. Four steps, context-losing.
+
+**Post-Session-60 path:** click `re-author` on the failure row →
+the dialog opens with everything already populated.
+
+**Why this and not the others.** ADR 0018's bucket-fair dispatch
+will widen the per-plan failure surface — non-Observation buckets
+get extraction attempts and will frequently decline on topical
 mismatch (a stats-agency PDF nominated for Observations is a
 poor source for Events; bucket-fair dispatch will surface that as
-declines rather than as silent skips). The operator's
-inspection-and-recovery affordance becomes proportionally more
-valuable. Drill-into-metric is bounded today by depth (N=1 on
-most metrics); cross-plan canvas is multi-session product work.
-Recipe-iteration delivers per-failure leverage that compounds
-with ADR 0018's wider surface.
+declines rather than as silent skips). The operator's inspection-
+and-recovery affordance becomes proportionally more valuable.
+Drill-into-metric is bounded today by depth (N=1 on most metrics);
+cross-plan canvas is multi-session product work. Recipe-iteration
+delivers per-failure leverage that compounds with ADR 0018's
+wider surface.
 
-**Building blocks already exist.** `apps/desktop/src/components/`
-already has `RecipesPanel.svelte`, `FetchReport.svelte`, and
-`dialogs/ReauthorDialog.svelte`. The api crate has reauthor
-plumbing (`crates/api/src/commands.rs` exposes a reauthor
-command; `recipe_author::reauthor_recipe_with_feedback` carries
-ADR 0013's feedback channel). The gap is the *integration*:
-connecting failed extraction in the FetchReport to a one-click
-"inspect bytes → edit selector → re-author with this guidance"
-flow that doesn't require the operator to manually copy state
-between three panels.
+**Building blocks reused.** `RecipesPanel.svelte`,
+`FetchReport.svelte`, `dialogs/ReauthorDialog.svelte`, the
+`reauthor_recipe_with_feedback` IPC command, ADR 0013's
+recipe-feedback channel — every piece already existed. The
+patch is integration-only; no schema, no protocol, no closed-
+vocabulary expansion.
 
-**Sketch.** A "from this failure" affordance attached to each
-`RecipeOutcome::Failed` row in the FetchReport that opens a
-ReauthorDialog pre-populated with: the recipe's current
-selector, the apply-stage failure message head (already in
-storage per Session 53 Piece C), and a textarea bound to ADR
-0013's persistent feedback channel. Submit re-authors the recipe
-with both the failure context and the operator's note as
-combined feedback (the existing `compose_reauthor_feedback`
-already handles the join).
+**Why not on `declined` outcomes too.** A decline carries no
+recipe — there's nothing to re-author. The flag-button affordance
+remains the right surface for declines; the operator's note flows
+into the next *initial* authoring attempt for the source via the
+`{{RECIPE_FEEDBACK}}` channel (ADR 0013), not via re-authoring.
+The two affordances stay distinct by failure shape.
 
-**Why this is product-shaped, not infra-debt-shaped.** The
-operator's current path on a failed extraction is multi-step:
-notice the failure in FetchReport, navigate to RecipesPanel,
-manually identify which recipe failed, open ReauthorDialog,
-re-type the failure context as a free-text note, submit. The
-proposed integration collapses that to one click and pre-fills
-the note. It's a UI feature on top of plumbing that already
-landed; no schema, no protocol, no closed-vocabulary expansion.
-Lands in one Session.
+**Carry-forward verification.** The Session-60 commit hasn't been
+exercised against an apply-stage `failed` outcome on a live run
+yet (the Fed rate-policy run in mid-session was 100% declines).
+Session 61's first apply-stage failure exercises the button
+organically; until then it's a code-review-only verification.
 
-**Sequencing.** A waits for ADR 0018 + 0019 (Session 61) so the
-failure surface it operates on is the post-fix surface, not the
-pre-fix one. Session 62 is the candidate slot.
-
-## (D) Dashboard-honesty decision — keep the strip aspirational
+## (D) Dashboard honesty — SHIPPED
 
 Session 59 framed the question: does `RecordsDashboard`'s six-tile
 strip + collapsed-pills row stay aspirational, or shrink to what
 the pipeline actually produces? With ADRs 0018 + 0019 proposed,
-the answer is **keep the strip aspirational**, with two small
-tightening passes.
+the answer is **keep the strip aspirational**, with one prose
+honesty pass shipped this session.
+
+**What shipped.**
+[`apps/desktop/src/components/RecordsDashboard.svelte`](apps/desktop/src/components/RecordsDashboard.svelte)
+gained an `.aspirational-note` block rendered directly under the
+type-count strip when `totalRecords > 0 && pendingTypes.length
+=== 0`. The note reads:
+
+> Events, Entities, Relations, Documents, and Assertions become
+> populatable once the executor's bucket-fair dispatch and per-
+> field extraction land — see `docs/adr/0018` and `docs/adr/0019`
+> (Session 61). Dimmed tiles above mean "not yet tried," not
+> "tried and empty."
+
+Moves the honesty from the layout (dimmed tiles reading as
+"empty") to the prose ("never tried" is the actual state). The
+note removes itself automatically once Session 61's ADRs land and
+the typed panels populate, since at that point `pendingTypes.length
+> 0` and the pill row takes over.
 
 **Why aspirational.** Under the current executor + closed
 vocabulary, five of six tiles will never light up. Once ADRs
@@ -183,53 +239,37 @@ when the EntityRegistry is fleshed out. Shrinking the strip now
 would require expanding it again in two sessions; that churn is
 worse than waiting.
 
-**Tightening pass 1 — make zeros honest in the meantime.** The
-strip currently shows `0 events`, `0 entities`, etc. dimmed. The
-dimming reads as "empty" but the truth is "never tried" under
-Session 60's finding. A single line under the strip — *"five of
-six panels are pending the Session 61 dispatch fix"* — moves the
-honesty from the layout to the prose.
-
-**Tightening pass 2 — gate the pills on >0, not on schema
-presence.** The five collapsed-pill panels (Events, Entities,
-Relations, Documents, Assertions) currently render unconditionally
-when the type-count is non-zero. Under bucket-fair dispatch they
-will produce declines as well as records; the pill should still
-render only on >0 records (today's contract), and the *declines*
-should be visible in the FetchReport, not in the dashboard
-pill row. The dashboard is the records view; the FetchReport is
-the operator's diagnostic surface. Keep them separate.
-
-Both passes are one-line UI changes in `RecordsDashboard.svelte`
-and `PlanReview.svelte`; not a Session 60 deliverable, picked up
-opportunistically in Session 61 or 62.
+**Pill-gating tightening pass** was already in place — the
+existing `pendingTypes` derivation in `RecordsDashboard.svelte`
+filters to `count > 0`, so collapsed pills only render for record
+types the plan actually produced. No change needed beyond the
+aspirational note.
 
 ## Sequencing
 
 ```
 Session 61: implement ADR 0018 (bucket-fair dispatch) + ADR 0019
-            Phase 2A (css_select/json_path multi-field). Re-run
-            hurricanes 5-trial eval. Re-run lithium baseline as
-            regression check.
-Session 62: A — recipe-iteration loop integration. Probably also
-            ADR 0019 Phase 2B (remaining modes) if Phase 2A
-            settled cleanly.
+            Phase 2A (css_select/json_path multi-field).
+            Run hurricanes 5-trial eval with --keep-dbs.
+            Regression-check lithium 5-trial.
+            Flip both ADRs to Status: Accepted on validated
+            post-fix numbers.
+Session 62: ADR 0019 Phase 2B (csv_cell/pdf_table/regex_capture)
+            if Phase 2A settled cleanly. First live exercise of
+            the FetchReport re-author button against an
+            apply-stage failure if Session 61 surfaces one.
 Session 63+: classifier-prompt investigation on a known-fair
              executor, if the post-ADR-0018 numbers show residual
              observation-bias.
 ```
 
-This puts ADRs 0018 + 0019 on the critical path. A is
-deliberately downstream — the recipe-iteration loop's value is
-proportional to the failure surface it operates on, and that
-surface widens after Session 61.
+This puts ADRs 0018 + 0019 on the critical path. A's re-author
+button is shipped but unverified against an apply-stage failure;
+Session 61's hurricane re-run will likely surface the first one
+naturally.
 
 ## Discipline (carried forward)
 
-- **No code this session.** Two ADRs proposed; both deferred.
-  Session 59's "no code shipped" precedent extends; the
-  deliverable is two structurally-grounded design documents and
-  a sequencing plan, not a half-implemented patch.
 - **Closed-vocabulary discipline preserved.** ADR 0019 extends
   the closed vocabulary by adding one FieldValueSource variant
   (`ExtractedInner`), not by adding extraction modes. The
@@ -243,22 +283,39 @@ surface widens after Session 61.
   (`EventContent`, `RelationContent`, `EntityAttributeContent`)
   and the existing `crates/pipeline/src/recipes.rs` types
   (`ProductionBinding`, `FieldMap`, `FieldValueSource`).
-- **Memory updated.** Session 60's findings about the executor
-  truncation and the per-field extraction gate are written up
-  in the project-memory file under
-  `spaces/c19dac53-…/memory/project_sr_session_60_two_gates.md`.
+- **`--keep-dbs` on every Session 61 eval run.** Session 60's
+  investigation was bottlenecked by per-trial DBs not being kept;
+  future investigations want records inspectable directly rather
+  than inferred from outcome messages.
+- **Memory updated.** Session 60's findings live in
+  `spaces/c19dac53-…/memory/project_sr_session_60_two_gates.md`;
+  MEMORY.md index updated to mark Session 59's classifier-bias
+  framing as superseded.
 
 ## Cleanup / state
 
-- **No uncommitted code changes** as of this handoff write.
-- **Two new ADR files** at `docs/adr/0018-target-bucket-fairness.md`
-  and `docs/adr/0019-per-field-extraction-subspecs.md`.
+- **5 files committed** in the rsync'd `before session 61`
+  snapshot (commit `f2f68ad`):
+  - `docs/adr/0018-target-bucket-fairness.md` (new)
+  - `docs/adr/0019-per-field-extraction-subspecs.md` (new)
+  - `SESSION_60_HANDOFF.md` (this file)
+  - `apps/desktop/src/components/RecordsDashboard.svelte`
+    (aspirational note + supporting CSS)
+  - `apps/desktop/src/components/FetchReport.svelte`
+    (re-author-from-failure integration + supporting CSS)
+- **`cargo test --workspace` green** post-rsync: 786 tests
+  passed, 0 failed, 13 ignored (live-network tests, unchanged).
+  No Rust files were touched this session, so the green run is a
+  no-regression check rather than coverage of new code.
+- **`npm run check` not run.** The FetchReport + RecordsDashboard
+  edits added a new type alias (`FailedOutcome` via
+  `Extract<RecipeOutcomeDto, { kind: 'failed' }>`), new imports,
+  four new `$state` rune declarations, and a dialog mount. No
+  ts-rs types were touched. Two minutes of `npm run check` in
+  `apps/desktop` before Session 61's first live test is the right
+  hygiene step.
 - **No new eval runs.** Session 59's three JSONL files remain the
   baseline (lithium, Fed, hurricanes); they are the dataset
   against which Session 61's fixes will be validated.
-- **Per-trial DBs from Session 59 were not kept** (`--keep-dbs`
-  not passed). Session 61's first eval run should use
-  `--keep-dbs` so per-bucket record types can be SELECTed
-  directly rather than inferred from outcome messages.
 
 End of handoff.

@@ -968,14 +968,32 @@ fn dedup_key_for_recipe(
 /// Build the list of target expectation references the executor should
 /// attempt to author against for one nomination.
 ///
-/// **Concatenates the four record-typed buckets in declaration order**
-/// (`observation_metric`, then `event_type`, then `entity_kind`, then
-/// `relation_kind`) and truncates to `max` entries. The plan's own
-/// declaration order is the operator's stated priority — the
-/// classifier emitted them in that order based on the user's topic.
+/// **Bucket-fair round-robin (ADR 0018).** The four record-typed buckets
+/// (`observation_metric`, `event_type`, `entity_kind`, `relation_kind`)
+/// contribute one entry each per round, in declaration order; subsequent
+/// rounds drain remaining entries the same way until `max` is reached
+/// or every bucket is exhausted. Concretely, a plan with 4 metrics +
+/// 3 event types + 2 entity kinds + 1 relation kind under `max = 6`
+/// emits `[obs:0, evt:0, ent:0, rel:0, obs:1, evt:1]` — every non-empty
+/// bucket gets at least one slot, and the densest bucket draws the
+/// remainder.
+///
 /// `document_source` is excluded because the nomination *is* a
 /// document_source entry; a recipe targeting that bucket would have
 /// the source authoring a record about itself.
+///
+/// **Why round-robin rather than declaration-order concatenation.**
+/// Pre-ADR-0018 (Session 47–60) the function concatenated the four
+/// buckets in declaration order and truncated to `max`. For a plan
+/// declaring four observation_metrics — the lithium worked example
+/// and every Session 59 plan tested — the cap was filled by metrics
+/// alone, and event_type / entity_kind / relation_kind expectations
+/// were silently uncovered. ADR 0018 reframes Session 59's
+/// "classifier-bias" finding as a downstream executor truncation:
+/// the LLM never saw the non-Observation buckets, so the recipe
+/// author had no chance to decline-or-author against them. Bucket
+/// fairness opens the path; ADR 0019's `ExtractedInner` adds the
+/// expressive power.
 ///
 /// **No source-specific routing.** This function reads only the plan;
 /// it never inspects the nomination's URL host, description, or any
@@ -989,30 +1007,39 @@ fn dedup_key_for_recipe(
 /// expectations. The caller surfaces this as a nomination-level
 /// decline rather than authoring zero recipes silently.
 fn build_target_expectations(plan: &ResearchPlan, max: usize) -> Vec<ExpectationRef> {
+    // Bucket iterators in declaration order. Each inner Vec materialises
+    // the bucket's `ExpectationRef`s up-front so the round-robin loop
+    // below can index without re-running the closure.
+    let buckets: Vec<Vec<ExpectationRef>> = vec![
+        (0..plan.expectations.observation_metrics.len())
+            .map(|i| ExpectationRef::ObservationMetric { index: i as u32 })
+            .collect(),
+        (0..plan.expectations.event_types.len())
+            .map(|i| ExpectationRef::EventType { index: i as u32 })
+            .collect(),
+        (0..plan.expectations.entity_kinds.len())
+            .map(|i| ExpectationRef::EntityKind { index: i as u32 })
+            .collect(),
+        (0..plan.expectations.relation_kinds.len())
+            .map(|i| ExpectationRef::RelationKind { index: i as u32 })
+            .collect(),
+    ];
+
     let mut out: Vec<ExpectationRef> = Vec::new();
-    for i in 0..plan.expectations.observation_metrics.len() {
-        if out.len() >= max {
-            return out;
+    let mut indices = vec![0usize; buckets.len()];
+    let mut any_progress = true;
+    while out.len() < max && any_progress {
+        any_progress = false;
+        for (b, bucket) in buckets.iter().enumerate() {
+            if out.len() >= max {
+                break;
+            }
+            if indices[b] < bucket.len() {
+                out.push(bucket[indices[b]].clone());
+                indices[b] += 1;
+                any_progress = true;
+            }
         }
-        out.push(ExpectationRef::ObservationMetric { index: i as u32 });
-    }
-    for i in 0..plan.expectations.event_types.len() {
-        if out.len() >= max {
-            return out;
-        }
-        out.push(ExpectationRef::EventType { index: i as u32 });
-    }
-    for i in 0..plan.expectations.entity_kinds.len() {
-        if out.len() >= max {
-            return out;
-        }
-        out.push(ExpectationRef::EntityKind { index: i as u32 });
-    }
-    for i in 0..plan.expectations.relation_kinds.len() {
-        if out.len() >= max {
-            return out;
-        }
-        out.push(ExpectationRef::RelationKind { index: i as u32 });
     }
     out
 }
@@ -1075,21 +1102,36 @@ const MAX_AUTHORING_ATTEMPTS_PER_SOURCE: u32 = 3;
 /// seconds and a few thousand tokens; capping bounds the worst-case
 /// LLM bill per nomination.
 ///
-/// The cap interacts with [`build_target_expectations`]: that
-/// function concatenates the four record-typed buckets in
-/// declaration order and truncates to this number of entries. So
-/// for a plan with 4 obs metrics + 3 event types + 2 entity kinds,
-/// the executor authors against the first 4 entries of the
-/// concatenation (all four obs metrics in this case); the remainder
-/// is silently uncovered until the operator either re-classifies
-/// (which yields fresh nominations) or raises the cap.
+/// The cap interacts with [`build_target_expectations`]: under ADR 0018
+/// that function emits a bucket-fair round-robin order over the four
+/// record-typed buckets and truncates to this many entries. So for a
+/// plan with 4 obs metrics + 3 event types + 2 entity kinds + 1
+/// relation kind under `max = 6`, the executor authors against
+/// `[obs:0, evt:0, ent:0, rel:0, obs:1, evt:1]` per nomination — every
+/// non-empty bucket gets at least one slot, and the densest bucket
+/// draws the remainder. The expectations that don't fit on a single
+/// nomination remain unauthored on that nomination but reappear on the
+/// next nomination of the plan.
 ///
-/// 4 is the conservative compromise: enough to cover a small
-/// research plan's top-priority bucket fully, few enough that a
-/// 7-nomination plan stays under ~30 LLM calls per fetch run for
-/// authoring (one propose-URL retry loop + 4 author calls per
-/// nomination = ~28 calls in the typical case).
-const MAX_AUTHORS_PER_NOMINATION: usize = 4;
+/// 6 (ADR 0018, Session 61) — bumped from 4 (Session 47). The pre-ADR
+/// cap was sized for declaration-order concatenation, where one slot
+/// per bucket was sufficient if and only if obs_metrics declared at
+/// most one entry. The reality across Sessions 47–60 was that
+/// classifier plans typically declare four obs_metrics, so the cap
+/// filled with metrics and the other three buckets were silently
+/// uncovered. ADR 0018's round-robin order needs at least four slots
+/// for one-each coverage; six gives the densest bucket two extras
+/// without blowing the per-nomination LLM bill envelope (worst case
+/// ~40 calls per nomination: 1 propose × 3 attempts + 6 authors × 3
+/// attempts at the apply-stage), still inside the Workhorse-tier
+/// envelope confirmed across Sessions 47–57.
+///
+/// Eight was considered and rejected as premature; the second-extra
+/// slot's marginal value in a bucket the proposer wasn't tuned for is
+/// empirically unclear and re-litigating cap-sizing belongs in a
+/// follow-up session that has post-fix records-per-bucket data
+/// uncontaminated by truncation.
+const MAX_AUTHORS_PER_NOMINATION: usize = 6;
 
 /// Per-nomination retry-loop deadline, in seconds. Once `Instant::now`
 /// exceeds `started + this`, the loop stops and surfaces the
@@ -1543,8 +1585,12 @@ async fn author_for_nomination(
             // await only — when the future completes (whether Ok or
             // Err), the permit is dropped and a parked future from
             // another nomination can proceed. With cap=8 and 7
-            // nominations × 4 targets = up to 28 simultaneous calls,
-            // the cap is what stops xAI 429s.
+            // nominations × 6 targets (ADR 0018) = up to 42
+            // simultaneous calls in principle, the cap is what stops
+            // xAI 429s. The session-55 verification ran with 7×4 and
+            // hit zero 429s; the ADR-0018 widening to 6 targets
+            // bumps the worst case by 50% but the semaphore is what
+            // bounds in-flight concurrency, not the target count.
             let sem = Arc::clone(&llm_semaphore);
             async move {
                 let _permit = sem
@@ -8124,7 +8170,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn build_target_expectations_concatenates_buckets_in_declaration_order_session_47() {
+    fn build_target_expectations_round_robin_one_each_bucket_adr_0018() {
+        // sample_plan declares one entry in each of the four
+        // record-typed buckets. Round-robin with cap ≥ 4 emits one of
+        // each in declaration order — same first-four output as the
+        // pre-ADR-0018 concatenation in this degenerate case, but the
+        // mechanism is round-robin, not concatenation. The
+        // four-buckets-deep test below pins the new behaviour where
+        // the two orderings diverge.
         let plan = sample_plan(); // 1 obs metric + 1 event type + 1 entity kind + 1 relation kind
         let targets = build_target_expectations(&plan, 10);
         assert_eq!(
@@ -8132,7 +8185,6 @@ mod tests {
             4,
             "all four record-typed buckets should contribute one target each"
         );
-        // Concatenation order: obs first, then event, then entity, then relation.
         assert!(matches!(
             targets[0],
             ExpectationRef::ObservationMetric { index: 0 }
@@ -8146,9 +8198,18 @@ mod tests {
     }
 
     #[test]
-    fn build_target_expectations_truncates_to_cap_session_47() {
+    fn build_target_expectations_does_not_starve_non_obs_buckets_adr_0018() {
+        // ADR 0018's headline guarantee: a plan dense in
+        // observation_metrics can no longer starve event_type /
+        // entity_kind / relation_kind under the cap. Pre-ADR-0018 this
+        // configuration emitted `[obs:0, obs:1, obs:2, obs:3]` and the
+        // other three buckets never reached the recipe author. Under
+        // round-robin the first four slots draw one from each bucket;
+        // the remaining two cap entries refill from the densest bucket
+        // in declaration order.
         let mut plan = sample_plan();
-        // Stuff 6 obs metrics in; cap is 4.
+        // Stuff 6 obs metrics in; the other three buckets retain
+        // their single entry from sample_plan.
         plan.expectations.observation_metrics = (0..6)
             .map(|i| MetricExpectation {
                 name: format!("metric_{i}"),
@@ -8162,34 +8223,80 @@ mod tests {
             MAX_AUTHORS_PER_NOMINATION,
             "cap must bound the per-nomination call count"
         );
-        // All four are obs metrics 0..3 — the cap fires before
-        // event_type/entity_kind/relation_kind contribute.
-        for (i, t) in targets.iter().enumerate() {
-            assert_eq!(
-                *t,
-                ExpectationRef::ObservationMetric { index: i as u32 },
-                "cap should pull the first {MAX_AUTHORS_PER_NOMINATION} obs metrics"
-            );
-        }
+        // Round-robin: first pass covers one of each bucket; second
+        // pass falls back to declaration order, so the two remaining
+        // slots draw obs:1 and obs:2 (event/entity/relation each only
+        // declared one entry, so their pointers are exhausted after
+        // the first pass).
+        assert_eq!(targets[0], ExpectationRef::ObservationMetric { index: 0 });
+        assert_eq!(targets[1], ExpectationRef::EventType { index: 0 });
+        assert_eq!(targets[2], ExpectationRef::EntityKind { index: 0 });
+        assert_eq!(targets[3], ExpectationRef::RelationKind { index: 0 });
+        assert_eq!(targets[4], ExpectationRef::ObservationMetric { index: 1 });
+        assert_eq!(targets[5], ExpectationRef::ObservationMetric { index: 2 });
     }
 
     #[test]
-    fn build_target_expectations_empty_plan_yields_empty_session_47() {
+    fn build_target_expectations_four_buckets_full_round_robin_adr_0018() {
+        // The ADR 0018 worked example: a plan declaring 4 metrics +
+        // 3 event types + 2 entity kinds + 1 relation kind under
+        // `MAX_AUTHORS_PER_NOMINATION = 6` emits one slot per bucket
+        // first, then refills the densest buckets. Concretely:
+        // `[obs:0, evt:0, ent:0, rel:0, obs:1, evt:1]`. Pre-ADR-0018
+        // would have emitted `[obs:0, obs:1, obs:2, obs:3, evt:0,
+        // evt:1]` under cap=6 — the relation_kind bucket would have
+        // remained empty.
+        let mut plan = sample_plan();
+        plan.expectations.observation_metrics = (0..4)
+            .map(|i| MetricExpectation {
+                name: format!("metric_{i}"),
+                unit_hint: Some(Unit::new("t").unwrap()),
+                rationale: format!("rationale_{i}"),
+            })
+            .collect();
+        plan.expectations.event_types = (0..3)
+            .map(|i| EventTypeExpectation {
+                event_type: EventType::new(&format!("event_{i}")).unwrap(),
+                rationale: format!("rationale_{i}"),
+            })
+            .collect();
+        plan.expectations.entity_kinds = (0..2)
+            .map(|i| EntityKindExpectation {
+                kind: format!("entity_{i}"),
+                exemplars: vec![EntityId::new(&format!("entity:{i}")).unwrap()],
+                rationale: format!("rationale_{i}"),
+            })
+            .collect();
+        // relation_kinds left as 1 from sample_plan.
+        let targets = build_target_expectations(&plan, MAX_AUTHORS_PER_NOMINATION);
+        assert_eq!(targets.len(), 6);
+        assert_eq!(targets[0], ExpectationRef::ObservationMetric { index: 0 });
+        assert_eq!(targets[1], ExpectationRef::EventType { index: 0 });
+        assert_eq!(targets[2], ExpectationRef::EntityKind { index: 0 });
+        assert_eq!(targets[3], ExpectationRef::RelationKind { index: 0 });
+        assert_eq!(targets[4], ExpectationRef::ObservationMetric { index: 1 });
+        assert_eq!(targets[5], ExpectationRef::EventType { index: 1 });
+    }
+
+    #[test]
+    fn build_target_expectations_empty_plan_yields_empty_adr_0018() {
+        // Empty plan → empty target list, and the round-robin's
+        // any-progress sentinel terminates cleanly without spinning.
         let mut plan = sample_plan();
         plan.expectations.observation_metrics.clear();
         plan.expectations.event_types.clear();
         plan.expectations.entity_kinds.clear();
         plan.expectations.relation_kinds.clear();
-        let targets = build_target_expectations(&plan, 4);
+        let targets = build_target_expectations(&plan, MAX_AUTHORS_PER_NOMINATION);
         assert!(targets.is_empty());
     }
 
     #[test]
-    fn build_target_expectations_excludes_document_source_bucket_session_47() {
+    fn build_target_expectations_excludes_document_source_bucket_adr_0018() {
         // The plan's document_sources is the nominations vec itself.
         // A recipe targeting document_source[i] would be a source
         // authoring a record about itself — circular. Confirm the
-        // helper never returns that bucket.
+        // helper never returns that bucket even with a generous cap.
         let plan = sample_plan();
         let targets = build_target_expectations(&plan, 100);
         for t in &targets {

@@ -167,17 +167,17 @@
   </header>
 
   <!--
-    Session 60 — aspirational-note pass (D). Five of six tiles will
-    never light up under the current executor: `build_target_expectations`
-    concatenates buckets metrics-first and truncates at
-    MAX_AUTHORS_PER_NOMINATION=4, and the closed extraction vocabulary
-    allows only one extracted leaf per binding. Both gates have proposed
-    ADRs (0018 bucket-fair dispatch; 0019 per-field extraction sub-specs)
-    deferred to Session 61.
-
-    The note moves the honesty from the layout (dimmed tiles reading
-    as "empty") to the prose ("never tried" is the actual state).
-    Removed once the gates land and the typed panels become populatable.
+    Session 60 — aspirational-note pass (D). Session 61 landed both
+    gates (ADR 0018 bucket-fair dispatch raised the per-nomination cap
+    to 6 and switched to round-robin order; ADR 0019 Phase 2A added
+    `extracted_inner` FieldMaps for css_select and json_path). The
+    note now reflects the structural-readiness state: dimmed tiles
+    mean "the gates are open, but a recipe hasn't authored against
+    that bucket on this plan yet" rather than "tried and empty" or
+    "structurally unreachable." Removed once the typed panels have
+    at least one record each — at which point `pendingTypes.length`
+    falls to 0 by definition and the pill row takes over the
+    "not-yet-populated" surface.
 
     Rendered only when at least one record exists for the plan, so the
     pre-fetch and true-empty cases don't carry an explanation for an
@@ -185,11 +185,13 @@
   -->
   {#if totalRecords > 0 && pendingTypes.length === 0}
     <p class="aspirational-note" aria-label="pending typed panels">
-      Events, Entities, Relations, Documents, and Assertions become
-      populatable once the executor's bucket-fair dispatch and per-field
-      extraction land — see <code>docs/adr/0018</code> and
-      <code>docs/adr/0019</code> (Session 61). Dimmed tiles above mean
-      "not yet tried," not "tried and empty."
+      Events, Entities, Relations, Documents, and Assertions are
+      structurally reachable from Session 61 onward (ADR 0018
+      bucket-fair dispatch + ADR 0019 per-field extraction sub-specs).
+      Dimmed tiles above mean "the gates are open but this plan
+      hasn't authored a recipe against that bucket yet," not
+      "tried and empty." The pill row below surfaces buckets where
+      a record landed.
     </p>
   {/if}
 
@@ -396,14 +398,10 @@
     line-height: 1.6;
     color: var(--fg-tertiary);
   }
-  .aspirational-note code {
-    font-family: var(--font-mono);
-    font-size: 10px;
-    color: var(--fg-secondary);
-    background: var(--bg-panel-alt);
-    padding: 0 4px;
-    border-radius: 2px;
-  }
+  /* Session 61: the v1.0 note's `<code>` rule for inline ADR
+     references was removed when the prose stopped quoting ADR file
+     paths; the gates landed so the note no longer needs to point at
+     unmerged ADRs. */
 
   /* ---- True-empty hint ---- */
 

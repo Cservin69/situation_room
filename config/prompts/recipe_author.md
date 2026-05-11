@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.18
+# Recipe Author Prompt — v1.19
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -257,6 +257,141 @@ Treating "the page contains the figure somewhere" as license to
 author a coarse selector produces a recipe that will be declined
 at authoring time by the shape validator. Pick the leaf whose
 text is the value the binding will store.
+
+## Multi-leaf records — when one row carries several fields
+
+Most recipes bind one extracted scalar to one field of the record
+(`extraction` → `headline`, or `extraction` → `value`). The other
+fields are either constants the recipe-author knows (`literal`) or
+values the session's plan already declares (`from_plan`). The
+single-leaf shape works when each row of the source carries the
+one thing the record needs and everything else is constant —
+news cards (headline only), single-number tables (value only).
+
+Some sources carry **multiple per-row fields** the record needs
+extracted at the same time:
+
+- An events listing where each row has a *headline* and a *date*
+  and the record's content type asks for both.
+- A relations listing where each row has a *from-entity* slug and
+  a *to-entity* slug and the record asks for both.
+- A papers listing where each row has a *title* and an *arxiv-id*
+  and the record asks for both.
+
+For these cases use `extracted_inner` — a per-FieldMap extraction
+sub-spec evaluated against the same per-match scope the binding's
+outer extraction operates on. Each `ExtractedInner` FieldMap
+extracts its own leaf from the same row.
+
+**The shape.** Replace the legacy `{"kind": "extracted"}` source
+with `{"kind": "extracted_inner", "spec": <ExtractionSpec>}` for
+each field that needs its own per-row leaf. The `spec` is the same
+five-mode closed vocabulary as the recipe's outer `extraction` —
+no new modes, no new vocabulary.
+
+**Mode congruence.** The `spec.mode` of every `extracted_inner`
+must equal the recipe's outer `extraction.mode`. CSS pairs with
+CSS, JSONPath with JSONPath. A `css_select` inner inside a
+`json_path` outer is rejected for the same reason an iterator's
+inner-extraction mode must match its iterator-mode — the per-match
+scope is mode-specific.
+
+**One shape per binding.** A binding either uses the legacy
+single-scalar `extracted` source (with literals/plan vars for the
+rest) **or** N `extracted_inner` sub-specs (with literals/plan
+vars for the rest). Mixing `extracted` and `extracted_inner` in
+one binding is rejected — the runtime needs to commit to one
+shape per binding, and the prompt's contract here is one shape
+per binding.
+
+**At least one extraction per binding.** Every binding must read
+at least one field from the source (one `extracted` or one
+`extracted_inner` FieldMap, minimum). A binding with all-`literal`
+or all-`from_plan` FieldMaps would emit a constant record on every
+fetch — that shape belongs at the recipe level as `static_payload`,
+not as a binding.
+
+**Phase 2A coverage.** The runtime currently implements
+`extracted_inner` for `css_select` and `json_path` outer modes.
+For `csv_cell`, `pdf_table`, and `regex_capture` the runtime
+declines `extracted_inner` at authoring time. If you reach for
+multi-leaf on a CSV / PDF / regex source, use the legacy single-
+leaf shape (one `extracted` FieldMap, the rest literals/plan
+vars) or decline.
+
+### Worked example — multi-leaf relations from an ownership-table listing
+
+A listing where each row has a from-entity, a to-entity, and a
+relation kind in a regulatory filing's ownership annex. The plan
+asks for relations of kind `operator_of`.
+
+```json
+{
+  "extraction": { "mode": "css_select", "selector": "td.from-slug" },
+  "iterator":   { "mode": "css_select", "selector": "tr.ownership-row" },
+  "produces": [{
+    "expectation": { "list": "relation_kind", "index": 0 },
+    "record_type": "relation",
+    "dedup_key_field": "from",
+    "field_mappings": [
+      { "path": "kind", "source": { "kind": "literal", "value": "operator_of" } },
+      { "path": "from",
+        "source": { "kind": "extracted_inner",
+                    "spec": { "mode": "css_select", "selector": "td.from-slug" } } },
+      { "path": "to",
+        "source": { "kind": "extracted_inner",
+                    "spec": { "mode": "css_select", "selector": "td.to-slug" } } }
+    ]
+  }]
+}
+```
+
+Per iterator match (each `tr.ownership-row`), the runtime
+evaluates both inner sub-selectors against that row's sub-tree.
+The recipe produces N Relation records, each with the literal
+`kind`, a per-row `from`, and a per-row `to`. The legacy single-
+scalar `extraction` field is required structurally (Phase 2A
+keeps the recipe's outer extraction non-optional) but its leaf
+value is not used by the bindings — the mutual-exclusion rule
+forbids mixing `extracted` and `extracted_inner` in one binding.
+
+### Worked example — multi-leaf events from a JSON listing API
+
+A JSON API returning an array of newsroom items, each carrying a
+headline string and a direction tag drawn from the closed
+`direction` enum (`supply_positive`, `supply_negative`,
+`demand_positive`, `demand_negative`, `context`).
+
+```json
+{
+  "extraction": { "mode": "json_path", "path": "$.headline" },
+  "iterator":   { "mode": "json_path", "path": "$.items[*]" },
+  "produces": [{
+    "expectation": { "list": "event_type", "index": 0 },
+    "record_type": "event",
+    "dedup_key_field": "headline",
+    "field_mappings": [
+      { "path": "event_type", "source": { "kind": "literal", "value": "milestone_announced" } },
+      { "path": "headline",
+        "source": { "kind": "extracted_inner",
+                    "spec": { "mode": "json_path", "path": "$.headline" } } },
+      { "path": "direction",
+        "source": { "kind": "extracted_inner",
+                    "spec": { "mode": "json_path", "path": "$.direction_tag" } } }
+    ]
+  }]
+}
+```
+
+Per iterator match (each element of the `$.items[*]` array), the
+runtime evaluates both inner JSONPath sub-specs against that
+element. One Event record per entry, each with the per-entry
+`headline` and its per-entry `direction`. Note: `direction` is a
+closed-enum field, so this shape is only honest when the source
+publishes one of the five enum values verbatim. If the source
+publishes a free-form prose tag instead, use `{"kind": "literal",
+"value": "<one of the allowed values>"}` for the `direction`
+field and fall back to single-leaf extraction for `headline`.
 
 ## When no recipe is honestly possible — the decline path
 
@@ -1481,9 +1616,33 @@ or pick a narrower listing endpoint.
   listing produces N duplicate records — the runtime has no per-
   record natural key to dedupe by. The `dedup_key_field` must
   name one of the binding's own `field_mappings` paths and that
-  field's source must be `extracted` (constant sources collapse
-  N records to 1 distinct key). See "Iterating over listings"
-  above.
+  field's source must be `extracted` or `extracted_inner`
+  (constant sources collapse N records to 1 distinct key). See
+  "Iterating over listings" above.
+- Do not pair an `extracted_inner` sub-spec mode with a different
+  outer extraction mode. The sub-spec's `spec.mode` must equal
+  the recipe's outer `extraction.mode`. CSS pairs with CSS,
+  JSONPath with JSONPath. See "Multi-leaf records" above; the
+  validator rejects cross-mode pairings.
+- Do not mix `extracted` and `extracted_inner` in one binding's
+  field_mappings. A binding commits to one shape: either the
+  legacy single-scalar `extracted` (with the rest as literals /
+  plan vars) or N `extracted_inner` sub-specs (with the rest as
+  literals / plan vars). Mixing the two creates an ambiguity the
+  runtime cannot resolve and the validator rejects.
+- Do not author an `extracted_inner` sub-spec in `csv_cell`,
+  `pdf_table`, or `regex_capture` modes. Phase 2A's runtime
+  supports `extracted_inner` for `css_select` and `json_path`
+  only; the other three modes defer to Phase 2B. On a CSV / PDF
+  / regex source whose row carries multiple fields, use the
+  legacy single-leaf shape (one `extracted` FieldMap, the rest
+  literals / plan vars) or decline.
+- Do not author a binding whose `field_mappings` are all
+  `literal` or `from_plan` — i.e. no field reads the fetched
+  bytes at all. That shape would emit a constant record on every
+  fetch; the place for "constant records under this URL" is
+  `static_payload` at the recipe level, not the binding level.
+  The validator rejects all-constant bindings.
 
 ## One-shot, no follow-up
 
@@ -1495,6 +1654,26 @@ you pick.
 ---
 
 ### Changelog
+
+- **v1.19** (2026-05-11) — Session 61, ADR 0019 Phase 2A. The
+  recipe-author output now supports `extracted_inner` as a fourth
+  `FieldValueSource` variant alongside `extracted`, `literal`, and
+  `from_plan`. Multi-leaf records — events with headline + date,
+  relations with from + to, papers with title + abstract — become
+  authorable from listings where each row carries several fields
+  the record needs. Two new prompt sections (one in the body, one
+  in "What NOT to produce") guide the LLM to the new shape and
+  flag the four new validator rules: mode congruence between
+  inner and outer, Extracted-and-ExtractedInner mutual exclusion
+  per binding, at-least-one-extraction per binding,
+  Phase-2A-runtime-supports-css_select-and-json_path-only.
+  Companion to ADR 0018 (target-bucket fairness, Session 61):
+  the executor now dispatches to event_type / entity_kind /
+  relation_kind expectations, and the recipe-author now has the
+  expressive power to author against them. Together the two ADRs
+  open the path from plan to records for the five non-Observation
+  typed panels; the dashboard's pill row populates from this
+  session forward.
 
 - **v1.18** (2026-05-10) — Session 55 Patch 4 (sub-pieces 4A + 4B
   + 4C + 4D + 4E). No output contract change; no schema change.

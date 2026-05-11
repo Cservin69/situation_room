@@ -43,6 +43,8 @@
 //! Errors identify the stage that failed so production logs point at
 //! the right piece of the recipe. No stage silently degrades.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
 use jsonpath_rust::JsonPath;
@@ -275,24 +277,150 @@ pub fn apply(ctx: ApplyContext<'_>) -> Result<Vec<Record>, ApplyError> {
 }
 
 /// Pre-Session-38 scalar contract: one extract, one record per
-/// binding. Behaviour unchanged from prior sessions.
+/// binding. ADR 0019 Phase 2A extends this with the
+/// **scalar + multi-leaf** case — a scalar recipe (no iterator)
+/// whose binding uses `FieldValueSource::ExtractedInner` for several
+/// fields. The runtime resolves the inner sub-specs against the
+/// outer extraction's scope: for `css_select` against the first
+/// element matching the outer selector; for `json_path` against the
+/// first value resolved by the outer path. csv_cell / pdf_table /
+/// regex_capture outer modes are rejected at the validator (ADR 0019
+/// rule iv); reaching them here would mean a hand-edited recipe.
 fn apply_scalar(ctx: ApplyContext<'_>) -> Result<Vec<Record>, ApplyError> {
-    // 1. Extract a single scalar value from the bytes.
+    // 1. Extract a single scalar value from the bytes. This populates
+    //    the legacy `Extracted`-source FieldMaps; multi-leaf bindings
+    //    don't read it.
     let extracted = extract(&ctx.recipe.extraction, ctx.bytes)?;
 
-    // 2. For each binding, build one record. Scalar-mode records
+    // 2. Detect whether any binding uses ExtractedInner. If so, we
+    //    must resolve a per-binding scope so inner sub-specs can run
+    //    against it. The detection is cheap (a single pass over the
+    //    bindings); doing it once up-front lets the legacy single-
+    //    scalar path keep its zero-allocation contract.
+    let any_inner = ctx.recipe.produces.iter().any(|b| {
+        b.field_mappings
+            .iter()
+            .any(|fm| matches!(fm.source, FieldValueSource::ExtractedInner { .. }))
+    });
+
+    // 3. Compute the inner-extractions map per binding once (scalar
+    //    mode produces one record per binding, so the "match scope"
+    //    is shared across bindings — the document/JSON root scoped to
+    //    the outer extraction's first hit).
+    let inner_by_binding: Option<Vec<Option<HashMap<String, String>>>> = if any_inner {
+        Some(scalar_inner_extractions(&ctx)?)
+    } else {
+        None
+    };
+
+    // 4. For each binding, build one record. Scalar-mode records
     //    carry `dedup_key: None` — the pre-Session-38 contract,
     //    documented in ADR 0016 §Carry-forward dependencies. A
     //    future session may backfill scalar dedup keys; iteration
     //    is not the place to clean it up universally.
     let mut records = Vec::with_capacity(ctx.recipe.produces.len());
     for (idx, binding) in ctx.recipe.produces.iter().enumerate() {
-        let record = build_record(binding, idx, &extracted, &ctx, None)
+        let inner = inner_by_binding.as_ref().and_then(|v| v[idx].as_ref());
+        let record = build_record(binding, idx, &extracted, inner, &ctx, None)
             .and_then(|r| crate::normalize::finalize(r, ctx.plan, ctx.recipe))?;
         records.push(record);
     }
 
     Ok(records)
+}
+
+/// ADR 0019 Phase 2A scalar+multi-leaf scope resolution.
+///
+/// For css_select outer: the scope is the first element matching the
+/// outer selector. Inner sub-selectors then run within that element's
+/// sub-tree (`ElementRef::select`).
+///
+/// For json_path outer: the scope is the first non-null value
+/// resolved by the outer path. Inner sub-paths then run against that
+/// value.
+///
+/// Returns a vector of optional inner-extraction maps, one slot per
+/// binding (same index as `ctx.recipe.produces`). A `None` slot means
+/// the binding has no ExtractedInner FieldMaps and the legacy single-
+/// scalar path applies.
+fn scalar_inner_extractions(
+    ctx: &ApplyContext<'_>,
+) -> Result<Vec<Option<HashMap<String, String>>>, ApplyError> {
+    match &ctx.recipe.extraction {
+        ExtractionSpec::CssSelect { selector, .. } => {
+            let html_str =
+                std::str::from_utf8(ctx.bytes).map_err(|e| ApplyError::Extraction {
+                    mode: "css_select",
+                    reason: format!("bytes were not UTF-8: {e}"),
+                })?;
+            let doc = Html::parse_document(html_str);
+            let outer_sel = Selector::parse(selector).map_err(|e| ApplyError::Extraction {
+                mode: "css_select",
+                reason: format!(
+                    "outer selector did not parse (scalar+multi-leaf scope): {e}"
+                ),
+            })?;
+            let scope = doc.select(&outer_sel).next().ok_or_else(|| {
+                ApplyError::Extraction {
+                    mode: "css_select",
+                    reason: format!(
+                        "outer selector {selector:?} matched no elements; \
+                         scalar+multi-leaf bindings need an outer scope \
+                         (ADR 0019 §\"Semantics, by recipe shape\")"
+                    ),
+                }
+            })?;
+            ctx.recipe
+                .produces
+                .iter()
+                .map(|b| compute_inner_extractions_css(scope, b))
+                .collect()
+        }
+        ExtractionSpec::JsonPath { path } => {
+            let value: Value =
+                serde_json::from_slice(ctx.bytes).map_err(|e| ApplyError::Extraction {
+                    mode: "json_path",
+                    reason: format!("bytes did not parse as JSON: {e}"),
+                })?;
+            let nodes: Vec<&Value> = value.query(path).map_err(|e| ApplyError::Extraction {
+                mode: "json_path",
+                reason: format!("outer path query failed: {e}"),
+            })?;
+            let scope = nodes
+                .iter()
+                .find(|n| !matches!(n, Value::Null))
+                .copied()
+                .ok_or_else(|| ApplyError::Extraction {
+                    mode: "json_path",
+                    reason: format!(
+                        "outer path {path:?} matched no non-null nodes; \
+                         scalar+multi-leaf bindings need an outer scope \
+                         (ADR 0019 §\"Semantics, by recipe shape\")"
+                    ),
+                })?;
+            ctx.recipe
+                .produces
+                .iter()
+                .map(|b| compute_inner_extractions_json(scope, b))
+                .collect()
+        }
+        other => {
+            // Validator rule (iv) blocks ExtractedInner in non-CSS/
+            // non-JSON outer modes; reaching here means a hand-edit
+            // or pre-validation legacy. Phase 2B will extend this.
+            Err(ApplyError::NotImplemented {
+                mode: "extracted_inner",
+                reason: format!(
+                    "scalar+multi-leaf bindings under outer mode {} are \
+                     not implemented in Phase 2A; supported outer modes \
+                     are css_select and json_path (ADR 0019 §\"Two-phase \
+                     rollout\"). csv_cell / pdf_table / regex_capture \
+                     defer to Phase 2B.",
+                    mode_name(other),
+                ),
+            })
+        }
+    }
 }
 
 /// ADR 0016 iterator path. Evaluate the iterator against the bytes
@@ -328,6 +456,14 @@ fn apply_iterator(
             inner_selector,
             inner_attribute.as_deref(),
         ),
+        (
+            ExtractionSpec::JsonPath {
+                path: iter_path,
+            },
+            ExtractionSpec::JsonPath {
+                path: inner_path,
+            },
+        ) => apply_json_iterator(ctx, iter_path, inner_path),
         (iter_other, inner_other) => {
             // The validator should reject these at authoring time;
             // surfacing here means a hand-edit or a Phase-2-shaped
@@ -339,10 +475,12 @@ fn apply_iterator(
                 mode: "iterator",
                 reason: format!(
                     "iterator runtime is wired for css_select × css_select \
-                     only in Phase 1 (ADR 0016). Got iter={iter_name}, \
-                     inner={inner_name}. Other modes are tracked for Phase 2; \
-                     until then, recipes against listing-shaped sources of \
-                     other modes should decline at authoring time."
+                     (ADR 0016 Phase 1) and json_path × json_path (ADR 0019 \
+                     Phase 2A). Got iter={iter_name}, inner={inner_name}. \
+                     Other modes (csv_cell, pdf_table, regex_capture) are \
+                     tracked for Phase 2B; until then, recipes against \
+                     listing-shaped sources of those modes should decline \
+                     at authoring time."
                 ),
             })
         }
@@ -439,23 +577,327 @@ fn apply_css_iterator(
         // against the whole document. Take the first match within
         // scope — Phase 1's single-extracted-field-per-match
         // contract.
+        //
+        // For multi-leaf bindings (ADR 0019 Phase 2A) the
+        // `extracted` value is unused at the FieldMap level, but
+        // we still run the outer inner-selector so dedup_key_field
+        // resolution and shape-validator parity remain stable, and
+        // so legacy bindings with `FieldValueSource::Extracted` in
+        // a recipe that also has ExtractedInner-bearing siblings
+        // continue to see a value. The validator's mutual-exclusion
+        // rule keeps these populations from intermingling within
+        // one binding, so the same extracted scalar can be passed
+        // to every binding without ambiguity.
         let extracted = extract_css_within(*matched, &inner_sel, inner_attribute)?;
 
         for (idx, binding) in ctx.recipe.produces.iter().enumerate() {
+            // ADR 0019 Phase 2A: pre-compute inner extractions for
+            // this (binding, match) pair. Returns `None` when the
+            // binding uses no ExtractedInner FieldMaps; in that case
+            // the build path is the legacy single-scalar contract.
+            let inner_extractions = compute_inner_extractions_css(*matched, binding)
+                .map_err(|e| match e {
+                    ApplyError::Extraction { mode, reason } => ApplyError::Extraction {
+                        mode,
+                        reason: format!("binding[{idx}] ExtractedInner: {reason}"),
+                    },
+                    other => other,
+                })?;
+
             // Resolve the dedup_key_field's value from the just-
-            // -extracted scalar. The validator guaranteed
-            // `dedup_key_field` is present and references a path
-            // in `field_mappings`; we re-read the binding here
-            // because that resolution is per-record and depends on
-            // the per-match `extracted` value.
-            let dedup_key = compute_dedup_key(binding, &extracted, ctx.recipe)?;
-            let record = build_record(binding, idx, &extracted, &ctx, Some(dedup_key))
-                .and_then(|r| crate::normalize::finalize(r, ctx.plan, ctx.recipe))?;
+            // -extracted scalar (or the inner-extractions map, if
+            // the dedup_key_field's source is ExtractedInner). The
+            // validator guaranteed `dedup_key_field` is present and
+            // references a path in `field_mappings`; we re-read the
+            // binding here because that resolution is per-record
+            // and depends on the per-match `extracted` value.
+            let dedup_key = compute_dedup_key(
+                binding,
+                &extracted,
+                inner_extractions.as_ref(),
+                ctx.recipe,
+            )?;
+            let record = build_record(
+                binding,
+                idx,
+                &extracted,
+                inner_extractions.as_ref(),
+                &ctx,
+                Some(dedup_key),
+            )
+            .and_then(|r| crate::normalize::finalize(r, ctx.plan, ctx.recipe))?;
             records.push(record);
         }
     }
 
     Ok(records)
+}
+
+/// ADR 0019 Phase 2A: pre-compute inner extractions for a CSS-mode
+/// binding against a per-match DOM scope.
+///
+/// Returns `None` when the binding has no `FieldValueSource::ExtractedInner`
+/// FieldMaps — the legacy single-scalar path is unchanged in that case
+/// and we avoid the allocation. Returns `Some(map)` otherwise, with
+/// one entry per `ExtractedInner` FieldMap, keyed by FieldMap path.
+///
+/// The inner sub-spec's mode is guaranteed `css_select` by the
+/// validator's mode-congruence rule (ADR 0019 rule (i)); the runtime
+/// surfaces a `NotImplemented` error for other modes as a belt-and-
+/// braces guard against hand-edits.
+fn compute_inner_extractions_css(
+    scope: scraper::ElementRef<'_>,
+    binding: &ProductionBinding,
+) -> Result<Option<HashMap<String, String>>, ApplyError> {
+    let needs_inner = binding
+        .field_mappings
+        .iter()
+        .any(|fm| matches!(fm.source, FieldValueSource::ExtractedInner { .. }));
+    if !needs_inner {
+        return Ok(None);
+    }
+
+    let mut out: HashMap<String, String> = HashMap::new();
+    for fm in &binding.field_mappings {
+        let spec = match &fm.source {
+            FieldValueSource::ExtractedInner { spec } => spec,
+            _ => continue,
+        };
+        let leaf = match spec {
+            ExtractionSpec::CssSelect {
+                selector,
+                attribute,
+            } => {
+                let sel = Selector::parse(selector).map_err(|e| ApplyError::Extraction {
+                    mode: "css_select",
+                    reason: format!(
+                        "FieldMap {:?} inner selector {selector:?} did not parse: {e}",
+                        fm.path
+                    ),
+                })?;
+                extract_css_within(scope, &sel, attribute.as_deref()).map_err(|e| {
+                    // Wrap the underlying error with the FieldMap path so
+                    // multi-field decline messages name which leaf failed.
+                    match e {
+                        ApplyError::Extraction { mode, reason } => ApplyError::Extraction {
+                            mode,
+                            reason: format!("FieldMap {:?}: {reason}", fm.path),
+                        },
+                        other => other,
+                    }
+                })?
+            }
+            other => {
+                return Err(ApplyError::NotImplemented {
+                    mode: "extracted_inner",
+                    reason: format!(
+                        "FieldMap {:?}: ExtractedInner sub-spec mode {} is not \
+                         supported in Phase 2A inside a css_select scope. The \
+                         validator should have rejected this at authoring time \
+                         (ADR 0019 rule (iv)); the row may be a hand-edit or \
+                         pre-validation legacy.",
+                        fm.path,
+                        mode_name(other),
+                    ),
+                });
+            }
+        };
+        out.insert(fm.path.clone(), leaf);
+    }
+    Ok(Some(out))
+}
+
+/// ADR 0019 Phase 2A: pre-compute inner extractions for a JSON-mode
+/// binding against a per-match JSON value scope.
+///
+/// Same shape as [`compute_inner_extractions_css`] but for JSONPath
+/// inner sub-specs evaluated against a scoped JSON value (e.g. one
+/// element of an array the iterator yielded).
+fn compute_inner_extractions_json(
+    scope: &Value,
+    binding: &ProductionBinding,
+) -> Result<Option<HashMap<String, String>>, ApplyError> {
+    let needs_inner = binding
+        .field_mappings
+        .iter()
+        .any(|fm| matches!(fm.source, FieldValueSource::ExtractedInner { .. }));
+    if !needs_inner {
+        return Ok(None);
+    }
+
+    let mut out: HashMap<String, String> = HashMap::new();
+    for fm in &binding.field_mappings {
+        let spec = match &fm.source {
+            FieldValueSource::ExtractedInner { spec } => spec,
+            _ => continue,
+        };
+        let leaf = match spec {
+            ExtractionSpec::JsonPath { path } => {
+                extract_json_within(scope, path).map_err(|e| match e {
+                    ApplyError::Extraction { mode, reason } => ApplyError::Extraction {
+                        mode,
+                        reason: format!("FieldMap {:?}: {reason}", fm.path),
+                    },
+                    other => other,
+                })?
+            }
+            other => {
+                return Err(ApplyError::NotImplemented {
+                    mode: "extracted_inner",
+                    reason: format!(
+                        "FieldMap {:?}: ExtractedInner sub-spec mode {} is not \
+                         supported in Phase 2A inside a json_path scope. The \
+                         validator should have rejected this at authoring time \
+                         (ADR 0019 rule (iv)); the row may be a hand-edit or \
+                         pre-validation legacy.",
+                        fm.path,
+                        mode_name(other),
+                    ),
+                });
+            }
+        };
+        out.insert(fm.path.clone(), leaf);
+    }
+    Ok(Some(out))
+}
+
+/// ADR 0019 Phase 2A: iterate over JSON-pathed matches and apply the
+/// recipe's bindings to each. Mirrors [`apply_css_iterator`] for the
+/// JSON case: the iterator's outer path resolves to an array of
+/// objects (or any sequence of values); per element, the recipe's
+/// `extraction` path resolves to the legacy single-leaf value, and
+/// any `ExtractedInner` FieldMaps resolve via per-FieldMap inner
+/// paths against the same element scope.
+///
+/// The cap [`MAX_RECORDS_PER_RECIPE`] applies to the *number of
+/// matches*. We bound the iterator's output before doing any
+/// per-element work so a runaway listing (a 10 000-element API
+/// response) costs ~one JSON parse plus the cap check, not 10 000
+/// sub-extractions.
+fn apply_json_iterator(
+    ctx: ApplyContext<'_>,
+    iter_path: &str,
+    inner_path: &str,
+) -> Result<Vec<Record>, ApplyError> {
+    let value: Value =
+        serde_json::from_slice(ctx.bytes).map_err(|e| ApplyError::Extraction {
+            mode: "json_path",
+            reason: format!("bytes did not parse as JSON: {e}"),
+        })?;
+
+    // Collect into an owned Vec<Value> so the per-match scopes
+    // outlive the query iterator. jsonpath-rust returns `Vec<&Value>`
+    // and we don't strictly need the clone — but cloning per scope
+    // is cheaper than juggling lifetimes against the per-binding
+    // closures below, and JSON listings are bounded by the cap.
+    let scope_refs: Vec<&Value> =
+        value.query(iter_path).map_err(|e| ApplyError::Extraction {
+            mode: "json_path",
+            reason: format!("iterator path query failed: {e}"),
+        })?;
+
+    if scope_refs.is_empty() {
+        return Err(ApplyError::Extraction {
+            mode: "json_path",
+            reason: format!(
+                "iterator path {iter_path:?} matched no nodes (the source \
+                 may have changed shape, or the path is targeting the \
+                 wrong array)"
+            ),
+        });
+    }
+    if scope_refs.len() > MAX_RECORDS_PER_RECIPE {
+        return Err(ApplyError::Extraction {
+            mode: "json_path",
+            reason: format!(
+                "iterator path {iter_path:?} matched {} elements; cap is \
+                 {} (ADR 0016 §Consequences). Likely cause: the iterator \
+                 path matches too broadly (every value rather than every \
+                 row), or the source is a paginated API whose first page \
+                 already exceeds the cap.",
+                scope_refs.len(),
+                MAX_RECORDS_PER_RECIPE,
+            ),
+        });
+    }
+
+    let mut records = Vec::with_capacity(scope_refs.len() * ctx.recipe.produces.len());
+    for &scope in scope_refs.iter() {
+        // Per-element single-leaf extraction (the legacy path) — used
+        // by bindings whose FieldMaps are `Extracted`. Multi-leaf
+        // bindings ignore this value (validator mutual-exclusion
+        // rule (ii)).
+        let extracted = extract_json_within(scope, inner_path)?;
+
+        for (idx, binding) in ctx.recipe.produces.iter().enumerate() {
+            let inner_extractions = compute_inner_extractions_json(scope, binding)
+                .map_err(|e| match e {
+                    ApplyError::Extraction { mode, reason } => ApplyError::Extraction {
+                        mode,
+                        reason: format!("binding[{idx}] ExtractedInner: {reason}"),
+                    },
+                    other => other,
+                })?;
+            let dedup_key = compute_dedup_key(
+                binding,
+                &extracted,
+                inner_extractions.as_ref(),
+                ctx.recipe,
+            )?;
+            let record = build_record(
+                binding,
+                idx,
+                &extracted,
+                inner_extractions.as_ref(),
+                &ctx,
+                Some(dedup_key),
+            )
+            .and_then(|r| crate::normalize::finalize(r, ctx.plan, ctx.recipe))?;
+            records.push(record);
+        }
+    }
+
+    Ok(records)
+}
+
+/// ADR 0019 Phase 2A: evaluate a JSONPath sub-spec against a scoped
+/// JSON value (one match of the outer query). Mirrors
+/// [`extract_json_path`] for the per-match scope: returns the first
+/// non-null result as a String, preserving the JSON natural
+/// representation (strings unquoted; numbers / bools / objects keep
+/// their JSON form).
+fn extract_json_within(scope: &Value, path: &str) -> Result<String, ApplyError> {
+    let nodes: Vec<&Value> = scope.query(path).map_err(|e| ApplyError::Extraction {
+        mode: "json_path",
+        reason: format!("inner path query failed: {e}"),
+    })?;
+
+    if nodes.is_empty() {
+        return Err(ApplyError::Extraction {
+            mode: "json_path",
+            reason: format!("inner path {path:?} matched no nodes within scope"),
+        });
+    }
+
+    let first_non_null = nodes.iter().find(|n| !matches!(n, Value::Null));
+    let first = match first_non_null {
+        Some(n) => *n,
+        None => {
+            return Err(ApplyError::Extraction {
+                mode: "json_path",
+                reason: format!(
+                    "inner path {path:?} matched {} node(s), all JSON null",
+                    nodes.len()
+                ),
+            });
+        }
+    };
+
+    let out = match first {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    bound_extracted(out, "json_path")
 }
 
 /// Compute a per-record dedup_key for an iterator-produced record.
@@ -485,6 +927,7 @@ fn apply_css_iterator(
 fn compute_dedup_key(
     binding: &ProductionBinding,
     extracted: &str,
+    inner_extractions: Option<&HashMap<String, String>>,
     recipe: &FetchRecipe,
 ) -> Result<String, ApplyError> {
     let field_path = binding.dedup_key_field.as_deref().ok_or_else(|| {
@@ -536,6 +979,30 @@ fn compute_dedup_key(
                      source, or pick a different path."
                 ),
             });
+        }
+        FieldValueSource::ExtractedInner { spec: _ } => {
+            // ADR 0019 Phase 2A. Multi-leaf records typically name an
+            // ExtractedInner FieldMap as their dedup_key source (the
+            // storm name, the article URL, the arXiv id). Look up the
+            // pre-computed per-match leaf in the inner-extractions
+            // map. Missing map / missing entry is a runtime bug —
+            // same diagnostics as `resolve_field_value`.
+            let map = inner_extractions.ok_or_else(|| ApplyError::FieldMapping {
+                reason: format!(
+                    "dedup_key_field {field_path:?} resolves to ExtractedInner \
+                     but the apply path did not thread an inner-extractions \
+                     map. ADR 0019 Phase 2A: iterator + multi-field flows \
+                     must compute inner extractions before dispatch."
+                ),
+            })?;
+            map.get(field_path)
+                .cloned()
+                .ok_or_else(|| ApplyError::FieldMapping {
+                    reason: format!(
+                        "dedup_key_field {field_path:?} resolves to ExtractedInner \
+                         but produced no leaf for this match."
+                    ),
+                })?
         }
     };
 
@@ -1121,6 +1588,7 @@ fn build_record(
     binding: &ProductionBinding,
     index: usize,
     extracted: &str,
+    inner_extractions: Option<&HashMap<String, String>>,
     ctx: &ApplyContext<'_>,
     dedup_key: Option<String>,
 ) -> Result<Record, ApplyError> {
@@ -1130,12 +1598,11 @@ fn build_record(
     // ObservationContent assembly.
     let mut content_json: Map<String, Value> = Map::new();
     for fm in &binding.field_mappings {
-        let value = resolve_field_value(fm, extracted, ctx.plan).map_err(|e| {
-            ApplyError::Binding {
+        let value = resolve_field_value(fm, extracted, ctx.plan, inner_extractions)
+            .map_err(|e| ApplyError::Binding {
                 index,
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
         insert_at_path(&mut content_json, &fm.path, value).map_err(|e| {
             ApplyError::Binding {
                 index,
@@ -1243,10 +1710,18 @@ fn build_record(
 }
 
 /// Resolve one field mapping to a `serde_json::Value`.
+///
+/// `inner_extractions` carries the per-FieldMap inner-extracted leaves
+/// for `ExtractedInner` sources (ADR 0019 Phase 2A). The map is keyed
+/// by FieldMap path. `None` indicates the caller is on the legacy
+/// single-scalar path (no binding in the recipe uses ExtractedInner),
+/// in which case an ExtractedInner FieldMap is an error: the validator
+/// should have rejected such a recipe before it reached apply.
 fn resolve_field_value(
     fm: &FieldMap,
     extracted: &str,
     plan: &ResearchPlan,
+    inner_extractions: Option<&HashMap<String, String>>,
 ) -> Result<Value, ApplyError> {
     match &fm.source {
         FieldValueSource::Extracted => {
@@ -1277,6 +1752,35 @@ fn resolve_field_value(
             walk_pointer(&plan_json, pointer).ok_or_else(|| ApplyError::FieldMapping {
                 reason: format!("from_plan pointer {pointer:?} resolved to nothing"),
             })
+        }
+        FieldValueSource::ExtractedInner { spec: _ } => {
+            // ADR 0019 Phase 2A. The inner-extraction map is computed
+            // upstream once per (binding, match) pair and threaded
+            // through. The map lookup uses the FieldMap's `path` —
+            // the same handle the validator's mutual-exclusion check
+            // operates on. Missing entries are a runtime bug
+            // (compute_inner_extractions failed to populate, or the
+            // caller forgot to thread the map) and surface as
+            // FieldMapping errors.
+            let map = inner_extractions.ok_or_else(|| ApplyError::FieldMapping {
+                reason: format!(
+                    "FieldMap {:?} has ExtractedInner source but the apply \
+                     path did not thread an inner-extractions map. This is \
+                     a runtime bug; the validator should have ensured \
+                     either the iterator or scalar+multi-field code path \
+                     ran (ADR 0019 Phase 2A).",
+                    fm.path
+                ),
+            })?;
+            let leaf = map.get(&fm.path).ok_or_else(|| ApplyError::FieldMapping {
+                reason: format!(
+                    "ExtractedInner FieldMap {:?} produced no leaf for this \
+                     match. The inner sub-spec ran but did not populate the \
+                     per-match map — this is a runtime bug.",
+                    fm.path
+                ),
+            })?;
+            Ok(parse_extracted_scalar(leaf))
         }
     }
 }
@@ -1849,89 +2353,6 @@ pub(crate) fn validate_recipe_shape_against_bytes(
     // useful shape work to do — the bytes never reach build_record.
     validate_recipe_against_bytes(recipe, bytes)?;
 
-    // Acquire one representative extracted scalar — the same one
-    // build_record would see at apply time. For scalar recipes this
-    // is the recipe's single extraction output. For iterator
-    // recipes (Phase 1: css_select × css_select only) it is the
-    // inner extraction's value within the first outer match that
-    // had an inner hit. This mirrors the runtime's per-record
-    // build_record contract; if that record's shape type-checks
-    // into the binding's content type, every subsequent record on
-    // the same page would too.
-    let extracted = match &recipe.iterator {
-        None => extract(&recipe.extraction, bytes)?,
-        Some(iter_spec) => match (iter_spec, &recipe.extraction) {
-            (
-                ExtractionSpec::CssSelect {
-                    selector: iter_selector,
-                    attribute: _,
-                },
-                ExtractionSpec::CssSelect {
-                    selector: inner_selector,
-                    attribute: inner_attribute,
-                },
-            ) => {
-                let html_str =
-                    std::str::from_utf8(bytes).map_err(|e| ApplyError::Extraction {
-                        mode: "css_select",
-                        reason: format!("bytes were not UTF-8: {e}"),
-                    })?;
-                let doc = Html::parse_document(html_str);
-
-                let iter_sel = Selector::parse(iter_selector).map_err(|e| {
-                    ApplyError::Extraction {
-                        mode: "css_select",
-                        reason: format!("iterator selector did not parse: {e}"),
-                    }
-                })?;
-                let inner_sel = Selector::parse(inner_selector).map_err(|e| {
-                    ApplyError::Extraction {
-                        mode: "css_select",
-                        reason: format!("inner selector did not parse: {e}"),
-                    }
-                })?;
-
-                // Walk outer matches until we find one that yields an
-                // inner hit. The structural validator already proved
-                // that at least one such match exists, but we can't
-                // hand its `ElementRef` across function boundaries
-                // without a separate borrow scope, so re-discover it
-                // here. Cost is one parse and at most O(outer)
-                // selector-runs — bounded by the source page size.
-                let mut representative: Option<String> = None;
-                for matched in doc.select(&iter_sel) {
-                    if matched.select(&inner_sel).next().is_some() {
-                        representative = Some(extract_css_within(
-                            matched,
-                            &inner_sel,
-                            inner_attribute.as_deref(),
-                        )?);
-                        break;
-                    }
-                }
-                representative.ok_or_else(|| ApplyError::Extraction {
-                    mode: "css_select",
-                    reason: "iterator validator agreed inner matches but \
-                             shape validator could not re-locate the \
-                             match — bytes mutated under us"
-                        .into(),
-                })?
-            }
-            _ => {
-                // Other iterator pairings are caught by the structural
-                // validator above; reaching this branch means a Phase
-                // 2 mode landed without updating this function.
-                return Err(ApplyError::NotImplemented {
-                    mode: "iterator",
-                    reason: "shape validator only mirrors Phase 1 \
-                             (css_select × css_select) iterator pairings; \
-                             extend when Phase 2 lands"
-                        .into(),
-                });
-            }
-        },
-    };
-
     // The same ApplyContext build_record would see. `fetched_at` is
     // synthetic — shape validation does not depend on the timestamp;
     // we pass `Utc::now()` so the constructed Envelope is well-formed
@@ -1944,23 +2365,261 @@ pub(crate) fn validate_recipe_shape_against_bytes(
         fetched_at: Utc::now(),
     };
 
-    // Build one record per binding. The dedup_key is computed from
-    // the binding's `dedup_key_field` for iterator recipes; for the
-    // shape-only check we pass a synthetic value because `build_record`
-    // is the consumer of the extracted scalar, and the dedup_key is
-    // a downstream concern that does not affect content-type
-    // serialization (the runtime stamps it onto the record envelope
-    // *after* the content has type-checked).
+    // The dedup_key on a shape-validation record is synthetic — the
+    // shape check is content-type-only; the runtime stamps the real
+    // dedup_key after the content type-checks.
     let dedup_key = match &recipe.iterator {
         None => None,
         Some(_) => Some(format!("shape-validator:{}", recipe.id)),
     };
-    for (idx, binding) in recipe.produces.iter().enumerate() {
-        // Discard the built record — the validator only asks "would
-        // build_record have succeeded?" If it would have, the
-        // binding's content type accepted the assembled JSON; that's
-        // the shape contract.
-        let _ = build_record(binding, idx, &extracted, &ctx, dedup_key.clone())?;
+
+    // Acquire one representative extracted scalar plus, for
+    // ExtractedInner-using bindings, the real per-FieldMap inner
+    // leaves the runtime would see at apply time. Scoping the work
+    // inside one match arm per (iterator-mode, outer-mode) keeps the
+    // borrow of the parsed document / JSON local — `scraper::ElementRef`
+    // and `&serde_json::Value` borrow from the parse output, so we
+    // build records inline within the borrow scope.
+    //
+    // ADR 0019 Phase 2A: for ExtractedInner-using bindings we run the
+    // inner sub-specs against the same scope the runtime would use:
+    //   - css_select iterator → the first iter match (ElementRef sub-tree).
+    //   - css_select scalar    → the first outer-extraction match.
+    //   - json_path iterator   → the first non-null iter match (JSON value).
+    //   - json_path scalar     → the first non-null outer-extraction match.
+    // The match-arm structure mirrors the runtime's apply dispatch so
+    // shape-validator behaviour and apply-stage behaviour cannot drift.
+    match (&recipe.iterator, &recipe.extraction) {
+        (
+            Some(ExtractionSpec::CssSelect {
+                selector: iter_selector,
+                attribute: _,
+            }),
+            ExtractionSpec::CssSelect {
+                selector: inner_selector,
+                attribute: inner_attribute,
+            },
+        ) => {
+            let html_str =
+                std::str::from_utf8(bytes).map_err(|e| ApplyError::Extraction {
+                    mode: "css_select",
+                    reason: format!("bytes were not UTF-8: {e}"),
+                })?;
+            let doc = Html::parse_document(html_str);
+            let iter_sel = Selector::parse(iter_selector).map_err(|e| {
+                ApplyError::Extraction {
+                    mode: "css_select",
+                    reason: format!("iterator selector did not parse: {e}"),
+                }
+            })?;
+            let inner_sel = Selector::parse(inner_selector).map_err(|e| {
+                ApplyError::Extraction {
+                    mode: "css_select",
+                    reason: format!("inner selector did not parse: {e}"),
+                }
+            })?;
+            let scope = doc
+                .select(&iter_sel)
+                .find(|m| m.select(&inner_sel).next().is_some())
+                .ok_or_else(|| ApplyError::Extraction {
+                    mode: "css_select",
+                    reason: "iterator validator agreed inner matches but \
+                             shape validator could not re-locate the \
+                             match — bytes mutated under us"
+                        .into(),
+                })?;
+            let extracted =
+                extract_css_within(scope, &inner_sel, inner_attribute.as_deref())?;
+            for (idx, binding) in recipe.produces.iter().enumerate() {
+                let inner_extractions = compute_inner_extractions_css(scope, binding)?;
+                let _ = build_record(
+                    binding,
+                    idx,
+                    &extracted,
+                    inner_extractions.as_ref(),
+                    &ctx,
+                    dedup_key.clone(),
+                )?;
+            }
+        }
+        (
+            Some(ExtractionSpec::JsonPath { path: iter_path }),
+            ExtractionSpec::JsonPath { path: inner_path },
+        ) => {
+            let value: Value =
+                serde_json::from_slice(bytes).map_err(|e| ApplyError::Extraction {
+                    mode: "json_path",
+                    reason: format!("bytes did not parse as JSON: {e}"),
+                })?;
+            let scope_refs: Vec<&Value> =
+                value.query(iter_path).map_err(|e| ApplyError::Extraction {
+                    mode: "json_path",
+                    reason: format!("iterator path query failed: {e}"),
+                })?;
+            let scope = scope_refs
+                .iter()
+                .find(|n| !matches!(n, Value::Null))
+                .copied()
+                .ok_or_else(|| ApplyError::Extraction {
+                    mode: "json_path",
+                    reason: format!(
+                        "iterator path {iter_path:?} matched no non-null nodes"
+                    ),
+                })?;
+            let extracted = extract_json_within(scope, inner_path)?;
+            for (idx, binding) in recipe.produces.iter().enumerate() {
+                let inner_extractions = compute_inner_extractions_json(scope, binding)?;
+                let _ = build_record(
+                    binding,
+                    idx,
+                    &extracted,
+                    inner_extractions.as_ref(),
+                    &ctx,
+                    dedup_key.clone(),
+                )?;
+            }
+        }
+        (Some(_), _) => {
+            // Other iterator pairings: caught by the structural
+            // validator above; reaching this branch means a Phase 2B
+            // mode landed without updating this function.
+            return Err(ApplyError::NotImplemented {
+                mode: "iterator",
+                reason: "shape validator handles css_select × css_select \
+                         (ADR 0016 Phase 1) and json_path × json_path \
+                         (ADR 0019 Phase 2A) iterator pairings; other \
+                         modes (csv_cell, pdf_table, regex_capture) \
+                         defer to Phase 2B."
+                    .into(),
+            });
+        }
+        (None, ExtractionSpec::CssSelect { selector, .. }) => {
+            // Scalar CSS — for ExtractedInner FieldMaps, scope is the
+            // first element matching the outer selector. The legacy
+            // single-leaf `extracted` comes from the same outer
+            // selector via `extract`.
+            let extracted = extract(&recipe.extraction, bytes)?;
+            let needs_inner_scope = recipe.produces.iter().any(|b| {
+                b.field_mappings
+                    .iter()
+                    .any(|fm| matches!(fm.source, FieldValueSource::ExtractedInner { .. }))
+            });
+            if needs_inner_scope {
+                let html_str =
+                    std::str::from_utf8(bytes).map_err(|e| ApplyError::Extraction {
+                        mode: "css_select",
+                        reason: format!("bytes were not UTF-8: {e}"),
+                    })?;
+                let doc = Html::parse_document(html_str);
+                let outer_sel = Selector::parse(selector).map_err(|e| {
+                    ApplyError::Extraction {
+                        mode: "css_select",
+                        reason: format!("outer selector did not parse: {e}"),
+                    }
+                })?;
+                let scope = doc.select(&outer_sel).next().ok_or_else(|| {
+                    ApplyError::Extraction {
+                        mode: "css_select",
+                        reason: format!(
+                            "outer selector {selector:?} matched no elements; \
+                             scalar+multi-leaf bindings need an outer scope"
+                        ),
+                    }
+                })?;
+                for (idx, binding) in recipe.produces.iter().enumerate() {
+                    let inner_extractions =
+                        compute_inner_extractions_css(scope, binding)?;
+                    let _ = build_record(
+                        binding,
+                        idx,
+                        &extracted,
+                        inner_extractions.as_ref(),
+                        &ctx,
+                        dedup_key.clone(),
+                    )?;
+                }
+            } else {
+                for (idx, binding) in recipe.produces.iter().enumerate() {
+                    let _ = build_record(
+                        binding,
+                        idx,
+                        &extracted,
+                        None,
+                        &ctx,
+                        dedup_key.clone(),
+                    )?;
+                }
+            }
+        }
+        (None, ExtractionSpec::JsonPath { path }) => {
+            // Scalar JSON — analogue of the scalar CSS branch above.
+            let extracted = extract(&recipe.extraction, bytes)?;
+            let needs_inner_scope = recipe.produces.iter().any(|b| {
+                b.field_mappings
+                    .iter()
+                    .any(|fm| matches!(fm.source, FieldValueSource::ExtractedInner { .. }))
+            });
+            if needs_inner_scope {
+                let value: Value =
+                    serde_json::from_slice(bytes).map_err(|e| ApplyError::Extraction {
+                        mode: "json_path",
+                        reason: format!("bytes did not parse as JSON: {e}"),
+                    })?;
+                let nodes: Vec<&Value> =
+                    value.query(path).map_err(|e| ApplyError::Extraction {
+                        mode: "json_path",
+                        reason: format!("outer path query failed: {e}"),
+                    })?;
+                let scope = nodes
+                    .iter()
+                    .find(|n| !matches!(n, Value::Null))
+                    .copied()
+                    .ok_or_else(|| ApplyError::Extraction {
+                        mode: "json_path",
+                        reason: format!("outer path {path:?} matched no non-null nodes"),
+                    })?;
+                for (idx, binding) in recipe.produces.iter().enumerate() {
+                    let inner_extractions =
+                        compute_inner_extractions_json(scope, binding)?;
+                    let _ = build_record(
+                        binding,
+                        idx,
+                        &extracted,
+                        inner_extractions.as_ref(),
+                        &ctx,
+                        dedup_key.clone(),
+                    )?;
+                }
+            } else {
+                for (idx, binding) in recipe.produces.iter().enumerate() {
+                    let _ = build_record(
+                        binding,
+                        idx,
+                        &extracted,
+                        None,
+                        &ctx,
+                        dedup_key.clone(),
+                    )?;
+                }
+            }
+        }
+        (None, _) => {
+            // Scalar non-CSS, non-JSON extraction (csv_cell, pdf_table,
+            // regex_capture). ExtractedInner is rejected by validator
+            // rule (iv) for these modes, so the legacy single-scalar
+            // path is the only path that reaches here.
+            let extracted = extract(&recipe.extraction, bytes)?;
+            for (idx, binding) in recipe.produces.iter().enumerate() {
+                let _ = build_record(
+                    binding,
+                    idx,
+                    &extracted,
+                    None,
+                    &ctx,
+                    dedup_key.clone(),
+                )?;
+            }
+        }
     }
 
     Ok(())
@@ -3345,6 +4004,281 @@ C 4
                 );
             }
             other => panic!("expected Observation, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR 0019 Phase 2A — ExtractedInner runtime (Session 61)
+    //
+    // Per-field extraction sub-specs let one record carry multiple
+    // extracted leaves (an event with date + headline; a relation
+    // with from + to). The runtime evaluates each inner sub-spec
+    // against the same per-match scope the binding's outer
+    // extraction operates on. These tests pin the css_select
+    // iterator path (the NHC storm-row motivating case) and the
+    // json_path iterator path (the array-of-objects API case).
+    // -----------------------------------------------------------------------
+
+    /// Build a css_select iterator recipe with multi-leaf bindings:
+    /// `headline` and `direction` are extracted via inner sub-selectors;
+    /// `event_type` is literal. Two extracted leaves per record exercise
+    /// the ADR 0019 multi-leaf path. The outer extraction is required
+    /// structurally but is benign — its scalar leaf is unused at the
+    /// FieldMap level because no FieldMap has `FieldValueSource::Extracted`.
+    fn multi_leaf_iterator_event_recipe() -> FetchRecipe {
+        FetchRecipe {
+            id: Uuid::now_v7(),
+            dedup_key: None,
+            plan_id: Uuid::now_v7(),
+            source_id: "nhc".into(),
+            source_url: Url::parse("https://example.com/storms").unwrap(),
+            extraction: ExtractionSpec::CssSelect {
+                selector: "td.storm-name".into(),
+                attribute: None,
+            },
+            iterator: Some(ExtractionSpec::CssSelect {
+                selector: "tr.storm-row".into(),
+                attribute: None,
+            }),
+            produces: vec![ProductionBinding {
+                record_type: RecordType::Event,
+                expectation: ExpectationRef::EventType { index: 0 },
+                field_mappings: vec![
+                    FieldMap {
+                        path: "event_type".into(),
+                        source: FieldValueSource::Literal {
+                            value: json!("milestone_announced"),
+                        },
+                    },
+                    FieldMap {
+                        path: "headline".into(),
+                        source: FieldValueSource::ExtractedInner {
+                            spec: ExtractionSpec::CssSelect {
+                                selector: "td.storm-name".into(),
+                                attribute: None,
+                            },
+                        },
+                    },
+                    FieldMap {
+                        path: "direction".into(),
+                        source: FieldValueSource::ExtractedInner {
+                            spec: ExtractionSpec::CssSelect {
+                                selector: "td.storm-direction".into(),
+                                attribute: None,
+                            },
+                        },
+                    },
+                ],
+                dedup_key_field: Some("headline".into()),
+            }],
+            authored_at: Utc.with_ymd_and_hms(2026, 5, 11, 0, 0, 0).unwrap(),
+            authored_by: "xai".into(),
+            version: 1,
+            static_payload: None,
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
+        }
+    }
+
+    #[test]
+    fn css_iterator_multi_leaf_produces_records_with_multiple_extracted_fields_adr_0019() {
+        // Two storm rows; each row carries a name (`td.storm-name`)
+        // and a direction tag (`td.storm-direction`). Under ADR 0019
+        // the runtime produces two Event records, each with a
+        // distinct headline *and* a distinct direction — both pulled
+        // per-row via ExtractedInner sub-selectors. The direction
+        // value deserialises into `EventDirection` because the
+        // fixture's text matches the snake_case variant names.
+        let html = br#"
+            <html><body><table class="storms">
+              <tr class="storm-row">
+                <td class="storm-name">Hurricane Alpha</td>
+                <td class="storm-direction">supply_negative</td>
+              </tr>
+              <tr class="storm-row">
+                <td class="storm-name">Hurricane Beta</td>
+                <td class="storm-direction">context</td>
+              </tr>
+            </table></body></html>
+        "#;
+        let recipe = multi_leaf_iterator_event_recipe();
+        let p = iterator_plan();
+        let ctx = ApplyContext {
+            recipe: &recipe,
+            plan: &p,
+            bytes: html,
+            fetched_at: fetched_at(),
+        };
+        let records = apply(ctx).expect("multi-leaf iterator must apply");
+        assert_eq!(records.len(), 2, "one record per storm row");
+
+        let mut by_headline: Vec<(&str, Option<&'static str>)> = records
+            .iter()
+            .map(|r| match r {
+                Record::Event(e) => {
+                    let dir_tag = e.content.direction.map(|d| match d {
+                        situation_room_core::schema::content::EventDirection::SupplyNegative => {
+                            "supply_negative"
+                        }
+                        situation_room_core::schema::content::EventDirection::Context => "context",
+                        situation_room_core::schema::content::EventDirection::SupplyPositive => {
+                            "supply_positive"
+                        }
+                        situation_room_core::schema::content::EventDirection::DemandPositive => {
+                            "demand_positive"
+                        }
+                        situation_room_core::schema::content::EventDirection::DemandNegative => {
+                            "demand_negative"
+                        }
+                    });
+                    (e.content.headline.as_str(), dir_tag)
+                }
+                other => panic!("expected Event, got {other:?}"),
+            })
+            .collect();
+        by_headline.sort_by_key(|(h, _)| *h);
+        assert_eq!(by_headline[0].0, "Hurricane Alpha");
+        assert_eq!(by_headline[0].1, Some("supply_negative"));
+        assert_eq!(by_headline[1].0, "Hurricane Beta");
+        assert_eq!(by_headline[1].1, Some("context"));
+
+        // Dedup keys reference the per-row headline (the
+        // dedup_key_field on the binding), resolved via the
+        // ExtractedInner path — confirms compute_dedup_key threads
+        // the inner-extractions map correctly.
+        for rec in &records {
+            let (key, headline) = match rec {
+                Record::Event(e) => (
+                    e.dedup_key.as_ref().expect("dedup_key set"),
+                    e.content.headline.as_str(),
+                ),
+                _ => unreachable!(),
+            };
+            let want = format!("{}:{}", recipe.id, headline);
+            assert_eq!(key, &want, "dedup_key should resolve to per-row headline");
+        }
+    }
+
+    /// JSONPath iterator + ExtractedInner: ADR 0019's other Phase 2A
+    /// case. The outer path resolves to an array of objects; per
+    /// object, inner paths resolve to per-field leaves. Mirrors the
+    /// FRED / FEMA-style API listing shape.
+    #[test]
+    fn json_iterator_multi_leaf_produces_records_with_multiple_extracted_fields_adr_0019() {
+        let json_bytes = br#"{"storms":[
+            {"name":"Hurricane Alpha","direction":"supply_negative"},
+            {"name":"Hurricane Beta","direction":"context"}
+        ]}"#;
+        let recipe = FetchRecipe {
+            id: Uuid::now_v7(),
+            dedup_key: None,
+            plan_id: Uuid::now_v7(),
+            source_id: "api".into(),
+            source_url: Url::parse("https://example.com/api/storms.json").unwrap(),
+            extraction: ExtractionSpec::JsonPath {
+                path: "$.name".into(),
+            },
+            iterator: Some(ExtractionSpec::JsonPath {
+                path: "$.storms[*]".into(),
+            }),
+            produces: vec![ProductionBinding {
+                record_type: RecordType::Event,
+                expectation: ExpectationRef::EventType { index: 0 },
+                field_mappings: vec![
+                    FieldMap {
+                        path: "event_type".into(),
+                        source: FieldValueSource::Literal {
+                            value: json!("milestone_announced"),
+                        },
+                    },
+                    FieldMap {
+                        path: "headline".into(),
+                        source: FieldValueSource::ExtractedInner {
+                            spec: ExtractionSpec::JsonPath {
+                                path: "$.name".into(),
+                            },
+                        },
+                    },
+                    FieldMap {
+                        path: "direction".into(),
+                        source: FieldValueSource::ExtractedInner {
+                            spec: ExtractionSpec::JsonPath {
+                                path: "$.direction".into(),
+                            },
+                        },
+                    },
+                ],
+                dedup_key_field: Some("headline".into()),
+            }],
+            authored_at: Utc.with_ymd_and_hms(2026, 5, 11, 0, 0, 0).unwrap(),
+            authored_by: "xai".into(),
+            version: 1,
+            static_payload: None,
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
+        };
+        let p = iterator_plan();
+        let ctx = ApplyContext {
+            recipe: &recipe,
+            plan: &p,
+            bytes: json_bytes,
+            fetched_at: fetched_at(),
+        };
+        let records = apply(ctx).expect("json multi-leaf iterator must apply");
+        assert_eq!(records.len(), 2);
+
+        let mut headlines: Vec<&str> = records
+            .iter()
+            .map(|r| match r {
+                Record::Event(e) => e.content.headline.as_str(),
+                other => panic!("expected Event, got {other:?}"),
+            })
+            .collect();
+        headlines.sort();
+        assert_eq!(headlines, vec!["Hurricane Alpha", "Hurricane Beta"]);
+
+        // Verify both records carry a per-row direction — confirms
+        // each ExtractedInner sub-spec ran independently against its
+        // per-match JSON scope.
+        let directions: Vec<bool> = records
+            .iter()
+            .map(|r| match r {
+                Record::Event(e) => e.content.direction.is_some(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert!(directions.iter().all(|d| *d), "every record carries direction");
+    }
+
+    /// Legacy iterator recipes (no ExtractedInner) still take the
+    /// pre-ADR-0019 path: the inner-extractions map stays `None` and
+    /// `resolve_field_value` walks the legacy three-variant arms.
+    /// This pins backwards compatibility — the
+    /// css_select_iterator_produces_n_records test already exercises
+    /// the same path, but this name documents the contract
+    /// explicitly.
+    #[test]
+    fn legacy_iterator_recipes_skip_inner_extractions_pass_adr_0019() {
+        let html = br#"
+            <html><body>
+              <div class="card"><h3>Old-shape headline</h3></div>
+            </body></html>
+        "#;
+        let recipe = iterator_event_recipe(".card", "h3");
+        let p = iterator_plan();
+        let ctx = ApplyContext {
+            recipe: &recipe,
+            plan: &p,
+            bytes: html,
+            fetched_at: fetched_at(),
+        };
+        let records = apply(ctx).expect("legacy iterator path must still apply");
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Event(e) => assert_eq!(e.content.headline, "Old-shape headline"),
+            other => panic!("got {other:?}"),
         }
     }
 

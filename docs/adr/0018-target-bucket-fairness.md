@@ -1,11 +1,13 @@
 # ADR 0018 — Target-bucket fairness: the executor's silent truncation of non-Observation expectations
 
-**Status**: Proposed
-**Date**: 2026-05-11
+**Status**: Accepted (Session 61, 2026-05-11)
+**Date**: 2026-05-11 (proposed); 2026-05-11 (accepted on validated post-fix numbers)
 **Related**: ADR 0003 (six record types as governance boundary), ADR
 0007 (research function: two-level LLM architecture), ADR 0011 (plan
 lifecycle and fetch executor), ADR 0015 (LLM-emitted source
-nominations), ADR 0016 (extraction iterator: Phase 1)
+nominations), ADR 0016 (extraction iterator: Phase 1), ADR 0019
+(per-field extraction sub-specs — the matching gate-opener for
+non-Observation extraction)
 
 ---
 
@@ -335,11 +337,62 @@ The dashboard's pill row should also light up:
 
 ## Status
 
-**Proposed** (2026-05-11, Session 60). Implementation deferred to
-Session 61 per the kickoff discipline that this session ships no
-code. The four-track decision matrix in Session 60's handoff
-records this ADR alongside ADR 0019 (multi-field extraction),
-plus a sub-direction pick for A (Observations deepening) and a
-dashboard-honesty decision for D.
+**Accepted** (2026-05-11, Session 61). Implementation landed in
+`crates/pipeline/src/fetch_executor.rs` —
+`build_target_expectations` reorders the four record-typed buckets
+in round-robin, and `MAX_AUTHORS_PER_NOMINATION` raised from 4 to
+6. Five unit tests pin the new dispatch order (one-each-bucket,
+densest-bucket-doesn't-starve-others, four-buckets-full worked
+example, empty-plan termination, document_source-still-excluded).
+
+### Post-fix validation — hurricane 5-trial re-run
+
+Re-ran Session 59's "2025 Atlantic hurricane season" eval under
+the bucket-fair dispatch + cap=6. Per-target nominations
+dispatched to the recipe-author, summed across 5 trials:
+
+| bucket            | Session 59 | Session 61 | delta   |
+|-------------------|-----------:|-----------:|--------:|
+| ObservationMetric | 12         | 73         | +6.1×   |
+| EventType         | 1          | 63         | +63×    |
+| EntityKind        | 0          | 33         | from 0  |
+| RelationKind      | 0          | 24         | from 0  |
+
+The `≥10 event_type per-target nominations across 5 trials` post-
+fix expectation (Validation section above) is met with substantial
+headroom (63 ≫ 10). EntityKind and RelationKind, which Session 59
+saw zero of, now both dispatch reliably (33 / 24). The starvation
+mode this ADR was designed to close is closed.
+
+Records produced rose from 0 to 2 over 5 hurricane trials. The
+records-per-trial improvement is small because the bottleneck moved
+downstream — most newly-dispatched non-Observation expectations now
+decline at the recipe-author stage on topical-mismatch grounds
+(authoritative_secondary hosts like AP News, FEMA's
+DisasterDeclarationsSummaries, NCEI's billion-dollar disasters
+landing page rarely surface storm-formation events in extraction-
+friendly shape). That is the right outcome: declines are honest,
+and they're now decorating per-expectation slots that previously
+weren't even tried. The remaining work to convert dispatched
+expectations into apply-stage records lives in ADR 0019 (multi-
+leaf record shapes) and in prompt iteration on the recipe-author
+side (Session 62+).
+
+### Lithium regression — the predicted trade-off
+
+The same Session 61 re-run on the lithium baseline (5 trials)
+shows records-per-trial drop from 2.0 (Session 58's variance-
+collapsed baseline) to 1.4 (records per trial: 1, 2, 2, 1, 1).
+This is the predicted trade-off documented in the Consequences
+section above: observation_metric slots per nomination drop from
+4 to 2 under bucket-fair dispatch (the obs bucket now shares
+slots with event/entity/relation rather than monopolising the
+cap), so a plan dominated by obs_metrics — which lithium is — sees
+fewer obs-targeted authoring attempts per nomination. The 1.4 mean
+sits inside the Session 56 historical variance band (0/1/1/2/3,
+mean 1.4), so the regression vs. Session 58 may also be partially
+variance rather than purely the dispatch change. Session 62
+investigations should target apply-stage success-rate
+improvements rather than rolling back the dispatch fairness.
 
 End of ADR.
