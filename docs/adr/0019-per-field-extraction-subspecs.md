@@ -1,0 +1,469 @@
+# ADR 0019 — Per-field extraction sub-specs: ADR 0016 Phase 2 for multi-leaf record types
+
+**Status**: Proposed
+**Date**: 2026-05-11
+**Related**: ADR 0003 (six record types as governance boundary), ADR
+0007 (research function: two-level LLM architecture and the
+closed-extraction-vocabulary discipline), ADR 0016 (extraction
+iterator: Phase 1, single extracted field per match — explicitly
+defers multi-field-per-match to its own ADR), ADR 0018 (target-
+bucket fairness)
+
+---
+
+## Context
+
+The closed-vocabulary discipline (ADR 0007 §"closed extraction
+vocabulary") fixes the recipe shape at:
+
+- one extraction mode per recipe (`css_select`, `json_path`,
+  `csv_cell`, `pdf_table`, `regex_capture`),
+- one extracted scalar per recipe, possibly iterated (ADR 0016 added
+  an `iterator` field that selects N nodes; the existing
+  `extraction` field still returns one leaf per node).
+
+Per the closed-vocabulary discipline, `ProductionBinding.field_mappings`
+is a `Vec<FieldMap>`, but every `FieldMap` whose source is
+`FieldValueSource::Extracted` receives **the same single scalar** —
+the one value produced by the recipe's `extraction`. Other
+`FieldValueSource` variants — `Literal` and `FromPlan` — fill the
+remaining fields from static recipe content or from the plan, not
+from the source bytes.
+
+This shape carries the four record types differently:
+
+| Record type        | Required extracted fields                                | Authorable today? |
+|--------------------|----------------------------------------------------------|-------------------|
+| `Observation`      | `value` (numeric)                                        | Yes — `metric` and `unit` are typically Literal or FromPlan |
+| `Event`, headline-only | `headline` (string)                                  | Yes — `event_type` and `direction` are Literal |
+| `Event`, with magnitude | `headline`, `magnitude.value`, `magnitude.unit`     | **No** — two extracted leaves per record |
+| `Relation`         | `from` (EntityId), `to` (EntityId)                       | **No** — two extracted leaves per record |
+| `EntityAttribute`  | `entity_id`, `value` (when typed-AttributeValue varies)  | **No** — two extracted leaves per record |
+
+ADR 0016 §"Phase 2 (deferred — separate ADR)" called this out
+explicitly:
+
+> When real listings need multiple extracted leaves per record
+> (headline + date + author from one news card, title + abstract +
+> arxiv-id from one paper card), the field_mappings need per-field
+> extractor sub-specs. This is a richer change that touches recipe
+> author validation, the runtime, the prompt, and the UI's recipe
+> inspection panel. It deserves its own ADR after Phase 1's contract
+> has run in production for a few cycles.
+
+Phase 1 has now run in production for 22 sessions (38 → 59). ADR
+0018 (target-bucket fairness) opens dispatch to the non-Observation
+buckets; the dispatched authoring calls against Relations and
+magnitude-bearing Events will hit the multi-leaf gate on every
+non-trivial source. This ADR is the matching gate-opening.
+
+### Why the iterator-with-inner-selector pattern is not enough
+
+Session 59's hurricane run included two `www.nhc.noaa.gov` recipes
+that reached the apply stage and failed with:
+
+> inner selector matched no elements within iterator match … the
+> inner selector is targeted at a sibling rather than a descendant.
+
+The recipes were authored under ADR 0016 Phase 1: one `iterator`
+(`css_select` over storm-list rows) and one `extraction` (the
+inner selector for one leaf — presumably `.storm-name a` or
+similar). The pattern works when each iterated card contains
+exactly one leaf the binding wants. It fails on a storm-list page
+because the LLM tried to encode a multi-field event into a single-
+leaf binding and the validator forced an awkward shape.
+
+Phase 1's prompt currently teaches the LLM to author *one*
+extracted field per binding under iterator mode, with all other
+per-record fields as literals. For Events with a headline-only
+shape (Nature subjects, qt.eu newsroom — ADR 0016's worked
+examples) this is fine. For Events whose row carries date +
+headline + magnitude, the constraint forces the LLM into one of
+three bad shapes:
+
+1. **Drop the per-row variation.** Encode the date as a literal
+   (always wrong) or omit it (loses the timeline).
+2. **Concatenate at extraction.** Use a `css_select` that returns
+   the row's text content as one long string and rely on
+   downstream parsing (no downstream parsing exists; the apply
+   layer's 2048-byte scalar cap rejects).
+3. **Decline.** The honest outcome under v1.18's discipline, and
+   the one Session 59 observed twice on hurricanes.
+
+The closed vocabulary is doing its job — declining shapes it can't
+represent — but the vocabulary is genuinely under-expressive for
+the topic shapes that drove the operator to broaden away from
+lithium in the first place.
+
+### What this is *not*
+
+This ADR does not relax ADR 0007's golden rule (runtime is LLM-
+free once recipes exist). Per-field sub-specs are still authored
+once and applied deterministically; there is no per-record LLM
+call.
+
+This ADR does not expand the closed extraction-mode enum. The five
+modes stay five. The change is in how `FieldMap` references them.
+
+This ADR does not address pagination, anti-bot/WAF, or cross-page
+joining. Each remains a separate concern, deferred to other ADRs.
+
+This ADR does not change the recipe-authoring boundary. One LLM
+call per (plan × nomination × target_expectation) — the Session 47
+contract — remains the unit of authoring.
+
+## Decision
+
+Extend `FieldValueSource` with a fourth variant,
+**`ExtractedInner { spec: ExtractionSpec }`**, that carries a
+per-field extraction sub-spec. The runtime evaluates the sub-spec
+against the same per-match scope the binding's outer extraction
+operates on, producing one leaf per FieldMap per match.
+
+### The shape
+
+```rust
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FieldValueSource {
+    /// Existing. The recipe's outer extraction result.
+    Extracted,
+    /// Existing. A literal value baked into the recipe.
+    Literal { value: serde_json::Value },
+    /// Existing. A value taken from the session's ResearchPlan.
+    FromPlan { pointer: String },
+    /// NEW (ADR 0019). A per-field extraction sub-spec evaluated
+    /// against the same scope as the binding's outer extraction.
+    /// The sub-spec's mode must be congruent with the binding's
+    /// outer mode (CSS pairs with CSS, JSONPath with JSONPath,
+    /// etc. — same congruence rule as ADR 0016).
+    ExtractedInner { spec: ExtractionSpec },
+}
+```
+
+The fourth variant is purely additive. Existing recipes deserialize
+unchanged because no existing `FieldMap` carries the new variant;
+the validator's exhaustiveness check picks it up where the four
+match arms exist today.
+
+### Semantics, by recipe shape
+
+**Scalar recipe, single-leaf record.** `iterator = None`, one
+binding with one `Extracted` FieldMap. Today's contract,
+unchanged.
+
+**Scalar recipe, multi-leaf record (the new case).** `iterator =
+None`, one binding with N `ExtractedInner` FieldMaps. The outer
+`extraction` field is still required (validator rejects null) and
+provides a "scope" for the inner sub-specs: in `css_select` mode
+the outer selector resolves to a DOM node, and each
+`ExtractedInner` sub-selector applies within that node's sub-tree.
+In `json_path` mode the outer path resolves to a JSON value and
+each inner path applies relative to it.
+
+A worked example. The NHC storm-list page has one row per named
+storm with date, name, and category fields. The recipe under this
+ADR:
+
+```json
+{
+  "extraction": { "mode": "css_select", "selector": "table.storms" },
+  "iterator":   { "mode": "css_select", "selector": "tr.storm-row" },
+  "produces": [{
+    "expectation": { "list": "event_type", "index": 0 },
+    "record_type": "event",
+    "dedup_key_field": "headline",
+    "field_mappings": [
+      {
+        "path": "event_type",
+        "source": { "kind": "literal", "value": "storm_formed" }
+      },
+      {
+        "path": "headline",
+        "source": { "kind": "extracted_inner",
+                    "spec": { "mode": "css_select",
+                              "selector": "td.storm-name" } }
+      },
+      {
+        "path": "valid_at",
+        "source": { "kind": "extracted_inner",
+                    "spec": { "mode": "css_select",
+                              "selector": "td.storm-date" } }
+      },
+      {
+        "path": "direction",
+        "source": { "kind": "literal", "value": "supply_negative" }
+      }
+    ]
+  }]
+}
+```
+
+The outer `extraction` (`table.storms`) selects the table; the
+`iterator` selects each row; per row, the headline sub-selector
+extracts the storm name and the valid_at sub-selector extracts the
+date. The recipe produces N Event records, one per row, each with
+multiple extracted leaves.
+
+**Iterator recipe, multi-leaf record (the dominant motivating case).**
+`iterator = Some(_)`, one binding with N `ExtractedInner` FieldMaps.
+Per match of the iterator, each inner sub-spec applies within the
+match's scope. This is the storm-list case above.
+
+**Mixed sources (typical).** Bindings can freely combine `Literal`,
+`FromPlan`, `Extracted`, and `ExtractedInner` per field. The
+NHC example above mixes Literal (event_type, direction) with
+ExtractedInner (headline, valid_at). A Relation binding might use
+ExtractedInner for `from` and `to` and Literal for `kind`.
+
+### Validation rules
+
+The recipe-author validator (`build_validated_recipe` in
+`crates/pipeline/src/recipe_author.rs`) gains four new rules:
+
+1. **Mode congruence.** Every `ExtractedInner.spec.mode` must equal
+   the recipe's outer `extraction.mode`. Cross-mode (a `css_select`
+   inner inside a `json_path` outer) is rejected — same congruence
+   rule as ADR 0016's iterator-vs-inner-selector check.
+
+2. **`Extracted` and `ExtractedInner` are mutually exclusive per
+   binding.** A binding either uses the legacy single-scalar
+   `Extracted` (with literals/plan vars for the rest) or uses N
+   `ExtractedInner` sub-specs (with literals/plan vars for the
+   rest). Mixing the two in one binding is rejected — the runtime
+   would have to pick whether `Extracted` means "the outer extraction
+   result" or "an inner sub-spec," and the v1.20 prompt teaches the
+   LLM to commit to one shape per binding.
+
+3. **At least one extraction reaches the bytes.** A binding with
+   zero `Extracted` and zero `ExtractedInner` FieldMaps (all
+   Literal + FromPlan) was a pre-existing degenerate shape that
+   the v1.18 prompt's required-field discipline already declines
+   for record types whose required fields are extraction-only. The
+   validator made this rule implicit; this ADR makes it explicit
+   so the multi-field case has a clean contract: a binding must
+   bind at least one field from the source.
+
+4. **`ExtractedInner` requires an outer `extraction`.** When any
+   FieldMap in any binding uses `ExtractedInner`, the recipe's
+   outer `extraction` field must be present and meaningful (not a
+   degenerate body-selector). The outer extraction defines the
+   per-match scope the inner sub-specs apply within. Today's
+   validator already requires `extraction` to be non-null; this
+   rule reinforces that the value must be a real selector when
+   inner sub-specs are present.
+
+### Runtime semantics
+
+`recipe_apply` gains one helper: `apply_inner_extraction(spec,
+scope_bytes)` that runs an `ExtractionSpec` against a scope (a DOM
+sub-tree, a JSON value, etc.) and returns one scalar. The existing
+`apply_extraction` is unchanged for legacy recipes; the
+multi-field path calls `apply_inner_extraction` once per
+`ExtractedInner` FieldMap, accumulates the leaves into the record
+content, and dispatches to the existing `RecordContent` validator.
+
+The runtime stays LLM-free. The inner sub-spec is a pre-authored
+deterministic spec like the outer extraction.
+
+### Dedup-key derivation
+
+Multi-field iterator recipes still require
+`ProductionBinding::dedup_key_field` (per ADR 0016). The named
+path now resolves to one of the extracted leaves (typically
+`headline` or a stable identifier field), with the same
+`{recipe.id}:{field_value}` dedup-key shape.
+
+For non-iterator multi-field recipes (one record per fetch with
+multiple extracted leaves), dedup_key_field stays optional, same
+as the scalar non-iterator path.
+
+## Two-phase rollout
+
+### Phase 2A (Session 61) — `css_select` + `json_path`
+
+Implement `ExtractedInner` end-to-end for the two extraction modes
+that produce the dominant share of listings:
+
+- `css_select`: per-DOM-subtree inner extraction. The cold-start
+  motivating case (NHC storm rows, Reuters article cards with
+  date+headline, arXiv listings with title+abstract).
+- `json_path`: per-JSON-value inner extraction. APIs that return
+  arrays of objects (FRED observation series, World Bank API
+  responses, FEMA disaster declarations) where each object's
+  fields map to different record fields.
+
+The other three modes (`csv_cell`, `pdf_table`, `regex_capture`)
+defer to Phase 2B. PDF tables in particular need a richer per-row
+column-mapping concept that doesn't slot cleanly into
+`ExtractedInner { spec }` — the spec's `pdf_table.row` field is
+already the per-iteration selector, leaving only `col` for inner
+variation. A first-cut Phase-2A `pdf_table` `ExtractedInner` would
+just be a per-FieldMap column index; that's tractable but worth
+its own validation pass.
+
+### Phase 2B (Session 62+, separate session) — remaining modes
+
+`csv_cell`, `pdf_table`, `regex_capture`. The CSV case generalizes
+the existing `row_filter` mechanism (one filter selects rows; per
+row, each FieldMap names a column). The PDF case adds per-FieldMap
+column indices to the existing `pdf_table.row` iterator. The regex
+case uses per-FieldMap capture group indices against a shared
+outer pattern.
+
+These are mechanically simpler than the CSS / JSON cases but the
+fixture corpus is thinner, so the validation surface needs more
+empirical input before locking the contract.
+
+### Prompt revision (Session 61, v1.19)
+
+The recipe-author prompt's v1.19 revision adds:
+
+- A new subsection "Multi-leaf records — when one row carries
+  several fields" between v1.18's "Selecting the mode that fits…"
+  and the decline-path section. Teaches the LLM to recognise the
+  multi-leaf case (event with date + headline; relation with
+  from + to entity slugs) and to author `ExtractedInner` sub-specs
+  rather than concatenating or declining.
+- A worked example pair: NHC storm-row → multi-field event;
+  arXiv recent-listings → multi-field document with title +
+  abstract + arxiv-id.
+- The "What NOT to produce" list gains entries for the new
+  failure modes the v1.19 validator catches (cross-mode
+  congruence, Extracted-and-ExtractedInner-mixed-in-one-binding,
+  ExtractedInner-without-outer-extraction).
+
+## Consequences
+
+### Positive
+
+- Magnitude-bearing events, relations, and entity-attributes
+  become authorable. Combined with ADR 0018 (target-bucket
+  fairness), the path from plan to records for the five non-
+  Observation typed panels is structurally complete.
+- The closed extraction-mode enum stays at five. The change is
+  in how `FieldMap` references them — additive in shape, not in
+  vocabulary.
+- ADR 0007's two-level LLM architecture is preserved. One LLM
+  call per (plan × nomination × target) authors the recipe with
+  N inner sub-specs; the runtime applies all inner sub-specs
+  deterministically per match.
+- Existing recipes are unaffected. `Extracted | Literal |
+  FromPlan` continues to deserialise and apply identically. New
+  recipes that don't need multi-leaf extraction don't use
+  `ExtractedInner`.
+
+### Negative / costs
+
+- Validator surface widens by four rules (mode congruence,
+  mutual exclusion, extraction-bytes-required,
+  outer-extraction-required-with-inner). Each rule is a unit-
+  testable structural check; the test count rises by ~12 across
+  these four invariants.
+- Recipe-author prompt grows a section. v1.19 carries the new
+  guidance plus a worked example pair, raising the prompt's
+  bound-relevant byte count by ~3 KiB. Still well inside
+  `Bounds::LLM_PROMPT_BODY` (256 KiB).
+- The LLM gains a new authoring shape to learn. The Session 59
+  hurricane decline was the LLM's honest "I can't represent
+  this" signal under the v1.18 contract; under v1.19 it learns
+  to reach for `ExtractedInner`. Empirically the rate at which
+  the LLM picks the right shape is unknown until Session 61's
+  first multi-field eval — anticipated to need 1–2 prompt
+  iterations to settle.
+- Inner sub-specs are unbounded in count per binding. A binding
+  could in principle declare 50 `ExtractedInner` FieldMaps. The
+  validator imposes a per-binding cap (suggested: 8) consistent
+  with the existing `MAX_BINDINGS` discipline; surfacing the cap
+  in the prompt as the maximum reasonable shape.
+- Failure-shape attribution becomes more nuanced. Today an apply
+  failure on a binding is "this single extraction returned X."
+  Under multi-field, an apply failure could be "this inner
+  sub-spec for `valid_at` returned X while the others succeeded."
+  The failure-stage record needs a per-FieldMap dimension; the
+  existing `apply_failures_for_nomination` storage row supports
+  the addition without a migration (the message column is text).
+
+### Alternatives considered
+
+**(a) Per-binding extraction.** Make `extraction` per-binding
+rather than per-recipe; each binding carries its own outer
+extraction and per-field-map literals. Equivalent in expressive
+power but heavier validator surface: now the binding has two
+extraction surfaces (outer + inner) instead of one (FieldMap-level
+sub-specs sharing the recipe's outer scope). Rejected for
+asymmetry — keeping `extraction` per-recipe as a shared scope
+preserves the iterator's compose-with-extraction story.
+
+**(b) A new "multi-record" extraction mode.** Add a sixth mode
+that returns `Vec<HashMap<String, Value>>` (one entry per row,
+one map per row, keyed by field name). Cleaner shape at the
+recipe level, but breaks ADR 0007's closed-vocabulary
+discipline at the type level: the mode would have a
+fundamentally different return type from the other five
+(scalar). Rejected as a violation of the vocabulary uniformity
+principle.
+
+**(c) Encode multi-field as multiple recipes per nomination.**
+One recipe per FieldMap (one for headline, one for date, etc.),
+all sharing a nomination and joined post-fetch by row index.
+Multiplies recipe count by per-record-field count and forces
+post-fetch joining into the runtime. Rejected for compositional
+complexity — the joining logic is essentially "iterate the
+shared scope and zip the extractions," which is what
+`ExtractedInner` does in a single recipe.
+
+**(d) Defer multi-field to a third extraction layer.** Add a
+new abstraction between recipe-authoring and record-emission:
+"row schemas" that map per-row positions to record fields.
+Heavier than the proposal. Worth revisiting if Phase 2A surfaces
+authoring patterns the per-FieldMap sub-spec shape can't
+capture, but Phase 2A's CSS and JSON cases fit `ExtractedInner`
+cleanly.
+
+### Carry-forward dependencies
+
+Two storage/observability surfaces should pick up the multi-field
+shape in Session 61's implementation pass:
+
+1. **`fetch_run_outcomes`'s decline messages** currently quote a
+   single extraction's failure. Under multi-field, the message
+   needs to identify which FieldMap failed: `"observation_metric:1
+   field 'headline' (ExtractedInner css_select): selector matched
+   no elements"`. Text-column-level change; no migration.
+2. **The RecipesPanel UI** (`apps/web/src/lib/components/
+   RecipesPanel.svelte`) renders one extraction line per recipe.
+   Multi-field recipes need a per-FieldMap row in the inspection
+   view. Pure UI change; the API surface already returns the full
+   recipe JSON.
+
+## Validation
+
+This ADR is empirically falsifiable on the Session 59 hurricane
+re-run. Pre-ADR-0019: hurricane NHC storm-list recipes apply-fail
+with "inner selector matched no elements within iterator match."
+Post-ADR-0019 with ADR 0018 also landed: a hurricane plan should
+produce ≥3 Event records per trial on NHC sources, each with
+distinct `headline` (storm name) and `valid_at` (formation date)
+extracted leaves — and the dashboard's `events` panel should
+populate.
+
+A secondary validation: a fresh "global semiconductor exports
+2024" topic, classified to populate `event_types`
+(`export_control_enacted`, `contract_signed`, etc.) and
+`relation_kinds` (`supplies_to`, `subject_to_sanction`), should
+produce Relation records when ADR 0019 lands. Relations are the
+canonical multi-field case (`from` + `to`); a populated Relations
+panel post-implementation is the strongest signal that the gate
+is open.
+
+## Status
+
+**Proposed** (2026-05-11, Session 60). Implementation deferred to
+Session 61 per the kickoff discipline that this session ships no
+code. Sequencing: ADR 0018's bucket-fair dispatch lands first
+(opens the path); ADR 0019 Phase 2A lands second (adds the
+expressive power); the dashboard pill row's events panel becomes
+populatable after both.
+
+End of ADR.

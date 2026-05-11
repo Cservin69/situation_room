@@ -166,6 +166,33 @@
     </span>
   </header>
 
+  <!--
+    Session 60 — aspirational-note pass (D). Five of six tiles will
+    never light up under the current executor: `build_target_expectations`
+    concatenates buckets metrics-first and truncates at
+    MAX_AUTHORS_PER_NOMINATION=4, and the closed extraction vocabulary
+    allows only one extracted leaf per binding. Both gates have proposed
+    ADRs (0018 bucket-fair dispatch; 0019 per-field extraction sub-specs)
+    deferred to Session 61.
+
+    The note moves the honesty from the layout (dimmed tiles reading
+    as "empty") to the prose ("never tried" is the actual state).
+    Removed once the gates land and the typed panels become populatable.
+
+    Rendered only when at least one record exists for the plan, so the
+    pre-fetch and true-empty cases don't carry an explanation for an
+    absence the operator hasn't yet measured.
+  -->
+  {#if totalRecords > 0 && pendingTypes.length === 0}
+    <p class="aspirational-note" aria-label="pending typed panels">
+      Events, Entities, Relations, Documents, and Assertions become
+      populatable once the executor's bucket-fair dispatch and per-field
+      extraction land — see <code>docs/adr/0018</code> and
+      <code>docs/adr/0019</code> (Session 61). Dimmed tiles above mean
+      "not yet tried," not "tried and empty."
+    </p>
+  {/if}
+
   <!-- Observations panel — the primary cargo of the dashboard.
        Renders only when there's at least one observation; the empty
        case is already communicated by the type-count strip above. -->
@@ -355,6 +382,27 @@
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
     color: var(--fg-primary);
+  }
+
+  /* ---- Aspirational note (Session 60, ADR 0018/0019) ---- */
+
+  .aspirational-note {
+    margin: 0;
+    padding: 8px 12px;
+    background: var(--bg-inset);
+    border-left: 2px dashed var(--border-subtle);
+    border-radius: 2px;
+    font-size: 11px;
+    line-height: 1.6;
+    color: var(--fg-tertiary);
+  }
+  .aspirational-note code {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--fg-secondary);
+    background: var(--bg-panel-alt);
+    padding: 0 4px;
+    border-radius: 2px;
   }
 
   /* ---- True-empty hint ---- */

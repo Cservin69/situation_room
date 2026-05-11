@@ -90,6 +90,45 @@
   next-step refactor when a third panel needs it; the local pattern
   matches RecipesPanel's existing shape and keeps this patch surgical.
 
+  Session 60 — re-author-from-failure (A direction pick)
+  -----------------------------------------------------
+
+  Pre-Session-60 the operator's path from "I see a failed outcome in
+  the FetchReport" to "let me re-author this recipe" was: notice the
+  failure here, navigate to RecipesPanel, manually scan for the
+  matching recipe row, click *its* re-author button, re-type the
+  failure context into the dialog's note textarea. Four-step,
+  context-losing.
+
+  Session 60 collapses that to one click. Each `failed` outcome row
+  now carries a `re-author` button that opens the same ReauthorDialog
+  RecipesPanel uses, pre-filled with:
+
+    - the prior recipe's id (from the outcome's `recipe_id`),
+    - the source id (from the outcome's `source_id`),
+    - the verbatim failure message (from the outcome's `message`),
+    - the latest captured bytes excerpt for that recipe (loaded via
+      `latestAttemptForRecipe`).
+
+  Both panels write through the same `reauthorRecipe` runes-store
+  helper, so the lineage chip in RecipesPanel updates without a
+  separate refresh roundtrip — same pattern as the flag-from-decline
+  affordance (Session 30, ADR 0013).
+
+  The dialog is mounted at the bottom of this component alongside
+  the `RecipeFlagDialog` mount. Two open dialogs from one component
+  is fine: each tracks its own state (`flagDialogSourceId` vs.
+  `reauthorOutcome`) and the dialogs themselves are backdrop-modal
+  with their own z-index, so even if both were somehow opened at
+  once the worst case is a confusing UX, not a state bug. (Same
+  containment argument as Session 30.)
+
+  Why this isn't on `declined` outcomes too: a decline carries no
+  recipe — there's nothing to re-author. The flag-button affordance
+  is the right surface for declines; the operator's note flows into
+  the next *initial* authoring attempt for the source via the
+  `{{RECIPE_FEEDBACK}}` channel (ADR 0013), not via re-authoring.
+
   Session 50 — running-now scaffold
   ---------------------------------
 
@@ -116,11 +155,25 @@
   its own session.
 -->
 <script lang="ts">
-  import { plans, flagRecipe } from '$stores/plans.svelte';
+  import { plans, flagRecipe, reauthorRecipe } from '$stores/plans.svelte';
   import type { FetchRunSummaryDto } from '$lib/api/types/FetchRunSummaryDto';
   import type { PriorityTierDto } from '$lib/api/types/PriorityTierDto';
+  import type { RecipeFetchAttemptDto } from '$lib/api/types/RecipeFetchAttemptDto';
+  import type { RecipeOutcomeDto } from '$lib/api/types/RecipeOutcomeDto';
   import { outcomeTone, outcomeLabel, outcomeDetail, outcomeKey } from '$lib/outcomes';
+  import { latestAttemptForRecipe, asCommandError } from '$lib/api/client';
   import RecipeFlagDialog from '$components/dialogs/RecipeFlagDialog.svelte';
+  import ReauthorDialog from '$components/dialogs/ReauthorDialog.svelte';
+
+  // Session 60 — re-author-from-failure (A direction pick).
+  //
+  // Narrow alias for the `failed` arm of RecipeOutcomeDto so the
+  // dialog's source state has a single concrete type and TypeScript
+  // narrows correctly across the two read sites (open handler +
+  // dialog render block). Using the discriminated union's narrowing
+  // here keeps RecipeOutcomeDto as the wire DTO and avoids leaking
+  // a parallel "failed-outcome shape" into the rest of the file.
+  type FailedOutcome = Extract<RecipeOutcomeDto, { kind: 'failed' }>;
 
   // Session 50: a tight label for the running-now nomination list's
   // tier badge. The full PriorityTierDto strings are too long for
@@ -186,6 +239,67 @@
       // the note and resubmit, or cancel.
     } finally {
       flagSubmitting = false;
+    }
+  }
+
+  // Session 60 — re-author-from-failure (A direction pick).
+  //
+  // State for the ReauthorDialog mounted on `failed` outcome rows.
+  // Mirrors RecipesPanel's pattern (which keys by `RecipeDto`); here
+  // the FetchReport surface only has the outcome (no full recipe row
+  // in scope) so we key by the failed outcome directly. The dialog
+  // needs source_id + recipe_id (both on the outcome) + the failure
+  // message (also on the outcome) + the bytes excerpt (loaded async).
+  //
+  // `reauthorOutcome === null` ⇒ no dialog open. Setting it to a
+  // FailedOutcome opens the dialog and kicks off the bytes load; the
+  // dialog itself tolerates `bytesExcerpt: ''` while the load is in
+  // flight (ReauthorDialog's `bytesEmpty` branch renders an honest
+  // "no bytes captured" placeholder so the operator isn't staring at
+  // a blank panel).
+  let reauthorOutcome: FailedOutcome | null = $state(null);
+  let reauthorAttempt: RecipeFetchAttemptDto | null = $state(null);
+  let reauthorLoadingAttempt = $state(false);
+  let reauthorSubmitting = $state(false);
+
+  async function openReauthorDialog(o: FailedOutcome) {
+    reauthorOutcome = o;
+    reauthorAttempt = null;
+    reauthorLoadingAttempt = true;
+    try {
+      reauthorAttempt = await latestAttemptForRecipe(o.recipe_id);
+    } catch (e) {
+      // The capture-load is non-fatal — the dialog opens with empty
+      // bytes and the failure-message panel from the outcome above.
+      // Surface the error in the global banner so the operator sees
+      // it but can still proceed with the failure-message-only
+      // re-author. Same fallback as RecipesPanel's wiring.
+      plans.error = asCommandError(e);
+    } finally {
+      reauthorLoadingAttempt = false;
+    }
+  }
+
+  function closeReauthorDialog() {
+    reauthorOutcome = null;
+    reauthorAttempt = null;
+    reauthorLoadingAttempt = false;
+  }
+
+  async function onReauthorSubmit(note: string | null) {
+    if (!reauthorOutcome) return;
+    reauthorSubmitting = true;
+    try {
+      const ok = await reauthorRecipe(reauthorOutcome.recipe_id, note);
+      if (ok) {
+        reauthorOutcome = null;
+        reauthorAttempt = null;
+      }
+      // On failure: dialog stays open, plans.error surfaces in the
+      // banner, the operator can edit + resubmit. Same contract as
+      // the flag-submit handler above and as RecipesPanel's.
+    } finally {
+      reauthorSubmitting = false;
     }
   }
 </script>
@@ -332,7 +446,33 @@
             {#if outcomeDetail(o)}
               <span class="detail">{outcomeDetail(o)}</span>
             {/if}
-            {#if o.kind === 'declined'}
+            {#if o.kind === 'failed'}
+              <!--
+                Session 60 — re-author-from-failure (A direction pick).
+                Failed outcomes carry recipe_id + source_id + the
+                verbatim failure message; together they're enough to
+                open ReauthorDialog directly without the operator
+                hopping to RecipesPanel first. The bytes excerpt
+                loads async after the dialog opens (the dialog has
+                its own empty-bytes placeholder so the open is not
+                blocked on the load).
+
+                Visual grammar mirrors the declined-row flag affordance
+                below: same `.actions` row spanning grid-column 1/-1,
+                right-aligned single button. The button itself uses
+                `.reauthor-button` styling — a constructive (re-author
+                is fixing the recipe) affordance with subordinate
+                chrome to the primary failure-status text.
+              -->
+              <span class="actions">
+                <button
+                  type="button"
+                  class="reauthor-button"
+                  title="Open the re-author dialog pre-filled with this failure's recipe, message, and the bytes the runtime saw."
+                  onclick={() => openReauthorDialog(o)}
+                >re-author</button>
+              </span>
+            {:else if o.kind === 'declined'}
               {@const feedback = plans.recipeFeedback[o.source_id]}
               <!--
                 Session 30 (ADR 0013 follow-up) — flag-from-decline.
@@ -434,6 +574,37 @@
     submitting={flagSubmitting}
     onSubmit={onFlagSubmit}
     onCancel={closeFlagDialog}
+  />
+{/if}
+
+{#if reauthorOutcome !== null}
+  <!--
+    Session 60 — re-author-from-failure (A direction pick).
+
+    Mounts the same ReauthorDialog RecipesPanel uses. Both panels
+    write through the `reauthorRecipe` store helper, so the new
+    recipe's lineage chip (Session-31 reauthored-from) appears in
+    RecipesPanel after submit without a separate refresh.
+
+    `failureMessage` comes straight from the outcome (`o.message`)
+    — apply-stage failures always carry one; the dialog's prose
+    panel renders it verbatim above the bytes excerpt. The
+    `bytesExcerpt` loads asynchronously after the dialog opens;
+    while `reauthorAttempt` is `null` the dialog shows its honest
+    "no bytes captured" placeholder rather than blocking the open.
+
+    `submitting` ORs the two pending states (load + submit) so the
+    primary button stays disabled while either is in flight. Same
+    pattern RecipesPanel uses.
+  -->
+  <ReauthorDialog
+    sourceId={reauthorOutcome.source_id}
+    priorRecipeShortId={shortId(reauthorOutcome.recipe_id)}
+    failureMessage={reauthorOutcome.message}
+    bytesExcerpt={reauthorAttempt?.bytes_excerpt ?? ''}
+    submitting={reauthorSubmitting || reauthorLoadingAttempt}
+    onSubmit={onReauthorSubmit}
+    onCancel={closeReauthorDialog}
   />
 {/if}
 
@@ -649,6 +820,34 @@
   .flag-button:hover {
     border-color: var(--signal-info, var(--border-accent));
     color: var(--fg-primary);
+  }
+
+  /* Session 60 — re-author button on failed-apply outcome rows.
+     Visually distinct from `.flag-button` so the operator scanning
+     the outcomes list doesn't confuse the two affordances: re-author
+     uses the same `--signal-info` accent as the dialog's primary
+     button (constructive — "we're fixing the recipe") and a filled
+     subtle background so it stands as a primary affordance within
+     the row, while flag stays as a subordinate outline. Shape
+     otherwise matches `.flag-button` for column-rhythm consistency. */
+  .reauthor-button {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+    padding: 2px 10px;
+    border-radius: 2px;
+    color: var(--signal-info, var(--fg-secondary));
+    background: var(--bg-canvas);
+    border: 1px solid var(--signal-info, var(--border-subtle));
+    cursor: pointer;
+    align-self: center;
+    transition: background var(--duration-ui) var(--ease),
+                color var(--duration-ui) var(--ease);
+  }
+  .reauthor-button:hover {
+    background: var(--signal-info, var(--bg-panel-alt));
+    color: var(--fg-inverse, var(--fg-primary));
   }
 
   .history {
