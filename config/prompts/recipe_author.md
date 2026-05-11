@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.19
+# Recipe Author Prompt — v1.20
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -260,6 +260,80 @@ text is the value the binding will store.
 
 ## Multi-leaf records — when one row carries several fields
 
+The single most consequential decision in iterator-bearing recipes
+is **single-leaf vs multi-leaf per binding**. Get this wrong by
+default to single-leaf and you will either decline a source that
+honestly carries the record's fields (false negative) or author an
+inner-selector recipe that matches nothing at apply time (silent
+zero-record forever). This section runs before mode-mechanics and
+before the decline path because it changes the question you're
+asking when you look at the excerpt.
+
+## Is this row multi-leaf? — the recognition checklist
+
+Before you write any FieldMap for an iterator-bearing recipe, run
+this check against the excerpt's `Repeating element classes` block
+(for HTML) or its `JSON shape` block (for JSON):
+
+1. **Does the listing have N rows / items?** Look for a repeating
+   container — `tr` rows, `li`/`div.item` cards, JSON array
+   entries. If yes, this is potentially iterator-shaped; continue.
+2. **Per row, how many distinct extractable values are visible?**
+   Count the leaves: a row with one `<td>` is single-leaf; a row
+   with `<td>storm-name</td><td>2025-06-12</td><td>Cat 3</td>` is
+   three-leaf. A row in a `tr` whose `td:nth-child(1)` is the
+   name and `td:nth-child(2)` is the date is multi-leaf even
+   though no `td` carries a semantic class name.
+3. **Does the record's content type need more than one of those
+   leaves?** An Event needs `headline`; if the row also carries a
+   date your record's `valid_at` would benefit from, that's two
+   leaves the binding wants — multi-leaf. A Relation needs `from`
+   and `to`; that's intrinsically two leaves. An Observation needs
+   `value`; the row's other cells (period label, unit label) are
+   usually plan-derived literals — single-leaf is fine.
+4. **Is there a single leaf that already concatenates everything
+   the record needs as one string?** Sometimes a row's `td.summary`
+   contains `"Hurricane Alpha — 2025-06-12 — Cat 3"` as one
+   blob. The downstream apply layer does **not** parse multi-field
+   strings. Either author multi-leaf (preferred — extract the
+   structured per-column leaves rather than the concatenated
+   summary) or, if the row truly has only the concatenated leaf
+   available, single-leaf the headline and decline the date.
+
+**If steps 1+2+3 are all yes, author multi-leaf.** The next
+section gives the shape. If step 4 is the only path to the date,
+you have a single-leaf with a partial coverage — be honest about
+which field is extracted and which is dropped.
+
+### What multi-leaf rows look like in the wild
+
+Real listing pages rarely carry one-class-per-cell semantic
+markup. The recognisable shapes you will encounter most often:
+
+- **Positional table rows.** `<table><tr><td>…</td><td>…</td>
+  <td>…</td></tr>…</table>` with no class names on `tr` or `td`.
+  The iterator is `tr` (or `tbody tr` if you need to skip a
+  header row), and the per-leaf selectors are `td:nth-child(1)`,
+  `td:nth-child(2)`, etc. **A row with no class is still a
+  multi-leaf row** — positional selectors are first-class.
+- **Card listings.** `<div class="item">` containers each carrying
+  several inner spans / anchors / time elements with their own
+  semantics: `<h3>`, `<time datetime="…">`, `<a class="permalink">`.
+  The iterator is `div.item` and the per-leaf selectors are
+  `h3`, `time`, `a.permalink` (or `time` with `attribute:
+  "datetime"`).
+- **JSON object listings.** An array of objects each carrying
+  multiple keys: `{"name": "...", "date": "...", "category":
+  "..."}` repeated N times. The iterator is `$.items[*]` and the
+  per-leaf JSONPaths are `$.name`, `$.date`, `$.category`.
+
+If the recognition checklist says multi-leaf but you cannot pick a
+clean per-leaf selector, that's a decline candidate — but read
+"What NOT to produce" first: an honest decline names which leaf
+was unidentifiable, not "no per-row events."
+
+### The shape
+
 Most recipes bind one extracted scalar to one field of the record
 (`extraction` → `headline`, or `extraction` → `value`). The other
 fields are either constants the recipe-author knows (`literal`) or
@@ -392,6 +466,96 @@ publishes one of the five enum values verbatim. If the source
 publishes a free-form prose tag instead, use `{"kind": "literal",
 "value": "<one of the allowed values>"}` for the `direction`
 field and fall back to single-leaf extraction for `headline`.
+
+### Worked example — multi-leaf events from a position-only table
+
+The first two worked examples picked rows with semantic class
+names (`tr.ownership-row`, `td.from-slug`). Many real listings do
+not have those class names: the table is just `<table>`, the rows
+are just `<tr>`, the cells are just `<td>` in column order. The
+multi-leaf shape applies unchanged — the per-leaf selectors are
+positional rather than semantic.
+
+A storm-summary table where each `<tr>` carries the storm name in
+column 1, the date in column 2, and the category in column 3, and
+no `<td>` carries a class name. The `Repeating element classes`
+block in the prefetch excerpt lists `tr` with N occurrences.
+
+```json
+{
+  "extraction": { "mode": "css_select", "selector": "table.storms tbody tr td:nth-child(1)" },
+  "iterator":   { "mode": "css_select", "selector": "table.storms tbody tr" },
+  "produces": [{
+    "expectation": { "list": "event_type", "index": 0 },
+    "record_type": "event",
+    "dedup_key_field": "headline",
+    "field_mappings": [
+      { "path": "event_type", "source": { "kind": "literal", "value": "storm_formed" } },
+      { "path": "headline",
+        "source": { "kind": "extracted_inner",
+                    "spec": { "mode": "css_select",
+                              "selector": "td:nth-child(1)" } } },
+      { "path": "valid_at",
+        "source": { "kind": "extracted_inner",
+                    "spec": { "mode": "css_select",
+                              "selector": "td:nth-child(2)" } } },
+      { "path": "direction",
+        "source": { "kind": "literal", "value": "supply_negative" } }
+    ]
+  }]
+}
+```
+
+The `td:nth-child(N)` inner selectors evaluate against each
+iterator-matched `tr` scope; column 1 yields the storm name,
+column 2 yields the date string. The table-level class on the
+iterator (`table.storms tbody tr`) is the page-wide hook that
+identifies *which* table on the page is the storm listing — when
+the page has multiple tables, you scope the iterator to the right
+one with whatever distinguishing selector the page offers
+(`table.storms`, `#storm-summary tr`, `section.tropical-cyclones
+table tr`, etc.).
+
+The pattern generalises: **a class-bearing iterator + positional
+inner selectors** covers the common shape where the listing has
+table-level identification but no cell-level semantics. Do not
+require semantic per-cell classes before authoring multi-leaf —
+positional selectors are how real HTML tables are extracted.
+
+### Apply-time signals that meant you should have authored multi-leaf
+
+The shape validator and the apply runtime emit specific failure
+messages that, in retrospect, point at a missed multi-leaf
+opportunity. When the prefetch excerpt for a *retry* surfaces any
+of these, the previous attempt was probably single-leaf and the
+right move now is multi-leaf:
+
+- **"inner selector matched no elements within iterator match (the
+  iterator's selector matched a card, but the inner selector
+  found nothing inside it)"** — a previous attempt used iterator +
+  one inner selector to pull a single leaf per row, and the inner
+  selector was wrong because the field is a *sibling* leaf in the
+  row, not a descendant of the row-level wrapper the iterator
+  picked. If you see this excerpt, the row almost certainly has
+  the structure of an `<li>` or `<tr>` whose immediate children
+  are the per-field cells. Reach for multi-leaf with per-cell
+  `td:nth-child(N)` or `> span.field-name` selectors.
+- **"selector matches a container element (body, div, table)
+  instead of a leaf"** with iterator present — the previous
+  attempt tried to concatenate row text into one extraction. The
+  correct shape is multi-leaf per cell.
+- **"binding[N]: no FieldMap has source `extracted` or
+  `extracted_inner`"** — the previous attempt authored an
+  all-literal binding (every field a constant or plan var). The
+  validator rejects this. If the row carries real per-row data,
+  author multi-leaf with `extracted_inner` for the
+  source-derived fields.
+
+These are not the only retry signals, but they are the three that
+specifically indicate the previous attempt's shape failure was
+missing multi-leaf, not a selector typo. When the prefetch is a
+fresh attempt rather than a retry, run the recognition checklist
+above on its own merits.
 
 ## When no recipe is honestly possible — the decline path
 
@@ -1654,6 +1818,88 @@ you pick.
 ---
 
 ### Changelog
+
+- **v1.20** (2026-05-11) — Session 62, ADR 0019 Phase 2A path-to-
+  Accepted (companion to the v1.19 prompt and the Phase 2A
+  runtime that landed in Session 61). No output contract change;
+  no schema change; no Rust changes. Three prompt-only edits
+  motivated by the Session 61 hurricane + lithium re-run, which
+  exercised the v1.19 prompt across 10 trials and produced zero
+  `extracted_inner` recipes despite the type + validator +
+  runtime + worked examples all being in place.
+
+  Sub-piece 20A (multi-leaf section moves to the front of its
+  surrounding subject area): the "Multi-leaf records" section
+  picks up an opening paragraph that frames single-leaf-vs-multi-
+  leaf as "the single most consequential decision in iterator-
+  bearing recipes." Motivated by the Session 61 observation that
+  the v1.19 prompt's multi-leaf section sat between
+  "Selecting the mode" and the decline path with no visible
+  signal that the LLM was supposed to *consider* it before
+  defaulting to single-leaf. The framing now states the decision
+  point explicitly so the recognition checklist below has
+  something to anchor against.
+
+  Sub-piece 20B (Is this row multi-leaf? — the recognition
+  checklist): new subsection above "The shape" that walks the
+  LLM through four explicit questions (does the listing have N
+  rows? per row, how many extractable leaves? does the record
+  need more than one? is there a single concatenated leaf that
+  would lose structure?). Motivated by the Session 61 hurricane
+  decline pattern: the LLM looked at structured pages and
+  concluded "no per-storm events" because no individual leaf
+  carried a complete English sentence headline — but the pages
+  *did* carry extractable per-row data, just not in headline-
+  shaped leaves. The checklist re-frames the recognition step
+  from "find the headline-shaped leaf" to "count the leaves and
+  match them to the record's fields." Forces the multi-leaf
+  consideration onto the decision path; the existing decline
+  conditions still apply after the checklist runs.
+
+  Sub-piece 20C (worked example with positional selectors): new
+  third worked example "multi-leaf events from a position-only
+  table" between the v1.19 ownership-table and JSON examples and
+  the apply-time-signals subsection. Demonstrates `tr` (no
+  class) + `td:nth-child(N)` (positional) inner selectors —
+  the shape that covers tables with table-level identification
+  but no per-cell semantics. Motivated by Session 61's
+  observation that v1.19's worked examples used
+  `tr.ownership-row` / `td.from-slug` synthetic class names; the
+  storm-list page that motivated ADR 0019 has no per-cell
+  classes, so the v1.19 worked examples didn't transfer.
+  Positional inner selectors are first-class — the new example
+  states this so the LLM doesn't require semantic classes before
+  authoring multi-leaf. Stays class-only per the closed-
+  vocabulary discipline: no host string, no source name; the
+  pattern is general.
+
+  Sub-piece 20D (apply-time signals that meant you should have
+  authored multi-leaf): new subsection after the worked examples
+  that names three specific validator/runtime error messages —
+  "inner selector matched no elements within iterator match,"
+  "selector matches a container element instead of a leaf" with
+  iterator present, and "binding[N]: no FieldMap has source
+  `extracted` or `extracted_inner`" — as signals that a previous
+  attempt was single-leaf when it should have been multi-leaf.
+  Motivated by Session 60's NHC apply failures (twice in Session
+  60, twice more in Session 61) where the v1.18-era message
+  surfaced in the retry excerpt and the LLM re-authored single-
+  leaf rather than reading the message as a multi-leaf signal.
+  Names the failure shapes that point at the missed shape
+  decision specifically; other retry signals (selector typo,
+  endpoint mismatch) remain as today.
+
+  All four sub-pieces are prompt-only, no schema or runtime
+  changes. The empirical question for the Session 63+ live re-
+  run: does the recognition checklist + positional-selector
+  example raise the rate at which the LLM picks `extracted_inner`
+  from 0/10 (Session 61) to ≥1/5 on the hurricane re-run? If
+  yes, ADR 0019 flips to Accepted and the dashboard's events /
+  relations panels become live-populated. If no, the
+  prompt-engineering ceiling on classifier output shape may be
+  closer than the v1.20 hypothesis suggests, and the next move
+  is a reasoning-block-before-JSON experiment or a
+  recipe-iteration-on-FetchReport loop (Session 60 candidate A).
 
 - **v1.19** (2026-05-11) — Session 61, ADR 0019 Phase 2A. The
   recipe-author output now supports `extracted_inner` as a fourth

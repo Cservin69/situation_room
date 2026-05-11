@@ -1,9 +1,10 @@
 # ADR 0019 — Per-field extraction sub-specs: ADR 0016 Phase 2 for multi-leaf record types
 
 **Status**: Proposed (Session 60) — Phase 2A implementation landed
-in Session 61 but **unexercised live**; remains Proposed pending
-live-data validation in Session 62+
-**Date**: 2026-05-11 (proposed); 2026-05-11 (Phase 2A implementation landed)
+Session 61; v1.20 prompt revision + multi-leaf fixture-integration
+test landed Session 62; remains Proposed pending live-data
+validation on the Session 63 hurricane re-run
+**Date**: 2026-05-11 (proposed); 2026-05-11 (Phase 2A implementation landed); 2026-05-11 (v1.20 prompt + fixture-integration test landed)
 **Related**: ADR 0003 (six record types as governance boundary), ADR
 0007 (research function: two-level LLM architecture and the
 closed-extraction-vocabulary discipline), ADR 0016 (extraction
@@ -534,30 +535,111 @@ patterns across 10 trials:
   silently land on unsupported shapes — the gate is consistent
   with what the runtime implements.
 
-### Session 62's path to Accepted
+### What Session 62 added (the path-to-Accepted infrastructure)
 
-Two non-orthogonal directions:
+Session 62 landed both prompt iteration and the
+fixture-integration test described in the previous revision of
+this section. Live re-run with the v1.20 prompt is deferred to
+Session 63.
 
-1. **Prompt iteration.** v1.20 elevates the multi-leaf section's
-   prominence (currently it sits between "mode selection" and
-   "decline path"; promoting it to a top-level subsection and
-   adding an inline "is this row multi-leaf?" rubric near the
-   binding-shape decision point). Add a NHC-shaped worked example
-   that aligns with the actual TCR index page's class structure
-   (operator-supplied per inspection). Re-run the hurricane 5-
-   trial after v1.20 lands.
-2. **Direct exercise.** Hand-author a multi-leaf recipe against a
-   known multi-field listing (e.g. a fixture-served HTML page
-   structured as the v1.19 worked example), apply it through the
-   apply pipeline, and confirm the runtime produces multi-leaf
-   records end-to-end. This is the structural smoke test the
-   runtime tests already cover at the unit level; a fixture-based
-   integration test extends the coverage to the apply-stage
-   normalize layer.
+**v1.20 prompt** (`config/prompts/recipe_author.md`). Four
+sub-pieces, all prompt-only — no schema change, no Rust change:
 
-The recipe-iteration loop on FetchReport (Session 60's A) becomes
-the operator's lever once a multi-leaf recipe has an apply-stage
-failure to re-author against. Session 61 surfaced no such failure
-because no `extracted_inner` recipe was authored at all.
+- **20A — multi-leaf section moves to the front of its
+  subject area.** The "Multi-leaf records" section gains an
+  opening framing that names single-leaf-vs-multi-leaf as "the
+  single most consequential decision in iterator-bearing
+  recipes." The v1.19 placement (between mode-selection and the
+  decline path) was visible but unsignposted; the v1.20 opener
+  forces the LLM to consider multi-leaf as a decision point
+  rather than an obscure option.
+- **20B — "Is this row multi-leaf?" recognition checklist.**
+  New subsection above the shape description that walks the LLM
+  through four explicit questions: does the listing have N
+  rows?, per row how many extractable leaves?, does the record
+  need more than one?, is there a single concatenated leaf that
+  would lose structure? Designed to attack the Session 61
+  failure mode where the LLM looked at structured pages and
+  concluded "no per-storm events" because no leaf was a
+  complete English-sentence headline — the pages did carry
+  extractable per-row data, just not in headline-shaped leaves.
+- **20C — worked example with positional selectors.** Third
+  worked example added: a `tr.row` iterator + `td:nth-child(N)`
+  per-leaf selectors. The v1.19 worked examples used
+  synthetic semantic class names (`tr.ownership-row`,
+  `td.from-slug`) that don't transfer to listings with no per-
+  cell classes — the dominant real-world shape. The new
+  example states "a class-bearing iterator + positional inner
+  selectors covers the common shape where the listing has
+  table-level identification but no cell-level semantics" and
+  explicitly names positional selectors as first-class. Closed-
+  vocabulary discipline preserved: no host strings, no source
+  names; the pattern is general.
+- **20D — apply-time signals that meant you should have
+  authored multi-leaf.** New subsection naming three specific
+  validator/runtime error messages as retry signals that
+  indicate the previous attempt was single-leaf when it should
+  have been multi-leaf: "inner selector matched no elements
+  within iterator match," "selector matches a container element
+  instead of a leaf" with iterator present, and validator rule
+  (iii)'s all-literal-binding rejection. Session 60's NHC apply
+  failures (twice in Session 60, twice more in Session 61)
+  surfaced the first message in retry excerpts and the LLM
+  re-authored single-leaf rather than reading the message as a
+  multi-leaf signal. v1.20 names the signal explicitly.
+
+**Fixture-based integration test**
+(`crates/pipeline/src/normalize.rs`). Two new tests in the
+normalize-stage test module exercise `apply` composed with
+`finalize` on a hand-authored multi-leaf css_select recipe
+(positional inner selectors, three-row HTML fixture):
+
+- `adr_0019_multi_leaf_position_only_table_applies_and_finalizes_end_to_end`
+  asserts (a) three records produced (one per row),
+  (b) per-row `headline` + `direction` extracted leaves,
+  (c) topic tags from the plan reach every record's envelope
+  via finalize's merge_topics, (d) per-row `dedup_key` resolves
+  to `{recipe.id}:{headline}` through the ExtractedInner path.
+  This is the apply→normalize integration the recipe_apply
+  unit tests don't cover.
+- `adr_0019_multi_leaf_preserves_record_shape_after_finalize`
+  pins that a multi-leaf Event recipe finalises to an Event,
+  catching accidental shape regressions in finalize's
+  envelope-mut match when a future change touches it.
+
+The integration test gives ADR 0019 a regression guard
+independent of LLM behaviour: if a future prompt iteration
+causes the recipe-author to stop authoring `extracted_inner`,
+the type+validator+runtime+normalize composition still has CI
+proof of correctness on the multi-leaf path.
+
+### Session 63's gate to Accepted
+
+Run the hurricane 5-trial with the v1.20 prompt. Promotion to
+Accepted requires:
+
+- **Sufficient condition** — ≥1 recipe authored with
+  `FieldValueSource::ExtractedInner` across the 5 trials. This
+  is the empirical falsification the v1.19 attempt couldn't
+  produce.
+- **Stronger signal** — ≥3 Event records per trial on the
+  hurricane plan, each with distinct `headline` and `valid_at`
+  extracted leaves, populating the dashboard's events panel.
+
+If v1.20 doesn't shift the rate from 0/10 (Session 61) to
+≥1/5 (Session 63), the prompt-engineering ceiling on
+shape selection may be closer than the v1.20 hypothesis
+suggests. Two follow-on directions are pre-staged:
+
+1. **Reasoning-block-before-JSON experiment** — let the LLM
+   write a freeform analysis of the prefetch before the
+   structured-output recipe JSON, so the recognition checklist
+   runs as visible reasoning rather than as latent
+   token-distribution shifting.
+2. **Recipe-iteration-on-FetchReport loop** (Session 60's
+   candidate A) — when a single-leaf recipe fails at apply with
+   "inner selector matched no elements," automatically
+   re-author against the retry excerpt with the failure
+   message inline as a multi-leaf signal.
 
 End of ADR.
