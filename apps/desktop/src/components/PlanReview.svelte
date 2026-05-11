@@ -64,6 +64,7 @@
   import NominationStatusGlyph from '$components/panels/NominationStatusGlyph.svelte';
   import NominationAttempts from '$components/panels/NominationAttempts.svelte';
   import RecordCard from '$components/panels/RecordCard.svelte';
+  import RecordsDashboard from '$components/RecordsDashboard.svelte';
   import RunFetchButton from '$components/RunFetchButton.svelte';
   import FetchReport from '$components/FetchReport.svelte';
   import RecipesPanel from '$components/RecipesPanel.svelte';
@@ -146,6 +147,46 @@
   let relationRecords = $derived(plans.records?.relations ?? []);
   let documentRecords = $derived(plans.records?.documents ?? []);
   let assertionRecords = $derived(plans.records?.assertions ?? []);
+
+  /**
+   * Total records across all six types. Drives whether the
+   * dashboard mode is offered at all — when the plan has produced
+   * nothing yet, there's nothing to dashboard, so the buckets view
+   * (with its inline "0 records yet — run a fetch" hints) is the
+   * useful surface and the toggle hides.
+   */
+  let totalRecords = $derived(
+    obsRecords.length +
+      eventRecords.length +
+      entityRecords.length +
+      relationRecords.length +
+      documentRecords.length +
+      assertionRecords.length,
+  );
+
+  /**
+   * Records-view toggle (Session 58). Two modes:
+   *   - `dashboard` — the situation-room view (`RecordsDashboard`):
+   *     records grouped by metric, big numbers + sparklines, type-
+   *     count strip across the top.
+   *   - `buckets` — the original six-bucket panel view:
+   *     expectations interleaved with one-line record cards, JSON
+   *     on expand. Useful when the operator is verifying a recipe
+   *     or auditing the wire shape.
+   *
+   * The default is `dashboard` because that's the answer to the
+   * "what did we get?" question that the user opens the plan to
+   * see. The toggle persists across this component instance; it is
+   * intentionally NOT persisted across the entire app so a fresh
+   * plan-load lands the user on the dashboard reliably.
+   *
+   * The toggle hides entirely when no records exist yet
+   * (`totalRecords === 0`) because the dashboard's empty hint and
+   * the buckets' "0 records yet" hint communicate the same thing,
+   * and the buckets view also surfaces expectations which is the
+   * only meaningful content in the cold-start state.
+   */
+  let recordsViewMode = $state<'dashboard' | 'buckets'>('dashboard');
 </script>
 
 <article class="plan">
@@ -262,7 +303,56 @@
     {/if}
   </section>
 
-  <!-- Six bucket panels.
+  <!-- Records view selector (Session 58). Renders only when the
+       plan has produced records; in the cold-start state the
+       buckets view below is the only useful surface (it carries
+       expectations and "0 records yet" hints), so the toggle
+       hides until there's something to dashboard.
+
+       The dashboard mode replaces the bucket section with the
+       situation-room view (metric-grouped cards, sparklines, type
+       counts). The buckets mode keeps the original
+       expectations-interleaved-with-records surface for auditing
+       the wire shape or verifying a specific recipe.
+  -->
+  {#if recordsLoaded && totalRecords > 0}
+    <header class="records-toolbar" aria-label="records view selector">
+      <span class="records-toolbar-label">records</span>
+      <div class="records-toggle" role="tablist">
+        <button
+          type="button"
+          role="tab"
+          class="seg"
+          class:active={recordsViewMode === 'dashboard'}
+          aria-selected={recordsViewMode === 'dashboard'}
+          onclick={() => (recordsViewMode = 'dashboard')}
+        >
+          dashboard
+        </button>
+        <button
+          type="button"
+          role="tab"
+          class="seg"
+          class:active={recordsViewMode === 'buckets'}
+          aria-selected={recordsViewMode === 'buckets'}
+          onclick={() => (recordsViewMode = 'buckets')}
+        >
+          buckets
+        </button>
+      </div>
+    </header>
+  {/if}
+
+  <!-- Dashboard view — the situation-room presentation. Renders
+       when the toggle is in `dashboard` mode AND records exist.
+       Expectations are intentionally NOT surfaced here: the
+       dashboard answers "what did we get?", not "what did we ask
+       for?". For the latter, flip to `buckets`. -->
+  {#if recordsLoaded && totalRecords > 0 && recordsViewMode === 'dashboard' && plans.records}
+    <RecordsDashboard records={plans.records} />
+  {/if}
+
+  <!-- Six bucket panels (legacy default, now toggle-gated).
 
        Each bucket renders expectations rows from the plan, then —
        when records have been loaded for this plan — a records
@@ -273,7 +363,15 @@
        records have been produced; it does NOT show when expectations
        are also empty (the bucket already shows "no expectations by
        design" in that case via Bucket's empty-state logic).
+
+       Session 58: this section renders in two cases:
+         1. There are no records yet (`totalRecords === 0`) — the
+            buckets carry the expectations and the "0 records yet"
+            hints, which the dashboard view doesn't surface.
+         2. The operator has explicitly switched to buckets mode
+            (`recordsViewMode === 'buckets'`).
   -->
+  {#if totalRecords === 0 || recordsViewMode === 'buckets'}
   <section class="buckets">
     <Bucket
       title="observation"
@@ -473,6 +571,7 @@
       {/if}
     </Bucket>
   </section>
+  {/if}
 
   <!-- Fetch report (Session 8). Renders only when the user has run a
        fetch, or when the history strip has prior runs to show. The
@@ -775,6 +874,59 @@
     display: flex;
     gap: 6px;
     flex-wrap: wrap;
+  }
+
+  /* Records view selector (Session 58). A small segmented control
+     above the records area that toggles between the situation-room
+     dashboard and the original six-bucket view. Visual weight is
+     deliberately low — the toggle is a power-user affordance, not
+     a primary action, and it should not compete with the topic
+     header above or the dashboard content below. */
+  .records-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0;
+  }
+  .records-toolbar-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-tertiary);
+  }
+  .records-toggle {
+    display: inline-flex;
+    border: 1px solid var(--border-subtle);
+    border-radius: 3px;
+    overflow: hidden;
+    background: var(--bg-panel);
+  }
+  .records-toggle .seg {
+    appearance: none;
+    background: transparent;
+    color: var(--fg-tertiary);
+    border: 0;
+    padding: 4px 10px;
+    font-family: var(--font-sans);
+    font-size: 11px;
+    cursor: pointer;
+    transition: background var(--duration-ui) var(--ease),
+                color var(--duration-ui) var(--ease);
+  }
+  .records-toggle .seg:hover {
+    background: var(--bg-panel-alt);
+    color: var(--fg-secondary);
+  }
+  .records-toggle .seg.active {
+    background: var(--bg-panel-alt);
+    color: var(--fg-primary);
+  }
+  .records-toggle .seg + .seg {
+    border-left: 1px solid var(--border-subtle);
+  }
+  .records-toggle .seg:focus-visible {
+    outline: 1px solid var(--border-accent);
+    outline-offset: -1px;
   }
 
   /* Six-bucket grid: 3 cols on wide screens, 2 on medium, 1 on narrow. */
