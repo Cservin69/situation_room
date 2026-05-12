@@ -1,6 +1,6 @@
 <!--
-  RecordsDashboard — the situation-room view of a plan's records
-  (Session 58).
+  RecordsDashboard — the situation-room view of a records bucket
+  (Session 58, expanded Session 63).
 
   ## What this replaces
 
@@ -15,48 +15,55 @@
   The dashboard view re-organises the same data so it reads as a
   briefing rather than a list. The buckets view remains available as
   a debug/power-user toggle in `PlanReview.svelte`; this component is
-  the default when records exist.
+  the default surface when records exist.
+
+  ## Session 63 — cross-plan + all six typed panels
+
+  The component is now data-source-agnostic: it accepts any
+  `RecordsByPlanDto`, whether produced by `records_for_plan` (per-plan)
+  or `records_recent_global` (cross-plan, the new home view in
+  `+page.svelte`). All five non-Observation types now ship typed
+  panels rather than collapsed "pending pill" placeholders.
 
   ## Layout
 
   - **Type-count strip** (top) — six tiles, one per record type, each
     showing the count. Tiles with records highlight; zeros dim. Lets
-    the operator answer "what did the plan get?" without scrolling.
+    the operator answer "what has the bucket got?" without scrolling.
   - **Observations panel** — grouped by `content.metric`, each metric
-    rendered as a `MetricCard`. This is the panel that carries the
-    plan's quantitative payload.
-  - **Other-type pills** (collapsed) — Event, Entity, Relation,
-    Document, Assertion render as small count pills with "details in
-    buckets view" guidance when non-zero. Full typed panels for these
-    five types ship in subsequent commits — Session 58 prioritises
-    Observations because every authored plan so far produces them
-    and the dashboard's value is most visible there. Empty types
-    don't render at all so the dashboard stays dense.
+    rendered as a `MetricCard`. Carries the quantitative payload.
+  - **Events panel** — grouped by `content.event_type`. KindCard
+    surfaces the latest headline as the sample.
+  - **Entities panel** — grouped by top-level `kind`. KindCard
+    surfaces `canonical_name`.
+  - **Relations panel** — grouped by `content.kind`. KindCard
+    surfaces `"{from} → {to}"`.
+  - **Documents panel** — grouped by top-level `kind` (the `doc_kind`
+    field on the wire). KindCard surfaces `title` or a body preview.
+  - **Assertions panel** — grouped by `stance` (top-level on
+    AssertionDto). KindCard surfaces `claimant`.
 
-  ## Why metric-grouping for observations
+  Each typed panel renders only when its bucket has at least one
+  record so the dashboard stays dense; absence is communicated by
+  the dimmed tile in the strip above, not by an empty section.
+
+  ## Why per-type grouping keys
 
   An "observation" of `production` and an "observation" of `reserves`
   share a wire shape but answer different questions; the operator
-  reading the dashboard doesn't think "I have 2 observations", they
-  think "I have a production number and a reserves number." Grouping
-  by `content.metric` matches that mental model directly. The
-  side-effect: when multiple observations of the same metric arrive
-  (different `valid_at`, e.g. historical series), they collapse into
-  one card with a sparkline rather than two separate cards. The
-  schema makes this trivial — `metric` is a closed snake_case
-  vocabulary (`production`, `reserves`, `price`, …), so grouping
-  doesn't require fuzzy matching.
+  doesn't think "I have 2 observations", they think "I have a
+  production number and a reserves number." Each non-Observation
+  panel applies the same principle to its type's natural grouping
+  key — drawn from the closed-vocabulary fields in
+  `crates/core/src/schema/content.rs`. Grouping doesn't require
+  fuzzy matching because the keys are enumerated.
 
   ## What this component does NOT do
 
   - **No re-fetching.** The component is presentational. The parent
-    (`PlanReview`) is responsible for the `records_for_plan` Tauri
-    invocation; this component receives the resolved DTO and
-    renders it.
-  - **No cross-plan comparison.** The dashboard scopes to one plan,
-    same as the rest of the review surface. Cross-plan views (the
-    real situation-room dream — pin records across plans into a
-    persistent canvas) are a separate product surface.
+    (`+page.svelte` for the global view, `PlanReview.svelte` for the
+    per-plan view) owns the Tauri invocation; this component
+    receives the resolved DTO and renders it.
   - **No mutations.** Records arrive read-only at the dashboard.
     Drill-into-recipe / re-author affordances live on the
     `RecipesPanel`, not here.
@@ -64,13 +71,20 @@
 <script lang="ts">
   import type { RecordsByPlanDto } from '$lib/api/types/RecordsByPlanDto';
   import type { ObservationDto } from '$lib/api/types/ObservationDto';
+  import type { EventDto } from '$lib/api/types/EventDto';
+  import type { EntityDto } from '$lib/api/types/EntityDto';
+  import type { RelationDto } from '$lib/api/types/RelationDto';
+  import type { DocumentDto } from '$lib/api/types/DocumentDto';
+  import type { AssertionDto } from '$lib/api/types/AssertionDto';
   import MetricCard from '$components/panels/MetricCard.svelte';
+  import KindCard from '$components/panels/KindCard.svelte';
 
   interface Props {
     /**
-     * The plan's records, as returned by `records_for_plan`. All
-     * six per-type Vecs are required (the wire DTO guarantees they
-     * exist, possibly empty). `null` should never reach this
+     * The records bucket, as returned by either `records_for_plan`
+     * (per-plan) or `records_recent_global` (cross-plan, Session 63).
+     * All six per-type Vecs are required (the wire DTO guarantees
+     * they exist, possibly empty). `null` should never reach this
      * component — the parent handles the "records not loaded yet"
      * state by not rendering us in that case.
      */
@@ -86,10 +100,68 @@
     }
     return undefined;
   }
+  function safeString(obj: unknown, key: string): string {
+    const v = safeGet(obj, key);
+    return typeof v === 'string' ? v : '';
+  }
 
   function metricOf(o: ObservationDto): string {
     const m = safeGet(o.content, 'metric');
     return typeof m === 'string' && m.length > 0 ? m : '(unknown)';
+  }
+
+  // -- envelope-level helpers (shared across typed panels) ---------
+
+  /**
+   * Best-effort bare-host extraction. Mirrors MetricCard's `hostOf`
+   * so the dashboard's per-type cards render hosts identically.
+   * Strips leading `www.` so e.g. `www.noaa.gov` and `noaa.gov`
+   * read as the same source.
+   */
+  function hostOf(rawUrl: string | null | undefined): string {
+    if (!rawUrl) return '';
+    try {
+      const u = new URL(rawUrl);
+      const h = u.host;
+      return h.startsWith('www.') ? h.slice(4) : h;
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Short ISO date for a record's `valid_at` (preferred) or
+   * `observed_at` (fallback). Used by KindCard's footer; year-only
+   * isn't reachable here without knowing whether the record's
+   * `content.period === 'annual'`, which is observation-specific, so
+   * the non-Observation panels just show the date.
+   */
+  function whenOf(env: { valid_at: string | null; observed_at: string }): string {
+    const raw = env.valid_at ?? env.observed_at;
+    if (!raw) return '';
+    const d = new Date(raw);
+    if (Number.isNaN(d.valueOf())) return '';
+    return d.toISOString().slice(0, 10);
+  }
+
+  // Generic group-by helper. Records are bucketed by `keyOf(r)`,
+  // preserving first-seen order so the panel reads left-to-right in
+  // the order records arrived. Per-group records stay in input order
+  // (DB query already returns observed_at DESC, so the first record
+  // in each bucket is the most recent — that's what the per-type
+  // sample readers index into below).
+  function groupBy<T>(
+    items: T[],
+    keyOf: (item: T) => string,
+  ): { key: string; records: T[] }[] {
+    const map = new Map<string, T[]>();
+    for (const item of items) {
+      const k = keyOf(item);
+      const bucket = map.get(k);
+      if (bucket) bucket.push(item);
+      else map.set(k, [item]);
+    }
+    return Array.from(map.entries()).map(([key, records]) => ({ key, records }));
   }
 
   // -- grouping ----------------------------------------------------
@@ -117,6 +189,76 @@
     }));
   });
 
+  // -- typed-panel grouping (Session 63) ---------------------------
+  //
+  // Each non-Observation type has its own grouping key drawn from the
+  // schema in `crates/core/src/schema/content.rs`:
+  //
+  //   - EventContent.event_type   → controlled vocab (see event_types.toml)
+  //   - EntityDto.kind            → top-level entity kind string
+  //   - RelationContent.kind      → snake_case relation kind
+  //   - DocumentDto.kind          → top-level doc_kind string
+  //   - AssertionDto.stance       → asserted / denied / hedged / …
+  //
+  // Sample-line per type chooses the most operator-readable single
+  // field: Event → headline, Entity → canonical_name, Relation →
+  // "{from} → {to}", Document → title, Assertion → claimant. When the
+  // sample is unavailable the card renders a "— no preview available"
+  // hint rather than blanking the line.
+
+  function eventKindOf(e: EventDto): string {
+    return safeString(e.content, 'event_type') || '(unknown)';
+  }
+  function eventSampleOf(e: EventDto): string {
+    return safeString(e.content, 'headline');
+  }
+
+  function entityKindOf(e: EntityDto): string {
+    return e.kind.length > 0 ? e.kind : '(unknown)';
+  }
+  function entitySampleOf(e: EntityDto): string {
+    return e.canonical_name;
+  }
+
+  function relationKindOf(r: RelationDto): string {
+    return safeString(r.content, 'kind') || '(unknown)';
+  }
+  function relationSampleOf(r: RelationDto): string {
+    const from = safeString(r.content, 'from');
+    const to = safeString(r.content, 'to');
+    if (from && to) return `${from} → ${to}`;
+    if (from) return from;
+    if (to) return to;
+    return '';
+  }
+
+  function documentKindOf(d: DocumentDto): string {
+    return d.kind.length > 0 ? d.kind : '(unknown)';
+  }
+  function documentSampleOf(d: DocumentDto): string {
+    if (d.title && d.title.trim().length > 0) return d.title;
+    // No title — show the first ~120 chars of the body as a preview.
+    // The body can be large; clamp so the panel doesn't blow up.
+    if (d.body && d.body.length > 0) {
+      const trimmed = d.body.trim();
+      return trimmed.length > 120 ? trimmed.slice(0, 117) + '…' : trimmed;
+    }
+    return '';
+  }
+
+  function assertionKindOf(a: AssertionDto): string {
+    return a.stance.length > 0 ? a.stance : '(unknown)';
+  }
+  function assertionSampleOf(a: AssertionDto): string {
+    return a.claimant;
+  }
+
+  let eventGroups = $derived(groupBy(records.events, eventKindOf));
+  let entityGroups = $derived(groupBy(records.entities, entityKindOf));
+  let relationGroups = $derived(groupBy(records.relations, relationKindOf));
+  let documentGroups = $derived(groupBy(records.documents, documentKindOf));
+  let assertionGroups = $derived(groupBy(records.assertions, assertionKindOf));
+
   // -- type-count strip --------------------------------------------
 
   /**
@@ -136,15 +278,9 @@
 
   let totalRecords = $derived(typeCounts.reduce((acc, t) => acc + t.count, 0));
 
-  /**
-   * Non-Observation types that have at least one record. Each
-   * becomes a "details in buckets view" pill below the
-   * Observations panel. When all five are empty, the pills
-   * section collapses entirely.
-   */
-  let pendingTypes = $derived(
-    typeCounts.filter((t) => t.kind !== 'observation' && t.count > 0),
-  );
+  // Session 63 — `pendingTypes` is gone. The pre-Session-63 surface
+  // collapsed five record types into a single "pending typed panel"
+  // pill row; the five typed panels below replace it entirely.
 </script>
 
 <section class="dashboard" aria-label="records dashboard">
@@ -166,34 +302,11 @@
     </span>
   </header>
 
-  <!--
-    Session 60 — aspirational-note pass (D). Session 61 landed both
-    gates (ADR 0018 bucket-fair dispatch raised the per-nomination cap
-    to 6 and switched to round-robin order; ADR 0019 Phase 2A added
-    `extracted_inner` FieldMaps for css_select and json_path). The
-    note now reflects the structural-readiness state: dimmed tiles
-    mean "the gates are open, but a recipe hasn't authored against
-    that bucket on this plan yet" rather than "tried and empty" or
-    "structurally unreachable." Removed once the typed panels have
-    at least one record each — at which point `pendingTypes.length`
-    falls to 0 by definition and the pill row takes over the
-    "not-yet-populated" surface.
-
-    Rendered only when at least one record exists for the plan, so the
-    pre-fetch and true-empty cases don't carry an explanation for an
-    absence the operator hasn't yet measured.
-  -->
-  {#if totalRecords > 0 && pendingTypes.length === 0}
-    <p class="aspirational-note" aria-label="pending typed panels">
-      Events, Entities, Relations, Documents, and Assertions are
-      structurally reachable from Session 61 onward (ADR 0018
-      bucket-fair dispatch + ADR 0019 per-field extraction sub-specs).
-      Dimmed tiles above mean "the gates are open but this plan
-      hasn't authored a recipe against that bucket yet," not
-      "tried and empty." The pill row below surfaces buckets where
-      a record landed.
-    </p>
-  {/if}
+  <!-- Session 63: the pre-Session-63 aspirational-note + pill-row
+       surface is gone. Every non-Observation type now has its own
+       typed panel below. Dimmed tiles in the strip mean "this type
+       has no records yet"; a populated tile points at the typed
+       panel underneath it. -->
 
   <!-- Observations panel — the primary cargo of the dashboard.
        Renders only when there's at least one observation; the empty
@@ -212,24 +325,117 @@
     </section>
   {/if}
 
-  <!-- "Pending-typed-panel" section. Surfaces the existence of
-       non-Observation records as a single line of pills, each with a
-       count and a small hint that the dashboard's typed panel for
-       this record type isn't built yet. Clicking falls through to
-       the buckets view (the parent owns the view-toggle wiring; this
-       component just emits a `requestBucketsView` event). -->
-  {#if pendingTypes.length > 0}
-    <aside class="pending" aria-label="other record types">
-      <span class="pending-label">other record types in this plan:</span>
-      <div class="pills">
-        {#each pendingTypes as t (t.kind)}
-          <span class="pill" title="full typed panel for {t.label} coming in a later session; use the buckets view for now">
-            <span class="pill-label">{t.label}</span>
-            <span class="pill-count">{t.count}</span>
-          </span>
+  <!-- Session 63 typed panels for the five non-Observation types.
+       Each panel groups by the type's natural kind field and renders
+       one KindCard per group with a count + representative sample.
+       Each panel renders only when its bucket has at least one record
+       so the dashboard stays dense — types with nothing collected
+       stay represented by the dimmed tile in the type-count strip
+       above, not by an empty section. -->
+
+  {#if records.events.length > 0}
+    <section class="typed-panel" aria-label="events">
+      <header class="panel-header">
+        <span>events · by event_type</span>
+        <span class="panel-coord">{eventGroups.length} type{eventGroups.length === 1 ? '' : 's'}</span>
+      </header>
+      <div class="cards">
+        {#each eventGroups as g (g.key)}
+          <KindCard
+            kind={g.key}
+            count={g.records.length}
+            sample={eventSampleOf(g.records[0])}
+            when={whenOf(g.records[0].envelope)}
+            sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
+            sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}
+          />
         {/each}
       </div>
-    </aside>
+    </section>
+  {/if}
+
+  {#if records.entities.length > 0}
+    <section class="typed-panel" aria-label="entities">
+      <header class="panel-header">
+        <span>entities · by kind</span>
+        <span class="panel-coord">{entityGroups.length} kind{entityGroups.length === 1 ? '' : 's'}</span>
+      </header>
+      <div class="cards">
+        {#each entityGroups as g (g.key)}
+          <KindCard
+            kind={g.key}
+            count={g.records.length}
+            sample={entitySampleOf(g.records[0])}
+            when={whenOf(g.records[0].envelope)}
+            sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
+            sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}
+          />
+        {/each}
+      </div>
+    </section>
+  {/if}
+
+  {#if records.relations.length > 0}
+    <section class="typed-panel" aria-label="relations">
+      <header class="panel-header">
+        <span>relations · by kind</span>
+        <span class="panel-coord">{relationGroups.length} kind{relationGroups.length === 1 ? '' : 's'}</span>
+      </header>
+      <div class="cards">
+        {#each relationGroups as g (g.key)}
+          <KindCard
+            kind={g.key}
+            count={g.records.length}
+            sample={relationSampleOf(g.records[0])}
+            when={whenOf(g.records[0].envelope)}
+            sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
+            sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}
+          />
+        {/each}
+      </div>
+    </section>
+  {/if}
+
+  {#if records.documents.length > 0}
+    <section class="typed-panel" aria-label="documents">
+      <header class="panel-header">
+        <span>documents · by kind</span>
+        <span class="panel-coord">{documentGroups.length} kind{documentGroups.length === 1 ? '' : 's'}</span>
+      </header>
+      <div class="cards">
+        {#each documentGroups as g (g.key)}
+          <KindCard
+            kind={g.key}
+            count={g.records.length}
+            sample={documentSampleOf(g.records[0])}
+            when={whenOf(g.records[0].envelope)}
+            sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
+            sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}
+          />
+        {/each}
+      </div>
+    </section>
+  {/if}
+
+  {#if records.assertions.length > 0}
+    <section class="typed-panel" aria-label="assertions">
+      <header class="panel-header">
+        <span>assertions · by stance</span>
+        <span class="panel-coord">{assertionGroups.length} stance{assertionGroups.length === 1 ? '' : 's'}</span>
+      </header>
+      <div class="cards">
+        {#each assertionGroups as g (g.key)}
+          <KindCard
+            kind={g.key}
+            count={g.records.length}
+            sample={assertionSampleOf(g.records[0])}
+            when={whenOf(g.records[0].envelope)}
+            sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
+            sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}
+          />
+        {/each}
+      </div>
+    </section>
   {/if}
 
   <!-- True-empty case: the plan produced nothing at all. The
@@ -321,6 +527,20 @@
     border: 1px solid var(--border-subtle);
     border-radius: 4px;
   }
+
+  /* ---- Typed panels for non-Observation types (Session 63) ----
+     Same visual shape as `.observations` so the dashboard reads as a
+     consistent stack of "type → kinds → cards" sections. The shared
+     `.cards` grid above governs the card layout. */
+  .typed-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+  }
   .panel-header {
     display: flex;
     align-items: baseline;
@@ -344,64 +564,9 @@
     gap: 10px;
   }
 
-  /* ---- Pending-typed-panel pills ---- */
-
-  .pending {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 8px 12px;
-    background: var(--bg-inset);
-    border: 1px dashed var(--border-subtle);
-    border-radius: 3px;
-  }
-  .pending-label {
-    font-size: 11px;
-    color: var(--fg-tertiary);
-    flex: 0 0 auto;
-  }
-  .pills {
-    display: flex;
-    gap: 6px;
-    flex-wrap: wrap;
-  }
-  .pill {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 4px;
-    padding: 2px 6px;
-    border: 1px solid var(--border-subtle);
-    border-radius: 10px;
-    background: var(--bg-panel);
-    font-size: 10px;
-  }
-  .pill-label {
-    color: var(--fg-secondary);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-  .pill-count {
-    font-family: var(--font-mono);
-    font-variant-numeric: tabular-nums;
-    color: var(--fg-primary);
-  }
-
-  /* ---- Aspirational note (Session 60, ADR 0018/0019) ---- */
-
-  .aspirational-note {
-    margin: 0;
-    padding: 8px 12px;
-    background: var(--bg-inset);
-    border-left: 2px dashed var(--border-subtle);
-    border-radius: 2px;
-    font-size: 11px;
-    line-height: 1.6;
-    color: var(--fg-tertiary);
-  }
-  /* Session 61: the v1.0 note's `<code>` rule for inline ADR
-     references was removed when the prose stopped quoting ADR file
-     paths; the gates landed so the note no longer needs to point at
-     unmerged ADRs. */
+  /* Session 63 — `.pending` / `.pill*` / `.aspirational-note` styles
+     removed. The typed panels above ship as first-class sections; no
+     pill row or unauthored-bucket explanation remains in the template. */
 
   /* ---- True-empty hint ---- */
 

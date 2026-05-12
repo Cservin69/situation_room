@@ -56,6 +56,7 @@
 <script lang="ts">
   import type { ObservationDto } from '$lib/api/types/ObservationDto';
   import MiniSparkline from '$components/charts/MiniSparkline.svelte';
+  import CopyButton from '$components/common/CopyButton.svelte';
 
   interface Props {
     /**
@@ -275,7 +276,12 @@
       </span>
     {/if}
     {#if sourceHost}
-      <span class="source" title={sourceUrl || sourceHost}>{sourceHost}</span>
+      <span class="source-wrap">
+        <span class="source" title={sourceUrl || sourceHost}>{sourceHost}</span>
+        {#if sourceUrl}
+          <CopyButton value={sourceUrl} />
+        {/if}
+      </span>
     {/if}
   </footer>
 </article>
@@ -384,13 +390,36 @@
     font-family: var(--font-mono);
     color: var(--fg-secondary);
   }
-  .source {
+  /* Source group — host text + copy affordance. The copy button
+     fades in on card-hover (and on its own focus-visible for
+     keyboard users); the host text stays visible at all times so
+     the operator sees *where* the URL points before deciding to
+     copy. */
+  .source-wrap {
     margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+  }
+  .source {
     font-family: var(--font-mono);
     color: var(--fg-tertiary);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     max-width: 14ch;
+  }
+  .source-wrap :global(.copy-btn) {
+    opacity: 0;
+    transition: opacity var(--duration-ui) var(--ease),
+                color var(--duration-ui) var(--ease),
+                background var(--duration-ui) var(--ease),
+                border-color var(--duration-ui) var(--ease);
+  }
+  .metric-card:hover .source-wrap :global(.copy-btn),
+  .source-wrap :global(.copy-btn:focus-visible),
+  .source-wrap :global(.copy-btn.copied) {
+    opacity: 1;
   }
 </style>

@@ -55,6 +55,7 @@ import {
   listRecipeFeedbackForPlan as apiListRecipeFeedbackForPlan,
   reauthorRecipe as apiReauthorRecipe,
   recordsForPlan as apiRecordsForPlan,
+  recordsRecentGlobal as apiRecordsRecentGlobal,
   recipeOutcomesHistory as apiRecipeOutcomesHistory,
   expectationCoverage as apiExpectationCoverage,
   hostBackoffState as apiHostBackoffState,
@@ -145,6 +146,22 @@ interface PlansState {
    */
   records: RecordsByPlanDto | null;
   /**
+   * Session 63 — cross-plan records bucket. The whole-database view
+   * of every record produced by every plan, capped at the backend's
+   * per-type limit. `null` means we haven't asked yet (pre-boot or
+   * pre-first-refresh); an all-empty bucket means we asked and the
+   * store has nothing yet.
+   *
+   * Lifecycle is intentionally **decoupled from plan selection**:
+   * `selectPlan` and `clearSelection` leave this field alone. The
+   * dashboard's whole point is that prior plans' records stay
+   * visible across plan changes. The field refreshes on app boot
+   * (in `+page.svelte`'s `onMount`) and after every successful
+   * `runFetch` so new records land in the dashboard within one
+   * synchronous handler.
+   */
+  globalRecords: RecordsByPlanDto | null;
+  /**
    * Per-(recipe-or-source) outcome history across the plan's recent
    * fetch runs (Session 46). Drives the recipe-success heatmap.
    * Empty until the first roundtrip lands; refreshed alongside
@@ -207,6 +224,7 @@ export const plans: PlansState = $state({
   recipes: [],
   recipeFeedback: {},
   records: null,
+  globalRecords: null,
   outcomesHistory: [],
   expectationCoverage: null,
   hostBackoff: [],
@@ -595,6 +613,12 @@ export async function runFetch(): Promise<boolean> {
     // The records command is safe at this point — the plan must
     // have been Accepted for the fetch to have run.
     void refreshRecords(current.id).catch(() => {});
+    // Session 63: refresh the cross-plan dashboard too. New records
+    // produced by this fetch must surface in the global view inside
+    // the synchronous handler — that's the whole point of the
+    // dashboard being cross-plan. Failure is non-fatal; the
+    // dashboard keeps showing what it had.
+    void refreshGlobalRecords().catch(() => {});
     // Session 46: a successful fetch writes outcome rows and may
     // author new recipes; refresh both heatmap history and coverage
     // matrix so the panels reflect what just happened.
@@ -675,6 +699,36 @@ export async function refreshRecipeFeedback(planId: string): Promise<void> {
     // Non-fatal: same rationale as refreshFetchRuns / refreshRecipes.
     // Don't reset the map; preserving the previous state is more
     // useful than blanking it on a transient failure.
+    plans.error = asCommandError(e);
+  }
+}
+
+/**
+ * Refresh the cross-plan global records bucket (Session 63). Pure
+ * read; no plan-id argument. Powers the situation-room dashboard
+ * which is cross-plan by design — the operator's view of "what have
+ * we collected" doesn't reset every time a fresh plan is classified.
+ *
+ * Called on app boot (so the dashboard populates immediately, even
+ * before the operator selects any plan) and after every successful
+ * `runFetch` (so newly-produced records surface inside the
+ * synchronous handler's lifetime, without waiting for a manual
+ * refresh).
+ *
+ * Failure preserves the previous `plans.globalRecords` so a transient
+ * network blip doesn't blank a populated dashboard. Same posture as
+ * `refreshRecords` for the per-plan view.
+ *
+ * `limit` defaults to the backend's default (200 per type, clamped
+ * server-side to a sane ceiling). The dashboard never needs more.
+ */
+export async function refreshGlobalRecords(limit = 200): Promise<void> {
+  try {
+    plans.globalRecords = await apiRecordsRecentGlobal(limit);
+  } catch (e) {
+    // Non-fatal: preserve the previous bucket on a transient failure
+    // (matches refreshRecords' policy). The dashboard staying stale
+    // for one fetch cycle is much better than blanking.
     plans.error = asCommandError(e);
   }
 }

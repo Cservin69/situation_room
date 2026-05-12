@@ -317,6 +317,35 @@ export async function recordsForPlan(id: string): Promise<RecordsByPlanDto> {
 }
 
 /**
+ * Return the most recent records of each type across **all plans**.
+ * Session 63. Pure read; no LLM call.
+ *
+ * Drives the cross-plan situation-room dashboard. The operator's
+ * mental model of "what have we collected" is cumulative across
+ * topics; this surface keeps prior plans' records visible after a
+ * new classification lands, instead of resetting on every plan
+ * change.
+ *
+ * `limit` caps each per-type Vec independently. The backend clamps
+ * to a sane ceiling regardless of what the frontend sends. Default
+ * suits the dashboard's panel densities (200 newest per type is more
+ * than any single panel renders before scrolling).
+ *
+ * Empty buckets surface as empty Vecs, never errors. A brand-new
+ * store with nothing fetched legitimately returns six empty arrays
+ * — the dashboard's empty-state copy handles that case.
+ *
+ * No status gating, no plan-id argument. Unlike `records_for_plan`,
+ * which refuses pending plans, the global query has nothing to
+ * refuse.
+ */
+export async function recordsRecentGlobal(
+  limit = 200,
+): Promise<RecordsByPlanDto> {
+  return invoke<RecordsByPlanDto>('records_recent_global', { limit });
+}
+
+/**
  * Per-(recipe-or-source) outcome history across the plan's recent
  * fetch runs. Pure read; safe to call on plan selection.
  *

@@ -166,8 +166,11 @@ hypothesis suggests. Two pre-staged follow-ons in the ADR:
   - `docs/adr/0019-per-field-extraction-subspecs.md`
     (Session 62 "What we added" subsection + Session 63
     "path to Accepted" gate + status date updated)
-- **`cargo test --workspace`**: <to-fill-from-cargo_test_session_62.log>
-- **`npm run check`**: <to-fill-from-npm_check_session_62.log>
+- **`cargo test --workspace` green**: 794 tests passed, 0 failed,
+  14 ignored (live-network tests, unchanged). Up from 792 in
+  Session 61 — net +2 tests from the two new normalize fixture-
+  integration tests for ExtractedInner.
+- **`npm run check` clean**: 0 errors, 0 warnings.
 
 ## Sequencing
 

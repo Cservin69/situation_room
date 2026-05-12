@@ -113,3 +113,79 @@ pub async fn records_for_plan(
 
     Ok(RecordsByPlanDto::from_typed(bucket))
 }
+
+// ---------------------------------------------------------------------------
+// records_recent_global — Session 63
+// ---------------------------------------------------------------------------
+
+/// Default per-type cap for `records_recent_global`. Each of the six
+/// per-type Vecs in the returned bucket is capped independently at
+/// this many newest-first rows, so the wire payload's worst case is
+/// 6 × 200 = 1,200 record rows. On realistic populations the totals
+/// are far smaller — most types are empty for any given session — and
+/// the IPC round-trip stays sub-100ms.
+const DEFAULT_GLOBAL_LIMIT: usize = 200;
+
+/// Hard ceiling for the operator-supplied limit. Keeps a pathological
+/// `limit = 1_000_000` from blowing the IPC round-trip even if the DB
+/// grew unexpectedly large. Operator-supplied values above this clamp
+/// down silently — there's no error case, just a saner answer.
+const MAX_GLOBAL_LIMIT: usize = 500;
+
+/// Return the most recent records of each type across **all plans**.
+/// Pure read; no LLM call.
+///
+/// Powers the situation-room dashboard's cross-plan view (Session 63).
+/// The per-plan view via [`records_for_plan`] still exists; this is
+/// the surface that answers "what has the system collected over
+/// time, across every plan." That's the operator's mental model of
+/// the dashboard: a cumulative view of records, not a per-plan
+/// projection that resets every time a new topic is classified.
+///
+/// ## Status gating
+///
+/// None. Unlike [`records_for_plan`], which refuses pending plans
+/// because their records bucket is meaningless, the global query has
+/// no plan to gate on. An empty store legitimately returns an empty
+/// `RecordsByPlanDto` — the frontend distinguishes "nothing has been
+/// fetched yet" from "we just don't have data for this type" by the
+/// six per-type counts in the response.
+///
+/// ## Limit
+///
+/// `limit` caps each per-type Vec independently. Defaults to
+/// [`DEFAULT_GLOBAL_LIMIT`] when `None`; clamped to
+/// [`MAX_GLOBAL_LIMIT`] regardless.
+///
+/// ## Errors
+///
+/// - `Storage` — DB-level failure during one of the six per-table
+///   queries. No other failure modes; the query is a pure read with
+///   no input validation surface.
+#[tauri::command]
+pub async fn records_recent_global(
+    limit: Option<usize>,
+    state: tauri::State<'_, AppState>,
+) -> Result<RecordsByPlanDto, CommandError> {
+    let effective = limit.unwrap_or(DEFAULT_GLOBAL_LIMIT).min(MAX_GLOBAL_LIMIT);
+
+    info!(limit = effective, "records_recent_global command invoked");
+
+    let bucket = state
+        .store
+        .recent_records_global(effective)
+        .map_err(CommandError::from)?;
+
+    info!(
+        limit = effective,
+        observations = bucket.observations.len(),
+        events = bucket.events.len(),
+        entities = bucket.entities.len(),
+        relations = bucket.relations.len(),
+        documents = bucket.documents.len(),
+        assertions = bucket.assertions.len(),
+        "records_recent_global returning"
+    );
+
+    Ok(RecordsByPlanDto::from_typed(bucket))
+}

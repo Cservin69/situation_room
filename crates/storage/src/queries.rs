@@ -1,6 +1,6 @@
 //! Queries that span record types.
 //!
-//! Two cross-record queries live here:
+//! Three cross-record queries live here:
 //!
 //! - [`Store::topics_in_use`] — the Level-1 classifier injection
 //!   (ADR 0007). The classifier is shown the topic strings already in
@@ -8,9 +8,15 @@
 //!   topic strings.
 //! - [`Store::records_for_plan`] (Session 22) — given a plan, return
 //!   every record produced by any of that plan's recipes, bucketed by
-//!   record type. Drives the records-on-the-workstation rendering.
+//!   record type. Drives the per-plan bucket panel.
+//! - [`Store::recent_records_global`] (Session 63) — the most recent
+//!   N records of each type across every plan, no plan filter. Drives
+//!   the situation-room dashboard, which is cross-plan by design: the
+//!   operator's mental model of "what have we collected" doesn't
+//!   reset every time a fresh plan is classified, so the dashboard
+//!   shouldn't either.
 //!
-//! Both queries scan junction or substring data and return owned
+//! All queries scan junction or substring data and return owned
 //! typed values rather than streaming — the volumes are bounded
 //! (topics in the low hundreds; records per plan in the low
 //! thousands) and the API surface is simpler.
@@ -187,6 +193,64 @@ impl Store {
             assertions,
         })
     }
+
+    /// Return the N most recent records of each type across **all
+    /// plans**. No plan filter — the bucket carries the union of
+    /// what every plan's recipes have produced, newest first per
+    /// table.
+    ///
+    /// ## Why cross-plan (Session 63)
+    ///
+    /// The operator's mental model of "what have we collected" is
+    /// cumulative: a fresh classification of a new topic does not
+    /// invalidate the prior topic's records. Per-plan dashboards
+    /// reset that view every time a new plan is opened or
+    /// classified, which makes it impossible to see whether the
+    /// system is producing more records over time. This query
+    /// powers the situation-room dashboard, which is cross-plan by
+    /// design.
+    ///
+    /// The per-plan view via [`Store::records_for_plan`] still
+    /// exists for drilling into one plan's recipe-by-recipe output.
+    ///
+    /// ## Bound
+    ///
+    /// `limit` caps each per-type Vec independently. With
+    /// `limit = 200` the wire payload sits below 200 KiB even on a
+    /// pathological all-typed-six-tables population — comfortable
+    /// for the Tauri IPC round-trip.
+    ///
+    /// ## Performance
+    ///
+    /// Six small SELECTs, each ordered on `observed_at` and
+    /// LIMITed. DuckDB's column-store + small LIMIT keeps these
+    /// well under 10ms each on the volumes this product targets.
+    /// No JOINs — the result is the union of what's in each table,
+    /// not a recipe-routed projection.
+    pub fn recent_records_global(&self, limit: usize) -> Result<RecordsByPlan> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Other(format!("connection poisoned: {e}")))?;
+
+        let limit_i = limit as i64;
+
+        let observations = list_observations_recent(&conn, limit_i)?;
+        let events = list_events_recent(&conn, limit_i)?;
+        let entities = list_entities_recent(&conn, limit_i)?;
+        let relations = list_relations_recent(&conn, limit_i)?;
+        let documents = list_documents_recent(&conn, limit_i)?;
+        let assertions = list_assertions_recent(&conn, limit_i)?;
+
+        Ok(RecordsByPlan {
+            observations,
+            events,
+            entities,
+            relations,
+            documents,
+            assertions,
+        })
+    }
 }
 
 /// Build a `(col LIKE ? OR col LIKE ? OR …)` clause for `n` patterns.
@@ -208,15 +272,54 @@ fn build_or_likes(col: &str, n: usize) -> String {
 // hurt readability. The shape is uniform enough for a review pass:
 // SELECT, query, decode, reconstruct envelope, push.
 
+/// SELECT column list shared by [`list_observations`] and
+/// [`list_observations_recent`]. Kept as a constant so the column
+/// order — which the per-row decoder indexes into — stays in lockstep
+/// across both query paths.
+const OBSERVATIONS_COLUMNS: &str =
+    "id, dedup_key, source_id, source_url, source_published_at, \
+     license, tags, subject_time, observed_at, valid_at, confidence, \
+     content";
+
+/// Decode one observation row produced by [`OBSERVATIONS_COLUMNS`].
+/// Shared between the WHERE-filtered ([`list_observations`]) and
+/// LIMIT-bounded ([`list_observations_recent`]) variants so the
+/// per-column index layout has a single source of truth.
+fn decode_observation_row(
+    conn: &duckdb::Connection,
+    row: &duckdb::Row<'_>,
+) -> Result<Observation> {
+    let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
+    let dedup_key: Option<String> = row.get(1).map_err(StorageError::DuckDb)?;
+    let raw = EnvelopeRow {
+        source_id: row.get(2).map_err(StorageError::DuckDb)?,
+        source_url: row.get(3).map_err(StorageError::DuckDb)?,
+        source_published_at: row.get(4).map_err(StorageError::DuckDb)?,
+        license: row.get(5).map_err(StorageError::DuckDb)?,
+        tags_json: row.get(6).map_err(StorageError::DuckDb)?,
+        subject_time_json: row.get(7).map_err(StorageError::DuckDb)?,
+        observed_at: row.get(8).map_err(StorageError::DuckDb)?,
+        valid_at: row.get(9).map_err(StorageError::DuckDb)?,
+        confidence_f: row.get(10).map_err(StorageError::DuckDb)?,
+    };
+    let content_json: String = row.get(11).map_err(StorageError::DuckDb)?;
+    let content: ObservationContent = serde_json::from_str(&content_json)?;
+    let envelope = reconstruct_envelope(conn, row_id, raw)?;
+    Ok(Observation {
+        id: row_id,
+        dedup_key,
+        envelope,
+        content,
+    })
+}
+
 fn list_observations(
     conn: &duckdb::Connection,
     where_clause: &str,
     patterns: &[String],
 ) -> Result<Vec<Observation>> {
     let sql = format!(
-        "SELECT id, dedup_key, source_id, source_url, source_published_at,
-                license, tags, subject_time, observed_at, valid_at, confidence,
-                content
+        "SELECT {OBSERVATIONS_COLUMNS}
          FROM observations
          WHERE {where_clause}
          ORDER BY observed_at DESC, id DESC"
@@ -228,30 +331,64 @@ fn list_observations(
 
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
-        let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
-        let dedup_key: Option<String> = row.get(1).map_err(StorageError::DuckDb)?;
-        let raw = EnvelopeRow {
-            source_id: row.get(2).map_err(StorageError::DuckDb)?,
-            source_url: row.get(3).map_err(StorageError::DuckDb)?,
-            source_published_at: row.get(4).map_err(StorageError::DuckDb)?,
-            license: row.get(5).map_err(StorageError::DuckDb)?,
-            tags_json: row.get(6).map_err(StorageError::DuckDb)?,
-            subject_time_json: row.get(7).map_err(StorageError::DuckDb)?,
-            observed_at: row.get(8).map_err(StorageError::DuckDb)?,
-            valid_at: row.get(9).map_err(StorageError::DuckDb)?,
-            confidence_f: row.get(10).map_err(StorageError::DuckDb)?,
-        };
-        let content_json: String = row.get(11).map_err(StorageError::DuckDb)?;
-        let content: ObservationContent = serde_json::from_str(&content_json)?;
-        let envelope = reconstruct_envelope(conn, row_id, raw)?;
-        out.push(Observation {
-            id: row_id,
-            dedup_key,
-            envelope,
-            content,
-        });
+        out.push(decode_observation_row(conn, row)?);
     }
     Ok(out)
+}
+
+/// Cross-plan recent-observations listing. No WHERE clause; the only
+/// bound is `LIMIT`. Used by [`Store::recent_records_global`] to feed
+/// the cross-plan dashboard.
+fn list_observations_recent(
+    conn: &duckdb::Connection,
+    limit: i64,
+) -> Result<Vec<Observation>> {
+    let sql = format!(
+        "SELECT {OBSERVATIONS_COLUMNS}
+         FROM observations
+         ORDER BY observed_at DESC, id DESC
+         LIMIT ?"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(StorageError::DuckDb)?;
+    let mut rows = stmt
+        .query(params![limit])
+        .map_err(StorageError::DuckDb)?;
+
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
+        out.push(decode_observation_row(conn, row)?);
+    }
+    Ok(out)
+}
+
+const EVENTS_COLUMNS: &str =
+    "id, dedup_key, source_id, source_url, source_published_at, \
+     license, tags, subject_time, observed_at, valid_at, confidence, \
+     content";
+
+fn decode_event_row(conn: &duckdb::Connection, row: &duckdb::Row<'_>) -> Result<Event> {
+    let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
+    let dedup_key: Option<String> = row.get(1).map_err(StorageError::DuckDb)?;
+    let raw = EnvelopeRow {
+        source_id: row.get(2).map_err(StorageError::DuckDb)?,
+        source_url: row.get(3).map_err(StorageError::DuckDb)?,
+        source_published_at: row.get(4).map_err(StorageError::DuckDb)?,
+        license: row.get(5).map_err(StorageError::DuckDb)?,
+        tags_json: row.get(6).map_err(StorageError::DuckDb)?,
+        subject_time_json: row.get(7).map_err(StorageError::DuckDb)?,
+        observed_at: row.get(8).map_err(StorageError::DuckDb)?,
+        valid_at: row.get(9).map_err(StorageError::DuckDb)?,
+        confidence_f: row.get(10).map_err(StorageError::DuckDb)?,
+    };
+    let content_json: String = row.get(11).map_err(StorageError::DuckDb)?;
+    let content: EventContent = serde_json::from_str(&content_json)?;
+    let envelope = reconstruct_envelope(conn, row_id, raw)?;
+    Ok(Event {
+        id: row_id,
+        dedup_key,
+        envelope,
+        content,
+    })
 }
 
 fn list_events(
@@ -260,9 +397,7 @@ fn list_events(
     patterns: &[String],
 ) -> Result<Vec<Event>> {
     let sql = format!(
-        "SELECT id, dedup_key, source_id, source_url, source_published_at,
-                license, tags, subject_time, observed_at, valid_at, confidence,
-                content
+        "SELECT {EVENTS_COLUMNS}
          FROM events
          WHERE {where_clause}
          ORDER BY observed_at DESC, id DESC"
@@ -274,30 +409,67 @@ fn list_events(
 
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
-        let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
-        let dedup_key: Option<String> = row.get(1).map_err(StorageError::DuckDb)?;
-        let raw = EnvelopeRow {
-            source_id: row.get(2).map_err(StorageError::DuckDb)?,
-            source_url: row.get(3).map_err(StorageError::DuckDb)?,
-            source_published_at: row.get(4).map_err(StorageError::DuckDb)?,
-            license: row.get(5).map_err(StorageError::DuckDb)?,
-            tags_json: row.get(6).map_err(StorageError::DuckDb)?,
-            subject_time_json: row.get(7).map_err(StorageError::DuckDb)?,
-            observed_at: row.get(8).map_err(StorageError::DuckDb)?,
-            valid_at: row.get(9).map_err(StorageError::DuckDb)?,
-            confidence_f: row.get(10).map_err(StorageError::DuckDb)?,
-        };
-        let content_json: String = row.get(11).map_err(StorageError::DuckDb)?;
-        let content: EventContent = serde_json::from_str(&content_json)?;
-        let envelope = reconstruct_envelope(conn, row_id, raw)?;
-        out.push(Event {
-            id: row_id,
-            dedup_key,
-            envelope,
-            content,
-        });
+        out.push(decode_event_row(conn, row)?);
     }
     Ok(out)
+}
+
+fn list_events_recent(conn: &duckdb::Connection, limit: i64) -> Result<Vec<Event>> {
+    let sql = format!(
+        "SELECT {EVENTS_COLUMNS}
+         FROM events
+         ORDER BY observed_at DESC, id DESC
+         LIMIT ?"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(StorageError::DuckDb)?;
+    let mut rows = stmt
+        .query(params![limit])
+        .map_err(StorageError::DuckDb)?;
+
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
+        out.push(decode_event_row(conn, row)?);
+    }
+    Ok(out)
+}
+
+const ENTITIES_COLUMNS: &str =
+    "id, entity_id, kind, canonical_name, geometry, \
+     source_id, source_url, source_published_at, \
+     license, tags, subject_time, observed_at, valid_at, confidence";
+
+fn decode_entity_row(conn: &duckdb::Connection, row: &duckdb::Row<'_>) -> Result<Entity> {
+    let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
+    let entity_id_s: String = row.get(1).map_err(StorageError::DuckDb)?;
+    let kind: String = row.get(2).map_err(StorageError::DuckDb)?;
+    let canonical_name: String = row.get(3).map_err(StorageError::DuckDb)?;
+    let geometry_json: Option<String> = row.get(4).map_err(StorageError::DuckDb)?;
+    let raw = EnvelopeRow {
+        source_id: row.get(5).map_err(StorageError::DuckDb)?,
+        source_url: row.get(6).map_err(StorageError::DuckDb)?,
+        source_published_at: row.get(7).map_err(StorageError::DuckDb)?,
+        license: row.get(8).map_err(StorageError::DuckDb)?,
+        tags_json: row.get(9).map_err(StorageError::DuckDb)?,
+        subject_time_json: row.get(10).map_err(StorageError::DuckDb)?,
+        observed_at: row.get(11).map_err(StorageError::DuckDb)?,
+        valid_at: row.get(12).map_err(StorageError::DuckDb)?,
+        confidence_f: row.get(13).map_err(StorageError::DuckDb)?,
+    };
+    let envelope = reconstruct_envelope(conn, row_id, raw)?;
+    let entity_id = EntityId::new(entity_id_s)
+        .map_err(|e| StorageError::Other(format!("entity_id round-trip: {e}")))?;
+    let geometry = match geometry_json {
+        Some(s) => Some(serde_json::from_str(&s)?),
+        None => None,
+    };
+    Ok(Entity {
+        id: row_id,
+        entity_id,
+        kind,
+        canonical_name,
+        geometry,
+        envelope,
+    })
 }
 
 fn list_entities(
@@ -306,9 +478,7 @@ fn list_entities(
     patterns: &[String],
 ) -> Result<Vec<Entity>> {
     let sql = format!(
-        "SELECT id, entity_id, kind, canonical_name, geometry,
-                source_id, source_url, source_published_at,
-                license, tags, subject_time, observed_at, valid_at, confidence
+        "SELECT {ENTITIES_COLUMNS}
          FROM entities
          WHERE {where_clause}
          ORDER BY observed_at DESC, id DESC"
@@ -320,39 +490,58 @@ fn list_entities(
 
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
-        let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
-        let entity_id_s: String = row.get(1).map_err(StorageError::DuckDb)?;
-        let kind: String = row.get(2).map_err(StorageError::DuckDb)?;
-        let canonical_name: String = row.get(3).map_err(StorageError::DuckDb)?;
-        let geometry_json: Option<String> = row.get(4).map_err(StorageError::DuckDb)?;
-        let raw = EnvelopeRow {
-            source_id: row.get(5).map_err(StorageError::DuckDb)?,
-            source_url: row.get(6).map_err(StorageError::DuckDb)?,
-            source_published_at: row.get(7).map_err(StorageError::DuckDb)?,
-            license: row.get(8).map_err(StorageError::DuckDb)?,
-            tags_json: row.get(9).map_err(StorageError::DuckDb)?,
-            subject_time_json: row.get(10).map_err(StorageError::DuckDb)?,
-            observed_at: row.get(11).map_err(StorageError::DuckDb)?,
-            valid_at: row.get(12).map_err(StorageError::DuckDb)?,
-            confidence_f: row.get(13).map_err(StorageError::DuckDb)?,
-        };
-        let envelope = reconstruct_envelope(conn, row_id, raw)?;
-        let entity_id = EntityId::new(entity_id_s)
-            .map_err(|e| StorageError::Other(format!("entity_id round-trip: {e}")))?;
-        let geometry = match geometry_json {
-            Some(s) => Some(serde_json::from_str(&s)?),
-            None => None,
-        };
-        out.push(Entity {
-            id: row_id,
-            entity_id,
-            kind,
-            canonical_name,
-            geometry,
-            envelope,
-        });
+        out.push(decode_entity_row(conn, row)?);
     }
     Ok(out)
+}
+
+fn list_entities_recent(conn: &duckdb::Connection, limit: i64) -> Result<Vec<Entity>> {
+    let sql = format!(
+        "SELECT {ENTITIES_COLUMNS}
+         FROM entities
+         ORDER BY observed_at DESC, id DESC
+         LIMIT ?"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(StorageError::DuckDb)?;
+    let mut rows = stmt
+        .query(params![limit])
+        .map_err(StorageError::DuckDb)?;
+
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
+        out.push(decode_entity_row(conn, row)?);
+    }
+    Ok(out)
+}
+
+const RELATIONS_COLUMNS: &str =
+    "id, dedup_key, source_id, source_url, source_published_at, \
+     license, tags, subject_time, observed_at, valid_at, confidence, \
+     content";
+
+fn decode_relation_row(conn: &duckdb::Connection, row: &duckdb::Row<'_>) -> Result<Relation> {
+    let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
+    let dedup_key: Option<String> = row.get(1).map_err(StorageError::DuckDb)?;
+    let raw = EnvelopeRow {
+        source_id: row.get(2).map_err(StorageError::DuckDb)?,
+        source_url: row.get(3).map_err(StorageError::DuckDb)?,
+        source_published_at: row.get(4).map_err(StorageError::DuckDb)?,
+        license: row.get(5).map_err(StorageError::DuckDb)?,
+        tags_json: row.get(6).map_err(StorageError::DuckDb)?,
+        subject_time_json: row.get(7).map_err(StorageError::DuckDb)?,
+        observed_at: row.get(8).map_err(StorageError::DuckDb)?,
+        valid_at: row.get(9).map_err(StorageError::DuckDb)?,
+        confidence_f: row.get(10).map_err(StorageError::DuckDb)?,
+    };
+    let content_json: String = row.get(11).map_err(StorageError::DuckDb)?;
+    let content: RelationContent = serde_json::from_str(&content_json)?;
+    let envelope = reconstruct_envelope(conn, row_id, raw)?;
+    Ok(Relation {
+        id: row_id,
+        dedup_key,
+        envelope,
+        content,
+    })
 }
 
 fn list_relations(
@@ -361,9 +550,7 @@ fn list_relations(
     patterns: &[String],
 ) -> Result<Vec<Relation>> {
     let sql = format!(
-        "SELECT id, dedup_key, source_id, source_url, source_published_at,
-                license, tags, subject_time, observed_at, valid_at, confidence,
-                content
+        "SELECT {RELATIONS_COLUMNS}
          FROM relations
          WHERE {where_clause}
          ORDER BY observed_at DESC, id DESC"
@@ -375,30 +562,68 @@ fn list_relations(
 
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
-        let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
-        let dedup_key: Option<String> = row.get(1).map_err(StorageError::DuckDb)?;
-        let raw = EnvelopeRow {
-            source_id: row.get(2).map_err(StorageError::DuckDb)?,
-            source_url: row.get(3).map_err(StorageError::DuckDb)?,
-            source_published_at: row.get(4).map_err(StorageError::DuckDb)?,
-            license: row.get(5).map_err(StorageError::DuckDb)?,
-            tags_json: row.get(6).map_err(StorageError::DuckDb)?,
-            subject_time_json: row.get(7).map_err(StorageError::DuckDb)?,
-            observed_at: row.get(8).map_err(StorageError::DuckDb)?,
-            valid_at: row.get(9).map_err(StorageError::DuckDb)?,
-            confidence_f: row.get(10).map_err(StorageError::DuckDb)?,
-        };
-        let content_json: String = row.get(11).map_err(StorageError::DuckDb)?;
-        let content: RelationContent = serde_json::from_str(&content_json)?;
-        let envelope = reconstruct_envelope(conn, row_id, raw)?;
-        out.push(Relation {
-            id: row_id,
-            dedup_key,
-            envelope,
-            content,
-        });
+        out.push(decode_relation_row(conn, row)?);
     }
     Ok(out)
+}
+
+fn list_relations_recent(conn: &duckdb::Connection, limit: i64) -> Result<Vec<Relation>> {
+    let sql = format!(
+        "SELECT {RELATIONS_COLUMNS}
+         FROM relations
+         ORDER BY observed_at DESC, id DESC
+         LIMIT ?"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(StorageError::DuckDb)?;
+    let mut rows = stmt
+        .query(params![limit])
+        .map_err(StorageError::DuckDb)?;
+
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
+        out.push(decode_relation_row(conn, row)?);
+    }
+    Ok(out)
+}
+
+const DOCUMENTS_COLUMNS: &str =
+    "id, dedup_key, title, doc_kind, mime, body, published_at, author, \
+     source_id, source_url, source_published_at, \
+     license, tags, subject_time, observed_at, valid_at, confidence";
+
+fn decode_document_row(conn: &duckdb::Connection, row: &duckdb::Row<'_>) -> Result<Document> {
+    let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
+    let dedup_key: Option<String> = row.get(1).map_err(StorageError::DuckDb)?;
+    let title: Option<String> = row.get(2).map_err(StorageError::DuckDb)?;
+    let kind: String = row.get(3).map_err(StorageError::DuckDb)?;
+    let mime: String = row.get(4).map_err(StorageError::DuckDb)?;
+    let body: String = row.get(5).map_err(StorageError::DuckDb)?;
+    let published_at: Option<chrono::DateTime<chrono::Utc>> =
+        row.get(6).map_err(StorageError::DuckDb)?;
+    let author: Option<String> = row.get(7).map_err(StorageError::DuckDb)?;
+    let raw = EnvelopeRow {
+        source_id: row.get(8).map_err(StorageError::DuckDb)?,
+        source_url: row.get(9).map_err(StorageError::DuckDb)?,
+        source_published_at: row.get(10).map_err(StorageError::DuckDb)?,
+        license: row.get(11).map_err(StorageError::DuckDb)?,
+        tags_json: row.get(12).map_err(StorageError::DuckDb)?,
+        subject_time_json: row.get(13).map_err(StorageError::DuckDb)?,
+        observed_at: row.get(14).map_err(StorageError::DuckDb)?,
+        valid_at: row.get(15).map_err(StorageError::DuckDb)?,
+        confidence_f: row.get(16).map_err(StorageError::DuckDb)?,
+    };
+    let envelope = reconstruct_envelope(conn, row_id, raw)?;
+    Ok(Document {
+        id: row_id,
+        dedup_key,
+        title,
+        kind,
+        mime,
+        body,
+        published_at,
+        author,
+        envelope,
+    })
 }
 
 fn list_documents(
@@ -407,9 +632,7 @@ fn list_documents(
     patterns: &[String],
 ) -> Result<Vec<Document>> {
     let sql = format!(
-        "SELECT id, dedup_key, title, doc_kind, mime, body, published_at, author,
-                source_id, source_url, source_published_at,
-                license, tags, subject_time, observed_at, valid_at, confidence
+        "SELECT {DOCUMENTS_COLUMNS}
          FROM documents
          WHERE {where_clause}
          ORDER BY observed_at DESC, id DESC"
@@ -421,40 +644,67 @@ fn list_documents(
 
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
-        let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
-        let dedup_key: Option<String> = row.get(1).map_err(StorageError::DuckDb)?;
-        let title: Option<String> = row.get(2).map_err(StorageError::DuckDb)?;
-        let kind: String = row.get(3).map_err(StorageError::DuckDb)?;
-        let mime: String = row.get(4).map_err(StorageError::DuckDb)?;
-        let body: String = row.get(5).map_err(StorageError::DuckDb)?;
-        let published_at: Option<chrono::DateTime<chrono::Utc>> =
-            row.get(6).map_err(StorageError::DuckDb)?;
-        let author: Option<String> = row.get(7).map_err(StorageError::DuckDb)?;
-        let raw = EnvelopeRow {
-            source_id: row.get(8).map_err(StorageError::DuckDb)?,
-            source_url: row.get(9).map_err(StorageError::DuckDb)?,
-            source_published_at: row.get(10).map_err(StorageError::DuckDb)?,
-            license: row.get(11).map_err(StorageError::DuckDb)?,
-            tags_json: row.get(12).map_err(StorageError::DuckDb)?,
-            subject_time_json: row.get(13).map_err(StorageError::DuckDb)?,
-            observed_at: row.get(14).map_err(StorageError::DuckDb)?,
-            valid_at: row.get(15).map_err(StorageError::DuckDb)?,
-            confidence_f: row.get(16).map_err(StorageError::DuckDb)?,
-        };
-        let envelope = reconstruct_envelope(conn, row_id, raw)?;
-        out.push(Document {
-            id: row_id,
-            dedup_key,
-            title,
-            kind,
-            mime,
-            body,
-            published_at,
-            author,
-            envelope,
-        });
+        out.push(decode_document_row(conn, row)?);
     }
     Ok(out)
+}
+
+fn list_documents_recent(conn: &duckdb::Connection, limit: i64) -> Result<Vec<Document>> {
+    let sql = format!(
+        "SELECT {DOCUMENTS_COLUMNS}
+         FROM documents
+         ORDER BY observed_at DESC, id DESC
+         LIMIT ?"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(StorageError::DuckDb)?;
+    let mut rows = stmt
+        .query(params![limit])
+        .map_err(StorageError::DuckDb)?;
+
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
+        out.push(decode_document_row(conn, row)?);
+    }
+    Ok(out)
+}
+
+const ASSERTIONS_COLUMNS: &str =
+    "id, dedup_key, claimant, stance, content_kind, content, \
+     source_id, source_url, source_published_at, \
+     license, tags, subject_time, observed_at, valid_at, confidence";
+
+fn decode_assertion_row(conn: &duckdb::Connection, row: &duckdb::Row<'_>) -> Result<Assertion> {
+    let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
+    let dedup_key: Option<String> = row.get(1).map_err(StorageError::DuckDb)?;
+    let claimant_s: String = row.get(2).map_err(StorageError::DuckDb)?;
+    let stance_s: String = row.get(3).map_err(StorageError::DuckDb)?;
+    let _content_kind: String = row.get(4).map_err(StorageError::DuckDb)?;
+    let content_json: String = row.get(5).map_err(StorageError::DuckDb)?;
+    let raw = EnvelopeRow {
+        source_id: row.get(6).map_err(StorageError::DuckDb)?,
+        source_url: row.get(7).map_err(StorageError::DuckDb)?,
+        source_published_at: row.get(8).map_err(StorageError::DuckDb)?,
+        license: row.get(9).map_err(StorageError::DuckDb)?,
+        tags_json: row.get(10).map_err(StorageError::DuckDb)?,
+        subject_time_json: row.get(11).map_err(StorageError::DuckDb)?,
+        observed_at: row.get(12).map_err(StorageError::DuckDb)?,
+        valid_at: row.get(13).map_err(StorageError::DuckDb)?,
+        confidence_f: row.get(14).map_err(StorageError::DuckDb)?,
+    };
+    let envelope = reconstruct_envelope(conn, row_id, raw)?;
+    let claimant = EntityId::new(claimant_s)
+        .map_err(|e| StorageError::Other(format!("claimant round-trip: {e}")))?;
+    let stance: Stance = serde_json::from_value(serde_json::Value::String(stance_s))
+        .map_err(StorageError::Serde)?;
+    let content: AssertedContent = serde_json::from_str(&content_json)?;
+    Ok(Assertion {
+        id: row_id,
+        dedup_key,
+        claimant,
+        stance,
+        content,
+        envelope,
+    })
 }
 
 fn list_assertions(
@@ -463,9 +713,7 @@ fn list_assertions(
     patterns: &[String],
 ) -> Result<Vec<Assertion>> {
     let sql = format!(
-        "SELECT id, dedup_key, claimant, stance, content_kind, content,
-                source_id, source_url, source_published_at,
-                license, tags, subject_time, observed_at, valid_at, confidence
+        "SELECT {ASSERTIONS_COLUMNS}
          FROM assertions
          WHERE {where_clause}
          ORDER BY observed_at DESC, id DESC"
@@ -477,37 +725,26 @@ fn list_assertions(
 
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
-        let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
-        let dedup_key: Option<String> = row.get(1).map_err(StorageError::DuckDb)?;
-        let claimant_s: String = row.get(2).map_err(StorageError::DuckDb)?;
-        let stance_s: String = row.get(3).map_err(StorageError::DuckDb)?;
-        let _content_kind: String = row.get(4).map_err(StorageError::DuckDb)?;
-        let content_json: String = row.get(5).map_err(StorageError::DuckDb)?;
-        let raw = EnvelopeRow {
-            source_id: row.get(6).map_err(StorageError::DuckDb)?,
-            source_url: row.get(7).map_err(StorageError::DuckDb)?,
-            source_published_at: row.get(8).map_err(StorageError::DuckDb)?,
-            license: row.get(9).map_err(StorageError::DuckDb)?,
-            tags_json: row.get(10).map_err(StorageError::DuckDb)?,
-            subject_time_json: row.get(11).map_err(StorageError::DuckDb)?,
-            observed_at: row.get(12).map_err(StorageError::DuckDb)?,
-            valid_at: row.get(13).map_err(StorageError::DuckDb)?,
-            confidence_f: row.get(14).map_err(StorageError::DuckDb)?,
-        };
-        let envelope = reconstruct_envelope(conn, row_id, raw)?;
-        let claimant = EntityId::new(claimant_s)
-            .map_err(|e| StorageError::Other(format!("claimant round-trip: {e}")))?;
-        let stance: Stance = serde_json::from_value(serde_json::Value::String(stance_s))
-            .map_err(StorageError::Serde)?;
-        let content: AssertedContent = serde_json::from_str(&content_json)?;
-        out.push(Assertion {
-            id: row_id,
-            dedup_key,
-            claimant,
-            stance,
-            content,
-            envelope,
-        });
+        out.push(decode_assertion_row(conn, row)?);
+    }
+    Ok(out)
+}
+
+fn list_assertions_recent(conn: &duckdb::Connection, limit: i64) -> Result<Vec<Assertion>> {
+    let sql = format!(
+        "SELECT {ASSERTIONS_COLUMNS}
+         FROM assertions
+         ORDER BY observed_at DESC, id DESC
+         LIMIT ?"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(StorageError::DuckDb)?;
+    let mut rows = stmt
+        .query(params![limit])
+        .map_err(StorageError::DuckDb)?;
+
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
+        out.push(decode_assertion_row(conn, row)?);
     }
     Ok(out)
 }
@@ -806,6 +1043,87 @@ mod tests {
 
         let result = store.records_for_plan(plan_id).unwrap();
         assert!(result.observations.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // recent_records_global tests (Session 63)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn recent_records_global_empty_when_nothing_stored() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let result = store.recent_records_global(50).unwrap();
+        assert!(result.observations.is_empty());
+        assert!(result.events.is_empty());
+        assert!(result.entities.is_empty());
+        assert!(result.relations.is_empty());
+        assert!(result.documents.is_empty());
+        assert!(result.assertions.is_empty());
+    }
+
+    #[test]
+    fn recent_records_global_returns_records_from_every_plan() {
+        // The whole point of the cross-plan query: records produced by
+        // two different plans' recipes must both surface, even though
+        // `records_for_plan` (used as a sanity baseline) would only
+        // return one or the other depending on which plan you asked
+        // about.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_a = Uuid::now_v7();
+        let plan_b = Uuid::now_v7();
+        let recipe_a = insert_test_recipe(&store, plan_a, "gdelt");
+        let recipe_b = insert_test_recipe(&store, plan_b, "rss_feeds");
+
+        let obs_a = obs_for_recipe("gdelt", recipe_a, 1);
+        let obs_b = obs_for_recipe("rss_feeds", recipe_b, 1);
+        store.insert_observation(&obs_a).unwrap();
+        store.insert_observation(&obs_b).unwrap();
+
+        let result = store.recent_records_global(50).unwrap();
+        assert_eq!(result.observations.len(), 2);
+        // Per-plan listings are unchanged — sanity that we haven't
+        // regressed the existing query in the refactor.
+        assert_eq!(store.records_for_plan(plan_a).unwrap().observations.len(), 1);
+        assert_eq!(store.records_for_plan(plan_b).unwrap().observations.len(), 1);
+    }
+
+    #[test]
+    fn recent_records_global_respects_limit_per_type() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_id = Uuid::now_v7();
+        let recipe_id = insert_test_recipe(&store, plan_id, "gdelt");
+
+        // Insert five observations; ask for two. Each must come back.
+        for i in 1..=5u32 {
+            let obs = obs_for_recipe("gdelt", recipe_id, i);
+            store.insert_observation(&obs).unwrap();
+        }
+
+        let result = store.recent_records_global(2).unwrap();
+        assert_eq!(result.observations.len(), 2);
+    }
+
+    #[test]
+    fn recent_records_global_includes_legacy_provenance_records() {
+        // Unlike records_for_plan (recipe-routed via the source_id
+        // substring), the global query is unfiltered — legacy rows
+        // without a `#recipe:` provenance still surface. The dashboard
+        // wants to see everything in the store, not just what a recipe
+        // produced. This is the deliberate semantic difference between
+        // the two queries.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let legacy = obs_with_topics(vec![Topic::new("test_topic").unwrap()]);
+        store.insert_observation(&legacy).unwrap();
+
+        let result = store.recent_records_global(50).unwrap();
+        assert_eq!(result.observations.len(), 1);
     }
 
     #[test]

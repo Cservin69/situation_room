@@ -240,7 +240,15 @@ fn main() -> Result<()> {
             // (a sibling module to `commands`), so the path differs
             // from the rest of this list — `commands_records::`,
             // not `commands::`.
-            situation_room_api::commands_records::records_for_plan
+            situation_room_api::commands_records::records_for_plan,
+            // Session 63 — cross-plan dashboard. Reads the same six
+            // per-type tables `records_for_plan` reads, but without a
+            // plan-id filter: returns the newest records of each
+            // type across every plan. Drives the global
+            // `RecordsDashboard` so the operator's view of "what has
+            // been collected" doesn't reset every time a fresh
+            // classification lands.
+            situation_room_api::commands_records::records_recent_global
         ])
         .run(tauri::generate_context!())
         .context("running tauri")?;
