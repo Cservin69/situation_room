@@ -151,57 +151,101 @@ crates/api/src/commands_records.rs           (+~60 lines)
 apps/desktop/src-tauri/src/main.rs           (+1 command registration)
 apps/desktop/src/lib/api/client.ts           (+1 wrapper)
 apps/desktop/src/stores/plans.svelte.ts      (+globalRecords field + helper + 2 hook calls)
-apps/desktop/src/routes/+page.svelte         (right-pane empty state → global dashboard)
+apps/desktop/src/routes/+page.svelte         (right-pane empty state → global dashboard;
+                                              dead `.empty` CSS rule pruned)
 apps/desktop/src/components/RecordsDashboard.svelte
                                              (+5 typed panels, -pending pill row)
 apps/desktop/src/components/panels/KindCard.svelte   (new)
+apps/desktop/src/components/panels/MetricCard.svelte (+CopyButton wiring + hover-reveal CSS)
+apps/desktop/src/components/common/CopyButton.svelte (new — clipboard copy affordance)
 ```
 
-## Verification gate — pending operator
+## Verification gate — green
 
-The operator runs cargo on Mac and tees the logs. Verification
-commands:
+- `cargo test --workspace`: passed on operator's Mac (operator
+  reported "all green"). Baseline 794 → expected ≥798 after the
+  +4 `recent_records_global_*` tests in `queries.rs`.
+- `npm run check`: 0 errors, 0 warnings after a follow-up pass
+  fixed two cosmetic warnings — added the standard `line-clamp`
+  property alongside `-webkit-line-clamp` in `KindCard.svelte` for
+  forward-compat, and pruned the now-unused `.empty` CSS rule from
+  `+page.svelte` (its markup was replaced by the `.home`
+  cross-plan dashboard block).
 
-```
-cd ~/Documents/Claude/Projects/SituationRoom && \
-  (cargo test --workspace 2>&1; echo "EXIT=$?") | tee test.log && \
-  (cd apps/desktop && npm run check 2>&1; echo "EXIT=$?") | tee ../../tsc.log
-```
+## Live-run result — hurricanes didn't break through
 
-Expected pass thresholds:
-- `cargo test --workspace`: previous baseline 794 passed → expect
-  ≥798 (the +4 `recent_records_global_*` tests added in
-  `queries.rs`).
-- `npm run check`: 0 errors, 0 warnings.
+Operator ran v1.20 against the 2025 Atlantic hurricane season plan
+and reported "hurricanes did not come out so fine" — meaning the
+prompt-only changes from Session 62 didn't shift the rate enough to
+clear ADR 0019's acceptance threshold. Events *did* land via a
+different topic during the session, so the typed Events panel is
+verified working end-to-end against live data; this is a recipe-
+authoring rate problem on the hurricane shape specifically, not a
+dashboard-rendering problem.
 
-## Path to Accepted — Session 64
+This kills the Session 62 hypothesis that "multi-leaf recognition
+checklist + positional-selector worked example + apply-time-signal
+subsection" would together move 0/10 → ≥1/5 on `extracted_inner`
+authoring. Session 64 needs a structurally different intervention,
+not another prompt iteration.
 
-Once the verification logs land green, rsync to the live binary and
-spot-check the home view:
+## Session 64 direction — two pre-staged ADR 0019 follow-ons
+
+Session 62's handoff documented two candidates in case v1.20
+didn't suffice. Both still apply; recommendation differs in
+intervention depth.
+
+1. **Reasoning-block-before-JSON** (cheaper, single-shot). Let the
+   LLM write a freeform analysis of the prefetch *before* emitting
+   the structured recipe JSON. The multi-leaf recognition checklist
+   runs as visible reasoning rather than as latent token-distribution
+   shifting. Lower cost: prompt-only delta. Tests whether the LLM
+   *can* recognise multi-leaf rows when forced to articulate first.
+2. **Recipe-iteration-on-FetchReport loop** (Session 60's candidate
+   A, deeper). When a single-leaf recipe fails at apply with
+   "inner selector matched no elements," automatically re-author
+   against the retry excerpt with the failure message inline as a
+   multi-leaf signal. Closes the loop that the v1.20 apply-time-
+   signal subsection only described in prose. Higher cost: runtime
+   loop + recipe-author re-entry. Tests whether *feedback on
+   failure* lifts the rate where prompt-only iteration plateaued.
+
+**Recommendation: recipe-iteration-on-FetchReport.** It's the
+no-easy-wins move per the operator's standing feedback (deeper
+than prompt iteration, exercises a real loop), and the typed
+Events panel now lets the operator read the iteration's result
+directly. The cheaper reasoning-block experiment is worth running
+*after* — if the loop lifts the rate, the reasoning-block test
+becomes a "can we get the same lift more cheaply" follow-up; if
+the loop *also* doesn't lift the rate, that's strong evidence the
+ceiling isn't prompt-engineerable at all and ADR 0019 needs a
+different structural pass.
+
+The eval-harness from Session 57 makes either candidate a 5-trial
+sweep with variance bounds — no more single-trial decisions on
+prompt experiments.
+
+## Smoke-test after rsync
+
+Spot-check the new home view independent of the Session 64
+candidates above. Four points:
 
 1. App boot lands on the global dashboard (no plan selected).
 2. Records across the lithium + hurricane + Fed plans all surface
    simultaneously.
-3. The `EVENTS 1` from the in-progress hurricane v1.20 run renders
-   as an Events typed panel with the event_type as the kind and the
-   headline as the sample.
-4. Running a fresh fetch updates the dashboard inside the
-   synchronous handler.
+3. Past hurricane runs' EVENTS render as a typed Events panel with
+   `event_type` as the kind and the headline as the sample.
+4. A fresh fetch updates the dashboard inside the synchronous
+   handler.
+5. Hovering any record card reveals the copy button next to the
+   source host; clicking copies the full URL, flashes a green
+   checkmark for ~1.5s, paste lands the URL into any external
+   destination.
 
-If any of those four don't hold, that's the next session's
-debugging surface — most likely a wire-shape mismatch in one of the
-per-type grouping accessors, or a missing call site for
-`refreshGlobalRecords`.
-
-## What this defers from Session 62's planned work
-
-Session 62 left the v1.20 hurricane re-run as the ADR 0019
-acceptance gate. The screenshot the operator shared *is* a v1.20
-run (1 event, mid-fetch), and the new typed panel will be how the
-operator visually verifies whether ≥1 `extracted_inner` recipe was
-authored. So Session 63's dashboard work is the empirical-gate
-visualization — the gate decision lands once the operator can read
-the panel data after a 5-trial sweep, which is Session 64+
-territory.
+If any of those don't hold, that's a Session 64 opening-debug
+surface — most likely a wire-shape mismatch in one of the per-type
+grouping accessors, a missing `refreshGlobalRecords` call site, or
+a `navigator.clipboard` permission edge case on the operator's
+specific Tauri runtime.
 
 End of handoff.

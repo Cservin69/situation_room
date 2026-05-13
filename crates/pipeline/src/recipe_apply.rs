@@ -206,6 +206,131 @@ fn truncate_content_assembly_reason(reason: String) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Schema-aware coercion at content assembly (Session 64)
+// ---------------------------------------------------------------------------
+//
+// Background. `parse_extracted_scalar` is type-blind: every numeric-
+// looking leaf becomes a `serde_json::Value::Number`. That is the
+// correct default for `ObservationContent::value: f64` — the most
+// common recipe target — but it is wrong whenever the binding's path
+// resolves to a JSON String at the schema level.
+//
+// The Session 64 incident: a persisted recipe for federalreserve.gov
+// produced records on its first apply (the leaf rendered as a
+// non-numeric date string), then began failing on subsequent applies
+// with `event content: invalid type: floating point '22.0', expected
+// a string`. The recipe was unchanged (`load_or_author_recipes`
+// short-circuits when a stored recipe exists). The source's leaf had
+// drifted to a numeric-looking shape between fetches. The type-blind
+// coercion turned that drift into a hard schema failure instead of a
+// still-acceptable string.
+//
+// Fix shape. Resolve every field value as today, then — *before*
+// inserting into the assembled JSON — consult the target field's
+// expected JSON shape and stringify `Value::Number` when the schema
+// expects a String. This sits at the same layer as the rest of
+// `build_record`: above `serde_json::from_value` (so the assembled
+// JSON we hand to serde is already type-consistent) and below
+// `resolve_field_value` (so each `FieldValueSource` keeps its
+// independent semantics).
+//
+// Why not push the decision into `parse_extracted_scalar`. The
+// extractor doesn't know the binding's target record type or path —
+// `FieldMap` carries that information, but `parse_extracted_scalar`
+// receives only the raw extracted string. Threading the schema
+// expectation down would require changing the recipe wire shape
+// (`FieldMap` would need a target-type field) and re-authoring every
+// existing recipe. The build-time coercion is a narrower change that
+// fixes the same volatility without disturbing the recipe schema.
+//
+// Why not catch the serde error and retry. The error doesn't carry
+// the offending field's path in a stable, parseable form, and a
+// blanket "stringify all numerics on retry" would clobber legitimate
+// f64 fields (`ObservationContent::value`) on records whose failure
+// was elsewhere. The proactive coercion path is both narrower (only
+// known-String paths) and stable (no error-message parsing).
+//
+// The String-path set is hardcoded per `RecordType`. Each entry
+// corresponds to a `String`, an enum-as-string, or a newtype-around-
+// String (`Unit`, `EntityId`) on the respective content struct in
+// `crates/core/src/schema/content.rs`. Nested paths through
+// `magnitude: Option<ObservationContent>` are included on `Event` and
+// `Relation` because the runtime can bind into them. The set is
+// deliberately small and explicit; if a new String-typed field is
+// added to a content struct, an entry must be added here, and a
+// failing assembly will keep the operator honest until it is.
+
+/// Paths on a record's content tree whose schema type is JSON String
+/// (a `String`, an enum, or a newtype around `String`). When a
+/// FieldMap's path matches one of these, the resolved
+/// `serde_json::Value` is coerced from `Number` to `String` before
+/// it lands in the assembled JSON. Matching is exact on the
+/// dot-separated path the FieldMap carries.
+fn path_expects_string(record_type: RecordType, path: &str) -> bool {
+    let entries: &[&str] = match record_type {
+        // ObservationContent: `metric: String`, `unit: Unit(String)`,
+        // `currency: Option<Currency>` (enum), `period:
+        // ObservationPeriod` (enum). `value` and `value_uncertainty`
+        // are f64; `geometry` is an object.
+        RecordType::Observation => &[
+            "metric",
+            "unit",
+            "currency",
+            "period",
+        ],
+        // EventContent: `event_type: EventType` (enum), `headline:
+        // String`, `direction: Option<EventDirection>` (enum).
+        // `magnitude: Option<ObservationContent>` — nested
+        // String-paths inherited from Observation.
+        RecordType::Event => &[
+            "event_type",
+            "headline",
+            "direction",
+            "magnitude.metric",
+            "magnitude.unit",
+            "magnitude.currency",
+            "magnitude.period",
+        ],
+        // RelationContent: `kind: String`, `from: EntityId(String)`,
+        // `to: EntityId(String)`. `magnitude` mirrors Event.
+        RecordType::Relation => &[
+            "kind",
+            "from",
+            "to",
+            "magnitude.metric",
+            "magnitude.unit",
+            "magnitude.currency",
+            "magnitude.period",
+        ],
+        // Document / Entity / Assertion are not recipe-producible
+        // (build_record rejects them with a Binding error before
+        // reaching this layer). Return the empty set so a future
+        // hand-rolled call site doesn't silently mis-coerce.
+        RecordType::Document | RecordType::Entity | RecordType::Assertion => &[],
+    };
+    entries.iter().any(|e| *e == path)
+}
+
+/// Coerce `Value::Number` to `Value::String` in-place when the field
+/// at `path` is schema-typed as String. No-op for non-Number values
+/// and for paths that are not in the String set. The numeric
+/// representation comes from `serde_json`'s own `Display` impl on
+/// `Number` so `22.0` round-trips to `"22.0"` and `22` round-trips
+/// to `"22"`.
+fn coerce_for_string_path(value: &mut Value, record_type: RecordType, path: &str) {
+    if !path_expects_string(record_type, path) {
+        return;
+    }
+    if let Value::Number(n) = value {
+        *value = Value::String(n.to_string());
+    }
+    // Booleans, nulls, and nested objects/arrays are intentionally
+    // left alone. Serde will reject them at deserialization with the
+    // record content type's actual constraints — the right failure
+    // signal for those shapes, which the operator should see.
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -1598,11 +1723,22 @@ fn build_record(
     // ObservationContent assembly.
     let mut content_json: Map<String, Value> = Map::new();
     for fm in &binding.field_mappings {
-        let value = resolve_field_value(fm, extracted, ctx.plan, inner_extractions)
+        let mut value = resolve_field_value(fm, extracted, ctx.plan, inner_extractions)
             .map_err(|e| ApplyError::Binding {
                 index,
                 reason: e.to_string(),
             })?;
+        // Session 64: `parse_extracted_scalar` is type-blind and
+        // promotes any numeric-looking leaf to `Value::Number`. When
+        // the FieldMap's target path resolves to a JSON String at the
+        // schema level (`event.headline`, `observation.metric`, …) we
+        // stringify the Number here so the assembled JSON lines up
+        // with serde's expectation. Same-plan volatility on
+        // federalreserve.gov surfaced this — a recipe that succeeded
+        // when the leaf rendered as a date string began failing with
+        // `invalid type: floating point '22.0', expected a string`
+        // after the source's leaf drifted to a numeric-looking shape.
+        coerce_for_string_path(&mut value, binding.record_type, &fm.path);
         insert_at_path(&mut content_json, &fm.path, value).map_err(|e| {
             ApplyError::Binding {
                 index,
@@ -3012,6 +3148,232 @@ mod tests {
             truncated.contains(&reason.chars().count().to_string()),
             "must name the original total length: {truncated}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema-aware coercion at content assembly (Session 64)
+    //
+    // Reproduces the Fed-volatility incident in unit form: a same-plan
+    // re-run after source-side leaf drift turning numeric-looking
+    // ("22", "22.0") used to fail at content assembly because
+    // parse_extracted_scalar promoted the leaf to f64 and serde then
+    // rejected the Number where the schema declared String. The
+    // coercion layer in build_record now lines those values up before
+    // serde sees them.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn path_expects_string_covers_event_headline() {
+        // The exact path that broke on federalreserve.gov.
+        assert!(path_expects_string(RecordType::Event, "headline"));
+    }
+
+    #[test]
+    fn path_expects_string_covers_observation_metric_unit_currency_period() {
+        // Every JSON-string field on ObservationContent.
+        for path in ["metric", "unit", "currency", "period"] {
+            assert!(
+                path_expects_string(RecordType::Observation, path),
+                "Observation.{path} must be in the String set"
+            );
+        }
+    }
+
+    #[test]
+    fn path_expects_string_rejects_observation_value() {
+        // The canonical numeric field — must not be coerced or apply's
+        // primary contract breaks.
+        assert!(!path_expects_string(RecordType::Observation, "value"));
+        assert!(
+            !path_expects_string(RecordType::Observation, "value_uncertainty"),
+            "value_uncertainty is Option<f64>, not String"
+        );
+    }
+
+    #[test]
+    fn path_expects_string_covers_relation_entity_endpoints() {
+        // EntityId is a newtype around String; from/to are JSON
+        // strings at the wire shape.
+        assert!(path_expects_string(RecordType::Relation, "from"));
+        assert!(path_expects_string(RecordType::Relation, "to"));
+        assert!(path_expects_string(RecordType::Relation, "kind"));
+    }
+
+    #[test]
+    fn path_expects_string_covers_nested_magnitude_paths() {
+        // Event.magnitude and Relation.magnitude both embed an
+        // ObservationContent — its String paths inherit through.
+        for record_type in [RecordType::Event, RecordType::Relation] {
+            for path in [
+                "magnitude.metric",
+                "magnitude.unit",
+                "magnitude.currency",
+                "magnitude.period",
+            ] {
+                assert!(
+                    path_expects_string(record_type, path),
+                    "{record_type:?}.{path} must be in the String set"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn path_expects_string_empty_for_non_recipe_record_types() {
+        // Document / Entity / Assertion are not recipe-producible.
+        // The set is empty so a future hand-rolled call site can't
+        // silently rely on coercion that won't fire.
+        for record_type in [
+            RecordType::Document,
+            RecordType::Entity,
+            RecordType::Assertion,
+        ] {
+            assert!(!path_expects_string(record_type, "any_path"));
+            assert!(!path_expects_string(record_type, "headline"));
+        }
+    }
+
+    #[test]
+    fn coerce_for_string_path_stringifies_number_at_known_path() {
+        // The exact transformation the Fed incident needed.
+        let mut v = json!(22.0);
+        coerce_for_string_path(&mut v, RecordType::Event, "headline");
+        assert_eq!(v, json!("22.0"));
+
+        // Integer-shaped Numbers come through as their integer
+        // representation — serde_json::Number's Display impl picks
+        // the canonical form.
+        let mut v = json!(22);
+        coerce_for_string_path(&mut v, RecordType::Event, "headline");
+        assert_eq!(v, json!("22"));
+    }
+
+    #[test]
+    fn coerce_for_string_path_leaves_value_field_alone() {
+        // Negative case: the prime numeric field on Observation must
+        // remain a Number. Stringifying it would break the f64
+        // contract for every Observation recipe in production.
+        let mut v = json!(22.0);
+        coerce_for_string_path(&mut v, RecordType::Observation, "value");
+        assert_eq!(v, json!(22.0));
+    }
+
+    #[test]
+    fn coerce_for_string_path_leaves_already_string_alone() {
+        // The common case — leaf was non-numeric, parse_extracted_scalar
+        // returned a String, no coercion needed.
+        let mut v = json!("Fed raised rates");
+        coerce_for_string_path(&mut v, RecordType::Event, "headline");
+        assert_eq!(v, json!("Fed raised rates"));
+    }
+
+    #[test]
+    fn coerce_for_string_path_leaves_non_number_non_string_alone() {
+        // Boolean / null / object / array land at content assembly
+        // through other paths (Literal, FromPlan). The coercion is
+        // narrow: only Number → String. Other shapes pass through and
+        // serde produces its own error message at deserialization,
+        // which is the right signal for those mismatches.
+        for mut v in [json!(true), json!(null), json!({}), json!([])] {
+            let before = v.clone();
+            coerce_for_string_path(&mut v, RecordType::Event, "headline");
+            assert_eq!(v, before, "non-Number/non-String must pass through");
+        }
+    }
+
+    /// End-to-end: an Event recipe extracts `"22.0"` from CSS and
+    /// binds it into `headline`. Pre-fix this failed at content
+    /// assembly with `invalid type: floating point '22.0', expected
+    /// a string`. Post-fix the record builds with `headline = "22.0"`
+    /// — a degraded but honest representation that the operator can
+    /// see, re-author against, or accept.
+    #[test]
+    fn end_to_end_event_recipe_with_numeric_leaf_stringifies_into_headline() {
+        let html = br#"<html><body><h1>22.0</h1></body></html>"#;
+        let recipe = FetchRecipe {
+            id: Uuid::now_v7(),
+            dedup_key: None,
+            plan_id: Uuid::now_v7(),
+            source_id: "federalreserve.gov".into(),
+            source_url: Url::parse("https://www.federalreserve.gov/x").unwrap(),
+            extraction: ExtractionSpec::CssSelect {
+                selector: "h1".into(),
+                attribute: None,
+            },
+            produces: vec![ProductionBinding {
+                record_type: RecordType::Event,
+                expectation: ExpectationRef::EventType { index: 0 },
+                field_mappings: vec![
+                    FieldMap {
+                        path: "event_type".into(),
+                        source: FieldValueSource::Literal {
+                            value: json!("milestone_announced"),
+                        },
+                    },
+                    FieldMap {
+                        path: "headline".into(),
+                        source: FieldValueSource::Extracted,
+                    },
+                ],
+                dedup_key_field: None,
+            }],
+            iterator: None,
+            authored_at: Utc.with_ymd_and_hms(2026, 5, 12, 0, 0, 0).unwrap(),
+            authored_by: "xai".into(),
+            version: 1,
+            static_payload: None,
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
+        };
+        let p = plan();
+        let ctx = ApplyContext {
+            recipe: &recipe,
+            plan: &p,
+            bytes: html,
+            fetched_at: fetched_at(),
+        };
+        let records = apply(ctx).expect(
+            "post-fix: numeric-looking leaf into headline must coerce to \
+             String and assemble cleanly",
+        );
+        assert_eq!(records.len(), 1);
+        let ev = match &records[0] {
+            Record::Event(e) => e,
+            other => panic!("expected Event, got {other:?}"),
+        };
+        assert_eq!(ev.content.headline, "22.0");
+    }
+
+    /// Companion negative case: the canonical Observation recipe with
+    /// a numeric leaf into `value` must still produce a numeric `value`
+    /// (the f64 path is the apply contract for every observation
+    /// recipe in production). Locks in that the coercion is path-
+    /// specific and does not regress the numeric path.
+    #[test]
+    fn end_to_end_observation_recipe_keeps_numeric_value_unchanged() {
+        let csv = b"country,production\nChile,49000\n";
+        let recipe = recipe_with(ExtractionSpec::CsvCell {
+            column: "production".into(),
+            row_filter: Some(RowFilter::Equals {
+                column: "country".into(),
+                value: "Chile".into(),
+            }),
+        });
+        let p = plan();
+        let ctx = ApplyContext {
+            recipe: &recipe,
+            plan: &p,
+            bytes: csv,
+            fetched_at: fetched_at(),
+        };
+        let records = apply(ctx).unwrap();
+        assert_eq!(records.len(), 1);
+        let obs = match &records[0] {
+            Record::Observation(o) => o,
+            other => panic!("expected Observation, got {other:?}"),
+        };
+        assert_eq!(obs.content.value, 49000.0);
     }
 
     // -----------------------------------------------------------------------

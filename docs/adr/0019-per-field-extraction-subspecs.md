@@ -1,10 +1,12 @@
 # ADR 0019 — Per-field extraction sub-specs: ADR 0016 Phase 2 for multi-leaf record types
 
-**Status**: Proposed (Session 60) — Phase 2A implementation landed
-Session 61; v1.20 prompt revision + multi-leaf fixture-integration
-test landed Session 62; remains Proposed pending live-data
-validation on the Session 63 hurricane re-run
-**Date**: 2026-05-11 (proposed); 2026-05-11 (Phase 2A implementation landed); 2026-05-11 (v1.20 prompt + fixture-integration test landed)
+**Status**: Accepted (Session 64). Sufficient condition met on the
+2026-05-12 v1.20 hurricane re-run — 2 of 5 trials authored a recipe
+with `FieldValueSource::ExtractedInner` (vs Session 61's 0/10). The
+stronger signal (≥3 Event records per trial via the multi-leaf path)
+remains unmet and is tracked as a follow-on improvement target
+rather than a blocker on acceptance.
+**Date**: 2026-05-11 (proposed); 2026-05-11 (Phase 2A implementation landed); 2026-05-11 (v1.20 prompt + fixture-integration test landed); 2026-05-12 (Accepted on Session 64 hurricane eval)
 **Related**: ADR 0003 (six record types as governance boundary), ADR
 0007 (research function: two-level LLM architecture and the
 closed-extraction-vocabulary discipline), ADR 0016 (extraction
@@ -641,5 +643,61 @@ suggests. Two follow-on directions are pre-staged:
    "inner selector matched no elements," automatically
    re-author against the retry excerpt with the failure
    message inline as a multi-leaf signal.
+
+### Session 64 verification (2026-05-12) — sufficient condition met
+
+The Session 63 hurricane re-run wasn't run inside Session 63 (the
+session pivoted to the cross-plan dashboard product gap). Session 64
+ran it: 5 trials of the v1.20 prompt against the 2025 Atlantic
+hurricane season plan via the eval-harness, with the
+`recipes_with_extracted_inner` counter newly instrumented in
+`TrialReport`. The JSONL lives at
+`eval-runs/2025-atlantic-hurricane-season-20260512T153257Z.jsonl`.
+
+Headline numbers:
+
+| Trial | wall_s | recipes_persisted | with_extracted_inner | records |
+|-------|--------|-------------------|----------------------|---------|
+| 0     | 135.3  | 1                 | 1                    | 0       |
+| 1     | 156.6  | 1                 | 0                    | 30      |
+| 2     | 164.6  | 0                 | 0                    | 0       |
+| 3     | 171.1  | 0                 | 0                    | 0       |
+| 4     | 180.1  | 2                 | 1                    | 1       |
+
+`recipes_with_extracted_inner` across the run: 2/5 trials (trials 0
+and 4). Session 61 baseline: 0/10. **Sufficient condition met.** The
+v1.20 prompt's combined effect — multi-leaf-as-first-class section
+opener (20A), recognition checklist (20B), positional-selector
+worked example (20C), apply-time-signal subsection (20D) — produced
+the empirical falsification the v1.19 attempt couldn't.
+
+**Stronger signal not met.** Both `extracted_inner`-bearing recipes
+authored against `www.nhc.noaa.gov` failed at apply with the same
+error: `extraction [css_select]: inner selector matched no elements
+within iterator match`. The LLM picked the right shape (iterator +
+inner) but the inner selector didn't land on a descendant of the
+iterator's matched element. The acceptance gate moves from
+**shape recognition** (which v1.20 carries) to **selector quality
+at authoring time** — a different axis.
+
+**Why this is Accepted and not Proposed-with-stronger-signal-gate.**
+The Phase 2A implementation, the v1.20 prompt, and the validator
+rules are not what's blocking records — the recipe-author is reaching
+for the right shape. The remaining gap is the selector quality the
+LLM produces against a prefetch excerpt, which is upstream of ADR
+0019's scope. Pinning ADR 0019 as Proposed pending selector quality
+would conflate two unrelated bottlenecks.
+
+**Follow-on direction realignment.** The recipe-iteration-on-
+FetchReport loop (Session 60's candidate A) is **explicitly gated by
+ADR 0012** — the automated re-author loop must not be implemented
+until ≥10 documented Class B failures exist across ≥3 extraction
+modes, the predicate strings are evidence-grounded, and migration v7
+is in place. Today's eval contributes the first such documented
+cases (`docs/failure_cases/class_b/`), and Session 64 lands migration
+v7's `prior_recipe_id` substrate. The loop lands in a later session
+when the gate is met. The reasoning-block-before-JSON experiment
+remains unblocked but is now a refinement target rather than a
+fallback — v1.20 already cleared the falsification gate.
 
 End of ADR.

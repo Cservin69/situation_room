@@ -397,6 +397,35 @@ the manual path correctly identified it as Class C."
 and verified in a real run — the version chain is visible via a
 storage query before the automated loop starts writing to it.
 
+> **Status update (Session 64, 2026-05-12):** The column landed
+> in Session 26 as `migrations/0011_recipes_prior_recipe_id.sql`,
+> not v7 — the migration version number drifted because
+> migrations 0001–0010 were already used by other ADRs between
+> ADR 0012's authoring (Session 14) and the column actually
+> landing (Session 26). The functional substrate is the same:
+> `recipes.prior_recipe_id UUID` (nullable), `RecipeRow::
+> prior_recipe_id: Option<Uuid>`, `StoredRecipe::prior_recipe_id:
+> Option<Uuid>`, `Store::recipe_lineage` walks the chain capped
+> by `MAX_RECIPE_LINEAGE_DEPTH`, and the storage tests
+> (`recipe_round_trips_with_no_prior_recipe_id`,
+> `recipe_round_trips_with_prior_recipe_id`,
+> `recipes_for_plan_carries_prior_recipe_id_through`) pin the
+> round-trip. The "applied" half of Condition 5 is satisfied
+> against this v11 column; future references in this ADR to
+> "v7" should be read as "the prior_recipe_id column, however
+> numbered."
+>
+> The "verified in a real run" half is still pending: it
+> requires a recipe to have actually been re-authored, so a
+> non-NULL pointer exists in storage and `recipe_lineage` is
+> exercised against real (not test-fixture) data. Session 64's
+> federalreserve.gov re-author surface (recipe `019e1cbb`,
+> screenshot in the Session 64 chat log) is the natural live
+> verification opportunity: the operator clicking re-author
+> writes a new recipe row with `prior_recipe_id = '019e1cbb'`
+> and a fresh `id`. A `SELECT id, prior_recipe_id FROM recipes
+> WHERE plan_id = <fed_plan_id>` post-click closes Condition 5.
+
 ---
 
 ## Consequences

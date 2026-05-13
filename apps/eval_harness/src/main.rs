@@ -70,8 +70,8 @@ use situation_room_apps_common::sources::load_source_descriptors;
 use situation_room_llm::{AnthropicProvider, LlmProvider, ModelTier, XaiProvider};
 use situation_room_pipeline::fetch_backoff::{BackoffFetcher, HostBackoff};
 use situation_room_pipeline::fetch_executor::{
-    run_fetch_for_plan as run_fetch_for_plan_impl, ExecutorContext, FetchReport,
-    RecipeOutcome,
+    run_fetch_for_plan as run_fetch_for_plan_impl, ExecutorContext, FetchExecutorError,
+    FetchReport, RecipeOutcome,
 };
 use situation_room_pipeline::research::DocumentSourceEntry;
 use situation_room_pipeline::research_classifier::{
@@ -202,6 +202,21 @@ struct TrialReport {
     /// `records_produced` — the headline number a prompt experiment
     /// is usually trying to move.
     records_produced: u32,
+    /// Total recipes persisted for this trial's plan, regardless of
+    /// outcome at apply time. Equivalent to `store.recipes_for_plan
+    /// (plan_id).len()`. Includes recipes that succeeded, failed at
+    /// apply, and were authored but never applied because of a
+    /// downstream error. The denominator for `recipes_with_extracted_inner`
+    /// and for cross-trial authoring-rate analysis.
+    recipes_persisted: u32,
+    /// Number of persisted recipes whose `produces` JSON contains at
+    /// least one binding with `FieldValueSource::ExtractedInner`
+    /// (serde-tagged `"kind":"extracted_inner"`). This is the
+    /// ADR 0019 Phase 2A acceptance-gate metric: prompt experiments
+    /// that aim to lift multi-leaf recognition are measured against
+    /// this count, not against `records_produced` (which conflates
+    /// extraction shape with successful apply).
+    recipes_with_extracted_inner: u32,
     /// Per-outcome summary, one entry per `RecipeOutcome` in the
     /// report. Slim shape (no recipe-id, no per-target detail) so
     /// the JSONL stays human-readable on a single line.
@@ -542,6 +557,18 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Successful return shape of the trial body's async block.
+/// Carries the metadata the four `TrialReport` match arms below
+/// need to assemble the JSONL line, including the two ADR 0019
+/// authoring-shape counters (Session 64 instrumentation).
+struct RunOneTrialOk {
+    plan_id: Uuid,
+    nominations_total: u32,
+    recipes_persisted: u32,
+    recipes_with_extracted_inner: u32,
+    fetch_result: Result<FetchReport, FetchExecutorError>,
+}
+
 /// Run one trial end-to-end. Returns a `TrialReport` regardless of
 /// outcome — failures are reported through `trial_error` /
 /// `fetch_error_summary` rather than returning `Err`. The harness
@@ -641,11 +668,38 @@ async fn run_one_trial(
         //    show up inside the FetchReport.outcomes vector.
         let fetch_result = run_fetch_for_plan_impl(&executor_ctx, plan.id).await;
 
-        Ok::<(Uuid, u32, Result<FetchReport, _>), anyhow::Error>((
+        // 6. Inspect the recipes that landed in storage for this plan.
+        //    We compute two counts here, outside the FetchReport
+        //    contract, because the report doesn't surface authoring
+        //    shape — only apply outcomes. ADR 0019 Phase 2A's
+        //    acceptance gate is "did the LLM reach for the
+        //    ExtractedInner shape at all," which is decided at
+        //    authoring time and can be answered even when the recipe
+        //    later failed at apply.
+        //
+        //    Substring match on the `produces_json` column is robust:
+        //    `FieldValueSource::ExtractedInner` serialises with the
+        //    tag `"kind":"extracted_inner"` (the same tag the
+        //    recipe-apply tests assert against — see
+        //    `crates/pipeline/src/recipes.rs` test
+        //    `extracted_inner_round_trips_through_serde`). The
+        //    substring cannot collide with the path or with any other
+        //    field on the binding because `"kind"` is unique to the
+        //    `FieldValueSource` tag.
+        let recipes_for_plan = store.recipes_for_plan(plan_id)?;
+        let recipes_persisted = recipes_for_plan.len() as u32;
+        let recipes_with_extracted_inner = recipes_for_plan
+            .iter()
+            .filter(|r| r.produces_json.contains("\"kind\":\"extracted_inner\""))
+            .count() as u32;
+
+        Ok::<RunOneTrialOk, anyhow::Error>(RunOneTrialOk {
             plan_id,
             nominations_total,
+            recipes_persisted,
+            recipes_with_extracted_inner,
             fetch_result,
-        ))
+        })
     };
 
     let outcome = tokio::time::timeout(trial_timeout, body).await;
@@ -659,6 +713,16 @@ async fn run_one_trial(
     //   3. body returned Ok but run_fetch_for_plan returned Err —
     //      executor wholesale failure
     //   4. body returned Ok with Ok(FetchReport) — normal path
+    // The body's two new counters (recipes_persisted +
+    // recipes_with_extracted_inner) are computed *after*
+    // run_fetch_for_plan returns inside the body. Therefore they're
+    // only populated on the Ok(Ok(_)) match arms. The two pre-fetch
+    // failure arms (timeout, body Err) and the executor-wholesale-Err
+    // arm leave them at zero — accurate: in those paths the harness
+    // either never reached the recipe-author step or doesn't know
+    // what landed in storage before the failure. Operators looking at
+    // an authoring-shape signal should filter by `trial_error is None
+    // && fetch_error_summary is None` first.
     match outcome {
         Err(_elapsed) => TrialReport {
             trial,
@@ -674,6 +738,8 @@ async fn run_one_trial(
             recipes_attempted: 0,
             recipes_succeeded: 0,
             records_produced: 0,
+            recipes_persisted: 0,
+            recipes_with_extracted_inner: 0,
             outcomes: Vec::new(),
             fetch_error_summary: None,
             trial_error: Some(format!(
@@ -695,11 +761,19 @@ async fn run_one_trial(
             recipes_attempted: 0,
             recipes_succeeded: 0,
             records_produced: 0,
+            recipes_persisted: 0,
+            recipes_with_extracted_inner: 0,
             outcomes: Vec::new(),
             fetch_error_summary: None,
             trial_error: Some(format!("{e:#}")),
         },
-        Ok(Ok((plan_id, nominations_total, Err(executor_err)))) => TrialReport {
+        Ok(Ok(RunOneTrialOk {
+            plan_id,
+            nominations_total,
+            recipes_persisted,
+            recipes_with_extracted_inner,
+            fetch_result: Err(executor_err),
+        })) => TrialReport {
             trial,
             topic: topic.to_string(),
             provider: provider_id.to_string(),
@@ -713,11 +787,19 @@ async fn run_one_trial(
             recipes_attempted: 0,
             recipes_succeeded: 0,
             records_produced: 0,
+            recipes_persisted,
+            recipes_with_extracted_inner,
             outcomes: Vec::new(),
             fetch_error_summary: Some(executor_err.to_string()),
             trial_error: None,
         },
-        Ok(Ok((plan_id, nominations_total, Ok(report)))) => {
+        Ok(Ok(RunOneTrialOk {
+            plan_id,
+            nominations_total,
+            recipes_persisted,
+            recipes_with_extracted_inner,
+            fetch_result: Ok(report),
+        })) => {
             let outcomes: Vec<OutcomeSummary> =
                 report.outcomes.iter().map(OutcomeSummary::from).collect();
             TrialReport {
@@ -734,6 +816,8 @@ async fn run_one_trial(
                 recipes_attempted: report.recipes_attempted,
                 recipes_succeeded: report.recipes_succeeded,
                 records_produced: report.records_produced,
+                recipes_persisted,
+                recipes_with_extracted_inner,
                 outcomes,
                 fetch_error_summary: report.error_summary,
                 trial_error: None,
