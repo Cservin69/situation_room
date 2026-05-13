@@ -99,12 +99,17 @@
    */
   let mapped = $derived.by(() => {
     if (points.length === 0) return [];
-    const xs = points.map((p) => p.x);
-    const ys = points.map((p) => p.y);
-    const xMin = Math.min(...xs);
-    const xMax = Math.max(...xs);
-    const yMin = Math.min(...ys);
-    const yMax = Math.max(...ys);
+    // Session 68 — replaced spread-based Math.min(...xs) / Math.max(...xs)
+    // with a single reduce loop. The spread variant blows the JS engine's
+    // call-arg ceiling around 64K-100K args; the reduce loop is O(N) with
+    // no arg-list ceiling and one pass over points instead of four.
+    let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+    for (const p of points) {
+      if (p.x < xMin) xMin = p.x;
+      if (p.x > xMax) xMax = p.x;
+      if (p.y < yMin) yMin = p.y;
+      if (p.y > yMax) yMax = p.y;
+    }
     const xRange = xMax - xMin;
     const yRange = yMax - yMin;
     return points.map((p) => {

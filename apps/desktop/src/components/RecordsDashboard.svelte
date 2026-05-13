@@ -259,6 +259,37 @@
   let documentGroups = $derived(groupBy(records.documents, documentKindOf));
   let assertionGroups = $derived(groupBy(records.assertions, assertionKindOf));
 
+  /*
+    Session 68 — per-panel KindCard rendering cap. Plans that produce
+    hundreds of records (FEMA's 872-event hunt fixture is the
+    motivating case) can group into many distinct kinds; rendering
+    every KindCard at once turns the dashboard into a wall of small
+    cards and slows initial paint. We cap at PANEL_INITIAL_KINDS per
+    typed panel and let the operator click "show all" per-panel to
+    expand. The cap applies to the number of distinct kind GROUPS,
+    not to the number of records inside each group — the underlying
+    dataset is unchanged, just the visual surface is bounded.
+
+    Observation panel exempt: its MetricCard variant is the primary
+    cargo; capping it would hide the headline numbers the dashboard
+    exists to show. Realistic plans don't produce dozens of distinct
+    metrics anyway (production, reserves, price, …).
+  */
+  const PANEL_INITIAL_KINDS = 12;
+  let expandedPanels = $state<Record<string, boolean>>({});
+  function panelGroups<T>(
+    panel: string,
+    groups: { key: string; records: T[] }[],
+  ): { key: string; records: T[] }[] {
+    if (expandedPanels[panel]) return groups;
+    return groups.length > PANEL_INITIAL_KINDS
+      ? groups.slice(0, PANEL_INITIAL_KINDS)
+      : groups;
+  }
+  function togglePanel(panel: string) {
+    expandedPanels[panel] = !expandedPanels[panel];
+  }
+
   // -- type-count strip --------------------------------------------
 
   /**
@@ -334,13 +365,20 @@
        above, not by an empty section. -->
 
   {#if records.events.length > 0}
+    {@const visible = panelGroups('events', eventGroups)}
+    {@const hidden = eventGroups.length - visible.length}
     <section class="typed-panel" aria-label="events">
       <header class="panel-header">
         <span>events · by event_type</span>
         <span class="panel-coord">{eventGroups.length} type{eventGroups.length === 1 ? '' : 's'}</span>
+        {#if hidden > 0 || expandedPanels['events']}
+          <button class="panel-expand" type="button" onclick={() => togglePanel('events')}>
+            {expandedPanels['events'] ? 'show first ' + PANEL_INITIAL_KINDS : '+' + hidden + ' more'}
+          </button>
+        {/if}
       </header>
       <div class="cards">
-        {#each eventGroups as g (g.key)}
+        {#each visible as g (g.key)}
           <KindCard
             kind={g.key}
             count={g.records.length}
@@ -355,13 +393,20 @@
   {/if}
 
   {#if records.entities.length > 0}
+    {@const visible = panelGroups('entities', entityGroups)}
+    {@const hidden = entityGroups.length - visible.length}
     <section class="typed-panel" aria-label="entities">
       <header class="panel-header">
         <span>entities · by kind</span>
         <span class="panel-coord">{entityGroups.length} kind{entityGroups.length === 1 ? '' : 's'}</span>
+        {#if hidden > 0 || expandedPanels['entities']}
+          <button class="panel-expand" type="button" onclick={() => togglePanel('entities')}>
+            {expandedPanels['entities'] ? 'show first ' + PANEL_INITIAL_KINDS : '+' + hidden + ' more'}
+          </button>
+        {/if}
       </header>
       <div class="cards">
-        {#each entityGroups as g (g.key)}
+        {#each visible as g (g.key)}
           <KindCard
             kind={g.key}
             count={g.records.length}
@@ -376,13 +421,20 @@
   {/if}
 
   {#if records.relations.length > 0}
+    {@const visible = panelGroups('relations', relationGroups)}
+    {@const hidden = relationGroups.length - visible.length}
     <section class="typed-panel" aria-label="relations">
       <header class="panel-header">
         <span>relations · by kind</span>
         <span class="panel-coord">{relationGroups.length} kind{relationGroups.length === 1 ? '' : 's'}</span>
+        {#if hidden > 0 || expandedPanels['relations']}
+          <button class="panel-expand" type="button" onclick={() => togglePanel('relations')}>
+            {expandedPanels['relations'] ? 'show first ' + PANEL_INITIAL_KINDS : '+' + hidden + ' more'}
+          </button>
+        {/if}
       </header>
       <div class="cards">
-        {#each relationGroups as g (g.key)}
+        {#each visible as g (g.key)}
           <KindCard
             kind={g.key}
             count={g.records.length}
@@ -397,13 +449,20 @@
   {/if}
 
   {#if records.documents.length > 0}
+    {@const visible = panelGroups('documents', documentGroups)}
+    {@const hidden = documentGroups.length - visible.length}
     <section class="typed-panel" aria-label="documents">
       <header class="panel-header">
         <span>documents · by kind</span>
         <span class="panel-coord">{documentGroups.length} kind{documentGroups.length === 1 ? '' : 's'}</span>
+        {#if hidden > 0 || expandedPanels['documents']}
+          <button class="panel-expand" type="button" onclick={() => togglePanel('documents')}>
+            {expandedPanels['documents'] ? 'show first ' + PANEL_INITIAL_KINDS : '+' + hidden + ' more'}
+          </button>
+        {/if}
       </header>
       <div class="cards">
-        {#each documentGroups as g (g.key)}
+        {#each visible as g (g.key)}
           <KindCard
             kind={g.key}
             count={g.records.length}
@@ -418,13 +477,20 @@
   {/if}
 
   {#if records.assertions.length > 0}
+    {@const visible = panelGroups('assertions', assertionGroups)}
+    {@const hidden = assertionGroups.length - visible.length}
     <section class="typed-panel" aria-label="assertions">
       <header class="panel-header">
         <span>assertions · by stance</span>
         <span class="panel-coord">{assertionGroups.length} stance{assertionGroups.length === 1 ? '' : 's'}</span>
+        {#if hidden > 0 || expandedPanels['assertions']}
+          <button class="panel-expand" type="button" onclick={() => togglePanel('assertions')}>
+            {expandedPanels['assertions'] ? 'show first ' + PANEL_INITIAL_KINDS : '+' + hidden + ' more'}
+          </button>
+        {/if}
       </header>
       <div class="cards">
-        {#each assertionGroups as g (g.key)}
+        {#each visible as g (g.key)}
           <KindCard
             kind={g.key}
             count={g.records.length}
@@ -557,6 +623,27 @@
     color: var(--fg-quaternary);
     text-transform: none;
     letter-spacing: 0;
+  }
+  /* Session 68 — per-panel expand toggle for the KindCard cap.
+     Tucks at the right of the panel header. Same monospace +
+     muted treatment as `.panel-coord` so it reads as panel meta,
+     not as a primary action. */
+  .panel-expand {
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    border-radius: 3px;
+    color: var(--fg-secondary);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    padding: 2px 6px;
+    margin-left: 8px;
+    cursor: pointer;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .panel-expand:hover {
+    border-color: var(--border-strong);
+    color: var(--fg-primary);
   }
   .cards {
     display: grid;

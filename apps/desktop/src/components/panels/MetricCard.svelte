@@ -208,8 +208,20 @@
       : 'flat',
   );
 
-  let sparkPoints = $derived(
-    chronological
+  /**
+   * Maximum sparkline points before uniform decimation kicks in.
+   * Session 68 — chosen so the 80×24 viewBox can resolve every
+   * point as a distinct vertex (~80 horizontal pixels gives ~80
+   * polyline edges; over-sampling beyond ~2× pixel resolution
+   * is just visual noise and CPU cost on the parse/render path).
+   * The `latest` and `previous` derived values upstream operate
+   * on the chronological full set, not the decimated points, so
+   * the "big number" and delta chip are unaffected.
+   */
+  const SPARK_MAX_POINTS = 200;
+
+  let sparkPoints = $derived.by(() => {
+    const raw = chronological
       .map((r, i) => {
         const v = obsValue(r);
         if (v === null) return null;
@@ -217,8 +229,23 @@
         const x = stamp ? new Date(stamp).valueOf() : i;
         return { x: Number.isFinite(x) ? x : i, y: v };
       })
-      .filter((p): p is { x: number; y: number } => p !== null),
-  );
+      .filter((p): p is { x: number; y: number } => p !== null);
+
+    if (raw.length <= SPARK_MAX_POINTS) return raw;
+
+    // Uniform decimation. Always keep first + last; sample evenly
+    // in between. This preserves the trend shape; per-point
+    // anomalies smooth out, which is correct for a sparkline (a
+    // "spike at index 437" is a detail-view question, not a
+    // dashboard question).
+    const stride = (raw.length - 1) / (SPARK_MAX_POINTS - 1);
+    const out: { x: number; y: number }[] = [];
+    for (let i = 0; i < SPARK_MAX_POINTS; i++) {
+      const idx = Math.round(i * stride);
+      out.push(raw[idx]);
+    }
+    return out;
+  });
 
   let unitLabel = $derived(latest ? obsUnit(latest) : '');
   let periodLabel = $derived(latest ? obsPeriod(latest) : '');

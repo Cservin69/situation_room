@@ -118,9 +118,10 @@ use crate::http_fetcher::{FetchError as HttpFetchError, HttpFetcher};
 use crate::propose_source_url::{
     propose_source_url, PriorAttempt, ProposalError, ProposalOutcome,
 };
-use crate::recipe_apply::{apply, ApplyContext, ApplyError};
+use crate::recipe_apply::{apply, ApplyContext, ApplyError, MAX_RECORDS_PER_RECIPE};
 use crate::recipe_author::{author_recipe, AuthoringContext, AuthoringError};
 use crate::recipes::{ExpectationRef, ExtractionSpec, FetchRecipe};
+use crate::url_pagination::{cap_pagination, PaginationCap};
 use crate::recipes_store::{
     load_recipes_for_plan, save_recipe, RecipeStoreError,
 };
@@ -3596,7 +3597,26 @@ async fn fetch_recipe_bytes(
         return Ok((payload.as_bytes().to_vec(), None));
     }
 
-    match fetch_with_backoff(ctx.http, recipe.source_url.as_str(), "runtime").await {
+    // Session 68: cap OData-shaped paginated URLs at the runtime
+    // record cap before they hit the wire. Pure shape-based
+    // detection (presence of $select|$filter|… or an /api/open/vN/
+    // path); no host strings — see `url_pagination` for the
+    // closed-vocabulary rationale. The fetch URL the host sees may
+    // differ from the recipe's stored `source_url`; the warn-log
+    // makes the rewrite operator-visible.
+    let (fetch_url, pagination_cap) =
+        cap_pagination(recipe.source_url.as_str(), MAX_RECORDS_PER_RECIPE as u64);
+    if let PaginationCap::Rewritten { prior_top, new_top } = pagination_cap {
+        warn!(
+            recipe_id = %recipe.id,
+            source_id = %recipe.source_id,
+            ?prior_top,
+            new_top,
+            "url_pagination: capped $top before fetch"
+        );
+    }
+
+    match fetch_with_backoff(ctx.http, fetch_url.as_ref(), "runtime").await {
         BackoffOutcome::Bytes { body, content_type } => Ok((body, content_type)),
         BackoffOutcome::RateLimited {
             retry_after_seconds,
@@ -4984,6 +5004,63 @@ mod tests {
                 "expected Succeeded (short-circuit engaged), got: {other:?}"
             ),
         }
+    }
+
+    /// Session 68 — wiring test for `cap_pagination` in the executor.
+    ///
+    /// The StaticFetcher only knows about the rewritten URL (with
+    /// `$top=500` appended). The recipe's `source_url` is the raw
+    /// OpenFEMA-shape path, no `$top`. If `cap_pagination` were not
+    /// wired into `fetch_recipe_bytes`, the fetch would surface as
+    /// `NoFixture` and the assertion below would fail.
+    ///
+    /// This is the integration anchor for the
+    /// `crates/pipeline/src/url_pagination.rs` unit tests — those
+    /// pin the rewriter logic; this pins that the executor actually
+    /// calls it before fetch.
+    #[tokio::test]
+    async fn run_fetch_for_plan_caps_odata_url_before_fetch_session_68() {
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        // OpenFEMA-shape path with no `$top` query string. The
+        // executor must rewrite this to add `$top=500` (the runtime
+        // record cap) before hitting the fetcher. Literal `$` —
+        // the rewriter splices the raw query string instead of
+        // round-tripping through `Url::query_pairs_mut`, so
+        // OData-convention URLs survive byte-for-byte.
+        let raw_url = "https://www.fema.gov/api/open/v2/Demo";
+        let rewritten_url = "https://www.fema.gov/api/open/v2/Demo?$top=500";
+
+        let recipe = working_json_recipe(&plan, raw_url);
+        save_recipe(&store, &recipe).unwrap();
+
+        // Body satisfies the JSON-path `$.data.production.chile`
+        // from `working_json_recipe`. The fixture is keyed at the
+        // rewritten URL only.
+        let body = br#"{"data":{"production":{"chile":49000}}}"#;
+        let fetcher = StaticFetcher::new().with(rewritten_url, body);
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            prefetch_http: None,
+            provider: &provider,
+            recipe_author_prompt: "unused — recipes already authored",
+            propose_url_prompt: "",
+            sources: &[],
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+        assert_eq!(
+            report.recipes_succeeded, 1,
+            "expected the rewritten-URL fixture to satisfy the fetch; \
+             if recipes_succeeded is 0, cap_pagination isn't wired \
+             into fetch_recipe_bytes — outcomes were: {:?}",
+            report.outcomes
+        );
+        assert_eq!(report.records_produced, 1);
     }
 
     #[tokio::test]

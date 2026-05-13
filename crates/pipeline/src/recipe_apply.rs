@@ -939,7 +939,13 @@ fn apply_json_iterator(
                  {} (ADR 0016 §Consequences). Likely cause: the iterator \
                  path matches too broadly (every value rather than every \
                  row), or the source is a paginated API whose first page \
-                 already exceeds the cap.",
+                 already exceeds the cap. Session 68: OData-shaped URLs \
+                 (presence of $select|$filter|$orderby, or an \
+                 /api/open/vN/ path) are auto-capped at fetch time; if \
+                 you're still seeing this, the URL didn't match those \
+                 shapes and the recipe's iterator/URL needs an explicit \
+                 narrowing (a JsonPath filter expression, or a more \
+                 specific URL).",
                 scope_refs.len(),
                 MAX_RECORDS_PER_RECIPE,
             ),

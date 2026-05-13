@@ -54,5 +54,11 @@ pub mod recipe_author;
 pub mod recipe_apply;
 pub mod recipes_store;
 pub mod research;
+// Session 68 — runtime URL normalisation for OData-shaped paginated
+// endpoints. Sits between the recipe's `source_url` and the HTTP
+// fetch in `fetch_executor::fetch_recipe_bytes`, capping `$top` at
+// the runtime record cap. Closes the FEMA-style "default page is
+// 1000, cap is 500" failure shape Session 67's hunt surfaced.
+pub mod url_pagination;
 pub mod research_classifier;
 pub mod research_plans_store;

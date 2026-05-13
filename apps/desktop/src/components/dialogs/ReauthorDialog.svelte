@@ -120,6 +120,87 @@
   const overHardLimit = $derived(charsTyped > HARD_LIMIT);
   const hasBytes = $derived(bytesExcerpt.length > 0);
 
+  /*
+    Session 68 — diagnosis hints. Pattern-match common apply-failure
+    predicates and surface a one-click suggestion that prefills the
+    operator note.
+
+    Each hint is keyed by a regex that matches the failure_message
+    substring. The `note` is the prose the LLM will see if the
+    operator clicks "use hint" — written in the diagnosis voice the
+    re-author prompt is tuned for ("the recipe assumed X; the source
+    actually emits Y; try Z").
+
+    Patterns are intentionally conservative: only well-understood
+    apply-failure shapes appear here. Unknown failure shapes get the
+    blank textarea and the operator's own diagnosis. Hints are
+    closed-vocabulary-safe — they pattern-match runtime failure
+    predicate strings, never source-host strings.
+  */
+  type DiagnosisHint = {
+    pattern: RegExp;
+    /** Short label shown on the hint button. */
+    label: string;
+    /** The note prose injected into the textarea on click. */
+    note: string;
+  };
+  const HINTS: DiagnosisHint[] = [
+    {
+      pattern: /matched \d+ elements; cap is \d+/i,
+      label: 'cap-exceeded — narrow the iterator',
+      note:
+        "The iterator path matched more elements than the runtime cap. " +
+        "Session 68's URL rewriter auto-caps OData-shaped URLs " +
+        "($select/$filter/$orderby keys, or /api/open/vN/ paths) at fetch " +
+        "time; if you're still seeing this, the URL didn't match those " +
+        "shapes. Re-author the recipe with one of: (a) a JsonPath filter " +
+        "like $.items[?(@.year==2025)]; (b) a more specific URL with a " +
+        "narrower scope; (c) a CSS selector that targets distinct cards " +
+        "rather than every link.",
+    },
+    {
+      pattern: /matched no elements/i,
+      label: 'css selector matched nothing — check shape',
+      note:
+        "The CSS iterator selector didn't fire on the fetched bytes. " +
+        "Likely causes: the page is JS-rendered (no static HTML for the " +
+        "selector to match — see ADR 0009 for browser-UA-only paths); " +
+        "the markup changed shape since authoring; or the selector is " +
+        "too specific (requires a class that's only present on some " +
+        "states of the page). Re-author against the bytes excerpt below.",
+    },
+    {
+      pattern: /matched no nodes|no row matched/i,
+      label: 'json/csv path matched nothing — check shape',
+      note:
+        "The JsonPath / CSV row selector didn't fire. The response " +
+        "shape may have changed (an extra wrapping object, a renamed " +
+        "field, a non-array value where an array was expected) or the " +
+        "path is wrong. Compare the path in the recipe against the " +
+        "bytes excerpt below and re-author with the corrected shape.",
+    },
+    {
+      pattern: /bytes did not parse as JSON/i,
+      label: 'wrong content type — wrong extraction mode',
+      note:
+        "The recipe's extraction mode is JsonPath but the response " +
+        "isn't JSON. Check the response's Content-Type chip on the " +
+        "recipe row: if it's text/html or text/csv, re-author with the " +
+        "matching extraction mode (CssSelect / CsvCell). If the bytes " +
+        "are JSON-shaped but invalid, the source is broken — flag the " +
+        "recipe instead.",
+    },
+  ];
+
+  const matchedHints = $derived(
+    HINTS.filter((h) => h.pattern.test(failureMessage))
+  );
+
+  function applyHint(h: DiagnosisHint) {
+    note = h.note;
+    textareaEl?.focus();
+  }
+
   function handleSubmit() {
     if (overHardLimit || submitting) return;
     const trimmed = note.trim();
@@ -166,6 +247,34 @@
         <span class="failure-label">failure</span>
         <pre class="failure-message">{failureMessage}</pre>
       </div>
+
+      <!--
+        Diagnosis hints — Session 68. Pattern-matches the failure
+        message against the small set of well-understood apply-failure
+        predicates and offers a one-click prefill of the operator
+        note. Surfaces only when at least one pattern hits; absent
+        otherwise so unknown shapes get the blank-textarea + own-
+        diagnosis path. The buttons set the textarea content, the
+        operator can edit before submit.
+      -->
+      {#if matchedHints.length > 0}
+        <div class="hints-panel" role="note">
+          <span class="hints-label">diagnosis hints</span>
+          <ul>
+            {#each matchedHints as hint (hint.label)}
+              <li>
+                <button
+                  type="button"
+                  class="hint-btn"
+                  title="Pre-fill the operator note with this diagnosis. Edit before submit."
+                  onclick={() => applyHint(hint)}
+                  disabled={submitting}
+                >use: {hint.label}</button>
+              </li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
 
       <!--
         Bytes excerpt — the source's actual response at the failed
@@ -333,6 +442,56 @@
     color: var(--fg-primary);
     white-space: pre-wrap;
     word-break: break-word;
+  }
+
+  /* Diagnosis hints — Session 68. Sits between the failure panel
+     (warning hue) and the bytes panel (canvas hue). Uses --signal-info
+     for the border-left to read as "constructive suggestion, not an
+     additional warning"; the action is "click to apply", not "read
+     this carefully". */
+  .hints-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 12px;
+    background: var(--bg-inset);
+    border-left: 3px solid var(--signal-info, var(--border-accent));
+    border-radius: 3px;
+  }
+  .hints-label {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--signal-info, var(--fg-secondary));
+  }
+  .hints-panel ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .hint-btn {
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    color: var(--fg-primary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 4px 8px;
+    border-radius: 3px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .hint-btn:hover:not(:disabled) {
+    background: var(--bg-canvas);
+    border-color: var(--signal-info, var(--border-accent));
+  }
+  .hint-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   /* Bytes excerpt — collapsible, scrollable, monospace. The
