@@ -86,6 +86,23 @@ fn main() -> Result<()> {
     store.migrate().context("running migrations")?;
     let store = Arc::new(store);
 
+    // Session 66: take a `Weak<Store>` reference for the signal-
+    // shutdown task. The signal task only needs to call
+    // `Store::checkpoint()` *when a signal fires*; in the more common
+    // Cmd-Q exit path no signal ever arrives. A strong `Arc<Store>`
+    // captured by the signal task's spawned thread would keep the
+    // Store alive past the App's Drop on Cmd-Q exit, preventing the
+    // DuckDB `Connection::drop` from running and regressing the
+    // pre-Session-65 working path.
+    //
+    // `Weak<Store>::upgrade()` returns `Some(Arc<Store>)` only while
+    // the strong-ref population is non-zero, which is exactly the
+    // window where checkpoint is meaningful. On Cmd-Q exit the strong
+    // refs drop, the upgrade returns `None`, the signal task's branch
+    // becomes a no-op — and the OS killing the detached spawn-thread
+    // at process exit is harmless because no Drop was riding on it.
+    let store_for_shutdown: std::sync::Weak<Store> = Arc::downgrade(&store);
+
     // --- LLM provider ------------------------------------------------
     //
     // Single SecureHttpClient instance shared by the provider AND by
@@ -187,7 +204,7 @@ fn main() -> Result<()> {
     // *this* file's scope, where it does not exist; the macro lives
     // in `situation_room_api::commands`. Bare imports work for the
     // function, not for the macro.
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             situation_room_api::commands::classify,
@@ -250,10 +267,183 @@ fn main() -> Result<()> {
             // classification lands.
             situation_room_api::commands_records::records_recent_global
         ])
-        .run(tauri::generate_context!())
-        .context("running tauri")?;
+        .build(tauri::generate_context!())
+        .context("building tauri")?;
+
+    // --- Signal-driven shutdown (Session 66) -----------------------
+    //
+    // Session 65 traced a "writes-vanish-between-desktop-sessions" bug
+    // to the fact that `run_desktop.sh`'s SIGTERM trap, when the
+    // operator Ctrl-C's the terminal hosting `tauri dev`, instant-kills
+    // the Rust binary. Drop never runs. DuckDB's in-memory buffer pool
+    // never checkpoints. Today's plans, recipes, and fetch-attempts
+    // vanish; only writes that exited via the Cmd-Q Tauri path (which
+    // does run `Drop`) survive.
+    //
+    // The fix has two halves. Half one: install signal handlers that
+    // turn SIGTERM/SIGINT into a clean Tauri exit via
+    // `AppHandle::exit(0)`, which runs Tauri's own cleanup, returns
+    // from `app.run`, drops `App`, drops the managed `AppState`, drops
+    // `Store`, and DuckDB's `Connection::drop` checkpoints the buffer
+    // pool to disk along the way. Half two: belt-and-braces — call
+    // `Store::checkpoint()` explicitly inside the signal handler
+    // *before* `AppHandle::exit`, so the data is durable even if the
+    // Drop chain is short-circuited downstream for any reason.
+    //
+    // The Cmd-Q path (which works today) never reaches this signal
+    // task; AppKit close → Tauri exit event → `app.run` returns,
+    // bypassing the signal handler entirely. So this code only changes
+    // behaviour on the SIGTERM/SIGINT path. Existing operator habits
+    // continue to work.
+    //
+    // `#[cfg(unix)]` because `tokio::signal::unix::signal` is Unix-only.
+    // On Windows we'd register a Ctrl-C handler via
+    // `tokio::signal::ctrl_c()`; not relevant for the current Mac-only
+    // desktop deploy target but easy to add later.
+    #[cfg(unix)]
+    {
+        let app_handle = app.handle().clone();
+        let weak_store = store_for_shutdown.clone();
+        // Dedicated current-thread tokio runtime on a std thread —
+        // decoupled from whatever async runtime Tauri uses internally,
+        // so we don't have to reason about feature unification or
+        // Tauri 2's choice of executor. The thread parks blocked on
+        // signal recv; the runtime exits the moment `shutdown_on_signal`
+        // returns (which happens on the first signal or on
+        // `app_handle.exit(0)`'s effects rippling through). Total cost:
+        // one parked OS thread + one tokio runtime, both negligible.
+        //
+        // Captures a `Weak<Store>` (not a strong `Arc`) so that on the
+        // Cmd-Q exit path — where no signal fires — the Store can drop
+        // normally when AppState drops, allowing DuckDB's
+        // `Connection::drop` to checkpoint. The detached thread is
+        // killed at process exit; the weak ref leaking is a no-op.
+        std::thread::Builder::new()
+            .name("sr-signal-shutdown".to_string())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "failed to build signal-handler tokio runtime — persistence at risk on Ctrl-C"
+                        );
+                        return;
+                    }
+                };
+                rt.block_on(shutdown_on_signal(weak_store, app_handle));
+            })
+            .ok();
+    }
+
+    // The Tauri event-loop callback. No-op — Tauri's own cleanup runs
+    // on App drop and is sufficient for the Cmd-Q exit path. Logging
+    // here would fire on every exit including the working Cmd-Q path
+    // and just add noise.
+    app.run(|_app_handle, _event| {});
+
+    // Explicitly drop the weak ref so its lifetime is clear in this
+    // function body. The signal-shutdown thread (if it exists) holds
+    // its own `Weak<Store>` clone; this one drops at the end of main
+    // either way.
+    drop(store_for_shutdown);
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Signal-driven shutdown (Session 66)
+// ---------------------------------------------------------------------------
+
+/// Wait for SIGTERM or SIGINT, then issue a DuckDB CHECKPOINT (if the
+/// Store is still alive) and ask Tauri to exit cleanly. Runs on a
+/// dedicated std thread with its own current-thread tokio runtime;
+/// spawned once at boot and lives until the first signal or until
+/// process exit.
+///
+/// **Why `Store::checkpoint()` here and not just trust Drop:** the
+/// Session 65 diagnosis was that SIGTERM with no handler instant-kills
+/// the binary, so `Drop` never runs and DuckDB's buffer pool never
+/// hits disk. Calling `checkpoint()` explicitly in the handler — *not*
+/// relying on `AppHandle::exit(0)` to fire Drop in time — is the
+/// belt-and-braces. If `exit(0)`'s tear-down ever races with the
+/// async signal-task drop ordering, we've already flushed.
+///
+/// **Why `Weak<Store>`:** if this task held a strong `Arc<Store>`, the
+/// Store could never drop until the task did, and the task only
+/// returns on signal. On the Cmd-Q exit path no signal fires; a
+/// strong ref would prevent the Store from dropping when AppState
+/// drops, regressing the pre-Session-65 working path. With `Weak`,
+/// upgrade fails cleanly when the strong refs have already gone away
+/// and the signal-handler branch becomes a no-op — exactly the
+/// semantics the Cmd-Q path needs.
+///
+/// **Why both signals:** `run_desktop.sh`'s `trap` block fires SIGTERM
+/// on Ctrl-C in the terminal; the user's shell can also raise SIGINT
+/// directly if they bypass the script. Either should be durable.
+#[cfg(unix)]
+async fn shutdown_on_signal(
+    store: std::sync::Weak<Store>,
+    app_handle: tauri::AppHandle,
+) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to install SIGTERM handler — persistence at risk on Ctrl-C");
+            return;
+        }
+    };
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to install SIGINT handler — persistence at risk on Ctrl-C");
+            return;
+        }
+    };
+
+    let signal_name = tokio::select! {
+        _ = sigterm.recv() => "SIGTERM",
+        _ = sigint.recv()  => "SIGINT",
+    };
+
+    tracing::info!(
+        signal = signal_name,
+        "received shutdown signal — checkpointing DuckDB then asking Tauri to exit"
+    );
+
+    match store.upgrade() {
+        Some(store) => {
+            if let Err(e) = store.checkpoint() {
+                // Don't return — still try the Tauri exit so the App's
+                // own Drop chain gets a shot. The checkpoint error is
+                // the more informative log line; this is the
+                // failure-mode the operator needs to see in the
+                // terminal stderr if it ever fires.
+                tracing::error!(
+                    error = %e,
+                    "DuckDB checkpoint failed during shutdown — relying on Drop chain only"
+                );
+            }
+        }
+        None => {
+            // The Store has already been dropped (Cmd-Q path beat the
+            // signal here, vanishingly unlikely on the SIGTERM path but
+            // logged for completeness). Nothing to checkpoint; Drop
+            // already ran.
+            tracing::info!(
+                "Store already dropped at signal arrival — checkpoint already \
+                 happened via Drop; calling AppHandle::exit anyway"
+            );
+        }
+    }
+
+    app_handle.exit(0);
 }
 
 // ---------------------------------------------------------------------------

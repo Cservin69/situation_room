@@ -514,6 +514,61 @@ pub async fn author_recipe(
 ///   the rest of validation when non-empty.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RecipeAuthoringOutput {
+    /// **Session 66 prompt-experiment field.** A plain-text reasoning
+    /// scratchpad the LLM is asked to fill in *before* it commits to
+    /// the recipe's selectors and bindings — the closest equivalent
+    /// to a "reasoning block before JSON" given that the LLM's
+    /// response is otherwise strict-schema JSON with no room for
+    /// prose.
+    ///
+    /// **Why this field exists.** Session 64 traced the Class B
+    /// failure shape ("inner selector matched no elements within
+    /// iterator match") to the LLM committing to a per-leaf selector
+    /// that targets a *sibling* of the iterator's match rather than
+    /// a *descendant*. The v1.20 prompt added recognition checklists
+    /// and worked examples; Session 64's eval-harness run still
+    /// produced the same failure mode in 2/5 hurricane trials. The
+    /// remaining bottleneck is the LLM not visibly walking through
+    /// "from the iterator match, is the inner selector a descendant?"
+    /// before committing.
+    ///
+    /// **What goes in here.** When the recipe has an iterator + inner
+    /// selectors, the LLM writes (in their own words) the per-leaf
+    /// trace: "iterator matches `<scope>`; inner selector
+    /// `<selector>` resolves to a [descendant | sibling | self] of
+    /// that scope, expected value `<expected>`." When the recipe is a
+    /// scalar single-leaf shape with no iterator, this field may be
+    /// empty. When the LLM is declining, this field may be empty —
+    /// `decline_reason` carries the explanation.
+    ///
+    /// **What the runtime does with it.** Nothing structural — the
+    /// validator does not parse the trace; the persisted recipe does
+    /// not store it; the apply runtime does not consult it. The
+    /// trace's only effect is on the LLM's chain-of-thought during
+    /// emission: writing it forces the LLM to commit to a
+    /// descendant-check before emitting the selectors. The trace IS
+    /// captured in the authoring-call response and may be surfaced
+    /// in operator-introspection UI for post-hoc inspection.
+    ///
+    /// **Field order matters.** `selector_trace` is declared first in
+    /// this struct so it appears first in the JSON-Schema the LLM
+    /// receives and first in the LLM's output. JSON-schema-strict
+    /// providers honor declaration order; emitting the trace before
+    /// the recipe shape is the mechanism by which "reasoning before
+    /// JSON" is approximated under strict-output constraints.
+    ///
+    /// **Wire shape: empty-string-as-absent.** Same idiom as
+    /// `static_payload` and `decline_reason` — xAI's
+    /// structured-output schema rejects top-level `Option<String>`,
+    /// so empty string carries absence.
+    ///
+    /// **Bounded at 4096 chars** in the validator (see
+    /// [`Bounds::SELECTOR_TRACE`]). Long enough for a multi-leaf
+    /// trace across 3-5 fields, short enough that the channel does
+    /// not drift into narrative invention.
+    #[serde(default)]
+    pub selector_trace: String,
+
     /// HTTPS URL the runtime will fetch. Parsed + URL-guarded
     /// server-side; the LLM just returns a string.
     pub source_url: String,
@@ -1066,6 +1121,25 @@ fn build_validated_recipe(
         return Err(AuthoringError::Declined {
             reason: trimmed_decline.to_string(),
         });
+    }
+
+    // 0a. Session 66 prompt-experiment field — `selector_trace`. The
+    // LLM is asked to write a reasoning trace before committing to
+    // selectors; this validator step enforces the size bound only.
+    // Empty is allowed (the v1.21 prompt explicitly says scalar
+    // single-leaf recipes may skip the trace). Over-bound is treated
+    // as InvalidRecipe — same shape as DECLINE_REASON.
+    //
+    // The trace's *content* is not validated. The runtime does not
+    // parse it, does not persist it on the FetchRecipe, does not
+    // consult it at apply time. Its only effect is on the LLM's
+    // emission order (see field-order rationale on the struct field).
+    if output.selector_trace.len() > Bounds::SELECTOR_TRACE {
+        return Err(AuthoringError::InvalidRecipe(format!(
+            "selector_trace exceeds bound: {} > {} chars",
+            output.selector_trace.len(),
+            Bounds::SELECTOR_TRACE
+        )));
     }
 
     // 1. URL: parse + URL-guard.
@@ -2220,6 +2294,10 @@ mod tests {
 
     fn good_output() -> RecipeAuthoringOutput {
         RecipeAuthoringOutput {
+            // Session 66 prompt-experiment field. Empty is fine for
+            // the scalar-recipe fixture (no iterator means no
+            // descendant-vs-sibling trace required per v1.21 prompt).
+            selector_trace: String::new(),
             source_url: "https://pubs.usgs.gov/periodicals/mcs2024/mcs2024-lithium.pdf"
                 .into(),
             extraction: AuthoredExtractionSpec::PdfTable {
@@ -2514,6 +2592,58 @@ mod tests {
         let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
         assert!(
             matches!(err, AuthoringError::InvalidRecipe(ref m) if m.contains("decline_reason")),
+            "got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Session 66 — `selector_trace` (prompt-experiment field).
+    // -----------------------------------------------------------------------
+
+    /// Empty `selector_trace` is the absent shape — same as
+    /// `static_payload` / `decline_reason`. The validator must let it
+    /// through. This is the v1.21 default for scalar single-leaf
+    /// recipes (no iterator → no descendant trace required).
+    #[test]
+    fn empty_selector_trace_accepted() {
+        let mut out = good_output();
+        out.selector_trace = String::new();
+        let recipe = build_validated_recipe(out, &sample_plan(), "xai", None)
+            .expect("empty trace must be accepted");
+        // The trace is not persisted on the FetchRecipe — sanity-check
+        // by confirming the recipe shape round-trips intact.
+        assert_eq!(recipe.produces.len(), 1);
+    }
+
+    /// Filled-in `selector_trace` under the bound is accepted. The
+    /// validator does not parse content; the trace's existence is the
+    /// signal that the LLM engaged with the descendant check before
+    /// emitting selectors. Asserts the recipe still builds and the
+    /// trace is dropped (not part of the persisted FetchRecipe — only
+    /// part of the LLM's authoring-output object).
+    #[test]
+    fn under_bound_selector_trace_accepted() {
+        let mut out = good_output();
+        out.selector_trace =
+            "iterator matches `table.storms tbody tr`; td:nth-child(1) is a \
+             descendant of each row scope; expected value: storm name string."
+                .into();
+        let recipe = build_validated_recipe(out, &sample_plan(), "xai", None)
+            .expect("under-bound trace must be accepted");
+        assert_eq!(recipe.produces.len(), 1);
+    }
+
+    /// `selector_trace` longer than `Bounds::SELECTOR_TRACE` is
+    /// rejected as `InvalidRecipe`. Mirrors the `decline_reason` size
+    /// behaviour. The honest framing is the same: we got a trace, but
+    /// we can't accept its size — channel-discipline rejection.
+    #[test]
+    fn over_bounded_selector_trace_is_invalid() {
+        let mut out = good_output();
+        out.selector_trace = "x".repeat(Bounds::SELECTOR_TRACE + 1);
+        let err = build_validated_recipe(out, &sample_plan(), "xai", None).unwrap_err();
+        assert!(
+            matches!(err, AuthoringError::InvalidRecipe(ref m) if m.contains("selector_trace")),
             "got {err:?}"
         );
     }
@@ -2918,6 +3048,13 @@ mod tests {
         // expectation list is structurally compatible — the LLM-side
         // wire form references list:event_type, index:0.
         RecipeAuthoringOutput {
+            // Session 66 prompt-experiment field. Empty here because
+            // this scalar-fixture variant lives without an iterator;
+            // iterator-bearing tests that mutate `iterator` to Some(..)
+            // may want to populate this for trace-coverage, but the
+            // validator only enforces the size bound — content is
+            // not parsed.
+            selector_trace: String::new(),
             source_url: "https://www.nhc.noaa.gov/data/tcr/index.php".into(),
             extraction: AuthoredExtractionSpec::CssSelect {
                 selector: "table.storms".into(),

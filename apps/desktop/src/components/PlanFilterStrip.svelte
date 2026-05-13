@@ -6,8 +6,8 @@
   the api with the right wire mapping (`'all'` → null, others
   pass-through).
 
-  Default lands on Pending (Session 7 §P1: "the user lands on what
-  needs review"). The active chip gets a strong-border treatment;
+  Default lands on All (Session 66; was Pending pre-Session-66 per
+  Session 7 §P1). The active chip gets a strong-border treatment;
   inactive chips are quiet chrome.
 -->
 <script lang="ts">

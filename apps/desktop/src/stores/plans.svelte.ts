@@ -212,9 +212,15 @@ interface PlansState {
 export const plans: PlansState = $state({
   recent: [],
   selected: null,
-  // Default to Pending so the user lands on what needs review — the
-  // session's purpose is triage, not archaeology. (Session 7 §P1.)
-  statusFilter: 'pending' as StatusFilter,
+  // Default to All. Session 7 §P1 originally argued for "Pending so
+  // the user lands on what needs review," but Session 66's operator
+  // testing on a populated DB showed the cost of that default: a
+  // freshly classified plan that auto-accepts falls out of the
+  // Pending bucket and the listing transiently looks empty.
+  // Defaulting to All keeps every plan visible across the
+  // classify → accept → review loop, matching how the operator
+  // actually uses the listing.
+  statusFilter: 'all' as StatusFilter,
   classifying: false,
   loading: false,
   mutating: false,
@@ -291,10 +297,11 @@ export async function setStatusFilter(filter: StatusFilter): Promise<void> {
  * `state.error` and leave the previous selection alone — the user
  * doesn't lose context because of a transient gateway failure.
  *
- * A newly-classified plan is always Pending, so flipping the filter
- * to 'pending' (if it isn't there already) keeps the new plan visible
- * in the listing — otherwise classifying while filtered to Accepted
- * would silently hide the freshly-created plan.
+ * A newly-classified plan is always Pending. If the current filter
+ * is one that would hide the new plan (`accepted` / `rejected`), we
+ * flip to `'all'` (Session 66 — was `'pending'` pre-Session-66) so
+ * the operator sees the new plan land alongside their existing
+ * accepted/rejected work rather than in a narrow Pending-only view.
  */
 export async function classifyTopic(topic: string): Promise<void> {
   plans.classifying = true;
@@ -303,7 +310,7 @@ export async function classifyTopic(topic: string): Promise<void> {
     const plan = await apiClassify(topic);
     plans.selected = plan;
     if (plans.statusFilter !== 'all' && plans.statusFilter !== 'pending') {
-      plans.statusFilter = 'pending';
+      plans.statusFilter = 'all';
     }
     await refreshRecent();
   } catch (e) {
@@ -504,10 +511,12 @@ export async function reclassifySelected(
   try {
     const fresh = await apiReclassifyPlan(current.id, editedReason);
     plans.selected = fresh;
-    // The new plan is Pending; flip the filter so the user sees
-    // it land in the listing.
+    // The new plan is Pending. Symmetric to `classifyTopic`: if the
+    // current filter would hide the new plan, flip to `'all'` so the
+    // operator sees the re-classified plan alongside everything else
+    // (Session 66 — was `'pending'` pre-Session-66).
     if (plans.statusFilter !== 'all' && plans.statusFilter !== 'pending') {
-      plans.statusFilter = 'pending';
+      plans.statusFilter = 'all';
     }
     await refreshRecent();
     return true;

@@ -38,7 +38,7 @@ authors = ["Situation room contributors"]
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "signal"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

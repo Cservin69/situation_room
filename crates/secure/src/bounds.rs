@@ -93,6 +93,19 @@ impl Bounds {
     /// `crates/pipeline/src/recipe_author.rs::build_validated_recipe`.
     pub const DECLINE_REASON: usize = 2_000;
 
+    /// Session 66 prompt experiment — see
+    /// `RecipeAuthoringOutput::selector_trace`. Plain-text reasoning
+    /// scratchpad the LLM fills in *before* committing to the
+    /// recipe's selectors and bindings.
+    ///
+    /// 4 096 chars is roughly 4× `DECLINE_REASON`, sized for a
+    /// multi-leaf trace across 3-5 fields each with a sentence-or-two
+    /// of justification. Larger than the decline cap because the
+    /// trace can legitimately enumerate per-field reasoning;
+    /// distinct constant so the two cohorts of LLM prose remain
+    /// independently tunable.
+    pub const SELECTOR_TRACE: usize = 4_096;
+
     /// A single URL.
     pub const URL: usize = 2_048;
 

@@ -66,24 +66,26 @@ directory was created in Session 24 alongside that entry; this
 README establishes the convention so subsequent sessions have a
 known-good schema to follow.
 
-## Gate status (Session 64, 2026-05-12)
+## Gate status (Session 66, 2026-05-13)
 
 ADR 0012 Condition 1 wants ≥10 distinct Class B cases across ≥3
 extraction modes. Current count:
 
 | Mode          | Cases | Spec-grounded | Notes |
 |---------------|-------|---------------|-------|
-| CssSelect     | 4     | 2 (pending fill-in) | All `www.nhc.noaa.gov`; Session 64 added trial 0+4 with `--keep-dbs`, Session 63 trials 0+3 are recurrence-only |
+| CssSelect     | 5     | 2 (pending fill-in) | 4× `www.nhc.noaa.gov` (Session 63/64); 1× `www.federalreserve.gov` (Session 65 screenshot; spec + bytes pending Session 66 re-run because of persistence bug). **Host-diverse as of Session 66**. |
 | RegexCapture  | 1     | 1             | `rss_feeds` (BBC CDATA mismatch) |
 | JsonPath      | 0     | —             | `world_bank_indicators` is **Class B-adjacent** (`null` vs f64), not strict |
 | CsvCell       | 0     | —             | None observed |
 | PdfTable      | 0     | —             | Phase 2B mode, may be rare |
 
-Strict Class B total: **5**. Of these, **3** are spec-grounded
+Strict Class B total: **6**. Of these, **3** are spec-grounded
 (rss_feeds + the two Session 64 CssSelect cases pending operator
-DB-fill). Class B-adjacent (broader-definition) total: **2**
-(world_bank + the gdelt case from Session 23 noted above as
-not-filed).
+DB-fill). The Session 65 federalreserve.gov case is documented but
+spec + bytes are **TBD until Session 66's persistence-fixed binary
+re-derives them** (see `scripts/session66_verify.sql`). Class
+B-adjacent (broader-definition) total: **2** (world_bank + the
+gdelt case from Session 23 noted above as not-filed).
 
 Outstanding for Condition 1 (≥10 distinct): need 5+ more strict
 cases. ≥2 modes are covered (CssSelect + RegexCapture); 1 more

@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.20
+# Recipe Author Prompt — v1.21
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -1352,6 +1352,45 @@ forever:
 
 The top-level shape is:
 
+- `selector_trace`: string. **New in v1.21.** A plain-text reasoning
+  scratchpad — your selector trace, written *before* you commit to
+  the rest of the JSON. The schema places this field first; you
+  emit it first; you commit to the recipe's selectors only after
+  writing the trace.
+
+  **When iterator + inner selectors are present** (any
+  iterator-bearing recipe — listings, tables, card containers), the
+  trace must walk through, in your own words:
+
+  1. What the iterator selector matches (the per-row scope —
+     "matches the `tr` rows inside `table.storms tbody`"; "matches
+     each `div.item` card").
+  2. For each `extracted_inner` field, the per-leaf trace:
+     "selector `td:nth-child(2)` resolves as a **descendant** of
+     the per-row scope; expected value: the date string in column
+     2." Or: "selector `> h3` resolves as a **direct child** of
+     the card scope; expected value: the headline."
+  3. The descendant/sibling/self verdict per leaf. If a leaf
+     reaches outside the per-row scope to a *sibling* DOM node or
+     a *parent's other child*, the inner-selector will match no
+     elements at apply time — that's the Class B inner-no-elements
+     failure shape. The trace forces you to spot this before
+     committing.
+
+  **When the recipe is scalar single-leaf** (no iterator,
+  one `extracted` field), the trace may be empty (`""`). The
+  trace's value is in catching the sibling-vs-descendant confusion
+  that only arises in iterator-bearing recipes.
+
+  **When you are declining**, the trace may be empty —
+  `decline_reason` carries the explanation.
+
+  The runtime does not parse the trace, does not persist it on the
+  FetchRecipe, does not consult it at apply time. It is captured
+  in the authoring-call response for operator inspection and to
+  force you to commit to the descendant check in writing before
+  emitting selectors. Up to 4 096 characters; longer is rejected.
+
 - `source_url`: string — an HTTPS URL the runtime will fetch. Usually
   the same as the sample URL above, or a more specific URL on the
   same host. Must not be `example.invalid` or any other synthetic
@@ -1818,6 +1857,45 @@ you pick.
 ---
 
 ### Changelog
+
+- **v1.21** (2026-05-13) — Session 66, reasoning-block-before-JSON
+  prompt experiment. Adds `selector_trace` as a new top-level field
+  on the LLM's output (empty-string-as-absent, same idiom as
+  `static_payload` and `decline_reason`). The field is declared
+  first in the schema so the LLM emits it first; declaration-order
+  is the mechanism by which "reasoning before JSON" is
+  approximated under strict-output constraints. The prompt
+  instructs: when the recipe has an iterator + inner selectors,
+  the trace must walk the per-leaf descendant/sibling/self verdict
+  before committing to selectors; for scalar single-leaf recipes
+  and declines the trace may be empty.
+
+  Motivated by the Session 64 hurricane eval (2/5 trials with
+  `selector matched no elements` apply failures) and the Session
+  65 federalreserve.gov screenshot (same predicate string on a
+  different host). v1.20 added recognition checklists and worked
+  examples for the multi-leaf shape but did nothing to force the
+  LLM to *check* its selector against the iterator scope before
+  emission. The trace forces that check in writing.
+
+  Output contract changes: `selector_trace` is now an expected
+  field on the LLM's output. Wire form is empty-string-as-absent.
+  The validator at `build_validated_recipe` enforces only the
+  4 096-char bound; the trace's content is not parsed, not
+  persisted on the FetchRecipe, not consulted at apply time. The
+  schema's `JsonSchema`-derived shape carries the field; existing
+  recipes deserialize cleanly (no `selector_trace` on the
+  FetchRecipe itself, only on the authoring-step
+  `RecipeAuthoringOutput`). No re-authoring required.
+
+  Verification path: Session 66 eval-harness runs the same 5-trial
+  hurricane topic that benchmarked v1.20 (Session 64 baseline:
+  records [0, 30, 0, 0, 1], 2/5 trials with `extracted_inner`).
+  If v1.21's trace-discipline drops the inner-no-elements failure
+  rate, records improve; if it doesn't, v1.21 is no worse than
+  v1.20 (the trace is mechanism-neutral for the apply path). The
+  Session 56 variance lesson stands: a single 5-trial run is not
+  enough to declare a winner. Compare distributions, not means.
 
 - **v1.20** (2026-05-11) — Session 62, ADR 0019 Phase 2A path-to-
   Accepted (companion to the v1.19 prompt and the Phase 2A
