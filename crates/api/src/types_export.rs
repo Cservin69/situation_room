@@ -381,6 +381,20 @@ pub enum CommandErrorDto {
         prior_recipe_id: String,
         message: String,
     },
+    /// Session 66: the LLM declined to re-author this recipe (Track B
+    /// decline channel firing inside Track A's re-author path). The
+    /// LLM looked at the bytes + prior recipe's selectors + failure
+    /// message and reached the honest conclusion that no recipe is
+    /// possible under the closed extraction vocabulary. Architecturally
+    /// distinct from `ReauthorFailed` — nothing broke — and the
+    /// frontend handles it distinctly: the dialog closes (the IPC
+    /// resolved cleanly), and the failed-apply row in FetchReport /
+    /// RecipesPanel surfaces the LLM's prose reason as a per-row
+    /// decline badge.
+    ReauthorDeclined {
+        prior_recipe_id: String,
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1787,6 +1801,34 @@ mod tests {
             json.contains(r#""prior_recipe_id":"019dee9a-ba75-7533-aa4f-ee673f03fece""#),
             "got {json}"
         );
+    }
+
+    /// Session 66: the new `ReauthorDeclined` variant must round-trip
+    /// distinctly from `ReauthorFailed`. Same prior-recipe-id key, but
+    /// `reason` (not `message`) and `kind: reauthor_declined`. The
+    /// frontend's match on `error.kind === 'reauthor_declined'`
+    /// distinguishes the two; the JSON shape pinned here is the
+    /// contract the frontend relies on.
+    #[test]
+    fn command_error_dto_reauthor_declined_serializes_with_kind_and_reason() {
+        let e = CommandErrorDto::ReauthorDeclined {
+            prior_recipe_id: "019e20b5-3881-7502-93fb-dcfdeb9c8b20".into(),
+            reason: "the source's actual markup doesn't admit my prior \
+                     recipe's iterator selectors; no css_select fix is \
+                     possible against these bytes."
+                .into(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""kind":"reauthor_declined""#), "got {json}");
+        assert!(
+            json.contains(r#""prior_recipe_id":"019e20b5-3881-7502-93fb-dcfdeb9c8b20""#),
+            "got {json}"
+        );
+        // `reason`, not `message` — distinguishing field name from
+        // ReauthorFailed so the frontend can't accidentally treat one
+        // as the other.
+        assert!(json.contains(r#""reason":"#), "got {json}");
+        assert!(!json.contains(r#""message":"#), "got {json}");
     }
 
     // -----------------------------------------------------------------

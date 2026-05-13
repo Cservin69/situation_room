@@ -561,13 +561,19 @@
     if (!reauthorDialogRecipe) return;
     reauthorSubmitting = true;
     try {
-      const ok = await reauthorRecipe(reauthorDialogRecipe.id, note);
-      if (ok) {
+      const outcome = await reauthorRecipe(reauthorDialogRecipe.id, note);
+      // Session 66: three-state outcome. `ok` and `declined` both
+      // close the dialog (the IPC resolved cleanly in either case);
+      // only a real `error` keeps the dialog open. The decline
+      // reason is already in `plans.recipeReauthorDeclines` —
+      // RecipesPanel renders it as a per-row badge on the failed-
+      // apply row on next render.
+      if (outcome.kind === 'ok' || outcome.kind === 'declined') {
         reauthorDialogRecipe = null;
         reauthorAttempt = null;
       }
-      // On failure: dialog stays open, plans.error renders in the
-      // parent banner, user can edit + resubmit or cancel.
+      // On real `error`: dialog stays open, plans.error renders in
+      // the parent banner, user can edit + resubmit or cancel.
     } finally {
       reauthorSubmitting = false;
     }
@@ -767,12 +773,29 @@
         re-authoring.
       -->
       {#if outcome && outcome.kind === 'failed' && outcome.stage === 'apply'}
-        <button
-          type="button"
-          class="reauthor-button"
-          title="Open the re-author dialog: shows the failure message + the bytes the runtime saw, lets you add a diagnosis note, then asks the LLM for a corrected recipe. ADR 0012 amendment 1."
-          onclick={() => openReauthorDialog(recipe)}
-        >re-author</button>
+        {@const declineReason = plans.recipeReauthorDeclines[recipe.id]}
+        <!--
+          Session 66 — if the LLM previously declined to re-author
+          this recipe, show the decline reason in place of the
+          button (clicking again would just produce the same
+          decline from the same bytes+prompt). The reason is the
+          LLM's verbatim prose; the badge style is italic+muted so
+          it reads as informational, not actionable. The button
+          falls back when no decline is recorded.
+        -->
+        {#if declineReason}
+          <span
+            class="decline-badge"
+            title={`LLM declined to re-author: ${declineReason}`}
+          >declined: {declineReason}</span>
+        {:else}
+          <button
+            type="button"
+            class="reauthor-button"
+            title="Open the re-author dialog: shows the failure message + the bytes the runtime saw, lets you add a diagnosis note, then asks the LLM for a corrected recipe. ADR 0012 amendment 1."
+            onclick={() => openReauthorDialog(recipe)}
+          >re-author</button>
+        {/if}
       {/if}
     </header>
 
@@ -1315,6 +1338,32 @@
   .reauthor-button:hover {
     border-color: var(--signal-warning, var(--border-accent));
     color: var(--fg-primary);
+  }
+
+  /* Session 66 — decline-badge replaces the re-author button on a
+     recipe whose prior re-author attempt landed
+     CommandError::ReauthorDeclined. Same row position as
+     `.reauthor-button` but italicized + muted + dashed border so it
+     reads as informational rather than actionable. Single-line
+     ellipsis at 60ch keeps row-rhythm consistent across long
+     decline reasons; full reason on hover via the title attribute. */
+  .decline-badge {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+    padding: 2px 8px;
+    border-radius: 2px;
+    color: var(--fg-tertiary);
+    background: var(--bg-inset, var(--bg-panel-alt));
+    border: 1px dashed var(--border-subtle);
+    align-self: center;
+    max-width: 60ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: help;
+    font-style: italic;
   }
 
   /*

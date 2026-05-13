@@ -273,6 +273,43 @@ pub enum CommandError {
         prior_recipe_id: String,
         message: String,
     },
+
+    /// The manual re-author (Track A) completed an LLM round-trip,
+    /// the response validated, and the LLM explicitly **declined** to
+    /// author a corrected recipe — Track B's decline channel
+    /// (ADR 0007 amendment 4) firing inside the re-author path.
+    ///
+    /// Architecturally distinct from `ReauthorFailed`: nothing broke.
+    /// The LLM read the bytes + the prior recipe's selectors + the
+    /// failure message and reached the honest conclusion that no
+    /// recipe is possible under the closed extraction vocabulary.
+    /// Surfacing this as a failure (the pre-Session-66 behavior, via
+    /// `ReauthorFailed` with a `[declined]` prefix on the message)
+    /// caused the dialog to stay open as if the IPC had errored,
+    /// which Session 66's operator testing flagged as a UX bug — the
+    /// dialog "reappeared with the same message" because no new
+    /// recipe was persisted and no clear signal told the operator
+    /// the LLM had declined.
+    ///
+    /// Wire shape mirrors `ReauthorFailed`: prior recipe id + the
+    /// LLM's prose reason. The reason is bounded at the authoring
+    /// step by [`Bounds::DECLINE_REASON`] (2 000 chars); it has
+    /// already been validated by the LLM provider's structured-
+    /// output enforcement by the time we get here.
+    ///
+    /// Frontend handles this distinctly: dialog closes, the failed-
+    /// apply row in FetchReport / RecipesPanel surfaces the decline
+    /// reason as a per-row badge so the operator sees what the LLM
+    /// said without an error banner.
+    ///
+    /// The supersession path from `ReauthorFailed[declined]` to this
+    /// variant is the Session-29 follow-up the original `Declined`-
+    /// match-arm comment in `commands.rs::reauthor_recipe` flagged.
+    #[error("re-author declined for recipe {prior_recipe_id}: {reason}")]
+    ReauthorDeclined {
+        prior_recipe_id: String,
+        reason: String,
+    },
 }
 
 impl From<ClassificationError> for CommandError {
@@ -1478,36 +1515,34 @@ pub async fn reauthor_recipe(
             // for this source." Architecturally this is *not* a
             // re-author failure (the LLM call worked, the schema
             // validated, the answer was honest); architecturally it
-            // is a *new authoring outcome* on a path the frontend
-            // doesn't yet know about — `ReauthorDeclined` would be
-            // the disciplined wire shape but introducing it requires
-            // a frontend arm we're not adding in this fix-up.
+            // is a *new authoring outcome*.
             //
-            // The pragmatic choice here is to surface the decline
-            // through the existing `ReauthorFailed` channel with a
-            // `[declined]` prefix on the message, so the operator
-            // sees the LLM's explanation in the dialog without a
-            // crashing UI. The follow-up — a real
-            // `CommandError::ReauthorDeclined { prior_recipe_id,
-            // reason }` variant + frontend handling — is documented
-            // in the Session 29 handoff as a Track B follow-up.
+            // **Session 66 landed the dedicated wire variant** —
+            // [`CommandError::ReauthorDeclined`] — that the original
+            // Session 29 follow-up note flagged. The pre-Session-66
+            // shim squeezed declines through `ReauthorFailed` with a
+            // `[declined]` prefix on the message; the frontend ate
+            // the error, the dialog stayed open as if the IPC had
+            // crashed, and the operator saw "the same message"
+            // reappear with no clear signal that the LLM had
+            // declined. Session 66's plan-review on a Fed re-author
+            // surfaced this directly.
             //
-            // The `[declined]` prefix is load-bearing: it is the
-            // only wire-distinguishable signal the frontend has
-            // today between "the gateway 500'd" and "the LLM read
-            // the source and said no recipe is possible." A future
-            // session must NOT remove this prefix without adding
-            // the dedicated wire variant first.
+            // With the dedicated variant, the frontend closes the
+            // dialog cleanly and surfaces the LLM's prose reason as
+            // a per-row decline badge on the failed-apply row in
+            // FetchReport / RecipesPanel. The reason flows through
+            // unmodified — no `[declined]` prefix; the wire variant
+            // IS the discriminator.
             AuthoringError::Declined { reason } => {
                 warn!(
                     prior_recipe_id = %parsed_recipe_id,
                     decline_reason = %reason,
-                    "reauthor_recipe declined by LLM; surfacing through \
-                     ReauthorFailed channel pending dedicated wire variant"
+                    "reauthor_recipe declined by LLM"
                 );
-                return Err(CommandError::ReauthorFailed {
+                return Err(CommandError::ReauthorDeclined {
                     prior_recipe_id: parsed_recipe_id.to_string(),
-                    message: format!("[declined] {reason}"),
+                    reason,
                 });
             }
         },
@@ -1973,6 +2008,33 @@ mod tests {
         assert!(json.contains(r#""kind":"reauthor_failed""#));
         assert!(json.contains(r#""prior_recipe_id":"019dee9a-ba75-7533-aa4f-ee673f03fece""#));
         assert!(json.contains("no captured fetch attempt"));
+    }
+
+    /// Session 66: the new `ReauthorDeclined` variant. Mirrors the
+    /// ReauthorFailed test on the real `CommandError` enum (the DTO
+    /// shadow has its own test in types_export.rs). The frontend
+    /// distinguishes the two via `kind`; this test pins the wire
+    /// contract on the Rust side. The reason field name is
+    /// `reason` (not `message`) because architecturally a decline
+    /// is not a failure-message — the LLM gave a structured answer,
+    /// which is the LLM's reason.
+    #[test]
+    fn command_error_reauthor_declined_serializes_with_kind_and_reason() {
+        let e = CommandError::ReauthorDeclined {
+            prior_recipe_id: "019e20b5-3881-7502-93fb-dcfdeb9c8b20".into(),
+            reason: "the source's actual markup doesn't admit my prior \
+                     recipe's iterator selectors; no css_select fix is \
+                     possible against these bytes."
+                .into(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""kind":"reauthor_declined""#));
+        assert!(json.contains(r#""prior_recipe_id":"019e20b5-3881-7502-93fb-dcfdeb9c8b20""#));
+        assert!(json.contains(r#""reason":"#));
+        // Distinguishing field name from ReauthorFailed — a frontend
+        // match on `error.message` would silently miss this variant
+        // if we'd reused the same key.
+        assert!(!json.contains(r#""message":"#), "got {json}");
     }
 
     // -----------------------------------------------------------------

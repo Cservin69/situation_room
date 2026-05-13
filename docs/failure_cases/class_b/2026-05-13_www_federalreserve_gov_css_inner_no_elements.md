@@ -110,35 +110,66 @@ descendant.
 
 ## Re-authoring outcome
 
-**Succeeded** (per Session 65 morning screenshot). Recipe `019e1ffc`
-failed apply; operator clicked the re-author button; recipe
-`019e1fff` authored with `prior_recipe_id = 019e1ffc` and
-`reauthor_reason` populated; apply ran cleanly on the next attempt
-and produced 1 record. The Track A UI in ADR 0012 works on real
-data. The full recipe-history column in the UI rendered the
-oldest-to-newest chain.
+**Session 66 live verification (2026-05-13, post persistence-fix):**
+operator clicked re-author on each of the two failing recipes
+(`019e20b5-3881-...` and `019e20b5-4f36-...`, both
+`ul.list-unstyled li` + `a` against the press-releases listing).
+Both calls **landed `CommandError::ReauthorDeclined`** — the LLM
+read the bytes + the failing selectors + the
+`inner selector matched no elements` predicate and explicitly
+declined to author a corrected recipe under the closed extraction
+vocabulary.
 
-The actual rows did not persist to disk (Session 65 persistence
-bug). Re-derivation in Session 66 should reproduce the shape
-(non-determinism risk is small — same source, same recipe-author
-prompt, same fetched markup).
+The decline is architecturally correct, not a Track A regression:
+the page's `<ul class="list-unstyled">` items do not directly
+contain the `<a>` descendants those recipes' inner selectors
+assumed. A *different* recipe authored from the same fetched
+bytes — `019e20b5-1bca-...` with `div.Card-card` + `a.Card-title`
+— succeeded with 57 records on the same page (the Press Releases
+listing uses Card-card containers as its actual press-release-row
+shape). Given only the failing recipe + bytes + failure_message,
+the re-author LLM call cannot reach the Card-card pattern from
+"correct the selectors of `ul.list-unstyled li + a`" alone; the
+honest answer is decline. ADR 0012 §"Frontier LLM pushback
+discipline" identifies this exact shape as a legitimate Track B
+outcome at re-author time.
+
+The pre-Session-66 backend squeezed `Declined` through
+`CommandError::ReauthorFailed` with a `[declined]` prefix on the
+message; the frontend handled it as a generic error, the dialog
+stayed open, and the operator saw "the same message reappear"
+with no clear signal. Session 66 landed the dedicated
+`CommandError::ReauthorDeclined { prior_recipe_id, reason }` wire
+variant + frontend arm; the dialog now closes cleanly and the
+failed-apply row's `re-author` button is replaced by an italic
+`declined: <reason>` badge that surfaces the LLM's prose verbatim.
+
+Status of ADR 0012 Condition 5 (chain populated in real data):
+**still pending** as of this case's outcome — both re-authors
+declined, so no `prior_recipe_id`-stamped row exists. The Session
+65 morning screenshot showed Track A succeeding end-to-end on an
+*earlier* version of these recipes (`019e1ffc → 019e1fff`), but
+that DB state was lost to the Session 65 persistence bug.
+Subsequent live verification of Condition 5 is unblocked by the
+fix here; a different plan (e.g. the 2025 atlantic hurricane
+season) is a more likely candidate where the LLM's re-author call
+authors rather than declines.
 
 ## Corrected extraction spec
 
-*TBD — re-derive in Session 66.* Query against the Session-66 DB:
+**N/A — re-author was declined twice in Session 66.** No corrected
+recipe was authored for either failing recipe. The case-file's
+"Corrected extraction spec" section is left empty in honest
+acknowledgment that the LLM, in the closed extraction vocabulary
+and given only the prior recipe + bytes + failure message, judged
+that no fix exists.
 
-```sql
-SELECT extraction, iterator, produces
-FROM recipes
-WHERE prior_recipe_id IS NOT NULL
-  AND endpoint_url LIKE '%federalreserve.gov%'
-ORDER BY authored_at DESC
-LIMIT 1;
-```
-
-Expected shape: inner selector swapped from sibling-of-card to
-descendant-of-card. The Session-65 screenshot showed the correction
-visually but the exact selector strings weren't transcribed.
+A *separate* recipe authored from the same bytes
+(`019e20b5-1bca-7251-a1c8-1011ac469af7`) uses
+`div.Card-card` + `a.Card-title` and succeeds with 57 records.
+That is the working pattern on this page, but it's not a
+"correction" of the failing recipes' selectors — it's a different
+recipe entirely, authored at the original authoring step.
 
 ## Connection to ADR 0019
 

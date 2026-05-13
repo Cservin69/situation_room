@@ -290,14 +290,20 @@
     if (!reauthorOutcome) return;
     reauthorSubmitting = true;
     try {
-      const ok = await reauthorRecipe(reauthorOutcome.recipe_id, note);
-      if (ok) {
+      const outcome = await reauthorRecipe(reauthorOutcome.recipe_id, note);
+      // Session 66: three-state outcome. `ok` and `declined` both
+      // close the dialog (the IPC resolved cleanly in either case);
+      // only a real `error` keeps the dialog open. The decline
+      // reason is already in `plans.recipeReauthorDeclines` by the
+      // time we get here — the failed-apply row's per-row badge
+      // picks it up on the next render.
+      if (outcome.kind === 'ok' || outcome.kind === 'declined') {
         reauthorOutcome = null;
         reauthorAttempt = null;
       }
-      // On failure: dialog stays open, plans.error surfaces in the
-      // banner, the operator can edit + resubmit. Same contract as
-      // the flag-submit handler above and as RecipesPanel's.
+      // On real `error`: dialog stays open, plans.error surfaces in
+      // the banner, the operator can edit + resubmit. Same contract
+      // as the flag-submit handler above and as RecipesPanel's.
     } finally {
       reauthorSubmitting = false;
     }
@@ -447,6 +453,7 @@
               <span class="detail">{outcomeDetail(o)}</span>
             {/if}
             {#if o.kind === 'failed'}
+              {@const declineReason = plans.recipeReauthorDeclines[o.recipe_id]}
               <!--
                 Session 60 — re-author-from-failure (A direction pick).
                 Failed outcomes carry recipe_id + source_id + the
@@ -463,15 +470,34 @@
                 `.reauthor-button` styling — a constructive (re-author
                 is fixing the recipe) affordance with subordinate
                 chrome to the primary failure-status text.
+
+                Session 66 — when the LLM has *already declined* a
+                re-author for this recipe (the prior attempt landed
+                `CommandError::ReauthorDeclined`), surface that here
+                as a `[declined: <reason>]` badge instead of the
+                button. The reason is the LLM's prose verbatim;
+                renders inline so the operator sees what the LLM said
+                without re-opening the dialog. Clicking re-author
+                again would just produce the same decline; the badge
+                replacing the button is the honest signal.
               -->
-              <span class="actions">
-                <button
-                  type="button"
-                  class="reauthor-button"
-                  title="Open the re-author dialog pre-filled with this failure's recipe, message, and the bytes the runtime saw."
-                  onclick={() => openReauthorDialog(o)}
-                >re-author</button>
-              </span>
+              {#if declineReason}
+                <span
+                  class="decline-badge"
+                  title={`LLM declined to re-author: ${declineReason}`}
+                >
+                  declined: {declineReason}
+                </span>
+              {:else}
+                <span class="actions">
+                  <button
+                    type="button"
+                    class="reauthor-button"
+                    title="Open the re-author dialog pre-filled with this failure's recipe, message, and the bytes the runtime saw."
+                    onclick={() => openReauthorDialog(o)}
+                  >re-author</button>
+                </span>
+              {/if}
             {:else if o.kind === 'declined'}
               {@const feedback = plans.recipeFeedback[o.source_id]}
               <!--
@@ -848,6 +874,33 @@
   .reauthor-button:hover {
     background: var(--signal-info, var(--bg-panel-alt));
     color: var(--fg-inverse, var(--fg-primary));
+  }
+
+  /* Session 66 — decline-badge replaces the re-author button on a
+     failed-apply row once the LLM has declined to re-author it. Same
+     row position as `.reauthor-button` but italicized + muted color
+     so it reads as "informational, not actionable" — the operator
+     should not click re-author again expecting a different answer
+     from the same source-bytes-prompt triple. The title attribute
+     carries the full reason verbatim for hover discovery; the
+     visible text shows a truncated preview via single-line ellipsis. */
+  .decline-badge {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+    padding: 2px 8px;
+    border-radius: 2px;
+    color: var(--fg-tertiary);
+    background: var(--bg-inset, var(--bg-panel-alt));
+    border: 1px dashed var(--border-subtle);
+    align-self: center;
+    max-width: 60ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: help;
+    font-style: italic;
   }
 
   .history {

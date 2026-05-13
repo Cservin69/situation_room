@@ -206,6 +206,30 @@ interface PlansState {
    * is sufficient.
    */
   sourcesMemory: SourcesMemoryEntryDto[];
+  /**
+   * Session 66 — re-author decline reasons, keyed by the prior recipe
+   * id the operator clicked re-author on. Populated when the
+   * `reauthor_recipe` IPC returns `CommandError::ReauthorDeclined`
+   * (the LLM read the bytes and honestly couldn't author a corrected
+   * recipe). The FetchReport and RecipesPanel surfaces read this map
+   * to render a per-row decline badge next to the failed-apply row,
+   * so the operator sees the LLM's prose reason without an error
+   * banner.
+   *
+   * Decoupled from `plans.error` because a decline is *not* an
+   * error — nothing broke, the LLM gave a structured answer. Treating
+   * it as an error caused the pre-Session-66 dialog-stuck UX bug.
+   *
+   * `Record<recipe_id, reason>` rather than a Map for the same reason
+   * `recipeFeedback` uses a plain object: Svelte 5 runes track plain-
+   * object property mutations through proxies.
+   *
+   * Lifecycle: lives across plan selections (the operator's decline
+   * memory should outlive a click on the listing). Cleared at plan
+   * load if/when a re-author succeeds and the prior recipe no longer
+   * shows as the head — but the dead key is harmless until then.
+   */
+  recipeReauthorDeclines: Record<string, string>;
   error: CommandErrorDto | null;
 }
 
@@ -235,6 +259,7 @@ export const plans: PlansState = $state({
   expectationCoverage: null,
   hostBackoff: [],
   sourcesMemory: [],
+  recipeReauthorDeclines: {},
   error: null,
 });
 
@@ -918,12 +943,33 @@ export async function refreshExpectationCoverage(planId: string): Promise<void> 
   }
 }
 
+/**
+ * Session 66 — re-author outcome discriminator. Three states the
+ * dialog handlers care about:
+ *
+ *  - `ok` — new recipe written, refresh the panel, close the dialog.
+ *  - `declined` — LLM read the bytes and explicitly declined to
+ *    author a corrected recipe. No new recipe was persisted; nothing
+ *    broke. Close the dialog cleanly; surface the LLM's reason as a
+ *    per-row badge on the failed-apply row. **This is the Session 66
+ *    fix for the pre-fix UX bug where declines kept the dialog open
+ *    as if the IPC had crashed.**
+ *  - `error` — a real failure (gateway down, schema rejection, no
+ *    captured bytes, etc.). Leave the dialog open with `plans.error`
+ *    populated so the operator can read the banner and decide
+ *    whether to resubmit.
+ */
+export type ReauthorOutcome =
+  | { kind: 'ok' }
+  | { kind: 'declined'; reason: string }
+  | { kind: 'error' };
+
 export async function reauthorRecipe(
   recipeId: string,
   operatorNote: string | null = null,
-): Promise<boolean> {
+): Promise<ReauthorOutcome> {
   const current = plans.selected;
-  if (!current) return false;
+  if (!current) return { kind: 'error' };
 
   // Pure write — no optimistic update available because the new
   // recipe id is server-assigned (UUIDv7 minted in the validator)
@@ -936,12 +982,26 @@ export async function reauthorRecipe(
     await apiReauthorRecipe(recipeId, operatorNote);
     // The new recipe lands in storage with a higher version on the
     // same dedup_key. Refresh the recipe list so the panel shows
-    // both the new head and the lineage chip pointing back.
+    // both the new head and the lineage chip pointing back. A
+    // successful re-author also supersedes any stale decline note
+    // we may have shown for this prior recipe — drop it now so the
+    // badge disappears when the panel re-renders.
+    delete plans.recipeReauthorDeclines[recipeId];
     await refreshRecipes(current.id);
-    return true;
+    return { kind: 'ok' };
   } catch (e) {
-    plans.error = asCommandError(e);
-    return false;
+    const err = asCommandError(e);
+    // Session 66 — distinguish the LLM-declined path from real
+    // failures. On decline, do *not* set `plans.error` (a banner
+    // would read as a crash); record the reason in the per-recipe
+    // map instead so the failed-apply row can render a badge, and
+    // return a `declined` outcome so the dialog closes cleanly.
+    if (err && err.kind === 'reauthor_declined') {
+      plans.recipeReauthorDeclines[err.prior_recipe_id] = err.reason;
+      return { kind: 'declined', reason: err.reason };
+    }
+    plans.error = err;
+    return { kind: 'error' };
   } finally {
     plans.mutating = false;
   }

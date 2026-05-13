@@ -281,6 +281,14 @@ export async function latestAttemptForRecipe(
  *  - `{ kind: 'reauthor_failed', prior_recipe_id, message }` — no
  *    captured failed-apply bytes for this recipe (the operator
  *    should run fetch first), or the LLM authoring call failed.
+ *  - `{ kind: 'reauthor_declined', prior_recipe_id, reason }` —
+ *    **Session 66**: the LLM read the bytes + the failing recipe's
+ *    selectors + the failure message and declined to author a
+ *    corrected recipe. Architecturally distinct from
+ *    `reauthor_failed`: nothing broke; the LLM gave a structured
+ *    answer. Frontend handles this by closing the dialog cleanly
+ *    and rendering the reason as a per-row decline badge instead
+ *    of as an error banner.
  */
 export async function reauthorRecipe(
   recipeId: string,
