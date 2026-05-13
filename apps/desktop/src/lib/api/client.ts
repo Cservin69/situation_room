@@ -293,10 +293,21 @@ export async function latestAttemptForRecipe(
 export async function reauthorRecipe(
   recipeId: string,
   operatorNote: string | null = null,
+  /**
+   * Session 68 follow-up — the failure message to use when no captured
+   * `recipe_fetch_attempts` row exists for this recipe. Pass the
+   * FetchReport outcome's `message` field for fetch-stage failures
+   * (status 4xx / 5xx / timeout) — the executor doesn't capture rows
+   * for those, so the backend's normal lookup returns null. When the
+   * captured row exists (apply-stage failures), the override is
+   * ignored. `null` keeps the pre-Session-68 behaviour.
+   */
+  failureMessageOverride: string | null = null,
 ): Promise<RecipeDto> {
   return invoke<RecipeDto>('reauthor_recipe', {
     recipeId,
     operatorNote,
+    failureMessageOverride,
   });
 }
 

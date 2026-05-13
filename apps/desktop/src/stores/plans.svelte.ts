@@ -967,6 +967,16 @@ export type ReauthorOutcome =
 export async function reauthorRecipe(
   recipeId: string,
   operatorNote: string | null = null,
+  /**
+   * Session 68 follow-up — passed straight through to the IPC client.
+   * Lets fetch-stage failures (no captured bytes row) re-author
+   * against the FetchReport outcome's failure message. RecipesPanel
+   * keeps the default `null` because its dialog only opens for
+   * apply-stage failures (where the captured row exists); FetchReport
+   * passes the outcome message because fetch-stage failures are its
+   * common case.
+   */
+  failureMessageOverride: string | null = null,
 ): Promise<ReauthorOutcome> {
   const current = plans.selected;
   if (!current) return { kind: 'error' };
@@ -979,7 +989,7 @@ export async function reauthorRecipe(
   plans.mutating = true;
   plans.error = null;
   try {
-    await apiReauthorRecipe(recipeId, operatorNote);
+    await apiReauthorRecipe(recipeId, operatorNote, failureMessageOverride);
     // The new recipe lands in storage with a higher version on the
     // same dedup_key. Refresh the recipe list so the panel shows
     // both the new head and the lineage chip pointing back. A

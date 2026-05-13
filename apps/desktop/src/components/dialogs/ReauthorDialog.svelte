@@ -190,6 +190,28 @@
         "are JSON-shaped but invalid, the source is broken — flag the " +
         "recipe instead.",
     },
+    {
+      // Session 68 follow-up — fetch-stage failures (4xx/5xx, timeout).
+      // The executor doesn't capture bytes for these (no body to
+      // capture), so the "bytes excerpt" panel above is empty and the
+      // re-author proceeds against the failure message alone (Tauri
+      // command's `failure_message_override` path). The remediation
+      // shape is "wrong URL" (propose a different one) or "wrong
+      // host" (propose a host that doesn't 503/403/404).
+      pattern: /status error: \d+|timed out after/i,
+      label: 'fetch failed — the URL or host is wrong',
+      note:
+        "The runtime never got a response body — the source returned " +
+        "an HTTP error or timed out before any bytes arrived. The " +
+        "extraction logic is irrelevant; the URL or host is what " +
+        "needs changing. Re-author with: (a) a different URL on the " +
+        "same host (a 404 means the path moved or was wrong); (b) a " +
+        "different host (a persistent 5xx or WAF block means the " +
+        "source is unreachable); (c) the same URL with a different " +
+        "transport hint if the executor surfaces one (Retry-After " +
+        "for 429s — the runtime already handles that; you don't need " +
+        "to re-author).",
+    },
   ];
 
   const matchedHints = $derived(

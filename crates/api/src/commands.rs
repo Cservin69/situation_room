@@ -1345,16 +1345,29 @@ pub async fn latest_attempt_for_recipe(
 ///   (control-character rejection, length cap, line-ending
 ///   normalization). Empty / `None` is allowed: the failure message
 ///   alone may be rich enough.
+/// - `failure_message_override` — **Session 68 follow-up**.
+///   Optional. The failure message to present to the LLM when no
+///   `recipe_fetch_attempts` row exists for this recipe. The
+///   executor only captures rows on apply-stage failures; fetch-
+///   stage failures (status 4xx/5xx, timeouts) have nothing in the
+///   table, so the pre-Session-68 lookup-or-fail path bailed even
+///   though re-authoring against the failure message alone is a
+///   real product use case ("the URL is wrong; propose a different
+///   one"). The frontend's FetchReport surface passes the outcome's
+///   `message` field here. When the captured row exists (apply-
+///   stage), the override is ignored and the row remains
+///   authoritative.
 ///
 /// ## Behaviour
 ///
 /// 1. Validate inputs.
 /// 2. Load the prior recipe and the plan it belongs to. Reject with
 ///    `NotFound` if either is missing.
-/// 3. Look up the latest fetch attempt for the recipe. If none
-///    exists, surface `ReauthorFailed` — re-authoring without ground-
-///    truth bytes would be guessing, which is exactly what ADR 0012
-///    forbids.
+/// 3. Look up the latest fetch attempt for the recipe.
+///    - **Row exists** → use the captured bytes + failure message.
+///    - **Row missing + override supplied** → use empty bytes +
+///      override message (the fetch-stage path).
+///    - **Row missing + no override** → surface `ReauthorFailed`.
 /// 4. Call `pipeline::recipe_author::reauthor_recipe` with the bytes
 ///    + failure message + operator note. The new recipe is stamped
 ///    with `prior_recipe_id = old.id` and `reauthor_reason = …`.
@@ -1368,11 +1381,14 @@ pub async fn latest_attempt_for_recipe(
 /// - `InvalidInput { field: "recipe_id" }` — not a UUID.
 /// - `InvalidInput { field: "operator_note" }` — bounds /
 ///   character-class violation.
+/// - `InvalidInput { field: "failure_message_override" }` — same
+///   bounds violation as `operator_note`.
 /// - `NotFound { id }` — recipe id, or its plan id, missing.
 /// - `ReauthorFailed { prior_recipe_id, message }` — no captured
-///   failed-apply bytes for the recipe (the executor never recorded
-///   one; the operator should run fetch first), or the LLM authoring
-///   call failed, or the resulting recipe failed validation.
+///   failed-apply bytes AND no `failure_message_override` (the
+///   operator should run fetch first, or the frontend should pass
+///   the override), or the LLM authoring call failed, or the
+///   resulting recipe failed validation.
 /// - `Storage { message }` — DB-level failure.
 ///
 /// ## Authoring provenance
@@ -1390,6 +1406,10 @@ pub async fn latest_attempt_for_recipe(
 pub async fn reauthor_recipe(
     recipe_id: String,
     operator_note: Option<String>,
+    // Session 68 follow-up — see `## Inputs` above for the rationale.
+    // (Doc comments aren't permitted on function parameters; the
+    // load-bearing explanation lives in the function-level docstring.)
+    failure_message_override: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<RecipeDto, CommandError> {
     // 1. Parse the recipe id.
@@ -1417,9 +1437,32 @@ pub async fn reauthor_recipe(
         },
     };
 
+    // Validate the override the same way — same character class +
+    // length bounds. (The frontend supplies executor-emitted prose
+    // verbatim; bounds-checking it makes the trust boundary
+    // symmetric with operator_note above.)
+    let normalized_override: Option<String> = match failure_message_override.as_deref() {
+        None => None,
+        Some(raw) => match check_user_text(
+            "failure_message_override",
+            raw,
+            Bounds::RECIPE_FEEDBACK,
+        ) {
+            Ok(normalized) if normalized.trim().is_empty() => None,
+            Ok(normalized) => Some(normalized),
+            Err(violation) => {
+                return Err(CommandError::InvalidInput {
+                    field: "failure_message_override".into(),
+                    message: violation.to_string(),
+                })
+            }
+        },
+    };
+
     info!(
         recipe_id = %parsed_recipe_id,
         has_note = normalized_note.is_some(),
+        has_failure_override = normalized_override.is_some(),
         "reauthor_recipe command invoked"
     );
 
@@ -1442,37 +1485,70 @@ pub async fn reauthor_recipe(
             id: prior.plan_id.to_string(),
         })?;
 
-    // 5. Pull the latest fetch attempt for the recipe — the bytes the
-    //    runtime saw + the failure message it produced.
-    let attempt = state
+    // 5. Pull the latest fetch attempt for the recipe — when present,
+    //    the bytes the runtime saw + the failure message it produced
+    //    are the load-bearing evidence for re-authoring.
+    //
+    //    **Session 68 follow-up:** when no row exists (the executor
+    //    only captures apply-failure rows; fetch-stage failures like
+    //    503s have nothing in the table), fall back to the frontend-
+    //    supplied `failure_message_override` with empty bytes. The
+    //    LLM gets "this recipe failed with `<msg>`; no body was
+    //    captured" and authors against the prior recipe's selectors
+    //    + the failure shape. Useful when the failure is "wrong URL"
+    //    (404) or "wrong host shape" (403/WAF) where the LLM can
+    //    propose a corrected URL without seeing bytes.
+    let attempt_opt = state
         .store
         .latest_attempt_for_recipe(parsed_recipe_id)
-        .map_err(CommandError::from)?
-        .ok_or_else(|| CommandError::ReauthorFailed {
-            prior_recipe_id: parsed_recipe_id.to_string(),
-            message: "no captured fetch attempt exists for this recipe; \
-                      run fetch and observe a failure before re-authoring"
-                .into(),
-        })?;
+        .map_err(CommandError::from)?;
 
-    // The capture only records on apply-failure today (executor's
-    // `record_apply_failure_attempt`). A `succeeded: true` row in
-    // `recipe_fetch_attempts` would be unexpected (the table never
-    // gets one written today) but checking is defensive — re-authoring
-    // a successful recipe is structurally meaningless.
-    if attempt.succeeded {
-        return Err(CommandError::ReauthorFailed {
-            prior_recipe_id: parsed_recipe_id.to_string(),
-            message: "the recipe's latest attempt succeeded; nothing to re-author"
-                .into(),
-        });
-    }
-
-    let failure_message = attempt
-        .failure_message
-        .as_deref()
-        .unwrap_or("(failure message not captured)");
-    let bytes = attempt.bytes_excerpt.as_deref().unwrap_or("").as_bytes();
+    let (failure_message_owned, bytes_owned): (String, Vec<u8>) =
+        match (attempt_opt, &normalized_override) {
+            (Some(attempt), _) => {
+                // Captured row exists — it's authoritative. The defensive
+                // `succeeded: true` check still applies.
+                if attempt.succeeded {
+                    return Err(CommandError::ReauthorFailed {
+                        prior_recipe_id: parsed_recipe_id.to_string(),
+                        message: "the recipe's latest attempt succeeded; nothing to re-author"
+                            .into(),
+                    });
+                }
+                let msg = attempt
+                    .failure_message
+                    .clone()
+                    .unwrap_or_else(|| "(failure message not captured)".into());
+                let bytes = attempt
+                    .bytes_excerpt
+                    .as_deref()
+                    .unwrap_or("")
+                    .as_bytes()
+                    .to_vec();
+                (msg, bytes)
+            }
+            (None, Some(override_msg)) => {
+                // Fetch-stage failure path: use the frontend's outcome
+                // message verbatim, no bytes. The downstream pipeline
+                // call already accepts an empty `bytes` slice — that's
+                // the architectural signal the LLM gets that the
+                // source returned the failure before any body could be
+                // captured.
+                (override_msg.clone(), Vec::new())
+            }
+            (None, None) => {
+                return Err(CommandError::ReauthorFailed {
+                    prior_recipe_id: parsed_recipe_id.to_string(),
+                    message: "no captured fetch attempt exists for this recipe and \
+                              no failure message was supplied; run fetch and observe \
+                              a failure before re-authoring, or pass \
+                              failure_message_override from the FetchReport outcome"
+                        .into(),
+                });
+            }
+        };
+    let failure_message: &str = failure_message_owned.as_str();
+    let bytes: &[u8] = bytes_owned.as_slice();
 
     // 6. Call into pipeline.
     let mut new_recipe = match reauthor_recipe_impl(

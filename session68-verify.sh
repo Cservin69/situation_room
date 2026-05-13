@@ -43,5 +43,6 @@ echo
 echo "Look for EXIT=0 on the last line of each."
 echo
 echo "If the desktop frontend (Svelte) edits need a real check, run:"
-echo "  pnpm --filter @situation-room/desktop check"
-echo "(separately — Svelte's tsc-shaped check isn't bundled into cargo)"
+echo "  cd apps/desktop && npm run check"
+echo "(separately — Svelte's tsc-shaped check isn't bundled into cargo;"
+echo " single npm package, no pnpm in this repo)"

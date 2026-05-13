@@ -290,7 +290,17 @@
     if (!reauthorOutcome) return;
     reauthorSubmitting = true;
     try {
-      const outcome = await reauthorRecipe(reauthorOutcome.recipe_id, note);
+      // Session 68 follow-up: pass the outcome's failure message as
+      // the override so fetch-stage failures (status 4xx/5xx,
+      // timeouts) — which the executor doesn't capture into
+      // `recipe_fetch_attempts` — can still re-author. Apply-stage
+      // failures ignore the override (the captured row remains
+      // authoritative on the backend).
+      const outcome = await reauthorRecipe(
+        reauthorOutcome.recipe_id,
+        note,
+        reauthorOutcome.message,
+      );
       // Session 66: three-state outcome. `ok` and `declined` both
       // close the dialog (the IPC resolved cleanly in either case);
       // only a real `error` keeps the dialog open. The decline
