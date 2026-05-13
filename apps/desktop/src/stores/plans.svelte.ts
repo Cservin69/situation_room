@@ -331,6 +331,30 @@ export async function setStatusFilter(filter: StatusFilter): Promise<void> {
 export async function classifyTopic(topic: string): Promise<void> {
   plans.classifying = true;
   plans.error = null;
+  // Session 69 — reset the whole plan context at the start of a new
+  // classification so the previous plan's body / records / fetch
+  // report / recipes don't bleed across the boundary. Pre-fix,
+  // kicking off a new classification left `plans.selected` and its
+  // dependent collections populated from the prior plan; the right
+  // pane kept rendering the previous plan until the new
+  // classification returned, which read as "the new topic is
+  // wearing the previous plan's data" mid-session. The second
+  // iteration of the Session 69 fix also nulls `plans.selected`
+  // itself so the right pane reverts to the home empty state
+  // during the in-flight wait; the new plan replaces it cleanly
+  // on success. Mirrors `selectPlan` / `clearSelection`.
+  // `globalRecords`, `hostBackoff`, `sourcesMemory`, and
+  // `recipeReauthorDeclines` are intentionally not cleared — they
+  // are global / cross-plan by design (see the PlansState fields'
+  // comments).
+  plans.selected = null;
+  plans.fetchReport = null;
+  plans.fetchRuns = [];
+  plans.recipes = [];
+  plans.recipeFeedback = {};
+  plans.records = null;
+  plans.outcomesHistory = [];
+  plans.expectationCoverage = null;
   try {
     const plan = await apiClassify(topic);
     plans.selected = plan;
@@ -533,6 +557,22 @@ export async function reclassifySelected(
   if (current.status !== 'rejected') return false;
   plans.classifying = true;
   plans.error = null;
+  // Session 69 — same full plan-context reset as `classifyTopic`.
+  // A re-classification lands a fresh pending plan in
+  // `plans.selected`; the prior plan's body and dependent
+  // collections must not bleed across the boundary. The right pane
+  // reverts to the home empty state during the in-flight wait and
+  // fills in with the freshly-classified plan on success. See
+  // `classifyTopic` for the rationale; the field-by-field decision
+  // is identical.
+  plans.selected = null;
+  plans.fetchReport = null;
+  plans.fetchRuns = [];
+  plans.recipes = [];
+  plans.recipeFeedback = {};
+  plans.records = null;
+  plans.outcomesHistory = [];
+  plans.expectationCoverage = null;
   try {
     const fresh = await apiReclassifyPlan(current.id, editedReason);
     plans.selected = fresh;
