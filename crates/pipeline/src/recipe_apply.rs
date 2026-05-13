@@ -2299,17 +2299,20 @@ fn insert_at_path(
 /// extracted string. Any [`ApplyError`] returned by the runtime
 /// extractor is the authoring-time decline reason.
 ///
-/// Iterator recipes (Phase 1, ADR 0016): the runtime supports the
-/// `css_select × css_select` pair only. We mirror that contract here
-/// — any other pairing surfaces the same `ApplyError::NotImplemented`
-/// the runtime would produce, but at authoring time so the recipe is
-/// never persisted. For css_select × css_select, the validator
-/// requires the outer iterator to match ≥1 element AND the inner
-/// extraction to match ≥1 element within at least one of those outer
-/// matches. This is the minimum "the runtime would produce records"
-/// contract; a recipe that fails this preflight would fail at apply.
+/// Iterator recipes: the runtime supports `css_select × css_select`
+/// (ADR 0016 Phase 1) and `json_path × json_path` (ADR 0019 Phase 2A).
+/// We mirror that contract here — any other pairing surfaces the same
+/// `ApplyError::NotImplemented` the runtime would produce, but at
+/// authoring time so the recipe is never persisted. For each
+/// supported pair, the validator requires the outer iterator to match
+/// ≥1 node AND the inner extraction to match ≥1 node within at least
+/// one of those outer matches. This is the minimum "the runtime would
+/// produce records" contract; a recipe that fails this preflight
+/// would fail at apply.
 ///
-/// Session 41 items 4–6.
+/// Session 41 items 4–6 added the css branch; Session 67 added the
+/// json_path branch (closing the authoring-time gate that prior
+/// sessions left around the existing Phase-2A runtime).
 pub(crate) fn validate_recipe_against_bytes(
     recipe: &FetchRecipe,
     bytes: &[u8],
@@ -2332,18 +2335,26 @@ pub(crate) fn validate_recipe_against_bytes(
                     attribute: _,
                 },
             ) => validate_css_iterator(bytes, iter_selector, inner_selector),
+            (
+                ExtractionSpec::JsonPath { path: iter_path },
+                ExtractionSpec::JsonPath { path: inner_path },
+            ) => validate_json_iterator(bytes, iter_path, inner_path),
             (iter_other, inner_other) => {
                 // Mirror the runtime's NotImplemented; the validator
                 // should never disagree with the runtime about which
-                // pairings are supported.
+                // pairings are supported. Keep this message aligned
+                // with `apply_iterator`'s fallthrough — operators
+                // reading either failure should see the same boundary.
                 Err(ApplyError::NotImplemented {
                     mode: "iterator",
                     reason: format!(
                         "iterator runtime is wired for css_select × css_select \
-                         only in Phase 1 (ADR 0016). Got iter={}, inner={}. \
-                         Other modes are tracked for Phase 2; until then, \
-                         iterator-bearing recipes against listing-shaped \
-                         sources of other modes should decline at authoring.",
+                         (ADR 0016 Phase 1) and json_path × json_path (ADR 0019 \
+                         Phase 2A). Got iter={}, inner={}. Other modes \
+                         (csv_cell, pdf_table, regex_capture) are tracked for \
+                         Phase 2B; until then, iterator-bearing recipes against \
+                         listing-shaped sources of those modes should decline \
+                         at authoring.",
                         mode_name(iter_other),
                         mode_name(inner_other),
                     ),
@@ -2415,6 +2426,88 @@ fn validate_css_iterator(
                  cards but none of them contained the value the inner selector \
                  addresses. Likely cause: the inner selector is hallucinated \
                  against markup the prefetch did not return.",
+                outer_matches.len()
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Iterator preflight for `json_path` × `json_path`. Mirror of
+/// [`validate_css_iterator`] for the JSON case. ADR 0019 Phase 2A
+/// declared this pairing supported at the runtime ([`apply_json_iterator`])
+/// since Session 61; this function closes the corresponding gap in
+/// the authoring-time validator so the structural validator no
+/// longer disagrees with the runtime about which pairings persist.
+///
+/// Differences from [`apply_json_iterator`]:
+/// - No record building (the validator has no `ApplyContext`).
+/// - No cap check — Phase 1's `MAX_RECORDS_PER_RECIPE` cap is a
+///   runtime concern; the validator only asks "would this produce
+///   ≥1 record." A recipe that yields too many records still gets
+///   persisted; the runtime caps it on apply.
+/// - All-null inner matches count as misses because the runtime's
+///   [`extract_json_within`] rejects them at apply time. Requiring
+///   ≥1 non-null inner hit at authoring matches the runtime's
+///   "would extraction succeed" contract.
+///
+/// Predicate strings deliberately re-use the runtime's
+/// `apply_json_iterator` text ("iterator path … matched no
+/// nodes", "inner path … matched no nodes within …") so the
+/// `failure_message` column reads the same whether the recipe
+/// failed at authoring or at apply. ADR 0012's strict-Class-B
+/// gate matches on these strings; keeping them aligned across
+/// validator and runtime preserves that contract.
+fn validate_json_iterator(
+    bytes: &[u8],
+    iter_path: &str,
+    inner_path: &str,
+) -> Result<(), ApplyError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|e| ApplyError::Extraction {
+        mode: "json_path",
+        reason: format!("bytes did not parse as JSON: {e}"),
+    })?;
+
+    let outer_matches: Vec<&Value> =
+        value.query(iter_path).map_err(|e| ApplyError::Extraction {
+            mode: "json_path",
+            reason: format!("iterator path query failed: {e}"),
+        })?;
+
+    if outer_matches.is_empty() {
+        return Err(ApplyError::Extraction {
+            mode: "json_path",
+            reason: format!(
+                "iterator path {iter_path:?} matched no nodes (the source \
+                 may have changed shape, or the path is targeting the \
+                 wrong array)"
+            ),
+        });
+    }
+
+    // Inner must produce ≥1 non-null node within at least one outer
+    // scope. Same posture as [`validate_css_iterator`]: we don't
+    // require every outer match to host a usable inner — the runtime
+    // tolerates per-element misses. All-null inner matches count as
+    // misses because [`extract_json_within`] rejects all-null at
+    // apply time. A query error (e.g. malformed inner path syntax)
+    // counts as a miss here; the failure surfaces on the next outer
+    // match or, if none match, in the aggregate error below — which
+    // names the path, the right diagnostic for the LLM to fix.
+    let any_inner_hit = outer_matches.iter().any(|scope| match scope.query(inner_path) {
+        Ok(nodes) => nodes.iter().any(|n| !matches!(n, Value::Null)),
+        Err(_) => false,
+    });
+    if !any_inner_hit {
+        return Err(ApplyError::Extraction {
+            mode: "json_path",
+            reason: format!(
+                "inner path {inner_path:?} matched no nodes within any of the \
+                 {} iterator matches — the iterator path found elements but \
+                 none contained a non-null value the inner path addresses. \
+                 Likely cause: the inner path is hallucinated against shape \
+                 the prefetch did not return.",
                 outer_matches.len()
             ),
         });
@@ -4157,6 +4250,52 @@ C 4
         }
     }
 
+    /// Helper: build an iterator-bearing recipe with json_path ×
+    /// json_path. Same Event-record shape as
+    /// [`iterator_event_recipe`] (one literal event_type, one
+    /// extracted headline, dedup_key_field on headline) so the
+    /// validator tests can vary only the bytes side. ADR 0019
+    /// Phase 2A case — the FEMA / FRED / World-Bank API shape.
+    fn iterator_event_recipe_json(iter_path: &str, inner_path: &str) -> FetchRecipe {
+        FetchRecipe {
+            id: Uuid::now_v7(),
+            dedup_key: None,
+            plan_id: Uuid::now_v7(),
+            source_id: "listing_source".into(),
+            source_url: Url::parse("https://example.com/listing.json").unwrap(),
+            extraction: ExtractionSpec::JsonPath {
+                path: inner_path.into(),
+            },
+            iterator: Some(ExtractionSpec::JsonPath {
+                path: iter_path.into(),
+            }),
+            produces: vec![ProductionBinding {
+                record_type: RecordType::Event,
+                expectation: ExpectationRef::EventType { index: 0 },
+                field_mappings: vec![
+                    FieldMap {
+                        path: "event_type".into(),
+                        source: FieldValueSource::Literal {
+                            value: json!("milestone_announced"),
+                        },
+                    },
+                    FieldMap {
+                        path: "headline".into(),
+                        source: FieldValueSource::Extracted,
+                    },
+                ],
+                dedup_key_field: Some("headline".into()),
+            }],
+            authored_at: Utc.with_ymd_and_hms(2026, 5, 13, 0, 0, 0).unwrap(),
+            authored_by: "xai".into(),
+            version: 1,
+            static_payload: None,
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
+        }
+    }
+
     /// Three-card listing: iterator selects three `.card`s, inner
     /// selector reads each card's `h3`, three Event records emerge
     /// with the three headlines verbatim. ADR 0016's Phase 1 happy
@@ -4781,6 +4920,166 @@ C 4
                 );
             }
             other => panic!("expected Extraction error from css_select, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR 0019 Phase 2A — validator-side json_path × json_path (Session 67)
+    //
+    // The runtime's `apply_json_iterator` has supported this pair since
+    // Session 61, but `validate_recipe_against_bytes` was missing the
+    // matching match-arm — every json_path × json_path attempt was
+    // intercepted at authoring with `NotImplemented`. These tests pin
+    // the closed gap: the validator now agrees with the runtime, and
+    // the runtime-side dispatch is exercised end-to-end by the existing
+    // ADR 0019 runtime tests below.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_recipe_json_iterator_accepts_when_outer_and_inner_match() {
+        // Array-of-objects API shape — the canonical FEMA / FRED /
+        // World-Bank case. Outer path picks each object; inner path
+        // picks the headline leaf. Both match in the fixture — the
+        // recipe persists.
+        let bytes = br#"{
+            "items": [
+                {"headline": "Storm declared", "id": 1},
+                {"headline": "Amendment filed", "id": 2}
+            ]
+        }"#;
+        let recipe = iterator_event_recipe_json("$.items[*]", "$.headline");
+        validate_recipe_against_bytes(&recipe, bytes)
+            .expect("matching iterator + inner json_paths must validate");
+    }
+
+    #[test]
+    fn validate_recipe_json_iterator_rejects_when_outer_matches_but_inner_does_not() {
+        // Outer items exist; inner targets a key not present in any
+        // item. Validator should reject — the recipe would produce
+        // zero records at apply, which is exactly the strict Class B
+        // shape the FEMA-hunt JSONL surfaced (Session 67 hunt;
+        // `$.femaDeclarationString` inner against
+        // `/api/open/v2/DisasterDeclarationsSummaries`).
+        let bytes = br#"{
+            "items": [
+                {"id": 1},
+                {"id": 2}
+            ]
+        }"#;
+        let recipe = iterator_event_recipe_json("$.items[*]", "$.headline");
+        match validate_recipe_against_bytes(&recipe, bytes).unwrap_err() {
+            ApplyError::Extraction { mode: "json_path", reason } => {
+                assert!(
+                    reason.contains("inner path"),
+                    "validator should attribute the failure to the inner \
+                     path specifically; got: {reason}"
+                );
+                assert!(
+                    reason.contains("matched no nodes"),
+                    "validator should re-use the runtime's predicate string \
+                     for the strict-Class-B failure_message match; got: {reason}"
+                );
+            }
+            other => panic!("expected Extraction error from json_path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_recipe_json_iterator_rejects_when_outer_matches_nothing() {
+        // Outer path targets a key not present at the document root.
+        // Validator should reject and attribute the failure to the
+        // iterator path so the LLM knows which path to fix.
+        let bytes = br#"{"other_root": []}"#;
+        let recipe = iterator_event_recipe_json("$.items[*]", "$.headline");
+        match validate_recipe_against_bytes(&recipe, bytes).unwrap_err() {
+            ApplyError::Extraction { mode: "json_path", reason } => {
+                assert!(
+                    reason.contains("iterator path"),
+                    "validator should attribute the failure to the iterator \
+                     path specifically; got: {reason}"
+                );
+                assert!(
+                    reason.contains("matched no nodes"),
+                    "predicate string must match the runtime / ADR 0012 \
+                     Class B contract; got: {reason}"
+                );
+            }
+            other => panic!("expected Extraction error from json_path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_recipe_json_iterator_rejects_when_inner_matches_only_null() {
+        // Outer hits N elements; inner path matches in each element
+        // but every match is JSON null. The runtime's
+        // `extract_json_within` rejects all-null at apply time
+        // (Session 32b's null-skip contract); the validator mirrors
+        // that contract so the LLM doesn't author a recipe whose
+        // every apply would fail with "all JSON null".
+        let bytes = br#"{
+            "items": [
+                {"headline": null, "id": 1},
+                {"headline": null, "id": 2}
+            ]
+        }"#;
+        let recipe = iterator_event_recipe_json("$.items[*]", "$.headline");
+        match validate_recipe_against_bytes(&recipe, bytes).unwrap_err() {
+            ApplyError::Extraction { mode: "json_path", reason } => {
+                assert!(
+                    reason.contains("inner path"),
+                    "validator should attribute the failure to the inner \
+                     path specifically; got: {reason}"
+                );
+            }
+            other => panic!("expected Extraction error from json_path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_recipe_json_iterator_rejects_when_bytes_are_not_json() {
+        // The structural validator's mode-pair dispatch is JSON; the
+        // runtime parses bytes-as-JSON; bytes that don't parse must
+        // produce the "bytes did not parse as JSON" predicate verbatim
+        // (the recipe-author prompt teaches that exact text as the
+        // category-error signal).
+        let html = b"<html><body><p>not json</p></body></html>";
+        let recipe = iterator_event_recipe_json("$.items[*]", "$.headline");
+        match validate_recipe_against_bytes(&recipe, html).unwrap_err() {
+            ApplyError::Extraction { mode: "json_path", reason } => {
+                assert!(
+                    reason.contains("bytes did not parse as JSON"),
+                    "validator must surface the runtime's category-error \
+                     predicate; got: {reason}"
+                );
+            }
+            other => panic!("expected Extraction error from json_path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_recipe_unsupported_iterator_pair_message_names_both_supported_pairs() {
+        // The fallthrough NotImplemented message must name both
+        // supported pairings (css × css and json × json) so the
+        // operator and the recipe-author prompt see the same
+        // boundary. Pre-Session-67 message only named css × css.
+        let mut recipe = iterator_event_recipe(".card", "h3");
+        recipe.iterator = Some(ExtractionSpec::JsonPath {
+            path: "$.items[*]".into(),
+        });
+        let bytes = br#"{"items": []}"#;
+        match validate_recipe_against_bytes(&recipe, bytes).unwrap_err() {
+            ApplyError::NotImplemented { mode, reason } => {
+                assert_eq!(mode, "iterator");
+                assert!(
+                    reason.contains("css_select × css_select"),
+                    "message must name css × css; got: {reason}"
+                );
+                assert!(
+                    reason.contains("json_path × json_path"),
+                    "message must name json × json post-Session-67; got: {reason}"
+                );
+            }
+            other => panic!("expected NotImplemented for cross-mode iterator pair, got {other:?}"),
         }
     }
 

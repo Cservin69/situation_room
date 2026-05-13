@@ -6,7 +6,7 @@ with `FieldValueSource::ExtractedInner` (vs Session 61's 0/10). The
 stronger signal (≥3 Event records per trial via the multi-leaf path)
 remains unmet and is tracked as a follow-on improvement target
 rather than a blocker on acceptance.
-**Date**: 2026-05-11 (proposed); 2026-05-11 (Phase 2A implementation landed); 2026-05-11 (v1.20 prompt + fixture-integration test landed); 2026-05-12 (Accepted on Session 64 hurricane eval)
+**Date**: 2026-05-11 (proposed); 2026-05-11 (Phase 2A implementation landed); 2026-05-11 (v1.20 prompt + fixture-integration test landed); 2026-05-12 (Accepted on Session 64 hurricane eval); 2026-05-13 (Session 67 closed structural-validator coherence gap on json_path × json_path)
 **Related**: ADR 0003 (six record types as governance boundary), ADR
 0007 (research function: two-level LLM architecture and the
 closed-extraction-vocabulary discipline), ADR 0016 (extraction
@@ -699,5 +699,62 @@ v7's `prior_recipe_id` substrate. The loop lands in a later session
 when the gate is met. The reasoning-block-before-JSON experiment
 remains unblocked but is now a refinement target rather than a
 fallback — v1.20 already cleared the falsification gate.
+
+### Session 67 verification (2026-05-13) — Phase 2A validator-gate closed
+
+**Discovered.** Across 5 FEMA trials (`eval-runs/fema-disaster-
+declarations-2025-20260513T113806Z.jsonl`) the LLM authored
+`json_path × json_path` iterator-bearing recipes against
+`api.fema.gov/.../DisasterDeclarationsSummaries` on every trial.
+Every one was intercepted at authoring with
+`extraction mode not implemented: iterator (iterator runtime is
+wired for css_select × css_select only in Phase 1 (ADR 0016))`. No
+JSON iterator recipe persisted across the 5 trials. FEMA trial 2
+came one validator-branch away from a strict Class B JsonPath case:
+the LLM authored `$.DisasterDeclarationsSummaries[*]` outer +
+`$.femaDeclarationString` inner, the inner would have failed at
+apply with "matched no nodes within scope", and the recipe would
+have been a strict ADR 0012 Class B JsonPath case at the apply
+boundary.
+
+**Cause.** The `apply_iterator` runtime (recipe_apply.rs:564) has
+supported `json_path × json_path` since Session 61 — see "What
+Phase 2A shipped" above, which names `apply_json_iterator` and the
+"new (JsonPath, JsonPath) iterator pair" runtime tests. The
+**structural validator** `validate_recipe_against_bytes`
+(recipe_apply.rs:2313) was missing the matching match-arm; its
+fallthrough returned `NotImplemented` with a stale "css_select ×
+css_select only in Phase 1 (ADR 0016)" message that contradicted
+the runtime. The **shape validator**
+`validate_recipe_shape_against_bytes` had its own (JsonPath,
+JsonPath) arm at line 2581, but the arm was unreachable because
+the structural validator gates it at line 2490.
+
+**Repair (not a new principle).** Session 67 added
+`validate_json_iterator` (mirror of `validate_css_iterator`) and
+wired the `(JsonPath, JsonPath)` arm into
+`validate_recipe_against_bytes`. The fallthrough's
+`NotImplemented` message now names both supported pairings,
+matching the runtime's own text (recipe_apply.rs:601-609). This
+closes the coherence gap; it does not introduce a new principle.
+The Phase-2A scope ADR 0019 already declared (css_select +
+json_path outer modes) is now uniformly enforced from prompt →
+runtime → structural validator → shape validator.
+
+Five new unit tests cover the validator path: happy path,
+outer-no-match (predicate "iterator path … matched no nodes"),
+inner-no-match (predicate "inner path … matched no nodes
+within …"), inner-all-null (mirrors runtime's null-skip
+rejection), bytes-not-json (category-error predicate). A sixth
+test pins the updated `NotImplemented` message names both pairs.
+
+**Carry-forward for ADR 0012.** Persisted `json_path × json_path`
+recipes that fail at apply with "iterator path … matched no
+nodes" or "inner path … matched no nodes within scope" are
+strict Class B JsonPath cases. Until Session 67 these could not
+exist on disk because the validator declined them at authoring.
+The Session 67 FEMA-hunt re-run is expected to land at least one
+such case, which would raise ADR 0012 Condition 2 (mode
+diversity) from 2 to 3.
 
 End of ADR.
