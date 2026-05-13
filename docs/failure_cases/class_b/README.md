@@ -66,39 +66,75 @@ directory was created in Session 24 alongside that entry; this
 README establishes the convention so subsequent sessions have a
 known-good schema to follow.
 
-## Gate status (Session 66, 2026-05-13)
+## Gate status (Session 67, 2026-05-13)
 
 ADR 0012 Condition 1 wants ≥10 distinct Class B cases across ≥3
 extraction modes. Current count:
 
-| Mode          | Cases | Spec-grounded | Notes |
-|---------------|-------|---------------|-------|
-| CssSelect     | 5     | 2 (pending fill-in) | 4× `www.nhc.noaa.gov` (Session 63/64); 1× `www.federalreserve.gov` (Session 65 screenshot; spec + bytes pending Session 66 re-run because of persistence bug). **Host-diverse as of Session 66**. |
-| RegexCapture  | 1     | 1             | `rss_feeds` (BBC CDATA mismatch) |
-| JsonPath      | 0     | —             | `world_bank_indicators` is **Class B-adjacent** (`null` vs f64), not strict |
-| CsvCell       | 0     | —             | None observed |
-| PdfTable      | 0     | —             | Phase 2B mode, may be rare |
+| Mode          | Strict cases | Spec-grounded | Notes |
+|---------------|--------------|---------------|-------|
+| CssSelect     | 5            | 2 (pending fill-in) | 4× `www.nhc.noaa.gov` (Session 63/64); 1× `www.federalreserve.gov` (Session 65 screenshot; spec + bytes filled in Session 66). **Host-diverse as of Session 66**. |
+| RegexCapture  | 1            | 1             | `rss_feeds` (BBC CDATA mismatch) |
+| JsonPath      | 0            | —             | `world_bank_indicators` is **Class B-adjacent** (`null` vs f64), not strict. Session 67's `api_fema_gov_jsonpath_iterator_cap_exceeded` is **also Class B-adjacent** (cap-exceeded predicate, not on strict list — but proposed for extension; see file). |
+| CsvCell       | 0            | —             | None observed |
+| PdfTable      | 0            | —             | Phase 2B mode, may be rare |
 
-Strict Class B total: **6**. Of these, **3** are spec-grounded
-(rss_feeds + the two Session 64 CssSelect cases pending operator
-DB-fill). The Session 65 federalreserve.gov case is documented but
-spec + bytes are **TBD until Session 66's persistence-fixed binary
-re-derives them** (see `scripts/session66_verify.sql`). Class
-B-adjacent (broader-definition) total: **2** (world_bank + the
-gdelt case from Session 23 noted above as not-filed).
+Strict Class B total: **6** (unchanged from Session 66 — Session
+67's hunt did **not** produce any strict-by-predicate JsonPath
+case, contrary to the pre-run expectation). Class B-adjacent
+total: **3** (world_bank + gdelt + fema_jsonpath_cap_exceeded).
 
-Outstanding for Condition 1 (≥10 distinct): need 5+ more strict
-cases. ≥2 modes are covered (CssSelect + RegexCapture); 1 more
-mode required (JsonPath strict, CsvCell strict, or a non-Phase-2B
-expansion of the predicate set).
+**Why Session 67's hunt didn't produce strict JsonPath cases.**
+Pre-Session 67, every `json_path × json_path` recipe was declined
+at authoring with a NotImplemented validator gate (recorded in ADR
+0019 Session 67 verification subsection). The Session 67 patch
+closed that gate; the eval ran 5 trials and persisted 23 such
+recipes, of which 11 succeeded with records (1047 total — biggest
+single-topic haul ever) and 11 failed at apply with the
+cap-exceeded predicate. Zero apply-time failures matched the
+strict predicate `path matched no nodes` — because the structural
+validator now catches that shape at authoring against the same
+prefetched bytes the apply will see, so on stable APIs like FEMA
+the validator and apply agree perfectly. The remaining apply-time
+failure surface for JsonPath is bytes-shape-dependent (paginated
+APIs that exceed our cap, or sources whose shape drifts between
+authoring fetch and apply fetch).
+
+**Implication for the predicate list.** Today's run is empirical
+evidence that ADR 0012's four-predicate list under-covers
+JsonPath's real apply-time failure modes on stable APIs. The
+[`2026-05-13_api_fema_gov_jsonpath_iterator_cap_exceeded.md`](2026-05-13_api_fema_gov_jsonpath_iterator_cap_exceeded.md)
+case file proposes extending the strict list with
+`matched N elements; cap is N` (mode-shared between JsonPath and
+CssSelect iterators). The extension decision belongs in a future
+ADR 0012 amendment, not in this README. If accepted, today's 11
+cap-exceeded failures convert from Class B-adjacent to strict
+Class B, Condition 1 count climbs 6 → 17, and Condition 2 mode
+diversity climbs 2 → 3 (closing Condition 2 outright).
+
+Outstanding for Condition 1 (≥10 distinct strict): need 5+ more
+strict cases under the current predicate list, OR adopt the
+proposed extension above (which yields +11 immediately).
 
 Outstanding for Condition 3 (each predicate string ≥2
 spec-grounded cases):
 
 - `selector matched no elements` (CssSelect): 2 ✓ (pending fill-in)
 - `matched 0 times` (RegexCapture): 1 — need 1 more
-- `path matched no nodes` (JsonPath): 0 — need 2
-- `no row matched filter` (CsvCell): 0 — need 2
+- `path matched no nodes` (JsonPath): 0 — need 2 (note: stable-API
+  validator-gating makes this predicate hard to produce at apply
+  time; the natural sources are shape-drifting APIs or sources
+  with prefetch-vs-fetch divergence — neither well-represented
+  in the eval-harness yet)
+- `no row matched filter` (CsvCell): 0 — need 2 (Session 66 +
+  Session 67 confirmed BLS / Census CSV hosts are WAF-blocked,
+  blocking the LLM from authoring CsvCell recipes; ADR 0009
+  amendment territory)
+- `matched N elements; cap is N` (proposed extension): 11 from
+  Session 67 — but per the case file's discussion, the
+  "spec-grounded" definition under the proposed extension may
+  want shape diversity across hosts, not just attempt count
+  on one host
 
 Outstanding for Condition 4 (Class C disguised as Class B):
 **none documented yet**. Several candidates exist in the eval

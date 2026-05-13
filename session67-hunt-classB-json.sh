@@ -25,10 +25,14 @@
 #     Any of (a/b) is a new mode for ADR 0012 Condition 2 (mode
 #     diversity climbs 2 → 3).
 #
-# The BLS topic stays in the run because the LLM occasionally reaches
-# for FRED JSON endpoints; if any such recipe persists and fails at
-# apply on the JsonPath predicate, that contributes a second strict
-# JsonPath case.
+# **Cost-cut from Session 66's 5×2 = 10-trial hunt:** this runs
+# 2 trials × FEMA only. BLS is dropped — Session 66 established
+# every BLS CSV path returns 403 (host_blocked_by_waf), so the LLM
+# never reaches CsvCell on it; running BLS again would re-confirm a
+# null result we already have. FEMA is enough to verify the
+# json_path × json_path path now persists. If 2 trials don't show
+# the new behaviour, the cost-cheap escalation is to bump to 5
+# trials on FEMA only — still cheaper than Session 66's matrix.
 #
 # Operator runs this on Mac. Sandbox can't run cargo per
 # memory/workflow_cargo_mac.md.
@@ -45,38 +49,28 @@ mkdir -p logs
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 
-echo "==> [1/3] cargo test --workspace (picks up Session 67 validator tests)"
+echo "==> [1/2] cargo test --workspace (picks up Session 67 validator tests)"
 cargo test --workspace 2>&1 \
   | tee "logs/session67-cargo-test-${stamp}.log"
 
-run_eval() {
-    local topic="$1"
-    local slug="$2"
-    echo
-    echo "==> eval-harness: 5 trials × '${topic}' (post-validator-fix)"
-    cargo run --release -p situation_room-eval-harness -- \
-        --topic "${topic}" \
-        --trials 5 \
-        --keep-dbs \
-      2>&1 | tee "logs/session67-${slug}-eval-${stamp}.log"
-}
-
-# --- JsonPath primary target ------------------------------------------
 echo
-echo "==> [2/3] FEMA disaster declarations (JsonPath primary target)"
-run_eval "FEMA disaster declarations 2025" "fema-2025"
-
-# --- JsonPath secondary target ----------------------------------------
-echo
-echo "==> [3/3] BLS unemployment (CsvCell primary; sometimes JsonPath via FRED)"
-run_eval "US monthly unemployment by state 2025" "bls-unemployment-2025"
+echo "==> [2/2] eval-harness: 2 trials × 'FEMA disaster declarations 2025' (post-validator-fix)"
+cargo run --release -p situation_room-eval-harness -- \
+    --topic "FEMA disaster declarations 2025" \
+    --trials 2 \
+    --keep-dbs \
+  2>&1 | tee "logs/session67-fema-2025-eval-${stamp}.log"
 
 echo
 echo "==> done."
 echo
 echo "Compare against Session 66 baseline:"
 echo "  eval-runs/fema-disaster-declarations-2025-20260513T113806Z.jsonl"
-echo "  eval-runs/us-monthly-unemployment-by-state-2025-20260513T114829Z.jsonl"
+echo
+echo "First diagnostic: did ANY recipe persist as json_path × json_path?"
+echo "  Read the new JSONL; look for outcomes[].kind=\"failed\"/stage=\"apply\""
+echo "  rows with json_path predicate text, OR outcomes[].kind=\"succeeded\""
+echo "  with FEMA source_id. Either confirms the gate opened."
 echo
 echo "Strict Class B JsonPath predicate match (apply-time, persisted recipe):"
 echo "  for db in /tmp/situation_room-eval-*/trial-*.duckdb \\"
