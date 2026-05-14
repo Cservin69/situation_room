@@ -298,10 +298,139 @@
     let parsed: unknown;
     try {
       parsed = JSON.parse(trimmed);
-    } catch {
-      return null;
+    } catch (e) {
+      /*
+        Session 71 — truncation recovery.
+
+        Body comes from `document_synth::body_preview` which caps at
+        128 KiB for structured-text MIMEs. A 2y daily-bars Yahoo
+        Finance feed sits comfortably under that cap, but if a future
+        feed (5y / minute bars / very wide indicators block) overruns,
+        the body lands mid-array and `JSON.parse` throws.
+
+        Rather than silently dropping back to the text preview (the
+        Session 70 regression mode — chart card showed raw JSON
+        instead of a sparkline), we make one repair attempt: walk
+        back from the end of the body to the last position that looks
+        like a structural close (`]` followed by enough closers to
+        balance the open braces / brackets seen so far), close the
+        outstanding scopes, and try parsing the patched string.
+
+        If recovery still doesn't parse we return null and the
+        KindCard renders the text sample as before — same outcome as
+        pre-Session-71, just on a strictly smaller set of inputs.
+
+        The console.warn surfaces what happened in DevTools so the
+        next time chart-preview regresses (e.g. a feed shape changes)
+        the operator sees the diagnostic directly instead of having
+        to query the documents table by hand.
+      */
+      const recovered = recoverTruncatedJson(trimmed);
+      if (recovered !== null) {
+        try {
+          parsed = JSON.parse(recovered);
+          // eslint-disable-next-line no-console
+          console.warn(
+            'situation_room: recovered truncated JSON for chart preview ' +
+              '(body was over the preview cap; consider raising STRUCTURED_BODY_CAP_BYTES). ' +
+              'Original length=' + trimmed.length + ', recovered length=' + recovered.length,
+          );
+        } catch {
+          // eslint-disable-next-line no-console
+          console.warn(
+            'situation_room: chart preview failed — JSON.parse threw and recovery also failed. ' +
+              'Body length=' + trimmed.length + ', first error=' + String(e),
+          );
+          return null;
+        }
+      } else {
+        // eslint-disable-next-line no-console
+        console.warn(
+          'situation_room: chart preview failed — JSON.parse threw and no recovery point found. ' +
+            'Body length=' + trimmed.length + ', first error=' + String(e),
+        );
+        return null;
+      }
     }
     return findSeries(parsed);
+  }
+
+  /**
+   * Session 71 — best-effort recovery of a truncated JSON string.
+   *
+   * Walks the string left-to-right tracking open-brace / open-bracket
+   * depth (ignoring string contents — quotes toggle a "in-string" flag
+   * and escapes are skipped). At each top-level structural close
+   * (`]` or `}`) we record a "safe truncation point" — the index just
+   * after that close.
+   *
+   * After the walk we slice at the last recorded safe point and
+   * append enough closing punctuation to balance the depth that was
+   * open at that point (computed during the walk by snapshotting the
+   * brace/bracket stack at each close). For Yahoo-shaped feeds this
+   * typically lands inside `chart.result[0]` after a complete inner
+   * array, then closes the remaining `}]}`.
+   *
+   * Returns the repaired string, or `null` if no safe point exists
+   * (body has no balanced subtree to recover from).
+   */
+  function recoverTruncatedJson(input: string): string | null {
+    // Snapshots of (sliceEnd, closingTail) at each recoverable point.
+    // We keep the *last* one — that gives us the maximum data
+    // preserved while still being syntactically closable.
+    let lastSafeEnd = 0;
+    let lastSafeTail = '';
+    const stack: string[] = [];
+    let inString = false;
+    let escape = false;
+    for (let i = 0; i < input.length; i++) {
+      const c = input[i];
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (inString) {
+        if (c === '\\') {
+          escape = true;
+        } else if (c === '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (c === '"') {
+        inString = true;
+        continue;
+      }
+      if (c === '{') {
+        stack.push('}');
+      } else if (c === '[') {
+        stack.push(']');
+      } else if (c === '}' || c === ']') {
+        // Pop and record a safe point *after* this close.
+        const expected = stack[stack.length - 1];
+        if (expected !== c) {
+          // Malformed input — bail; not our problem to fix beyond
+          // the truncation case.
+          return null;
+        }
+        stack.pop();
+        // Only record at "top-level-ish" closes (depth > 0 means we
+        // closed an inner scope but the document isn't done yet).
+        // We snapshot the closing tail we'd need at this depth.
+        lastSafeEnd = i + 1;
+        lastSafeTail = stack
+          .slice()
+          .reverse()
+          .join('');
+        if (stack.length === 0) {
+          // Body is already complete — caller would have parsed
+          // directly; nothing for us to do.
+          return null;
+        }
+      }
+    }
+    if (lastSafeEnd === 0) return null;
+    return input.slice(0, lastSafeEnd) + lastSafeTail;
   }
 
   function isAllNumeric(arr: unknown[]): boolean {

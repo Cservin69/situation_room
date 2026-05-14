@@ -75,6 +75,29 @@ use crate::research::ResearchPlan;
 /// from URL X at time T."
 pub const BODY_PREVIEW_CAP_BYTES: usize = 32 * 1024;
 
+/// Session 71 — separate cap for structured-text MIMEs (JSON, CSV, XML)
+/// whose downstream consumer is a *parser*, not a human eye. The
+/// dashboard's `RecordsDashboard.detectTimeSeriesShape` runs
+/// `JSON.parse` on the body to surface inline charts on `data_feed`
+/// tiles; if the body is truncated mid-array, parse fails and the
+/// chart preview silently degrades to a 117-char JSON sample
+/// (`{"chart":{"result":[{"meta":...`).
+///
+/// At the pre-Session-71 32 KiB cap, ~1y of Yahoo Finance daily bars
+/// (~25 KiB) fit cleanly and the chart rendered; ~2y (~47 KiB) got
+/// truncated and the chart regressed. The cap was sized for "human
+/// preview", not for "structural integrity feeding a parser."
+///
+/// 128 KiB matches `HTML_STRIP_INPUT_CAP_BYTES` (the upstream window
+/// we feed into the HTML stripper before its own 32 KiB post-strip
+/// cap), giving 2-3y of daily time series comfortable headroom while
+/// keeping the documents table's per-row growth bounded.
+///
+/// The HTML and `text/plain` paths keep the 32 KiB cap — operators
+/// reading prose don't need (or want) more than a screenful, and HTML
+/// already has its own pre-strip window.
+pub const STRUCTURED_BODY_CAP_BYTES: usize = 128 * 1024;
+
 /// Synthesize and insert a `Document` row capturing a successful fetch.
 ///
 /// Returns `()` regardless of insert outcome — Document persistence is
@@ -259,17 +282,27 @@ const HTML_STRIP_INPUT_CAP_BYTES: usize = 4 * BODY_PREVIEW_CAP_BYTES;
 /// routing is open by definition; the closed-vocabulary discipline is
 /// about host identity).
 ///
-/// For non-HTML text MIMEs (`text/plain`, `application/json`,
-/// `text/csv`, …) we keep the pre-Session-70 behaviour: the longest
-/// valid-UTF-8 prefix of the byte cap. JSON bodies are routed
-/// downstream by `RecordsDashboard.detectTimeSeriesShape` into the
-/// sparkline preview, so leaving them as raw JSON is correct.
+/// For non-HTML text MIMEs we split by whether the body is intended to
+/// be parsed downstream:
+///
+/// - **Structured (`application/json`, `text/csv`, XML and spreadsheets,
+///   per `is_structured_text_mime`)** — capped at
+///   `STRUCTURED_BODY_CAP_BYTES` (128 KiB; Session 71) so a
+///   2y-of-daily-bars time series doesn't get truncated mid-array on
+///   its way to `RecordsDashboard.detectTimeSeriesShape`. Raw bytes
+///   preserved verbatim within the cap; no strip pass runs.
+/// - **Plain (`text/plain` and the catch-all)** — capped at
+///   `BODY_PREVIEW_CAP_BYTES` (32 KiB) as before. A human reading
+///   prose doesn't need 128 KiB.
 fn body_preview(mime: &str, bytes: &[u8]) -> String {
     if is_binary_mime(mime) {
         return String::new();
     }
     if is_html_mime(mime) {
         return html_body_preview(bytes);
+    }
+    if is_structured_text_mime(mime) {
+        return structured_body_preview(bytes);
     }
     text_body_preview(bytes)
 }
@@ -292,6 +325,18 @@ fn html_body_preview(bytes: &[u8]) -> String {
 /// truncation or genuine mojibake) are dropped.
 fn text_body_preview(bytes: &[u8]) -> String {
     let take = bytes.len().min(BODY_PREVIEW_CAP_BYTES);
+    utf8_lossy_prefix(&bytes[..take])
+}
+
+/// Session 71 — structured-text preview. Same shape as
+/// `text_body_preview` (longest valid-UTF-8 prefix), but at the larger
+/// `STRUCTURED_BODY_CAP_BYTES`. Used for JSON / CSV / XML bodies whose
+/// downstream consumer is a parser (the dashboard's
+/// `detectTimeSeriesShape` for charts, the drawer's pretty-printer).
+/// Without the larger window, a 2y daily-bars time series gets
+/// truncated mid-array and silently fails parse.
+fn structured_body_preview(bytes: &[u8]) -> String {
+    let take = bytes.len().min(STRUCTURED_BODY_CAP_BYTES);
     utf8_lossy_prefix(&bytes[..take])
 }
 
@@ -501,6 +546,27 @@ fn lookup_numeric_entity(name: &str) -> Option<char> {
         digits.parse::<u32>().ok()?
     };
     char::from_u32(code)
+}
+
+/// Session 71 — decide whether a MIME's body is *structured text*
+/// (JSON / CSV / XML / spreadsheet) whose downstream consumer is a
+/// parser rather than a human reader. These MIMEs get the larger
+/// `STRUCTURED_BODY_CAP_BYTES` so the structural integrity survives
+/// the preview cap.
+///
+/// Keep this list in sync with `document_kind_from_mime`'s
+/// `data_feed` arm — the predicate exists separately so the cap
+/// decision can be inverted (cap is structural; kind is presentational)
+/// without dragging the kind classifier into the cap logic.
+pub fn is_structured_text_mime(mime: &str) -> bool {
+    let m = mime.trim().to_ascii_lowercase();
+    m.starts_with("application/json")
+        || m.starts_with("text/json")
+        || m.starts_with("application/xml")
+        || m.starts_with("text/xml")
+        || m.starts_with("text/csv")
+        || m == "text/tab-separated-values"
+        || m == "application/vnd.ms-excel"
 }
 
 /// Decide whether a MIME's body has no useful inline text shape.
@@ -891,6 +957,164 @@ mod tests {
         let csv = b"date,close\n2026-05-14,312.50\n2026-05-13,308.10\n";
         let out = body_preview("text/csv", csv);
         assert_eq!(out, "date,close\n2026-05-14,312.50\n2026-05-13,308.10\n");
+    }
+
+    // --- Session 71: structured-body cap (JSON / CSV / XML) ---------
+
+    #[test]
+    fn is_structured_text_mime_matches_json_csv_xml() {
+        assert!(is_structured_text_mime("application/json"));
+        assert!(is_structured_text_mime("application/json; charset=utf-8"));
+        assert!(is_structured_text_mime("APPLICATION/JSON"));
+        assert!(is_structured_text_mime("text/json"));
+        assert!(is_structured_text_mime("application/xml"));
+        assert!(is_structured_text_mime("text/xml"));
+        assert!(is_structured_text_mime("text/csv"));
+        assert!(is_structured_text_mime("text/tab-separated-values"));
+        assert!(is_structured_text_mime("application/vnd.ms-excel"));
+    }
+
+    #[test]
+    fn is_structured_text_mime_rejects_html_plain_binary() {
+        // HTML routes through its own strip path; text/plain through
+        // the small-cap reader; binary MIMEs get an empty body. None
+        // of these should reach `structured_body_preview`.
+        assert!(!is_structured_text_mime("text/html"));
+        assert!(!is_structured_text_mime("application/xhtml+xml"));
+        assert!(!is_structured_text_mime("text/plain"));
+        assert!(!is_structured_text_mime("application/pdf"));
+        assert!(!is_structured_text_mime("image/png"));
+        assert!(!is_structured_text_mime("application/octet-stream"));
+    }
+
+    #[test]
+    fn body_preview_json_uses_structured_cap_not_text_cap() {
+        // Pre-Session-71: any JSON body over 32 KiB got truncated by
+        // `text_body_preview`, which silently broke chart preview.
+        // Post-Session-71: JSON gets the larger 128 KiB cap so a
+        // realistic 2y daily time series survives intact.
+        //
+        // Body is constructed at 64 KiB — comfortably over the old
+        // 32 KiB cap, comfortably under the new 128 KiB cap. The
+        // assertion that we get 64 KiB out (not 32 KiB) is the
+        // regression guard.
+        let bytes = b"{\"x\":\"".to_vec();
+        let filler_len = 64 * 1024 - bytes.len() - 2; // 2 for closing `"}`
+        let mut json = bytes;
+        json.extend(std::iter::repeat(b'a').take(filler_len));
+        json.extend_from_slice(b"\"}");
+        assert_eq!(json.len(), 64 * 1024);
+
+        let out = body_preview("application/json", &json);
+        assert_eq!(out.len(), 64 * 1024);
+        assert!(out.starts_with("{\"x\":\""));
+        assert!(out.ends_with("\"}"));
+    }
+
+    #[test]
+    fn body_preview_json_still_caps_at_structured_cap() {
+        // 200 KiB JSON should land at exactly 128 KiB — the cap fires,
+        // just at the larger structured limit, so an *extremely* large
+        // feed still has a bounded preview row.
+        let big = "a".repeat(200 * 1024);
+        let json = format!("\"{}\"", big);
+        let out = body_preview("application/json", json.as_bytes());
+        assert!(out.len() <= STRUCTURED_BODY_CAP_BYTES);
+        assert!(
+            out.len() >= STRUCTURED_BODY_CAP_BYTES - 4,
+            "preview surprisingly short: {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn body_preview_text_plain_keeps_small_cap() {
+        // text/plain is for humans, not parsers — keep the 32 KiB cap
+        // so prose previews stay screen-sized.
+        let big = "x".repeat(100 * 1024);
+        let out = body_preview("text/plain", big.as_bytes());
+        assert_eq!(out.len(), BODY_PREVIEW_CAP_BYTES);
+    }
+
+    #[test]
+    fn body_preview_csv_uses_structured_cap() {
+        // CSV time-series feeds (FRED, NOAA daily series) have the
+        // same parser-downstream property as JSON. Verify a 50 KiB
+        // CSV body is preserved in full, not truncated at 32 KiB.
+        let mut csv = String::from("date,value\n");
+        for i in 0..3500 {
+            csv.push_str(&format!("2026-{:02}-{:02},{}.50\n",
+                ((i % 12) + 1), ((i % 28) + 1), i));
+        }
+        assert!(csv.len() > 50 * 1024, "fixture too small: {}", csv.len());
+        assert!(csv.len() < STRUCTURED_BODY_CAP_BYTES, "fixture too large: {}", csv.len());
+        let out = body_preview("text/csv", csv.as_bytes());
+        assert_eq!(out.len(), csv.len());
+        assert!(out.starts_with("date,value\n"));
+    }
+
+    #[test]
+    fn body_preview_yahoo_chart_shape_preserves_timestamps_and_close() {
+        // Regression test for Session 70's broken chart on the TESLA
+        // plan: Yahoo Finance v8 chart API with `range=2y interval=1d`
+        // returns ~503 days of OHLCV data. Pre-Session-71 the body
+        // truncated at 32 KiB mid-array, breaking JSON.parse and the
+        // chart preview.
+        //
+        // We build a representative payload (timestamps + 6 numeric
+        // arrays of 1000 points each) sized comfortably over the
+        // pre-Session-71 cap and under the new structured cap, and
+        // assert the post-cap body still parses — meaning `serde_json`
+        // can roundtrip it, which is the same contract
+        // `RecordsDashboard.detectTimeSeriesShape` relies on.
+        let mut timestamps = String::from("[");
+        let mut closes = String::from("[");
+        for i in 0..1000 {
+            if i > 0 {
+                timestamps.push(',');
+                closes.push(',');
+            }
+            // 10-digit unix epoch like Yahoo emits.
+            let ts: u64 = 1_700_000_000_u64 + (i as u64) * 86_400_u64;
+            timestamps.push_str(&format!("{}", ts));
+            // 6-digit close like "303.42".
+            closes.push_str(&format!("{}.{:02}", 200 + (i % 150), i % 100));
+        }
+        timestamps.push(']');
+        closes.push(']');
+
+        let json = format!(
+            "{{\"chart\":{{\"result\":[{{\"meta\":{{\"symbol\":\"TSLA\",\"currency\":\"USD\"}},\
+             \"timestamp\":{},\
+             \"indicators\":{{\"quote\":[{{\"open\":{},\"high\":{},\"low\":{},\"close\":{},\"volume\":{}}}],\"adjclose\":[{{\"adjclose\":{}}}]}}\
+             }}],\"error\":null}}}}",
+            timestamps, closes, closes, closes, closes, closes, closes
+        );
+        // The fixture must exceed the pre-Session-71 cap so this
+        // test would have failed before the fix. If a future refactor
+        // changes the shape and makes the fixture smaller, this guard
+        // catches drift.
+        assert!(
+            json.len() > BODY_PREVIEW_CAP_BYTES,
+            "fixture too small to test the regression: {} bytes",
+            json.len()
+        );
+        // Fixture must also stay under the new cap or the test
+        // proves nothing — we want to assert "the larger cap holds
+        // realistic 2y feeds", not "the test fixture is huge".
+        assert!(
+            json.len() < STRUCTURED_BODY_CAP_BYTES,
+            "fixture exceeds new cap; test cannot distinguish cap from format: {} bytes",
+            json.len()
+        );
+
+        let out = body_preview("application/json", json.as_bytes());
+
+        // The full body must round-trip parse — the consumer is
+        // JSON.parse on the frontend; if serde_json can parse it,
+        // JSON.parse can too.
+        let _parsed: serde_json::Value = serde_json::from_str(&out)
+            .expect("Yahoo-shaped payload at 2y must parse — chart-preview regression");
     }
 
     #[test]
