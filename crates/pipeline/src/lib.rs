@@ -69,5 +69,14 @@ pub mod url_pagination;
 // on the per-plan dashboard. Called from each `run_X_recipe` after
 // `fetch_recipe_bytes` returns Ok.
 pub mod document_synth;
+// Session 70 / ADR 0009 amendment 2 — host-class-aware User-Agent
+// policy. A closed `UaPolicy` enum mirrors the `FetchOutcomeClass`
+// vocabulary in `fetch_classes`; each variant maps to one UA string
+// constant. The policy boundary is structural — no host strings
+// appear in this module, only in `fetch_classes::HOST_CLASS_OVERRIDES`
+// which is empty until probe evidence justifies entries. Wires into
+// `SecureHttpClient::get_with_headers_ua`, the per-request override
+// path added in the same session.
+pub mod ua_policies;
 pub mod research_classifier;
 pub mod research_plans_store;

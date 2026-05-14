@@ -353,3 +353,136 @@ itself is unchanged.
 - `crates/pipeline/src/http_fetcher.rs::FetchError::RateLimited`
   — executor's view of the rate-limit signal.
 - `crates/pipeline/src/fetch_backoff.rs` — backoff policy.
+
+### 2026-05-14 — Per-request `User-Agent` override and host-class UA policy (Session 70)
+
+The original ADR text named one User-Agent: the build-time
+`SituationRoom/<version> (+<repo-url>)` identifier baked into
+`SecureHttpConfig::default()` (Session 45). That UA is honest, works
+for the majority of hosts, and survives review precisely because it
+doesn't pretend to be anything it isn't. A small but persistent
+minority of hosts rejects it anyway: WAFs that fingerprint past UA
+(403 on anything that doesn't read as a real browser) and policy
+hosts that require a specific UA shape (SEC EDGAR's documented
+"identify yourself with an email" convention).
+
+ADR 0017 introduced `FetchOutcomeClass` (Session 57) with two
+classes that name exactly these failure modes:
+
+- `HostBlockedByWaf` — 403 from a fingerprinting WAF.
+- `HostRequiresUaPolicy` — 403 from a host with a published UA policy.
+
+The classes existed; what didn't was a way to *act on them*. Both
+classes return 403 to SituationRoom's default UA and stay 403 on
+every retry against that UA — the propose-URL retry loop's only
+recovery was to pivot off the host entirely, which throws away
+sources the operator wants reachable.
+
+Session 70 closes the gap with three additions:
+
+1. **`SecureHttpClient::get_with_headers_ua(url, Option<&str>)`** —
+   a per-request UA-override variant of `get_with_headers`. When
+   `ua` is `None`, behaviour is bit-for-bit identical to the
+   pre-Session-70 path (the client's configured UA is used). When
+   `ua` is `Some(&str)`, the value is sent via
+   `RequestBuilder::header(USER_AGENT, _)` for this request only;
+   the underlying `Client`'s connection pool, redirect policy, and
+   TLS configuration are reused. Constructing a fresh
+   `SecureHttpClient` per UA would have duplicated all of that — a
+   real cost on plans that fetch dozens of hosts in one execution.
+
+2. **`crates/pipeline/src/ua_policies.rs`** — closed enum
+   `UaPolicy` with three variants (`Default`, `BrowserLike`,
+   `ResearchToolWithContact`), each mapped to a single UA string
+   constant. The `policy_for_class(class)` function maps each
+   `FetchOutcomeClass` to the policy that addresses it.
+   `BrowserLike` is a pinned recent-Chrome-on-macOS string;
+   `ResearchToolWithContact` is `SituationRoom-Research/<version>
+   (+<contact>)` where `<contact>` comes from the
+   `SITUATIONROOM_CONTACT_EMAIL` env var (falling back to the
+   repository URL).
+
+3. **Closed-vocabulary discipline preserved.** No host strings
+   appear in `ua_policies.rs`. The host-to-class boundary stays in
+   `crate::fetch_classes::HOST_CLASS_OVERRIDES` (still empty until
+   probe evidence justifies entries — same posture as ADR 0017's
+   landing condition). The proposer prompt and recipe-author prompt
+   never see UA strings or host strings; they see classes.
+
+**The rule extended.** ADR 0009's pre-Session-70 rule was "one UA,
+the build-time default, set on the client at construction." The
+amended rule is **"one default UA + a closed table of policy UAs,
+selected per request based on host class, never per host."** That
+covers:
+
+- Default path: every fetch that doesn't classify into a UA-
+  benefiting class uses the build-time default UA. Unchanged from
+  Session 45.
+- Policy path: a fetch against a host classified as
+  `HostBlockedByWaf` or `HostRequiresUaPolicy` uses the
+  corresponding policy UA via `get_with_headers_ua`. The policy
+  table is closed (`UaPolicy` enum); adding a new policy is a
+  deliberate ADR amendment, not a per-fetcher patch.
+- Boundary: the *only* place a host string ever encodes a UA
+  decision is `HOST_CLASS_OVERRIDES`. Everything else routes
+  through the `UaPolicy` table.
+
+**Activation gate.** The override map in `fetch_classes` is empty
+on landing. The structural code (per-request UA on the secure
+client, `UaPolicy` enum, `policy_for_class` mapping) is in place,
+but no host is yet known to need a policy UA. Activating a host
+requires running `apps/eval_harness/src/bin/host_probe.rs` against
+that host, observing the status code under each UA, and adding the
+`(host_suffix, FetchOutcomeClass)` entry — same discipline ADR
+0017 already established for the override map. The Session 70
+landing therefore changes behaviour for *no* host today; it makes
+behaviour-change for a target host a single deliberate edit.
+
+**Why per-request, not per-policy clients.** Three reasons:
+
+1. *Connection pool sharing.* Constructing N `SecureHttpClient`s
+   for N policies fragments the pool — every host hit through a
+   different policy reopens TLS. The per-request UA reuses the
+   pool.
+2. *Single audit surface.* All UA-policy decisions route through
+   `get_with_headers_ua`; a future contributor wanting to know
+   "where does the secure client apply UA overrides" grep-hits one
+   place.
+3. *Composability with the existing API.* `get_with_headers`
+   stays the canonical path; `get_with_headers_ua` is the
+   override-aware variant that delegates to the same internal.
+   Callers that don't need an override don't change.
+
+**Why three variants and not five.** Closed vocabularies should be
+small. Three classes is enough to cover the evidence today: the
+default works; WAFs want a browser; policy hosts want a contact.
+Adding rotation, per-platform UAs, or fingerprint randomisation
+would each be separate decisions with their own justification. We
+ship the minimum that closes the observed gap.
+
+**Build-time content baking, not runtime.** The `BrowserLike` UA
+is a `const &'static str` pinned in `ua_policies.rs`. Bumping it
+is a deliberate edit (with an entry in this amendment log) rather
+than a network-dependent lookup. "Always send the current real
+Chrome UA" would require an upstream-fetch dependency in the
+fetch path — a circular dependency we don't want.
+
+**Compatibility.** Every pre-Session-70 caller of
+`SecureHttpClient::get_with_headers` continues to compile and
+behave identically; the new method is opt-in. The fetch executor's
+`fetch_recipe_bytes` path is unchanged in this session (the wire-
+up to `policy_for_class` is a follow-on candidate gated on probe
+evidence). Same posture as ADR 0017 itself: ship the shape; gate
+activation on measurement.
+
+**Code references** (added to the list above):
+- `crates/secure/src/http.rs::SecureHttpClient::get_with_headers_ua`
+  — the per-request UA override surface.
+- `crates/pipeline/src/ua_policies.rs` — `UaPolicy` enum, UA
+  string constants, `policy_for_class` mapping.
+- `crates/pipeline/src/fetch_classes.rs::HOST_CLASS_OVERRIDES`
+  — host-to-class boundary; the single bake-in of host-specific
+  knowledge.
+- `apps/eval_harness/src/bin/host_probe.rs` — diagnostic probe
+  that produces the status-vs-UA evidence needed to populate
+  `HOST_CLASS_OVERRIDES`.

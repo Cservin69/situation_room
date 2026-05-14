@@ -341,7 +341,38 @@ impl SecureHttpClient {
     /// The body is bounded by `config.max_response_bytes`, same as
     /// [`Self::get_bytes`].
     pub async fn get_with_headers(&self, url: &Url) -> Result<SecureHttpResponse, HttpError> {
-        let resp = self.get_with_headers_internal(url.as_str()).await?;
+        self.get_with_headers_ua(url, None).await
+    }
+
+    /// Same as [`Self::get_with_headers`] but with a per-request
+    /// `User-Agent` override.
+    ///
+    /// Session 70 / ADR 0009 amendment 2. The motivating case is
+    /// host-class-aware UA selection: a small closed table in
+    /// `pipeline::ua_policies` maps `FetchOutcomeClass` values to
+    /// browser-like UA strings, and a host-class-aware caller (the
+    /// fetch executor's retry path) passes the policy UA per request
+    /// rather than constructing a separate `SecureHttpClient` per
+    /// class.
+    ///
+    /// Pass `None` to use the client's default UA (built at
+    /// construction from `config.user_agent`). When `Some(ua)` is
+    /// supplied, that string is sent on this request only; subsequent
+    /// requests revert to the default.
+    ///
+    /// The override is intentionally a per-request knob, not a
+    /// per-client one: every host class needing a different UA would
+    /// otherwise need a fresh `SecureHttpClient` (rustls handshake
+    /// state, connection pool, redirect policy — all duplicated). The
+    /// per-request route shares the connection pool across classes,
+    /// which matters when one plan fetches dozens of hosts in a
+    /// single execution.
+    pub async fn get_with_headers_ua(
+        &self,
+        url: &Url,
+        ua: Option<&str>,
+    ) -> Result<SecureHttpResponse, HttpError> {
+        let resp = self.get_with_headers_internal_ua(url.as_str(), ua).await?;
         if !resp.status.is_success() {
             return Err(HttpError::StatusWithHeaders {
                 status: resp.status.as_u16(),
@@ -399,11 +430,28 @@ impl SecureHttpClient {
         &self,
         url: &str,
     ) -> Result<SecureHttpResponse, HttpError> {
+        self.get_with_headers_internal_ua(url, None).await
+    }
+
+    /// Session 70 / ADR 0009 amendment 2 — UA-overriding variant.
+    /// When `ua` is `None`, behaviour is bit-for-bit identical to the
+    /// pre-Session-70 `get_with_headers_internal` path: the request
+    /// goes out with the client's configured UA from
+    /// `ClientBuilder::user_agent`. When `ua` is `Some`, the override
+    /// is applied via `RequestBuilder::header` which replaces the
+    /// default UA for this request only.
+    async fn get_with_headers_internal_ua(
+        &self,
+        url: &str,
+        ua: Option<&str>,
+    ) -> Result<SecureHttpResponse, HttpError> {
         let parsed = self.guard.check(url)?;
         self.check_host_ip(&parsed)?;
-        let resp = self
-            .inner
-            .get(parsed)
+        let mut req = self.inner.get(parsed);
+        if let Some(u) = ua {
+            req = req.header(reqwest::header::USER_AGENT, u);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| Self::classify_err(e, self.config.total_timeout))?;
@@ -627,5 +675,36 @@ mod tests {
         // (network bound); the round-trip is exercised by the
         // workspace's integration tests.
         let _client = SecureHttpClient::new(cfg).expect("client builds with overridden UA");
+    }
+
+    /// Session 70 / ADR 0009 amendment 2. The per-request UA-override
+    /// method [`SecureHttpClient::get_with_headers_ua`] is exercised
+    /// here by routing a localhost URL through the guard: the guard
+    /// rejects localhost before any network call, so we get a clean
+    /// `UrlRejected` whether the UA arg is `None` or `Some(...)`. The
+    /// test's structural value is that *both* call shapes compile and
+    /// short-circuit at the guard — proving the surface exists and
+    /// the override threads through to the same guard path as the
+    /// non-override variant.
+    #[tokio::test]
+    async fn get_with_headers_ua_routes_through_url_guard_session_70() {
+        let client = SecureHttpClient::new(SecureHttpConfig::default())
+            .expect("default secure http client builds");
+        // localhost is rejected by UrlGuard for SSRF reasons. Any
+        // request that *would* go out instead errors with
+        // UrlRejected — and the guard runs before the UA header is
+        // attached, so both UA arms reach this point identically.
+        let bad = Url::parse("http://127.0.0.1/").unwrap();
+
+        let err_none = client
+            .get_with_headers_ua(&bad, None)
+            .await
+            .expect_err("localhost must be guard-rejected");
+        let err_with = client
+            .get_with_headers_ua(&bad, Some("BrowserLike/1.0 (+test)"))
+            .await
+            .expect_err("localhost must be guard-rejected regardless of UA");
+        assert!(matches!(err_none, HttpError::UrlRejected(_)));
+        assert!(matches!(err_with, HttpError::UrlRejected(_)));
     }
 }

@@ -65,6 +65,17 @@
       label?: string;
       valueKey?: string;
     } | null;
+    /**
+     * Session 70 — optional open-drawer callback. When non-null, the
+     * card becomes clickable: a click anywhere on the card surface
+     * (other than child controls like the source-copy button) fires
+     * `onOpen`. The dashboard wires this only on the Documents panel
+     * today — Event/Entity/Relation/Assertion cards stay
+     * presentational because their underlying records don't carry a
+     * preview-able body. Adding a click handler to those cards
+     * without a destination would be a noop affordance.
+     */
+    onOpen?: (() => void) | null;
   }
   let {
     kind,
@@ -74,7 +85,27 @@
     sourceHost = '',
     sourceUrl = '',
     chartSeries = null,
+    onOpen = null,
   }: Props = $props();
+
+  // Click handler that ignores clicks on the source-copy button and
+  // any links/buttons nested inside the card. Without this guard,
+  // clicking the copy button would also open the drawer — annoying
+  // and slightly confusing.
+  function onCardClick(e: MouseEvent) {
+    if (!onOpen) return;
+    const t = e.target as HTMLElement;
+    if (t.closest('button, a')) return;
+    onOpen();
+  }
+
+  function onCardKeydown(e: KeyboardEvent) {
+    if (!onOpen) return;
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      onOpen();
+    }
+  }
 
   // Strip and format the chart sub-caption — the small text shown
   // beside or below the sparkline. Empty when neither valueKey nor
@@ -91,7 +122,22 @@
   });
 </script>
 
-<article class="kind-card">
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+<!-- Session 70: `<article>` is intrinsically noninteractive per the
+     a11y rule, but `role="button"` + `tabindex={0}` makes it
+     focusable + clickable at the a11y-tree level. The semantic
+     `<article>` element is preserved (it's a self-contained record
+     summary) rather than switching to `<div>` purely to silence the
+     check. Keyboard activation is wired via `onCardKeydown`. -->
+<article
+  class="kind-card"
+  class:clickable={onOpen !== null}
+  role={onOpen ? 'button' : undefined}
+  tabindex={onOpen ? 0 : undefined}
+  onclick={onCardClick}
+  onkeydown={onCardKeydown}
+>
   <header class="head">
     <span class="kind-name" title={kind}>{kind}</span>
     <span class="count" title="{count} record{count === 1 ? '' : 's'}">×{count}</span>
@@ -140,6 +186,24 @@
     border: 1px solid var(--border-subtle);
     border-radius: 3px;
     min-width: 160px;
+  }
+  /* Session 70 — clickable cards (Documents panel today) get a
+     cursor, a subtle hover lift, and a visible focus ring. The
+     non-clickable variant is byte-for-byte unchanged from
+     Session 69 because the `.clickable` class only attaches when
+     `onOpen` is non-null. */
+  .kind-card.clickable {
+    cursor: pointer;
+    transition: border-color var(--duration-ui) var(--ease),
+                background var(--duration-ui) var(--ease);
+  }
+  .kind-card.clickable:hover {
+    border-color: var(--border-strong);
+    background: var(--bg-elevated, var(--bg-panel-alt));
+  }
+  .kind-card.clickable:focus-visible {
+    outline: 2px solid var(--fg-secondary);
+    outline-offset: 1px;
   }
 
   .head {

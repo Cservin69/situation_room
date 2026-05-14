@@ -78,6 +78,7 @@
   import type { AssertionDto } from '$lib/api/types/AssertionDto';
   import MetricCard from '$components/panels/MetricCard.svelte';
   import KindCard from '$components/panels/KindCard.svelte';
+  import DocumentDrawer from '$components/DocumentDrawer.svelte';
 
   interface Props {
     /**
@@ -488,6 +489,26 @@
   // Session 63 — `pendingTypes` is gone. The pre-Session-63 surface
   // collapsed five record types into a single "pending typed panel"
   // pill row; the five typed panels below replace it entirely.
+
+  // Session 70 — DocumentDrawer state. When non-null, the drawer
+  // renders over the dashboard inspecting the selected Document.
+  // Clicking a Document KindCard sets the selection; the drawer's
+  // close handler clears it.
+  let selectedDocument = $state<DocumentDto | null>(null);
+  let selectedDocumentSeries = $state<{
+    points: Array<{ x: number; y: number }>;
+    label: string;
+    valueKey: string;
+  } | null>(null);
+
+  function openDocumentDrawer(doc: DocumentDto): void {
+    selectedDocument = doc;
+    selectedDocumentSeries = documentSeriesOf(doc);
+  }
+  function closeDocumentDrawer(): void {
+    selectedDocument = null;
+    selectedDocumentSeries = null;
+  }
 </script>
 
 <section class="dashboard" aria-label="records dashboard">
@@ -647,6 +668,7 @@
             when={whenOf(g.records[0].envelope)}
             sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
             sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}
+            onOpen={() => openDocumentDrawer(g.records[0])}
           />
         {/each}
       </div>
@@ -693,6 +715,18 @@
     </p>
   {/if}
 </section>
+
+<!-- Session 70 — DocumentDrawer renders over the dashboard when a
+     Document is selected. The {#if} gate keeps the modal off the DOM
+     entirely when no document is open, so the dashboard's
+     keyboard-event handling isn't disturbed in the common case. -->
+{#if selectedDocument !== null}
+  <DocumentDrawer
+    document={selectedDocument}
+    chartSeries={selectedDocumentSeries}
+    onClose={closeDocumentDrawer}
+  />
+{/if}
 
 <style>
   .dashboard {

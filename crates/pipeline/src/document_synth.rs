@@ -224,25 +224,80 @@ pub fn document_kind_from_mime(mime: &str) -> String {
     }
 }
 
+/// Maximum bytes we *consider* when producing an HTML preview. After
+/// stripping `<script>`, `<style>`, and remaining tags, a typical
+/// news-article HTML doc shrinks 3-5×, so a 128 KiB window comfortably
+/// produces a 32 KiB visible-text preview. We pay one larger UTF-8
+/// decode per article-kind Document, then the regex stripper runs
+/// against a bounded slice — costs are independent of the upstream
+/// page size.
+const HTML_STRIP_INPUT_CAP_BYTES: usize = 4 * BODY_PREVIEW_CAP_BYTES;
+
 /// Produce a UTF-8-safe text preview of `bytes`, capped at
 /// `BODY_PREVIEW_CAP_BYTES`. For binary MIMEs (PDF, image, video,
 /// octet-stream) returns an empty string — there's no useful inline
 /// text representation and forcing UTF-8 through a PDF stream just
 /// produces garbage.
 ///
-/// For text MIMEs we keep the longest valid-UTF-8 prefix of the cap.
-/// `std::str::from_utf8`'s `valid_up_to()` gives the exact boundary —
-/// no manual byte-walking, no chance of leaving a truncated codepoint
-/// in the slice. Trailing invalid bytes (a mid-codepoint truncation or
-/// genuine mojibake) are dropped, which is the right move for a
-/// preview: we'd rather show 32 KiB minus a few bytes of valid text
-/// than 32 KiB with a replacement-char tail.
+/// ## HTML special-case (Session 70)
+///
+/// For `text/html` and `application/xhtml*` MIMEs the raw bytes are
+/// useless as a dashboard preview (`<!doctype html> <html lang="en-US"
+/// theme="auto" data-color-...`). Before the cap we run a scoped
+/// strip:
+///
+///   1. Drop `<script>…</script>` and `<style>…</style>` blocks
+///      (case-insensitive, `.` matches `\n`).
+///   2. Drop remaining `<…>` tags.
+///   3. Decode a small whitelist of HTML entities so the preview
+///      reads as natural prose (no `&amp;` or `&nbsp;` artefacts).
+///   4. Collapse runs of whitespace to a single space.
+///
+/// The stripper is closed-vocabulary by construction — no host
+/// strings, no source-specific rules; just an HTML-MIME gate. This
+/// keeps `project_sr_no_source_routing` discipline intact (MIME-based
+/// routing is open by definition; the closed-vocabulary discipline is
+/// about host identity).
+///
+/// For non-HTML text MIMEs (`text/plain`, `application/json`,
+/// `text/csv`, …) we keep the pre-Session-70 behaviour: the longest
+/// valid-UTF-8 prefix of the byte cap. JSON bodies are routed
+/// downstream by `RecordsDashboard.detectTimeSeriesShape` into the
+/// sparkline preview, so leaving them as raw JSON is correct.
 fn body_preview(mime: &str, bytes: &[u8]) -> String {
     if is_binary_mime(mime) {
         return String::new();
     }
+    if is_html_mime(mime) {
+        return html_body_preview(bytes);
+    }
+    text_body_preview(bytes)
+}
+
+/// Stripped HTML text preview. Takes up to `HTML_STRIP_INPUT_CAP_BYTES`
+/// of UTF-8 input, removes script/style/tag noise, decodes a small
+/// entity whitelist, collapses whitespace, then caps at
+/// `BODY_PREVIEW_CAP_BYTES` on a char boundary.
+fn html_body_preview(bytes: &[u8]) -> String {
+    let take = bytes.len().min(HTML_STRIP_INPUT_CAP_BYTES);
+    let raw = utf8_lossy_prefix(&bytes[..take]);
+    let stripped = strip_html_for_preview(&raw);
+    truncate_at_char_boundary(&stripped, BODY_PREVIEW_CAP_BYTES)
+}
+
+/// Pre-Session-70 text preview: the longest valid-UTF-8 prefix of the
+/// byte cap. `std::str::from_utf8`'s `valid_up_to()` gives the exact
+/// boundary — no manual byte-walking, no chance of leaving a truncated
+/// codepoint in the slice. Trailing invalid bytes (a mid-codepoint
+/// truncation or genuine mojibake) are dropped.
+fn text_body_preview(bytes: &[u8]) -> String {
     let take = bytes.len().min(BODY_PREVIEW_CAP_BYTES);
-    let slice = &bytes[..take];
+    utf8_lossy_prefix(&bytes[..take])
+}
+
+/// Helper: return the longest valid-UTF-8 prefix of `slice` as an owned
+/// `String`. Used by both the HTML and plain-text paths.
+fn utf8_lossy_prefix(slice: &[u8]) -> String {
     match std::str::from_utf8(slice) {
         Ok(s) => s.to_string(),
         Err(e) => {
@@ -254,6 +309,198 @@ fn body_preview(mime: &str, bytes: &[u8]) -> String {
                 .to_string()
         }
     }
+}
+
+/// Truncate `s` to at most `max_bytes` bytes, rounding down to the
+/// nearest UTF-8 char boundary. After HTML stripping we have valid
+/// UTF-8 to begin with, so the boundary check is cheap (`char_indices`
+/// walk). Returns the truncated owned String.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    // Walk char boundaries forward, keeping track of the largest
+    // boundary that's still within the cap. We advance `last` to the
+    // byte position *after* each char that fully fits, so the final
+    // `last` value is the slice length we return.
+    let mut last = 0usize;
+    for (idx, ch) in s.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        last = next;
+    }
+    s[..last].to_string()
+}
+
+/// Decide whether a MIME is HTML-ish (article-kind Documents). HTML
+/// and XHTML both produce `kind: "article"` upstream
+/// (`document_kind_from_mime`); this predicate mirrors that gate so
+/// the strip pass runs on exactly the same inputs that the kind
+/// classifier labels `article`.
+pub fn is_html_mime(mime: &str) -> bool {
+    let m = mime.trim().to_ascii_lowercase();
+    m.starts_with("text/html") || m.starts_with("application/xhtml")
+}
+
+/// Strip HTML markup for preview-quality display.
+///
+/// The contract is "what would the operator read if they opened this
+/// page in a browser, with all the navigation chrome turned off?"
+/// Not a full DOM parser — a scoped regex pass that's good enough to
+/// surface real article text without dragging `<script>` payloads,
+/// CSS, or attribute soup into the dashboard tile.
+///
+/// ## Why not `scraper`?
+///
+/// `scraper` is already a workspace dependency for recipe extraction
+/// (CSS-select recipes). It would handle this better than regex.
+/// We're not using it because:
+///   1. The recipe path uses `scraper` against *trusted* recipe-
+///      authored selectors. Throwing raw fetched HTML at it on every
+///      Document insert adds CPU we don't need.
+///   2. Document synthesis runs on the executor's hot path. The
+///      regex-based stripper is O(n) byte-walking; `scraper`'s parse
+///      + serialise round-trip is markedly more expensive.
+///   3. For preview-quality output, "no `<script>` payloads, no tags,
+///      decoded entities" is sufficient. Cleaning attribute-only
+///      mistakes (e.g. malformed comment delimiters) isn't worth the
+///      cost difference.
+///
+/// If a future use-case wants higher-fidelity preview text (Phase-3
+/// extraction layer), the right move is to plumb that pass through
+/// `scraper` once and persist the result alongside the raw body, not
+/// to upgrade this preview function.
+pub fn strip_html_for_preview(input: &str) -> String {
+    use std::sync::OnceLock;
+    use regex::RegexBuilder;
+
+    static SCRIPT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static STYLE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static COMMENT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static TAG_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static WS_RE: OnceLock<regex::Regex> = OnceLock::new();
+
+    let script_re = SCRIPT_RE.get_or_init(|| {
+        RegexBuilder::new(r"<script\b[^>]*>.*?</script\s*>")
+            .case_insensitive(true)
+            .dot_matches_new_line(true)
+            .build()
+            .expect("static script regex compiles")
+    });
+    let style_re = STYLE_RE.get_or_init(|| {
+        RegexBuilder::new(r"<style\b[^>]*>.*?</style\s*>")
+            .case_insensitive(true)
+            .dot_matches_new_line(true)
+            .build()
+            .expect("static style regex compiles")
+    });
+    let comment_re = COMMENT_RE.get_or_init(|| {
+        RegexBuilder::new(r"<!--.*?-->")
+            .dot_matches_new_line(true)
+            .build()
+            .expect("static comment regex compiles")
+    });
+    // Tag stripper: any `<` followed by characters up to `>`. Doesn't
+    // try to handle `>` inside quoted attributes — for preview-quality
+    // output, "everything between < and the next >" is good enough,
+    // and HTML5 doesn't allow `<` inside tag-attribute names anyway.
+    let tag_re = TAG_RE
+        .get_or_init(|| regex::Regex::new(r"<[^>]*>").expect("static tag regex compiles"));
+    let ws_re = WS_RE.get_or_init(|| regex::Regex::new(r"\s+").expect("static ws regex compiles"));
+
+    let s = script_re.replace_all(input, " ");
+    let s = style_re.replace_all(&s, " ");
+    let s = comment_re.replace_all(&s, " ");
+    let s = tag_re.replace_all(&s, " ");
+    let s = decode_html_entities(&s);
+    let s = ws_re.replace_all(&s, " ");
+    s.trim().to_string()
+}
+
+/// Decode a small whitelist of HTML entities that show up in the
+/// overwhelming majority of news-article bodies. Numeric character
+/// references (`&#39;`, `&#x27;`) are handled for the ASCII range —
+/// enough to surface curly-quote and dash codepoints without dragging
+/// in a full entity table. Unknown entities pass through unchanged so
+/// the operator can spot them if a future page uses something exotic.
+fn decode_html_entities(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            // Find the terminating ';' within a short window — entity
+            // names cap at 8 chars in our whitelist, numeric refs at 7
+            // digits. Beyond that, treat the `&` as literal.
+            if let Some(rel) = bytes[i + 1..(i + 10).min(bytes.len())]
+                .iter()
+                .position(|&b| b == b';')
+            {
+                let entity = &input[i + 1..i + 1 + rel];
+                if let Some(decoded) = lookup_named_entity(entity) {
+                    out.push_str(decoded);
+                    i += 1 + rel + 1;
+                    continue;
+                }
+                if let Some(ch) = lookup_numeric_entity(entity) {
+                    out.push(ch);
+                    i += 1 + rel + 1;
+                    continue;
+                }
+            }
+        }
+        // Fast path for the common case of all-ASCII bodies: push the
+        // byte directly. The multi-byte branch falls through to push
+        // the codepoint starting at `i`.
+        if bytes[i] < 0x80 {
+            out.push(bytes[i] as char);
+            i += 1;
+        } else {
+            // Multi-byte UTF-8 codepoint: copy the full codepoint.
+            let ch = input[i..].chars().next().expect("non-empty");
+            let ch_len = ch.len_utf8();
+            out.push(ch);
+            i += ch_len;
+        }
+    }
+    out
+}
+
+fn lookup_named_entity(name: &str) -> Option<&'static str> {
+    match name {
+        "amp" => Some("&"),
+        "lt" => Some("<"),
+        "gt" => Some(">"),
+        "quot" => Some("\""),
+        "apos" => Some("'"),
+        "nbsp" => Some(" "),
+        "ndash" => Some("–"),
+        "mdash" => Some("—"),
+        "hellip" => Some("…"),
+        "lsquo" => Some("‘"),
+        "rsquo" => Some("’"),
+        "ldquo" => Some("“"),
+        "rdquo" => Some("”"),
+        "copy" => Some("©"),
+        "reg" => Some("®"),
+        "trade" => Some("™"),
+        _ => None,
+    }
+}
+
+fn lookup_numeric_entity(name: &str) -> Option<char> {
+    let digits = name.strip_prefix('#')?;
+    let code = if let Some(hex) = digits
+        .strip_prefix('x')
+        .or_else(|| digits.strip_prefix('X'))
+    {
+        u32::from_str_radix(hex, 16).ok()?
+    } else {
+        digits.parse::<u32>().ok()?
+    };
+    char::from_u32(code)
 }
 
 /// Decide whether a MIME's body has no useful inline text shape.
@@ -389,9 +636,14 @@ mod tests {
     }
 
     #[test]
-    fn body_preview_preserves_short_html() {
+    fn body_preview_strips_short_html() {
+        // Session 70: HTML body preview is now tag-stripped. The
+        // pre-Session-70 contract preserved the raw markup; the new
+        // contract preserves the visible text. `<html><body>hello</body></html>`
+        // collapses to just `hello` — the operator-readable preview
+        // we want in the dashboard tile.
         let html = b"<html><body>hello</body></html>";
-        assert_eq!(body_preview("text/html", html), "<html><body>hello</body></html>");
+        assert_eq!(body_preview("text/html", html), "hello");
     }
 
     #[test]
@@ -432,7 +684,10 @@ mod tests {
 
         assert_eq!(doc.kind, "article");
         assert_eq!(doc.mime, "text/html");
-        assert_eq!(doc.body, "<html><body>hi</body></html>");
+        // Session 70: HTML bodies are tag-stripped at preview time.
+        // The raw markup `<html><body>hi</body></html>` collapses
+        // to the visible text `hi`.
+        assert_eq!(doc.body, "hi");
         assert_eq!(doc.envelope.observed_at, at);
         assert_eq!(
             doc.envelope.provenance.source_id,
@@ -474,5 +729,182 @@ mod tests {
         assert_eq!(doc.kind, "filing");
         assert_eq!(doc.mime, "application/pdf");
         assert_eq!(doc.body, "");
+    }
+
+    // --- Session 70: HTML-strip behaviour ---------------------------
+
+    #[test]
+    fn is_html_mime_matches_html_and_xhtml() {
+        assert!(is_html_mime("text/html"));
+        assert!(is_html_mime("text/html; charset=utf-8"));
+        assert!(is_html_mime("TEXT/HTML"));
+        assert!(is_html_mime("application/xhtml+xml"));
+        assert!(!is_html_mime("application/json"));
+        assert!(!is_html_mime("text/plain"));
+        assert!(!is_html_mime("text/csv"));
+    }
+
+    #[test]
+    fn strip_html_drops_script_payload() {
+        let html = r#"<html><body><p>Headline.</p><script>window.x = "tracker pixel" + 42;</script><p>Body.</p></body></html>"#;
+        let out = strip_html_for_preview(html);
+        assert!(!out.contains("tracker"), "script payload leaked: {out}");
+        assert!(!out.contains("window.x"), "script payload leaked: {out}");
+        assert!(out.contains("Headline"));
+        assert!(out.contains("Body"));
+    }
+
+    #[test]
+    fn strip_html_drops_style_payload() {
+        let html = r#"<html><head><style>.foo { color: hotpink; } /* don't show me */</style></head><body>Visible.</body></html>"#;
+        let out = strip_html_for_preview(html);
+        assert!(!out.contains("hotpink"), "style payload leaked: {out}");
+        assert!(!out.contains("don't show me"), "style payload leaked: {out}");
+        assert_eq!(out, "Visible.");
+    }
+
+    #[test]
+    fn strip_html_drops_html_comments() {
+        let html = "<p>Visible.</p><!-- analytics: hidden --><p>Also visible.</p>";
+        let out = strip_html_for_preview(html);
+        assert!(!out.contains("analytics"), "comment leaked: {out}");
+        assert_eq!(out, "Visible. Also visible.");
+    }
+
+    #[test]
+    fn strip_html_drops_tags_keeps_text() {
+        let html = r#"<!doctype html><html lang="en-US" theme="auto" data-color-theme-enabled="true"><body><h1 class="hero">TSLA closes at $312</h1><p>Tesla Inc. reported earnings...</p></body></html>"#;
+        let out = strip_html_for_preview(html);
+        assert!(!out.contains('<'), "unstripped angle bracket: {out}");
+        assert!(!out.contains('>'), "unstripped angle bracket: {out}");
+        assert!(out.contains("TSLA closes at $312"));
+        assert!(out.contains("Tesla Inc."));
+    }
+
+    #[test]
+    fn strip_html_decodes_named_entities() {
+        let html = "<p>Foo &amp; Bar &mdash; &ldquo;hello&rdquo;&nbsp;world.</p>";
+        let out = strip_html_for_preview(html);
+        // Single-space between "hello"-quote and "world" (collapsed
+        // from the &nbsp;); the em-dash and curly quotes decode.
+        assert_eq!(out, "Foo & Bar — “hello” world.");
+    }
+
+    #[test]
+    fn strip_html_decodes_numeric_entities() {
+        let html = "<p>It&#39;s also &#x2014; here.</p>";
+        let out = strip_html_for_preview(html);
+        assert_eq!(out, "It's also — here.");
+    }
+
+    #[test]
+    fn strip_html_collapses_whitespace() {
+        let html = "<p>One</p>\n\n\n  <p>two</p>\n<p>three</p>";
+        let out = strip_html_for_preview(html);
+        // Tags are replaced with single spaces and surrounding
+        // whitespace is collapsed, so the run between "One" and "two"
+        // becomes a single space.
+        assert_eq!(out, "One two three");
+    }
+
+    #[test]
+    fn strip_html_passes_through_unknown_entity() {
+        // Unknown entities are left alone so the operator can notice
+        // them if a future page uses something the whitelist doesn't
+        // cover.
+        let html = "<p>&euro; sign here, &middot; here.</p>";
+        let out = strip_html_for_preview(html);
+        assert!(out.contains("&euro;"));
+        assert!(out.contains("&middot;"));
+    }
+
+    #[test]
+    fn strip_html_preserves_ampersand_when_no_entity() {
+        // A bare `&` followed by non-entity text must not eat the
+        // surrounding bytes.
+        let html = "<p>A & B</p>";
+        let out = strip_html_for_preview(html);
+        assert_eq!(out, "A & B");
+    }
+
+    #[test]
+    fn body_preview_strips_a_realistic_homepage() {
+        // The reported TESLA bug: raw HTML preview starts with
+        // `<!doctype html> <html lang="en-US" theme="auto" data-color-...`.
+        // After Session 70 the preview reads as visible article text.
+        let html = r#"<!doctype html>
+<html lang="en-US" theme="auto" data-color-theme-enabled="true">
+<head><title>Tesla Q2 earnings</title>
+<script src="/analytics.js"></script>
+<style>.nav { display: none; }</style>
+</head>
+<body>
+<header><nav>Home | About | Contact</nav></header>
+<main>
+<h1>Tesla beats Q2 expectations</h1>
+<p>The company reported &dollar;25.4B in revenue.</p>
+</main>
+</body></html>"#;
+        let out = body_preview("text/html", html.as_bytes());
+        assert!(!out.contains('<'), "raw markup leaked: {out}");
+        assert!(!out.contains("analytics.js"), "script src leaked: {out}");
+        assert!(!out.contains("display: none"), "style leaked: {out}");
+        assert!(out.contains("Tesla Q2 earnings"));
+        assert!(out.contains("Tesla beats Q2 expectations"));
+        assert!(out.contains("Home | About | Contact"));
+    }
+
+    #[test]
+    fn body_preview_caps_after_strip_at_32_kib() {
+        // A pathological HTML doc that's mostly tags. After stripping
+        // we should land near the cap, not below it — the strip
+        // input window is 4× the cap, so 50 KiB of text post-strip is
+        // enough to fill 32 KiB.
+        let mut html = String::from("<html><body>");
+        let chunk = "<p>The quick brown fox jumps over the lazy dog. </p>";
+        while html.len() < 4 * BODY_PREVIEW_CAP_BYTES {
+            html.push_str(chunk);
+        }
+        html.push_str("</body></html>");
+        let out = body_preview("text/html", html.as_bytes());
+        assert!(out.len() <= BODY_PREVIEW_CAP_BYTES);
+        // Should be close to the cap (within 1 KiB), not far below it.
+        assert!(out.len() >= BODY_PREVIEW_CAP_BYTES - 1024, "preview too short: {}", out.len());
+        assert!(!out.contains('<'));
+    }
+
+    #[test]
+    fn body_preview_json_unchanged_by_strip() {
+        // JSON Documents (data_feed kind) must not be touched by the
+        // HTML strip — `RecordsDashboard.detectTimeSeriesShape` parses
+        // the raw JSON to find time series.
+        let json = br#"{"chart":{"result":[{"meta":{"symbol":"TSLA"},"timestamp":[1,2,3]}]}}"#;
+        let out = body_preview("application/json", json);
+        assert_eq!(
+            out,
+            r#"{"chart":{"result":[{"meta":{"symbol":"TSLA"},"timestamp":[1,2,3]}]}}"#
+        );
+    }
+
+    #[test]
+    fn body_preview_csv_unchanged_by_strip() {
+        let csv = b"date,close\n2026-05-14,312.50\n2026-05-13,308.10\n";
+        let out = body_preview("text/csv", csv);
+        assert_eq!(out, "date,close\n2026-05-14,312.50\n2026-05-13,308.10\n");
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_drops_partial_codepoint() {
+        // String with a 4-byte codepoint at index 30. Cap at 32 bytes
+        // would split it; we should land at 30 instead.
+        let s = format!("{}🦀", "a".repeat(30));
+        assert_eq!(s.len(), 34); // 30 ASCII + 4-byte crab
+        let out = truncate_at_char_boundary(&s, 32);
+        // The crab starts at index 30. char_indices yields 0..29 then
+        // 30. With max_bytes=32, idx 30 > 32 is false (30 < 32), so
+        // last advances to 30. Next index would be 34 (after the
+        // 4-byte char), which is > 32, so loop breaks. last=30.
+        assert_eq!(out.len(), 30);
+        assert!(out.chars().all(|c| c == 'a'));
     }
 }
