@@ -118,6 +118,7 @@ use crate::http_fetcher::{FetchError as HttpFetchError, HttpFetcher};
 use crate::propose_source_url::{
     propose_source_url, PriorAttempt, ProposalError, ProposalOutcome,
 };
+use crate::document_synth::insert_fetch_document;
 use crate::recipe_apply::{apply, ApplyContext, ApplyError, MAX_RECORDS_PER_RECIPE};
 use crate::recipe_author::{author_recipe, AuthoringContext, AuthoringError};
 use crate::recipes::{ExpectationRef, ExtractionSpec, FetchRecipe};
@@ -3938,9 +3939,28 @@ async fn run_csv_recipe(
         Ok((b, ct)) => (b, ct),
         Err(outcome) => return outcome,
     };
+    let fetched_at = Utc::now();
+
+    // Session 69 — synthesise a Document for the fetched page before
+    // apply runs. The Document captures "we fetched this URL at this
+    // time and these are the bytes," independently of whether the
+    // recipe's field-mappings succeed against those bytes. That makes
+    // the Documents bucket on the plan dashboard reflect actual fetch
+    // activity rather than only end-to-end apply success — an
+    // operator looking at a Failed @ Apply still sees what came back
+    // from the source. Persistence failure is warn-logged inside the
+    // helper, never fatal, to match the existing posture of
+    // `record_apply_failure_attempt`.
+    insert_fetch_document(
+        ctx.store,
+        plan,
+        recipe,
+        &bytes,
+        response_content_type.as_deref(),
+        fetched_at,
+    );
 
     // Apply.
-    let fetched_at = Utc::now();
     let apply_ctx = ApplyContext {
         recipe,
         plan,
@@ -4028,9 +4048,28 @@ async fn run_json_recipe(
         Ok((b, ct)) => (b, ct),
         Err(outcome) => return outcome,
     };
+    let fetched_at = Utc::now();
+
+    // Session 69 — synthesise a Document for the fetched page before
+    // apply runs. The Document captures "we fetched this URL at this
+    // time and these are the bytes," independently of whether the
+    // recipe's field-mappings succeed against those bytes. That makes
+    // the Documents bucket on the plan dashboard reflect actual fetch
+    // activity rather than only end-to-end apply success — an
+    // operator looking at a Failed @ Apply still sees what came back
+    // from the source. Persistence failure is warn-logged inside the
+    // helper, never fatal, to match the existing posture of
+    // `record_apply_failure_attempt`.
+    insert_fetch_document(
+        ctx.store,
+        plan,
+        recipe,
+        &bytes,
+        response_content_type.as_deref(),
+        fetched_at,
+    );
 
     // Apply.
-    let fetched_at = Utc::now();
     let apply_ctx = ApplyContext {
         recipe,
         plan,
@@ -4112,9 +4151,28 @@ async fn run_css_recipe(
         Ok((b, ct)) => (b, ct),
         Err(outcome) => return outcome,
     };
+    let fetched_at = Utc::now();
+
+    // Session 69 — synthesise a Document for the fetched page before
+    // apply runs. The Document captures "we fetched this URL at this
+    // time and these are the bytes," independently of whether the
+    // recipe's field-mappings succeed against those bytes. That makes
+    // the Documents bucket on the plan dashboard reflect actual fetch
+    // activity rather than only end-to-end apply success — an
+    // operator looking at a Failed @ Apply still sees what came back
+    // from the source. Persistence failure is warn-logged inside the
+    // helper, never fatal, to match the existing posture of
+    // `record_apply_failure_attempt`.
+    insert_fetch_document(
+        ctx.store,
+        plan,
+        recipe,
+        &bytes,
+        response_content_type.as_deref(),
+        fetched_at,
+    );
 
     // Apply.
-    let fetched_at = Utc::now();
     let apply_ctx = ApplyContext {
         recipe,
         plan,
@@ -4202,9 +4260,28 @@ async fn run_regex_recipe(
         Ok((b, ct)) => (b, ct),
         Err(outcome) => return outcome,
     };
+    let fetched_at = Utc::now();
+
+    // Session 69 — synthesise a Document for the fetched page before
+    // apply runs. The Document captures "we fetched this URL at this
+    // time and these are the bytes," independently of whether the
+    // recipe's field-mappings succeed against those bytes. That makes
+    // the Documents bucket on the plan dashboard reflect actual fetch
+    // activity rather than only end-to-end apply success — an
+    // operator looking at a Failed @ Apply still sees what came back
+    // from the source. Persistence failure is warn-logged inside the
+    // helper, never fatal, to match the existing posture of
+    // `record_apply_failure_attempt`.
+    insert_fetch_document(
+        ctx.store,
+        plan,
+        recipe,
+        &bytes,
+        response_content_type.as_deref(),
+        fetched_at,
+    );
 
     // Apply.
-    let fetched_at = Utc::now();
     let apply_ctx = ApplyContext {
         recipe,
         plan,
@@ -4289,6 +4366,21 @@ async fn run_pdf_recipe(
     };
 
     let fetched_at = Utc::now();
+
+    // Session 69 — synthesise a Document for the fetched page before
+    // apply runs. Same posture as the other four runners; PDFs land
+    // with an empty body (we don't materialise PDF text inline today,
+    // see `document_synth::body_preview`) but the row still tells the
+    // operator "we fetched a PDF from URL X at time T."
+    insert_fetch_document(
+        ctx.store,
+        plan,
+        recipe,
+        &bytes,
+        response_content_type.as_deref(),
+        fetched_at,
+    );
+
     let apply_ctx = ApplyContext {
         recipe,
         plan,
@@ -5061,6 +5153,85 @@ mod tests {
             report.outcomes
         );
         assert_eq!(report.records_produced, 1);
+    }
+
+    /// Session 69 — wiring test for per-fetch Document synthesis.
+    ///
+    /// Before Session 69 the documents bucket was zero on every plan
+    /// regardless of recipe success: `recipe_apply::build_record`
+    /// rejects `RecordType::Document` by design, and no other code
+    /// path produced Documents. The Session 69 fix synthesises one
+    /// Document per successful fetch from the executor side. This
+    /// test pins:
+    ///
+    /// 1. A successful CSV recipe lands a Document on the plan's
+    ///    per-plan dashboard (`records_for_plan`'s `documents`
+    ///    bucket). Pre-fix this would be `[]`.
+    /// 2. The Document's source_id uses the
+    ///    `{source}#recipe:{id}@v{ver}` shape that `records_for_plan`
+    ///    LIKE-joins on. If the provenance format ever diverges from
+    ///    `recipe_apply::build_record`'s, the Document falls out of
+    ///    the plan's bucket and shows up only on the cross-plan
+    ///    dashboard — this assertion catches that.
+    /// 3. MIME → kind mapping: `text/csv` → `data_feed` (via
+    ///    `document_synth::document_kind_from_mime`).
+    #[tokio::test]
+    async fn run_fetch_synthesises_one_document_per_successful_fetch_session_69() {
+        let plan = sample_plan();
+        let store = make_store_with_accepted_plan(&plan);
+
+        let url = "https://example.test/lithium.csv";
+        let recipe = working_csv_recipe(&plan, url);
+        save_recipe(&store, &recipe).unwrap();
+
+        let csv = b"country,production\nAustralia,88000\nChile,49000\n";
+        // StaticFetcher returns content with no Content-Type header by
+        // default, which exercises the "missing CT → octet-stream
+        // fallback" branch. The wiring test for the CT-aware kind
+        // mapping lives in `document_synth::tests`; here we only need
+        // the recipe to fetch + apply + insert successfully and the
+        // Document to land in the plan's bucket.
+        let fetcher = StaticFetcher::new().with(url, csv);
+
+        let provider = UnreachableProvider;
+        let ctx = ExecutorContext {
+            store: &store,
+            http: &fetcher,
+            prefetch_http: None,
+            provider: &provider,
+            recipe_author_prompt: "unused — recipe already authored",
+            propose_url_prompt: "",
+            sources: &[],
+        };
+
+        let report = run_fetch_for_plan(&ctx, plan.id).await.unwrap();
+        assert_eq!(report.recipes_succeeded, 1, "fetch + apply must succeed; outcomes: {:?}", report.outcomes);
+
+        // The Document landed in this plan's bucket — i.e. its
+        // provenance.source_id matches the LIKE-join pattern that
+        // `records_for_plan` uses to attribute rows to recipes.
+        let by_plan = store.records_for_plan(plan.id).unwrap();
+        assert_eq!(
+            by_plan.documents.len(),
+            1,
+            "expected exactly one Document per successful fetch; got {}",
+            by_plan.documents.len()
+        );
+
+        let doc = &by_plan.documents[0];
+        assert_eq!(doc.envelope.provenance.source_url.as_deref(), Some(url));
+        assert_eq!(
+            doc.envelope.provenance.source_id,
+            format!("{}#recipe:{}@v{}", recipe.source_id, recipe.id, recipe.version),
+            "Document provenance must match `recipe_apply::build_record`'s \
+             format or `records_for_plan` will not route it to this plan",
+        );
+        // CT is None (StaticFetcher doesn't surface headers) → mime
+        // falls back to application/octet-stream → kind falls back to
+        // data_feed per `document_kind_from_mime`. The dashboard tile
+        // still renders the URL and observed_at.
+        assert_eq!(doc.mime, "application/octet-stream");
+        assert_eq!(doc.kind, "data_feed");
     }
 
     #[tokio::test]

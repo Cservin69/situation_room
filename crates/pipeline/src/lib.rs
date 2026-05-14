@@ -60,5 +60,14 @@ pub mod research;
 // the runtime record cap. Closes the FEMA-style "default page is
 // 1000, cap is 500" failure shape Session 67's hunt surfaced.
 pub mod url_pagination;
+// Session 69 — per-fetch Document synthesis. `recipe_apply::build_record`
+// rejects `RecordType::Document` by design (Documents aren't field-
+// mapped extractions; they're the raw fetched page). This module fills
+// the Documents bucket from the executor side by synthesising one
+// Document record per successful fetch — kind from MIME, body
+// preview-capped, provenance routed so `records_for_plan` picks it up
+// on the per-plan dashboard. Called from each `run_X_recipe` after
+// `fetch_recipe_bytes` returns Ok.
+pub mod document_synth;
 pub mod research_classifier;
 pub mod research_plans_store;
