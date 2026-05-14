@@ -28,6 +28,7 @@
 -->
 <script lang="ts">
   import CopyButton from '$components/common/CopyButton.svelte';
+  import MiniSparkline from '$components/charts/MiniSparkline.svelte';
 
   interface Props {
     /** Grouping key — event_type / entity kind / relation_kind / doc_kind / stance. */
@@ -46,6 +47,24 @@
     sourceHost?: string;
     /** Full source URL for hover. Empty when unknown. */
     sourceUrl?: string;
+    /**
+     * Session 69 — optional time-series for the tile preview.
+     * When non-null, the card replaces its text sample with an
+     * inline `MiniSparkline` and a small label strip showing the
+     * detected value-key and entity (e.g. `close · TSLA`). When
+     * null (the common case), the card renders the text sample as
+     * before. The decision to render a chart vs. text is the
+     * caller's; KindCard just honours whichever shape it received.
+     *
+     * Keeping this as an additive optional prop means every other
+     * panel that uses KindCard (events / entities / relations /
+     * assertions) is byte-for-byte unchanged.
+     */
+    chartSeries?: {
+      points: Array<{ x: number; y: number }>;
+      label?: string;
+      valueKey?: string;
+    } | null;
   }
   let {
     kind,
@@ -54,7 +73,22 @@
     when = '',
     sourceHost = '',
     sourceUrl = '',
+    chartSeries = null,
   }: Props = $props();
+
+  // Strip and format the chart sub-caption — the small text shown
+  // beside or below the sparkline. Empty when neither valueKey nor
+  // label is meaningful (we never want the sparkline floating with
+  // no context).
+  let chartCaption = $derived.by(() => {
+    if (!chartSeries) return '';
+    const parts: string[] = [];
+    if (chartSeries.valueKey) parts.push(chartSeries.valueKey);
+    if (chartSeries.label) parts.push(chartSeries.label);
+    const n = chartSeries.points.length;
+    parts.push(`${n} pt${n === 1 ? '' : 's'}`);
+    return parts.join(' · ');
+  });
 </script>
 
 <article class="kind-card">
@@ -63,7 +97,19 @@
     <span class="count" title="{count} record{count === 1 ? '' : 's'}">×{count}</span>
   </header>
 
-  {#if sample}
+  {#if chartSeries && chartSeries.points.length > 0}
+    <!-- Session 69 — chart preview (Path B). Renders when the
+         caller detected a time-series shape in the underlying
+         record's body. The sparkline scales freely inside the
+         fixed-height container; the caption strip carries the
+         what-am-I-looking-at signal. -->
+    <div class="chart" title={sample || chartCaption}>
+      <MiniSparkline points={chartSeries.points} />
+    </div>
+    {#if chartCaption}
+      <p class="chart-caption">{chartCaption}</p>
+    {/if}
+  {:else if sample}
     <p class="sample" title={sample}>{sample}</p>
   {:else}
     <p class="sample missing">— no preview available</p>
@@ -139,6 +185,32 @@
   .sample.missing {
     color: var(--fg-tertiary);
     font-style: italic;
+  }
+
+  /* Session 69 — chart preview (Path B). Sits where the .sample
+     paragraph would be when the caller passes a chartSeries. The
+     fixed height matches roughly the 3-line clamp so the tile
+     keeps the same overall vertical rhythm whether it's showing
+     text or a sparkline. */
+  .chart {
+    height: 48px;
+    width: 100%;
+    /* MiniSparkline renders its svg at 100% × 100% with
+       preserveAspectRatio="none" so the container's dimensions
+       decide the visible aspect ratio. */
+  }
+  .chart-caption {
+    margin: 0;
+    font-size: 10px;
+    color: var(--fg-tertiary);
+    text-transform: lowercase;
+    letter-spacing: 0.02em;
+    /* Single-line — if the caption gets long, ellipsise. The full
+       value-key + label combo is short by construction (we cap at
+       three pieces) so this is paranoia, not load-bearing. */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .foot {

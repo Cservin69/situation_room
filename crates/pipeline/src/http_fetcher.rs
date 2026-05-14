@@ -234,7 +234,7 @@ impl From<HttpError> for FetchError {
         // -as-reason carries enough detail for the LLM's general
         // knowledge to route around.
         match &e {
-            HttpError::StatusWithHeaders { status, headers } if *status == 429 => {
+            HttpError::StatusWithHeaders { status, headers, .. } if *status == 429 => {
                 FetchError::RateLimited {
                     retry_after_seconds: headers.retry_after_seconds(),
                 }

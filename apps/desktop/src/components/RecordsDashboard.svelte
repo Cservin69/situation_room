@@ -246,6 +246,182 @@
     return '';
   }
 
+  /**
+   * Session 69 — Path B time-series chart preview.
+   *
+   * Detect "this Document body is a time series" by structural shape,
+   * not by host/source. Rule:
+   *
+   *  1. Body parses as JSON.
+   *  2. Somewhere in the tree there's an array named (case-insensitively)
+   *     `timestamp` or `timestamps`, length >= 2, all elements numeric.
+   *  3. Somewhere else in the tree there's another numeric array of
+   *     the same length. Among multiple candidates we prefer keys that
+   *     name a primary value series (close, price, value, rate, yield)
+   *     over secondaries (open, high, low, volume). The preference list
+   *     is generic to time-series shapes, not source-specific.
+   *
+   * A friendly `label` falls out of common identity keys
+   * (`symbol`, `longName`, `name`) when present, with a generic
+   * fallback. This is presentation, not routing — see
+   * `project_sr_no_source_routing` memory.
+   *
+   * Returns `null` when no time-series shape is detectable. The
+   * caller (`documentSeriesOf`) then leaves the KindCard rendering
+   * the text sample as before.
+   */
+  interface TimeSeries {
+    timestamps: number[];
+    values: number[];
+    label: string;
+    valueKey: string;
+  }
+
+  // Keys that, when found, indicate a "primary" value series.
+  // First match wins; if none match, fall back to any same-length
+  // numeric array. Lowercased for case-insensitive comparison.
+  const PRIMARY_SERIES_KEYS = [
+    'close', 'price', 'value', 'rate', 'yield', 'level',
+  ];
+  // Keys we recognise but rank lower — useful as fallbacks but not
+  // first-choice for a one-line chart preview.
+  const SECONDARY_SERIES_KEYS = [
+    'open', 'high', 'low', 'volume', 'count',
+  ];
+  // Keys for friendly chart labels (entity name / ticker / metric id).
+  const LABEL_KEYS = ['symbol', 'longname', 'shortname', 'name', 'series_id', 'id'];
+
+  function detectTimeSeriesShape(body: string): TimeSeries | null {
+    const trimmed = body.trim();
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return null;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return null;
+    }
+    return findSeries(parsed);
+  }
+
+  function isAllNumeric(arr: unknown[]): boolean {
+    if (arr.length < 2) return false;
+    for (const v of arr) {
+      if (typeof v !== 'number' || !Number.isFinite(v)) return false;
+    }
+    return true;
+  }
+
+  function findSeries(root: unknown): TimeSeries | null {
+    // First pass — collect timestamp arrays and value-candidate
+    // arrays in one walk. Each candidate carries the key name and the
+    // array, so the preference filter can rank them after the walk.
+    const timestampArrays: number[][] = [];
+    const valueCandidates: { key: string; values: number[] }[] = [];
+    const labelCandidates: { key: string; value: string }[] = [];
+
+    function walk(node: unknown, key: string | null): void {
+      if (Array.isArray(node)) {
+        if (isAllNumeric(node)) {
+          if (key !== null) {
+            const lc = key.toLowerCase();
+            if (lc === 'timestamp' || lc === 'timestamps') {
+              timestampArrays.push(node as number[]);
+            } else {
+              valueCandidates.push({ key: lc, values: node as number[] });
+            }
+          } else {
+            // Top-level numeric array — treat as a value candidate
+            // with an empty key (lowest priority).
+            valueCandidates.push({ key: '', values: node as number[] });
+          }
+        } else {
+          for (const item of node) walk(item, null);
+        }
+        return;
+      }
+      if (node !== null && typeof node === 'object') {
+        for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+          // Capture label candidates from string-valued keys.
+          if (typeof v === 'string' && LABEL_KEYS.includes(k.toLowerCase())) {
+            labelCandidates.push({ key: k.toLowerCase(), value: v });
+          }
+          walk(v, k);
+        }
+      }
+    }
+    walk(root, null);
+
+    if (timestampArrays.length === 0 || valueCandidates.length === 0) {
+      return null;
+    }
+
+    // Pair the first timestamp array with the best-ranked value
+    // candidate of matching length. Most Yahoo-shaped feeds have one
+    // timestamp array per result; for the rare multi-result payload,
+    // the first one usually carries the primary series. A future
+    // session can revisit if we hit a case where the first isn't.
+    const timestamps = timestampArrays[0];
+
+    const sameLength = valueCandidates.filter((c) => c.values.length === timestamps.length);
+    if (sameLength.length === 0) return null;
+
+    // Rank: primary keys (close, price, …) > secondary (open, high, …)
+    // > everything else. Within a tier, first-seen wins.
+    function rank(key: string): number {
+      const i1 = PRIMARY_SERIES_KEYS.indexOf(key);
+      if (i1 >= 0) return i1;
+      const i2 = SECONDARY_SERIES_KEYS.indexOf(key);
+      if (i2 >= 0) return PRIMARY_SERIES_KEYS.length + i2;
+      return PRIMARY_SERIES_KEYS.length + SECONDARY_SERIES_KEYS.length + 1;
+    }
+    sameLength.sort((a, b) => rank(a.key) - rank(b.key));
+    const chosen = sameLength[0];
+
+    // Label preference: first LABEL_KEYS hit (symbol > longName > name).
+    let label = '';
+    for (const lk of LABEL_KEYS) {
+      const hit = labelCandidates.find((l) => l.key === lk);
+      if (hit) {
+        label = hit.value;
+        break;
+      }
+    }
+
+    return {
+      timestamps,
+      values: chosen.values,
+      label,
+      valueKey: chosen.key,
+    };
+  }
+
+  /**
+   * Convert a Document into MiniSparkline-shaped points, or `null`
+   * when the body has no time-series structure. The KindCard
+   * conditionally renders the chart when this returns non-null.
+   *
+   * Cap at 500 points to keep the SVG polyline path string bounded —
+   * MiniSparkline's reduce loop scales fine to many thousands, but
+   * 500 is more than enough resolution for a tile-sized preview and
+   * keeps per-record render cost predictable.
+   */
+  function documentSeriesOf(d: DocumentDto): { points: Array<{ x: number; y: number }>; label: string; valueKey: string } | null {
+    if (!d.body || d.body.length === 0) return null;
+    const ts = detectTimeSeriesShape(d.body);
+    if (ts === null) return null;
+    const n = ts.timestamps.length;
+    const stride = n > 500 ? Math.ceil(n / 500) : 1;
+    const points: Array<{ x: number; y: number }> = [];
+    for (let i = 0; i < n; i += stride) {
+      points.push({ x: ts.timestamps[i], y: ts.values[i] });
+    }
+    // Always include the last point even if stride'd.
+    if (points.length > 0 && points[points.length - 1].x !== ts.timestamps[n - 1]) {
+      points.push({ x: ts.timestamps[n - 1], y: ts.values[n - 1] });
+    }
+    return { points, label: ts.label, valueKey: ts.valueKey };
+  }
+
   function assertionKindOf(a: AssertionDto): string {
     return a.stance.length > 0 ? a.stance : '(unknown)';
   }
@@ -467,6 +643,7 @@
             kind={g.key}
             count={g.records.length}
             sample={documentSampleOf(g.records[0])}
+            chartSeries={documentSeriesOf(g.records[0])}
             when={whenOf(g.records[0].envelope)}
             sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
             sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}

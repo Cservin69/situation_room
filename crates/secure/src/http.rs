@@ -146,20 +146,25 @@ pub enum HttpError {
     #[error("status error: {0}")]
     Status(u16),
     /// 4xx/5xx response that arrived intact, with headers the caller
-    /// can act on (e.g. `Retry-After` on 429). Distinct from
+    /// can act on (e.g. `Retry-After` on 429) and the response body
+    /// preserved for diagnostic projection. Distinct from
     /// [`HttpError::Status`] which is the legacy variant returned by
     /// `get_bytes` / `post_json_bytes` — the body-only methods can't
     /// surface headers, so they keep the simpler shape.
     ///
-    /// The body of the failing response is *not* carried here; it's
-    /// already been logged at debug level if non-empty. Adding it
-    /// would force every caller to think about how to handle a body
-    /// they probably can't act on; the diagnostic value is at the
-    /// log layer, not the error.
+    /// Session 69 — the `body` field carries the failing response
+    /// payload so callers like the LLM provider can project the
+    /// upstream API's structured error message ("quota exceeded",
+    /// "model not in your tier", etc.) into their own error shape
+    /// rather than dropping it on the floor. Body size is already
+    /// bounded by `config.max_response_bytes` upstream, so this
+    /// doesn't introduce a new memory-pressure vector. Callers that
+    /// don't need the body match it with `..`.
     #[error("status error: {status} (with response headers)")]
     StatusWithHeaders {
         status: u16,
         headers: SecureHeaderMap,
+        body: Vec<u8>,
     },
     #[error("tls error: {0}")]
     Tls(String),
@@ -341,6 +346,11 @@ impl SecureHttpClient {
             return Err(HttpError::StatusWithHeaders {
                 status: resp.status.as_u16(),
                 headers: resp.headers,
+                // Session 69: preserve the response body on error so
+                // callers can project the upstream API's reason
+                // message into their own error shape (e.g. xAI's
+                // 429 JSON body).
+                body: resp.body,
             });
         }
         Ok(resp)
@@ -368,6 +378,11 @@ impl SecureHttpClient {
             return Err(HttpError::StatusWithHeaders {
                 status: resp.status.as_u16(),
                 headers: resp.headers,
+                // Session 69: see the matching producer in
+                // `get_with_headers` — body is preserved on error so
+                // LLM providers can surface the upstream API's
+                // structured reason on a 429.
+                body: resp.body,
             });
         }
         Ok(resp)

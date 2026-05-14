@@ -52,8 +52,8 @@ use situation_room_secure::http::{HttpError, SecureHttpClient};
 use situation_room_secure::secrets::ApiKey;
 
 use crate::providers::trait_def::{
-    CompletionRequest, CompletionResponse, LlmError, LlmProvider, ModelTier,
-    ReasoningEffort,
+    render_rate_limit_reason, CompletionRequest, CompletionResponse, LlmError, LlmProvider,
+    ModelTier, ReasoningEffort,
 };
 
 /// Environment variable the provider reads its key from.
@@ -478,8 +478,11 @@ fn map_http_err(e: HttpError) -> LlmError {
             // `Status(u16)` shape arrives via the body-only path
             // that drops them. Report 0 as "unknown" so the router
             // applies its own backoff. The `StatusWithHeaders` arm
-            // below carries the real value when present.
+            // below carries the real value when present. Reason is
+            // empty on this branch because the body-only HTTP path
+            // discards the response payload before we reach here.
             retry_after_seconds: 0,
+            reason: String::new(),
         },
         HttpError::Status(code) => LlmError::Api(format!("http {code}")),
         // Track D, Session 25: when the LLM provider's HTTP call
@@ -487,10 +490,19 @@ fn map_http_err(e: HttpError) -> LlmError {
         // the parsed `Retry-After` value through to the router so
         // its backoff is informed rather than guessed. Other status
         // codes collapse to the same shape as the body-only path.
-        HttpError::StatusWithHeaders { status, headers } => match status {
+        //
+        // Session 69: also project the response body into the
+        // RateLimited variant's `reason` field so the operator sees
+        // xAI's actual explanation (daily quota, model not in tier,
+        // etc.) instead of just "retry after Ns". The body comes
+        // from `HttpError::StatusWithHeaders` (Session 69 added the
+        // field); `render_rate_limit_reason` parses common JSON
+        // error shapes and falls back to plain-text projection.
+        HttpError::StatusWithHeaders { status, headers, body } => match status {
             401 | 403 => LlmError::Auth,
             429 => LlmError::RateLimited {
                 retry_after_seconds: headers.retry_after_seconds().unwrap_or(0),
+                reason: render_rate_limit_reason(&body),
             },
             code => LlmError::Api(format!("http {code}")),
         },
@@ -1272,7 +1284,8 @@ mod tests {
         assert!(!looks_like_truncated_json(&LlmError::Auth));
         assert!(!looks_like_truncated_json(&LlmError::Api("boom".into())));
         assert!(!looks_like_truncated_json(&LlmError::RateLimited {
-            retry_after_seconds: 30
+            retry_after_seconds: 30,
+            reason: String::new(),
         }));
         assert!(!looks_like_truncated_json(&LlmError::Network("dns".into())));
     }
