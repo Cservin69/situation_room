@@ -59,6 +59,23 @@ use crate::providers::trait_def::{
 /// Environment variable the provider reads its key from.
 pub const XAI_API_KEY_ENV: &str = "XAI_API_KEY";
 
+/// Environment variable that pins the `x-grok-conv-id` header value
+/// across process restarts. Optional; if unset (or empty / whitespace-
+/// only) the provider generates a fresh uuid4 at construction.
+///
+/// xAI's prompt cache is per-server. The `x-grok-conv-id` header
+/// routes requests with the same value to the same server so the cache
+/// (stored on that server, lifetime ~minutes-hours) can be reused.
+/// Session 72 / xAI prompt-caching docs:
+/// <https://docs.x.ai/developers/advanced-api-usage/prompt-caching/maximizing-cache-hits>
+///
+/// Operator-pinning use case: a 5-trial eval running across process
+/// restarts wants the same conv-id so trials 2-5 hit the same server
+/// as trial 1 and consume the cache trial 1 warmed. Set
+/// `XAI_CONV_ID=$(uuidgen)` (or any stable string) for the duration of
+/// the eval run.
+pub const XAI_CONV_ID_ENV: &str = "XAI_CONV_ID";
+
 /// Environment variables for per-tier model overrides. Optional; if any
 /// is unset (or set to an empty / whitespace-only string) the tier's
 /// hardcoded default in [`XaiConfig::default`] is used. Added in
@@ -235,6 +252,21 @@ fn env_or(name: &str, default: &str) -> String {
     }
 }
 
+/// Resolve the `x-grok-conv-id` header value: env var when present and
+/// non-blank, otherwise a fresh uuid4. Same empty-string-as-unset
+/// normalisation as the model/effort env vars. Session 72.
+///
+/// The value is opaque to xAI — they accept any string. We default to
+/// uuid4 because it's collision-safe across processes (so two laptops
+/// running the same plan don't accidentally evict each other's caches
+/// by colliding on a constant string).
+fn load_conv_id_from_env() -> String {
+    match std::env::var(XAI_CONV_ID_ENV) {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => uuid::Uuid::new_v4().to_string(),
+    }
+}
+
 /// Parse a [`ReasoningEffort`] from a user-facing string. Accepts
 /// `low`, `medium`, `high` case-insensitively with surrounding
 /// whitespace trimmed. Any other input — typos, alternative spellings
@@ -296,16 +328,30 @@ pub struct XaiProvider {
     key: ApiKey,
     config: XaiConfig,
     endpoint: String,
+    /// Value sent in the `x-grok-conv-id` header on every request.
+    /// Maximizes xAI's prompt-cache hit rate by routing requests with
+    /// the same value to the same server. Session 72; see
+    /// [`XAI_CONV_ID_ENV`] for the pinning env var.
+    ///
+    /// Stable for the lifetime of the provider. Operators who want
+    /// cross-process stickiness (e.g. multi-trial evals) set
+    /// `XAI_CONV_ID` at boot.
+    conv_id: String,
 }
 
 impl XaiProvider {
     /// Construct from an already-loaded key and shared HTTP client.
+    ///
+    /// The conv-id is read from `XAI_CONV_ID`; if absent, a fresh
+    /// uuid4 is generated. Either way it stays stable for the lifetime
+    /// of this `XaiProvider` instance. See [`XAI_CONV_ID_ENV`].
     pub fn new(http: SecureHttpClient, key: ApiKey) -> Self {
         Self {
             http,
             key,
             config: XaiConfig::default(),
             endpoint: DEFAULT_ENDPOINT.to_string(),
+            conv_id: load_conv_id_from_env(),
         }
     }
 
@@ -335,6 +381,11 @@ impl XaiProvider {
                 frontier_effort = ?p.config.frontier_effort,
                 workhorse_effort = ?p.config.workhorse_effort,
                 cheap_effort = ?p.config.cheap_effort,
+                // Session 72: the `x-grok-conv-id` we'll send on every
+                // request. Logged so the operator can verify cache
+                // stickiness across a multi-trial eval (set XAI_CONV_ID
+                // to pin it; otherwise it's a fresh uuid4 per process).
+                conv_id = %p.conv_id,
                 "xai: provider configured"
             );
             p
@@ -345,6 +396,21 @@ impl XaiProvider {
     pub fn with_config(mut self, config: XaiConfig) -> Self {
         self.config = config;
         self
+    }
+
+    /// Override the `x-grok-conv-id` header value. Test-and-eval only;
+    /// production callers leave the default (uuid4 at construction or
+    /// the `XAI_CONV_ID` env var). Session 72.
+    pub fn with_conv_id(mut self, conv_id: impl Into<String>) -> Self {
+        self.conv_id = conv_id.into();
+        self
+    }
+
+    /// The `x-grok-conv-id` value this provider sends on every request.
+    /// Exposed so tests + the operator can sanity-check what got
+    /// resolved at boot. Session 72.
+    pub fn conv_id(&self) -> &str {
+        &self.conv_id
     }
 
     /// Test-only: override the endpoint URL. Not exposed outside tests so
@@ -409,10 +475,17 @@ impl XaiProvider {
     }
 
     /// Parse an xAI response body into a [`CompletionResponse`].
+    ///
+    /// Session 72: also extracts `usage.prompt_tokens_details
+    /// .cached_tokens` and logs it at INFO so the operator can verify
+    /// xAI's prompt cache is hitting without DB inspection. Wire
+    /// format documented at
+    /// <https://docs.x.ai/developers/advanced-api-usage/prompt-caching/usage-and-pricing>
     fn parse_response(
         &self,
         raw: Value,
         schema_requested: bool,
+        tier: ModelTier,
     ) -> Result<CompletionResponse, LlmError> {
         // Deserialize via a private shape type so we get clear errors
         // rather than index-chasing on Value.
@@ -434,13 +507,46 @@ impl XaiProvider {
             None
         };
 
+        let input_tokens = parsed.usage.as_ref().and_then(|u| u.prompt_tokens);
+        let output_tokens =
+            parsed.usage.as_ref().and_then(|u| u.completion_tokens);
+        // Session 72: surface cached_tokens. Field path is
+        // `usage.prompt_tokens_details.cached_tokens` per xAI's
+        // chat-completions caching docs. A missing or `0` value means
+        // the request was a cache miss (first turn, evicted, or
+        // routed to a server that doesn't have the prefix). A non-zero
+        // value means that many input tokens were billed at the
+        // cached rate.
+        let cached_tokens = parsed
+            .usage
+            .as_ref()
+            .and_then(|u| u.prompt_tokens_details.as_ref())
+            .and_then(|d| d.cached_tokens);
+        let model = parsed.model.unwrap_or_default();
+
+        // Log one INFO line per completion so the operator sees
+        // input/cached/output side-by-side in the tail. The cached
+        // value is the load-bearing signal for "is the cache working?"
+        // — we always log it (including the absent / zero case) so a
+        // regression that drops the field doesn't silently lose the
+        // signal.
+        tracing::info!(
+            tier = ?tier,
+            model = %model,
+            input_tokens = ?input_tokens,
+            cached_tokens = ?cached_tokens,
+            output_tokens = ?output_tokens,
+            conv_id = %self.conv_id,
+            "xai: completion done"
+        );
+
         Ok(CompletionResponse {
             text,
             structured,
             provider: "xai".to_string(),
-            model: parsed.model.unwrap_or_default(),
-            input_tokens: parsed.usage.as_ref().and_then(|u| u.prompt_tokens),
-            output_tokens: parsed.usage.as_ref().and_then(|u| u.completion_tokens),
+            model,
+            input_tokens,
+            output_tokens,
         })
     }
 }
@@ -651,6 +757,7 @@ impl XaiProvider {
             model = %self.config.model_for(tier),
             structured = schema_requested,
             max_tokens = request.max_tokens,
+            conv_id = %self.conv_id,
             "xai: sending completion"
         );
 
@@ -660,6 +767,13 @@ impl XaiProvider {
                 &self.endpoint,
                 &body,
                 &[("authorization", &bearer_secret)],
+                // Session 72 — `x-grok-conv-id` routes requests to the
+                // same xAI server so the per-server prompt cache can be
+                // reused. Stable for the lifetime of `self`. xAI's
+                // chat-completions docs name this header as the
+                // chat-completions equivalent of the Responses API's
+                // `prompt_cache_key` body field.
+                //
                 // No `content-type` here — `SecureHttpClient::post_json_bytes`
                 // calls `.json(body)` on the reqwest builder, which already
                 // sets `Content-Type: application/json`. Adding it again as
@@ -667,12 +781,12 @@ impl XaiProvider {
                 // Content-Type to the wire, and xAI's API gateway returns
                 // `415 Unsupported Media Type` when it sees two of them.
                 // See `SecureHttpClient::post_json_bytes` for the rule.
-                &[],
+                &[("x-grok-conv-id", self.conv_id.as_str())],
             )
             .await
             .map_err(map_http_err)?;
 
-        self.parse_response(raw, schema_requested)
+        self.parse_response(raw, schema_requested, tier)
     }
 }
 
@@ -707,6 +821,23 @@ struct XaiUsage {
     prompt_tokens: Option<u32>,
     #[serde(default)]
     completion_tokens: Option<u32>,
+    /// Session 72 — xAI's prompt-cache report rides on the OpenAI-compat
+    /// `prompt_tokens_details.cached_tokens` field. `#[serde(default)]`
+    /// makes the parser forgiving of legacy responses (and of test
+    /// fixtures that don't bother with the nested object).
+    #[serde(default)]
+    prompt_tokens_details: Option<XaiPromptTokensDetails>,
+}
+
+/// Session 72 — partial mirror of xAI's `prompt_tokens_details` block.
+/// We only project `cached_tokens` today (the load-bearing signal for
+/// the prompt-cache rollout); other fields the API returns
+/// (`text_tokens`, `audio_tokens`, `image_tokens`) are ignored
+/// deliberately to keep this provider's text-only contract honest.
+#[derive(Debug, Deserialize)]
+struct XaiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -894,7 +1025,7 @@ mod tests {
                 "total_tokens": 11
             }
         });
-        let resp = p.parse_response(raw, false).unwrap();
+        let resp = p.parse_response(raw, false, ModelTier::Cheap).unwrap();
         assert_eq!(resp.text, "4");
         assert!(resp.structured.is_none());
         assert_eq!(resp.provider, "xai");
@@ -915,7 +1046,7 @@ mod tests {
                 }
             }]
         });
-        let resp = p.parse_response(raw, true).unwrap();
+        let resp = p.parse_response(raw, true, ModelTier::Cheap).unwrap();
         assert_eq!(resp.text, "{\"answer\":\"four\"}");
         let s = resp.structured.unwrap();
         assert_eq!(s["answer"], json!("four"));
@@ -930,7 +1061,7 @@ mod tests {
                 "message": { "role": "assistant", "content": "not json at all" }
             }]
         });
-        let err = p.parse_response(raw, true).unwrap_err();
+        let err = p.parse_response(raw, true, ModelTier::Cheap).unwrap_err();
         assert!(matches!(err, LlmError::JsonParse(_)), "got {err:?}");
     }
 
@@ -938,7 +1069,7 @@ mod tests {
     fn parse_response_errors_when_no_choices() {
         let p = test_provider();
         let raw = json!({ "model": "grok-4-1-fast-reasoning", "choices": [] });
-        let err = p.parse_response(raw, false).unwrap_err();
+        let err = p.parse_response(raw, false, ModelTier::Cheap).unwrap_err();
         assert!(matches!(err, LlmError::Api(_)), "got {err:?}");
     }
 
@@ -981,6 +1112,10 @@ mod tests {
         std::env::remove_var(XAI_FRONTIER_EFFORT_ENV);
         std::env::remove_var(XAI_WORKHORSE_EFFORT_ENV);
         std::env::remove_var(XAI_CHEAP_EFFORT_ENV);
+        // Session 72: same posture for the conv-id env var. Tests
+        // that rely on the "fresh uuid4 per construction" default
+        // must observe an absent XAI_CONV_ID.
+        std::env::remove_var(XAI_CONV_ID_ENV);
     }
 
     #[test]
@@ -1415,5 +1550,213 @@ mod tests {
             .expect("live xai structured completion should succeed");
         let structured = resp.structured.expect("structured field should be populated");
         assert!(structured.get("result").is_some(), "expected result field, got {structured}");
+    }
+
+    // -----------------------------------------------------------------
+    // Session 72 — `x-grok-conv-id` + cached_tokens visibility
+    //
+    // Three contracts the prompt-caching rollout pins:
+    //   1. The provider resolves a non-empty conv-id at construction
+    //      (uuid4 default, env-override honoured), and the value is
+    //      stable for the provider's lifetime.
+    //   2. The OpenAI-compat `prompt_tokens_details.cached_tokens`
+    //      field deserialises through `XaiPromptTokensDetails` whether
+    //      it is present, absent, or zero — without panicking on
+    //      legacy responses that predate prompt caching.
+    //   3. The conv-id env var follows the same empty/whitespace-as-
+    //      unset posture as the model + effort env vars.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn conv_id_defaults_to_a_uuid4_when_env_is_absent() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_model_envs();
+        let p = test_provider();
+        let id = p.conv_id();
+        // uuid4's hyphenated form is 36 chars. A weaker bound (non-
+        // empty) would let a regression that dropped the uuid entirely
+        // pass; pinning the shape catches it.
+        assert_eq!(id.len(), 36, "expected uuid4 shape, got {id:?}");
+        // Quick sanity check: parses back as a uuid.
+        uuid::Uuid::parse_str(id).expect("default conv_id must be a uuid");
+    }
+
+    #[test]
+    fn conv_id_picks_up_env_override_when_set() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_model_envs();
+        std::env::set_var(XAI_CONV_ID_ENV, "pinned-eval-conv-id-42");
+        let p = test_provider();
+        assert_eq!(p.conv_id(), "pinned-eval-conv-id-42");
+        clear_model_envs();
+    }
+
+    #[test]
+    fn conv_id_env_treats_empty_string_as_unset() {
+        // Same posture as the model + effort env vars: a blank export
+        // from a shell conditional stays at default (fresh uuid4)
+        // rather than sending an empty header value (which xAI would
+        // accept but with no cache benefit).
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_model_envs();
+        std::env::set_var(XAI_CONV_ID_ENV, "");
+        let p = test_provider();
+        // Empty-as-unset → default uuid4 → 36 chars.
+        assert_eq!(p.conv_id().len(), 36);
+        clear_model_envs();
+    }
+
+    #[test]
+    fn conv_id_env_treats_whitespace_only_as_unset() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_model_envs();
+        std::env::set_var(XAI_CONV_ID_ENV, "   \t  \n");
+        let p = test_provider();
+        assert_eq!(p.conv_id().len(), 36);
+        clear_model_envs();
+    }
+
+    #[test]
+    fn conv_id_is_stable_across_repeated_reads() {
+        // A regression that re-generated the uuid on every call site
+        // would break cache locality (each request would route to a
+        // different server). Pin the stability contract.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_model_envs();
+        let p = test_provider();
+        let first = p.conv_id().to_string();
+        let second = p.conv_id().to_string();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn with_conv_id_overrides_the_construction_default() {
+        // The builder method is the test/eval escape hatch. A test
+        // pinning wire shape (or an eval runner that wants a known
+        // conv-id) sets it explicitly.
+        let p = test_provider().with_conv_id("explicit-test-conv-id");
+        assert_eq!(p.conv_id(), "explicit-test-conv-id");
+    }
+
+    #[test]
+    fn parse_response_projects_cached_tokens_from_prompt_tokens_details() {
+        // The wire shape documented at
+        // docs.x.ai/.../prompt-caching/usage-and-pricing — the
+        // OpenAI-compat `usage.prompt_tokens_details.cached_tokens`
+        // field. The provider's INFO log relies on this projection;
+        // a regression that dropped the field would silently mask
+        // whether the cache was working.
+        let raw = json!({
+            "model": "grok-4.3",
+            "choices": [{
+                "message": { "role": "assistant", "content": "4" }
+            }],
+            "usage": {
+                "prompt_tokens": 125,
+                "completion_tokens": 48,
+                "total_tokens": 173,
+                "prompt_tokens_details": {
+                    "text_tokens": 125,
+                    "audio_tokens": 0,
+                    "image_tokens": 0,
+                    "cached_tokens": 98
+                }
+            }
+        });
+        let parsed: XaiChatResponse = serde_json::from_value(raw).unwrap();
+        let cached = parsed
+            .usage
+            .as_ref()
+            .and_then(|u| u.prompt_tokens_details.as_ref())
+            .and_then(|d| d.cached_tokens);
+        assert_eq!(cached, Some(98));
+        // And the input/output projection still works alongside.
+        assert_eq!(parsed.usage.as_ref().and_then(|u| u.prompt_tokens), Some(125));
+        assert_eq!(
+            parsed.usage.as_ref().and_then(|u| u.completion_tokens),
+            Some(48)
+        );
+    }
+
+    #[test]
+    fn parse_response_handles_missing_prompt_tokens_details() {
+        // Legacy responses (and test fixtures that don't bother with
+        // the nested object) must still deserialise. The cached_tokens
+        // projection should yield None rather than panic.
+        let raw = json!({
+            "model": "grok-4.3",
+            "choices": [{
+                "message": { "role": "assistant", "content": "4" }
+            }],
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 5
+            }
+        });
+        let parsed: XaiChatResponse = serde_json::from_value(raw).unwrap();
+        let cached = parsed
+            .usage
+            .as_ref()
+            .and_then(|u| u.prompt_tokens_details.as_ref())
+            .and_then(|d| d.cached_tokens);
+        assert!(cached.is_none(), "missing details should yield None, got {cached:?}");
+    }
+
+    #[test]
+    fn parse_response_handles_present_details_with_zero_cached_tokens() {
+        // The cache-miss case: details object is present but the
+        // cached_tokens field is zero (first turn, evicted, or routed
+        // to a cold server). Distinguish "field reported zero" from
+        // "field absent."
+        let raw = json!({
+            "model": "grok-4.3",
+            "choices": [{
+                "message": { "role": "assistant", "content": "4" }
+            }],
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 5,
+                "prompt_tokens_details": {
+                    "cached_tokens": 0
+                }
+            }
+        });
+        let parsed: XaiChatResponse = serde_json::from_value(raw).unwrap();
+        let cached = parsed
+            .usage
+            .as_ref()
+            .and_then(|u| u.prompt_tokens_details.as_ref())
+            .and_then(|d| d.cached_tokens);
+        assert_eq!(cached, Some(0));
+    }
+
+    #[test]
+    fn parse_response_handles_details_without_cached_tokens_field() {
+        // Forward-compat: the details object may carry text/audio/
+        // image counts even when cached_tokens is absent (e.g. a
+        // future endpoint that splits caching out by media type).
+        // Ignore the other fields and surface None for cached_tokens.
+        let raw = json!({
+            "model": "grok-4.3",
+            "choices": [{
+                "message": { "role": "assistant", "content": "4" }
+            }],
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 5,
+                "prompt_tokens_details": {
+                    "text_tokens": 50,
+                    "audio_tokens": 0,
+                    "image_tokens": 0
+                }
+            }
+        });
+        let parsed: XaiChatResponse = serde_json::from_value(raw).unwrap();
+        let cached = parsed
+            .usage
+            .as_ref()
+            .and_then(|u| u.prompt_tokens_details.as_ref())
+            .and_then(|d| d.cached_tokens);
+        assert!(cached.is_none());
     }
 }

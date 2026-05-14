@@ -22,6 +22,9 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 async-trait = { workspace = true }
 schemars = { workspace = true }
+# Session 72: uuid4 for the per-process `x-grok-conv-id` default
+# (cache-locality header on every xAI request).
+uuid = { workspace = true }
 
 [dev-dependencies]
 dotenvy = { workspace = true }
