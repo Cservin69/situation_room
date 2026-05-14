@@ -44,6 +44,8 @@
   import type { DocumentDto } from '$lib/api/types/DocumentDto';
   import MiniSparkline from '$components/charts/MiniSparkline.svelte';
   import CopyButton from '$components/common/CopyButton.svelte';
+  import DocumentTable from '$components/DocumentTable.svelte';
+  import { detectTableShape } from '$lib/dashboard/document_table';
   import { onMount } from 'svelte';
 
   interface Props {
@@ -95,6 +97,39 @@
     }
     return doc.body;
   });
+
+  /*
+    Session 73 — table-shape detection for array-of-objects payloads.
+
+    Only attempt detection when no chart shape was matched. A payload
+    that satisfies both detectors (rare in practice — a Yahoo-shaped
+    feed has nested objects but not as a top-level row list) is best
+    visualised as a chart; the operator can still see the raw rows
+    via the pretty-printed JSON below the chart.
+
+    `tableShape` is `null` when:
+      - the body isn't JSON, or
+      - the JSON tree has no array of plain objects with ≥ 2 entries.
+    In both cases the drawer renders just the pretty-printed body as
+    before — pre-Session-73 behaviour, no regression.
+  */
+  let tableShape = $derived.by(() => {
+    if (chartSeries !== null) return null;
+    if (!doc.body || doc.body.length === 0) return null;
+    return detectTableShape(doc.body);
+  });
+
+  /*
+    When a table renders we collapse the raw-JSON `<pre>` block into
+    a toggleable "show raw JSON" affordance. The table is the
+    high-signal view; the raw block stays one click away for power
+    users who need the literal payload (e.g. to copy a nested object
+    that the table truncates at the cell-cap).
+  */
+  let rawExpanded = $state(false);
+  function toggleRaw() {
+    rawExpanded = !rawExpanded;
+  }
 
   /** Short ISO date for the header. Same logic as RecordsDashboard's
    * `whenOf` but inline here so the drawer is self-contained. */
@@ -197,6 +232,18 @@
         <p class="empty">
           (binary content — no inline preview available)
         </p>
+      {:else if tableShape !== null}
+        <!-- Session 73 — table-shape detected; render the rows
+             inline and tuck the raw JSON behind a toggle. -->
+        <DocumentTable table={tableShape} />
+        <div class="raw-row">
+          <button type="button" class="raw-toggle" onclick={toggleRaw}>
+            {rawExpanded ? 'hide raw JSON' : 'show raw JSON'}
+          </button>
+        </div>
+        {#if rawExpanded}
+          <pre class="body">{prettyBody}</pre>
+        {/if}
       {:else}
         <pre class="body">{prettyBody}</pre>
       {/if}
@@ -358,5 +405,30 @@
     font-style: italic;
     color: var(--fg-tertiary);
     text-align: center;
+  }
+
+  /* Session 73 — raw-JSON disclosure row (only renders when a
+     table was detected). Sits between the table and the optional
+     `<pre>` fallback, right-aligned so it reads as panel meta
+     rather than as a primary action. */
+  .raw-row {
+    display: flex;
+    justify-content: flex-end;
+    padding: 8px 0 4px;
+  }
+  .raw-toggle {
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    border-radius: 3px;
+    color: var(--fg-secondary);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    padding: 2px 6px;
+    cursor: pointer;
+  }
+  .raw-toggle:hover,
+  .raw-toggle:focus-visible {
+    border-color: var(--border-strong);
+    color: var(--fg-primary);
   }
 </style>
