@@ -152,20 +152,38 @@ impl Store {
     pub fn records_for_plan(&self, plan_id: Uuid) -> Result<RecordsByPlan> {
         // Step 1: collect recipe ids. Reuse the existing indexed query.
         let recipes = self.recipes_for_plan(plan_id)?;
-        if recipes.is_empty() {
-            return Ok(RecordsByPlan::default());
-        }
 
         // Build the LIKE patterns once — same vector reused across
         // all six per-table queries via params_from_iter.
         //
-        // Pattern: `%#recipe:<uuid>@v%`. The leading `%` matches the
-        // source-name prefix (`gdelt#`, `usgs_mcs#`, etc.); the
-        // trailing `%` matches the version digits.
-        let patterns: Vec<String> = recipes
+        // Two pattern shapes are matched:
+        //
+        //   `%#recipe:<uuid>@v%`         — recipe-keyed rows (the
+        //                                  Session 22 shape). The
+        //                                  leading `%` matches the
+        //                                  source-name prefix
+        //                                  (`gdelt#`, `usgs_mcs#`,
+        //                                  etc.); the trailing `%`
+        //                                  matches the version digits.
+        //   `plan:<plan_id>#%`           — plan-keyed rows produced
+        //                                  outside the recipe path:
+        //                                  Session-76 Entity exemplar
+        //                                  materialisation, and any
+        //                                  future plan-accept-time
+        //                                  synthesisers that follow
+        //                                  the same provenance shape.
+        //
+        // The plan-keyed pattern is appended unconditionally so a
+        // plan with no recipes yet still surfaces its materialised
+        // exemplars on the per-plan dashboard. (Pre-Session-76 the
+        // early-return `if recipes.is_empty()` would have returned
+        // an empty `RecordsByPlan` here, hiding any plan-keyed rows
+        // that already existed.)
+        let mut patterns: Vec<String> = recipes
             .iter()
             .map(|r| format!("%#recipe:{}@v%", r.id))
             .collect();
+        patterns.push(format!("plan:{plan_id}#%"));
         let where_clause = build_or_likes("source_id", patterns.len());
 
         let conn = self
@@ -255,8 +273,10 @@ impl Store {
 
 /// Build a `(col LIKE ? OR col LIKE ? OR …)` clause for `n` patterns.
 /// Empty `n` would produce `()` — invalid SQL — so callers must
-/// guard against the zero case (we do, via the early return in
-/// `records_for_plan`).
+/// guard against the zero case. In `records_for_plan` this is
+/// enforced structurally: the Session-76 plan-keyed pattern
+/// (`plan:{plan_id}#%`) is appended unconditionally, so `n` is
+/// always ≥ 1 even when `recipes_for_plan` returns nothing.
 fn build_or_likes(col: &str, n: usize) -> String {
     let parts: Vec<String> = (0..n).map(|_| format!("{col} LIKE ?")).collect();
     format!("({})", parts.join(" OR "))
@@ -1020,6 +1040,105 @@ mod tests {
 
         let result = store.records_for_plan(plan_id).unwrap();
         assert_eq!(result.observations.len(), 2);
+    }
+
+    #[test]
+    fn records_for_plan_returns_plan_keyed_entity_with_no_recipes() {
+        // Session 76 — entity exemplar materialisation produces
+        // Entity rows whose `provenance.source_id` is
+        // `plan:<plan_id>#entity_exemplar`, NOT the recipe-keyed
+        // shape. `records_for_plan` must surface them even when
+        // the plan has no recipes yet (the plan-accept path runs
+        // before any fetching).
+        use situation_room_core::schema::records::Entity;
+        use situation_room_core::vocab::EntityId;
+
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_id = Uuid::now_v7();
+
+        let envelope = Envelope {
+            provenance: Provenance {
+                source_id: format!("plan:{plan_id}#entity_exemplar"),
+                source_url: None,
+                source_published_at: None,
+                license: "classifier-emitted".into(),
+                derived_from: vec![],
+            },
+            subjects: Subjects {
+                entities: vec![EntityId::new("company:tsla").unwrap()],
+                places: vec![],
+                time: None,
+                topics: vec![Topic::new("test_topic").unwrap()],
+            },
+            tags: vec![],
+            valid_at: None,
+            observed_at: Utc::now(),
+            confidence: Confidence::ONE,
+        };
+
+        let ent = Entity::new(
+            EntityId::new("company:tsla").unwrap(),
+            "company",
+            "tsla",
+            envelope,
+        );
+        store.insert_entity(&ent).unwrap();
+
+        let result = store.records_for_plan(plan_id).unwrap();
+        assert_eq!(result.entities.len(), 1);
+        assert_eq!(result.entities[0].id, ent.id);
+        assert_eq!(result.entities[0].kind, "company");
+        assert_eq!(result.entities[0].canonical_name, "tsla");
+    }
+
+    #[test]
+    fn records_for_plan_plan_keyed_pattern_does_not_leak_across_plans() {
+        // Pin the prefix-precision of the new plan-keyed `LIKE`
+        // pattern: an entity materialised for plan A must NOT
+        // surface when asking records_for_plan(plan_b).
+        use situation_room_core::schema::records::Entity;
+        use situation_room_core::vocab::EntityId;
+
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_a = Uuid::now_v7();
+        let plan_b = Uuid::now_v7();
+
+        let envelope = Envelope {
+            provenance: Provenance {
+                source_id: format!("plan:{plan_a}#entity_exemplar"),
+                source_url: None,
+                source_published_at: None,
+                license: "classifier-emitted".into(),
+                derived_from: vec![],
+            },
+            subjects: Subjects {
+                entities: vec![EntityId::new("company:tsla").unwrap()],
+                places: vec![],
+                time: None,
+                topics: vec![Topic::new("test_topic").unwrap()],
+            },
+            tags: vec![],
+            valid_at: None,
+            observed_at: Utc::now(),
+            confidence: Confidence::ONE,
+        };
+
+        let ent = Entity::new(
+            EntityId::new("company:tsla").unwrap(),
+            "company",
+            "tsla",
+            envelope,
+        );
+        store.insert_entity(&ent).unwrap();
+
+        let result_a = store.records_for_plan(plan_a).unwrap();
+        let result_b = store.records_for_plan(plan_b).unwrap();
+        assert_eq!(result_a.entities.len(), 1);
+        assert!(result_b.entities.is_empty());
     }
 
     #[test]

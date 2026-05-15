@@ -31,9 +31,11 @@ pub mod providers;
 pub mod prompts;
 pub mod extraction;
 pub mod cache;
+pub mod cost_ledger;
 
 pub use providers::{LlmProvider, LlmError, ModelTier, ReasoningEffort, CompletionRequest, CompletionResponse};
 pub use providers::{XaiProvider, XaiConfig, XAI_API_KEY_ENV};
 pub use providers::{AnthropicProvider, AnthropicConfig, ANTHROPIC_API_KEY_ENV};
+pub use cost_ledger::{CostLedger, LedgerEntry, MeteredProvider, Tally};
 
 pub type Result<T> = std::result::Result<T, LlmError>;

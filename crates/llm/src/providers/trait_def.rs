@@ -18,7 +18,7 @@ use thiserror::Error;
 ///   most extraction tasks where quality matters but cost does too.
 /// `Cheap` — small fast model (Haiku, GPT-mini, Flash). Used for high-volume
 ///   tagging, classification, and routing decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelTier {
     Frontier,
     Workhorse,

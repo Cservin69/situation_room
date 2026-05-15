@@ -1402,10 +1402,16 @@ The top-level shape is:
 - `produces`: array of one or more production bindings. Each binding
   has:
   - `record_type`: one of `"observation"`, `"event"`, `"relation"`.
-    (Not `"entity"`, `"document"`, or `"assertion"` — entities come
-    from registry lookup, documents come from ingest, and assertions
+    (Not `"entity"`, `"document"`, or `"assertion"` — entities are
+    materialised from the classifier's `entity_kinds[*].exemplars[*]`
+    at plan-accept time, documents come from ingest, and assertions
     carry a claimant + stance that field-mappings don't populate
-    and are produced by the LLM extraction layer instead.)
+    and are produced by the LLM extraction layer instead.) If a
+    nomination's target list contains `entity_kind` or `relation_kind`
+    expectations that you cannot bind with a `produces` array of
+    these three record types, decline that (URL, target) pair with
+    a clear reason — the multi-target authoring path is built to
+    accept partial fulfilment.
   - `expectation`: a reference to one of the plan's expectations by
     list and index.
   - `field_mappings`: array of `{path, source}` pairs. `path` is the

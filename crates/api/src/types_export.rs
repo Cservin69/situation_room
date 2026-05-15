@@ -1447,6 +1447,90 @@ impl SourcesMemoryEntryDto {
 }
 
 // ---------------------------------------------------------------------------
+// Session 75 — LLM cost-ledger DTO (cost-by-tier dashboard tile)
+// ---------------------------------------------------------------------------
+
+/// Wire mirror of [`situation_room_llm::ModelTier`]. ts-rs renders this
+/// as a string-union type (`"frontier" | "workhorse" | "cheap"`) so the
+/// frontend can use it as a label without re-encoding.
+///
+/// Why a parallel DTO: `ModelTier` lives in the llm crate, which —
+/// per the same posture as `MemorySource` in storage — doesn't depend
+/// on `ts-rs`. The cost is one tiny enum mirror; the benefit is that
+/// the llm crate stays free of UI-tooling deps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+#[serde(rename_all = "lowercase")]
+pub enum ModelTierDto {
+    Frontier,
+    Workhorse,
+    Cheap,
+}
+
+impl From<situation_room_llm::ModelTier> for ModelTierDto {
+    fn from(t: situation_room_llm::ModelTier) -> Self {
+        match t {
+            situation_room_llm::ModelTier::Frontier => ModelTierDto::Frontier,
+            situation_room_llm::ModelTier::Workhorse => ModelTierDto::Workhorse,
+            situation_room_llm::ModelTier::Cheap => ModelTierDto::Cheap,
+        }
+    }
+}
+
+/// One row in the LLM cost-ledger surface. Mirrors
+/// [`situation_room_llm::LedgerEntry`] one-for-one, with totals lifted
+/// into the wire shape the dashboard tile reads.
+///
+/// ## Cache-hit ratio is computed client-side
+///
+/// We surface raw counts here — `input_tokens`, `cached_input_tokens`,
+/// `calls_with_cache_data` — and let the frontend compute the ratio
+/// when it has data to compute over. Wire-shape stability matters
+/// across binary restarts more than the convenience of a pre-computed
+/// float; the operator's eye lands on the chip the dashboard renders
+/// regardless of where the divide happens.
+///
+/// ## Why `calls_with_cache_data` is on the wire
+///
+/// Distinguishes "provider doesn't report cache hits" (None) from
+/// "cold prefix, reported zero" (Some(0)) for ratio purposes. See
+/// the same field's doc on
+/// [`situation_room_llm::cost_ledger::Tally`] for the underlying
+/// invariant.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct LlmCostLedgerEntryDto {
+    /// Provider id — the same string `LlmProvider::id()` returns
+    /// (`"xai"`, `"anthropic"`, …).
+    pub provider: String,
+    pub tier: ModelTierDto,
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    /// How many of `calls` reported a `Some(_)` for cached tokens;
+    /// denominator for the cache-hit ratio. A value of 0 means the
+    /// provider didn't report (the dashboard renders "—" rather than
+    /// "0%").
+    pub calls_with_cache_data: u64,
+}
+
+impl LlmCostLedgerEntryDto {
+    /// Lift a typed [`situation_room_llm::LedgerEntry`] into wire shape.
+    pub fn from_typed(e: situation_room_llm::LedgerEntry) -> Self {
+        Self {
+            provider: e.provider,
+            tier: e.tier.into(),
+            calls: e.tally.calls,
+            input_tokens: e.tally.input_tokens,
+            output_tokens: e.tally.output_tokens,
+            cached_input_tokens: e.tally.cached_input_tokens,
+            calls_with_cache_data: e.tally.calls_with_cache_data,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2476,5 +2560,87 @@ mod tests {
         let dto = HostBackoffSnapshotDto::from_typed(typed);
         assert_eq!(dto.consecutive_failures, 3);
         assert_eq!(dto.wait_seconds_remaining, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Session 75 — LLM cost-ledger DTO
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn model_tier_dto_serializes_lowercase() {
+        // The ts-rs render is `"frontier" | "workhorse" | "cheap"`; pin
+        // each variant so a future renaming of `ModelTier` cannot
+        // silently break the frontend's literal-union type.
+        let f = serde_json::to_string(&ModelTierDto::Frontier).unwrap();
+        let w = serde_json::to_string(&ModelTierDto::Workhorse).unwrap();
+        let c = serde_json::to_string(&ModelTierDto::Cheap).unwrap();
+        assert_eq!(f, r#""frontier""#);
+        assert_eq!(w, r#""workhorse""#);
+        assert_eq!(c, r#""cheap""#);
+    }
+
+    #[test]
+    fn model_tier_dto_lifts_each_tier_variant() {
+        assert_eq!(
+            ModelTierDto::from(situation_room_llm::ModelTier::Frontier),
+            ModelTierDto::Frontier
+        );
+        assert_eq!(
+            ModelTierDto::from(situation_room_llm::ModelTier::Workhorse),
+            ModelTierDto::Workhorse
+        );
+        assert_eq!(
+            ModelTierDto::from(situation_room_llm::ModelTier::Cheap),
+            ModelTierDto::Cheap
+        );
+    }
+
+    #[test]
+    fn llm_cost_ledger_entry_dto_round_trips_tally_counts() {
+        // The typed `Tally` carries all the counts; the DTO copies them
+        // verbatim. Pin so a future Tally field addition that drops one
+        // on the way to the wire surface (e.g. forgetting to extend the
+        // mapping) trips this test rather than silently zero-ing the
+        // dashboard tile.
+        let typed = situation_room_llm::LedgerEntry {
+            provider: "xai".into(),
+            tier: situation_room_llm::ModelTier::Workhorse,
+            tally: situation_room_llm::Tally {
+                calls: 7,
+                input_tokens: 14_000,
+                output_tokens: 2_100,
+                cached_input_tokens: 12_800,
+                calls_with_cache_data: 6,
+            },
+        };
+        let dto = LlmCostLedgerEntryDto::from_typed(typed);
+        assert_eq!(dto.provider, "xai");
+        assert_eq!(dto.tier, ModelTierDto::Workhorse);
+        assert_eq!(dto.calls, 7);
+        assert_eq!(dto.input_tokens, 14_000);
+        assert_eq!(dto.output_tokens, 2_100);
+        assert_eq!(dto.cached_input_tokens, 12_800);
+        assert_eq!(dto.calls_with_cache_data, 6);
+    }
+
+    #[test]
+    fn llm_cost_ledger_entry_dto_handles_zero_cache_denominator() {
+        // The "no cache data" denominator path: provider never reported
+        // a Some(_) on `cached_input_tokens`. The wire surface preserves
+        // the zero so the frontend can render "—" instead of "0%".
+        let typed = situation_room_llm::LedgerEntry {
+            provider: "anthropic".into(),
+            tier: situation_room_llm::ModelTier::Frontier,
+            tally: situation_room_llm::Tally {
+                calls: 3,
+                input_tokens: 4_000,
+                output_tokens: 400,
+                cached_input_tokens: 0,
+                calls_with_cache_data: 0,
+            },
+        };
+        let dto = LlmCostLedgerEntryDto::from_typed(typed);
+        assert_eq!(dto.calls_with_cache_data, 0);
+        assert_eq!(dto.cached_input_tokens, 0);
     }
 }

@@ -809,6 +809,46 @@ not a comfortable default. If on reflection the topic genuinely
 warrants a thin classification (the OFAC case), keep it thin and
 say so explicitly in `interpretation`.
 
+## Don't let `observation_metrics` crowd out `event_types`
+
+A specific failure mode worth naming: when the topic surfaces a
+**continuously-measured quantity** (a stock price, a benchmark
+rate, a commodity spot price, a population count), the temptation
+is to fill `observation_metrics` exhaustively (`closing_price`,
+`opening_price`, `trading_volume`, `intraday_high`,
+`intraday_low`, `52_week_range`, …) and call the plan complete.
+The numeric story feels self-contained; the event-shaped story
+gets squeezed out.
+
+This is wrong. Almost every continuously-measured topic has a
+parallel event stream that the operator cares about:
+
+- **Stock price** → `earnings_release`, `delivery_update`,
+  `analyst_rating_change`, `sec_filing_8k`, `dividend_declared`,
+  `stock_split`, `share_repurchase_announced`,
+  `executive_transition`.
+- **Interest rate** → `fomc_decision`, `dot_plot_published`,
+  `speech_by_governor`, `summary_of_economic_projections`,
+  `minutes_released`.
+- **Commodity spot price** → `mine_production_report`,
+  `inventory_update`, `tariff_announced`, `embargo_lifted`,
+  `producer_meeting_outcome`.
+- **Population / case count** → `policy_action`,
+  `outbreak_declared`, `containment_milestone`,
+  `regulatory_response`.
+
+The test: if your `interpretation` paragraph contains words like
+"announcements", "releases", "decisions", "events",
+"developments", "actions", or "milestones" — or any phrase that
+implies a discrete dated happening — `event_types` must not be
+empty. Aim for at least **two to four** event types when the
+interpretation acknowledges them, even if you can also enumerate
+many observable metrics.
+
+The dashboard's Event panel is one of the most operator-readable
+surfaces in the product, and a topic with rich `observation_metrics`
+but empty `event_types` reads as half-finished to the analyst.
+
 ## One-shot, no follow-up
 
 You will not be called again to refine this plan. The user reviews
@@ -823,6 +863,18 @@ honest about what the workstation will surface.
 
 ### Changelog
 
+- **v2.1** (2026-05-15) — Session 76. New section
+  "Don't let `observation_metrics` crowd out `event_types`"
+  addresses a recurring failure mode where
+  continuously-measured topics (stock prices, interest rates,
+  commodity spot prices) get fully-populated `observation_metrics`
+  but empty `event_types` — even when the interpretation
+  paragraph explicitly names announcements, releases, or
+  decisions. Concrete event-type vocabularies given for four
+  common continuously-measured topic shapes (stock, rate,
+  commodity, population/case-count). Trigger: words like
+  "announcements", "releases", "decisions", "events" appearing
+  in the interpretation → `event_types` must not be empty.
 - **v2.0** (2026-05-08) — Session 39. URL discovery moves out of
   Level-1 entirely. The classifier no longer emits `endpoint_url`
   or `known_id` on `document_sources` nominations; each nomination

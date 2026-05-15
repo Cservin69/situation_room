@@ -21,7 +21,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use situation_room_api::commands::AppState;
 use situation_room_apps_common::sources::load_source_descriptors;
-use situation_room_llm::{AnthropicProvider, LlmProvider, XaiProvider};
+use situation_room_llm::{
+    AnthropicProvider, CostLedger, LlmProvider, MeteredProvider, XaiProvider,
+};
 use situation_room_secure::{
     http::{SecureHttpClient, SecureHttpConfig},
     logging,
@@ -158,6 +160,23 @@ fn main() -> Result<()> {
 
     let provider = pick_provider(http)?;
 
+    // --- Cost ledger + metered-provider wrap (Session 75) -----------
+    //
+    // The ledger is a process-wide tally keyed by (provider_id, tier).
+    // We hold the strong `Arc<CostLedger>` in `AppState` (so the
+    // `llm_cost_ledger` Tauri command reads from it without going
+    // through the provider) AND inside `MeteredProvider` (so every
+    // LlmProvider::complete call records here).
+    //
+    // Wrapping at the trait boundary catches every call site for free —
+    // classifier, recipe-author, propose-URL, re-author — without
+    // having to thread an accounting hook through each one. See
+    // `crates/llm/src/cost_ledger.rs` module docs for the wrap
+    // rationale.
+    let cost_ledger = Arc::new(CostLedger::new());
+    let provider: Arc<dyn LlmProvider + Send + Sync> =
+        Arc::new(MeteredProvider::new(provider, Arc::clone(&cost_ledger)));
+
     // --- Source descriptors -----------------------------------------
     //
     // Doc-narrowed under ADR 0015 (Session 37). The classifier no
@@ -181,6 +200,7 @@ fn main() -> Result<()> {
         provider,
         http_arc,
         prefetch_http_arc,
+        cost_ledger,
         CLASSIFIER_PROMPT,
         RECIPE_AUTHOR_PROMPT,
         PROPOSE_URL_PROMPT,
@@ -265,7 +285,15 @@ fn main() -> Result<()> {
             // `RecordsDashboard` so the operator's view of "what has
             // been collected" doesn't reset every time a fresh
             // classification lands.
-            situation_room_api::commands_records::records_recent_global
+            situation_room_api::commands_records::records_recent_global,
+            // Session 75 — LLM cost-by-tier ledger. Pure read over
+            // `AppState::cost_ledger.snapshot()`; the metered-provider
+            // wrap installed above accumulates every LLM completion's
+            // (input, output, cached) token totals keyed by
+            // (provider_id, tier). Drives the CostByTierPanel on the
+            // dashboard so the operator can see the Session-74 v1.22
+            // prompt-cache lever working without grepping INFO logs.
+            situation_room_api::commands::llm_cost_ledger
         ])
         .build(tauri::generate_context!())
         .context("building tauri")?;

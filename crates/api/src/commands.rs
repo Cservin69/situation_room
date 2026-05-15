@@ -46,8 +46,9 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use situation_room_llm::{LlmProvider, ModelTier};
+use situation_room_llm::{CostLedger, LlmProvider, ModelTier};
 use situation_room_pipeline::fetch_backoff::{BackoffFetcher, HostBackoff};
+use situation_room_pipeline::entity_synth::materialize_entity_exemplars;
 use situation_room_pipeline::fetch_executor::{
     run_fetch_for_plan as run_fetch_for_plan_impl, ExecutorContext, FetchExecutorError,
 };
@@ -149,6 +150,12 @@ pub struct AppState {
     /// runtime fetch in the same session, and across sessions until
     /// the binary restarts.
     pub host_backoff: Arc<HostBackoff>,
+    /// Session 75 — process-wide cost ledger. The provider is wrapped
+    /// in `MeteredProvider` in the composition root; that wrap holds
+    /// the same `Arc<CostLedger>` we keep here. Reading from the
+    /// dashboard goes through `llm_cost_ledger` which calls
+    /// `cost_ledger.snapshot()` directly — no provider round-trip.
+    pub cost_ledger: Arc<CostLedger>,
     pub classifier_prompt: &'static str,
     pub recipe_author_prompt: &'static str,
     /// The Session-39 propose-URL prompt — consumed by the fetch
@@ -193,6 +200,7 @@ impl AppState {
         provider: Arc<dyn LlmProvider + Send + Sync>,
         http: Arc<SecureHttpClient>,
         prefetch_http: Arc<SecureHttpClient>,
+        cost_ledger: Arc<CostLedger>,
         classifier_prompt: &'static str,
         recipe_author_prompt: &'static str,
         propose_url_prompt: &'static str,
@@ -211,6 +219,7 @@ impl AppState {
             // backoff schedule don't ripple through the binary
             // signatures.
             host_backoff: Arc::new(HostBackoff::new()),
+            cost_ledger,
             classifier_prompt,
             recipe_author_prompt,
             propose_url_prompt,
@@ -709,8 +718,70 @@ async fn set_status_and_load(
         .map_err(CommandError::from)?
         .ok_or_else(|| CommandError::NotFound { id: id.clone() })?;
 
+    // Session 76 — on accept, promote each `entity_kinds[*].exemplars[*]`
+    // to a persisted Entity row. Idempotent (the `entities.entity_id`
+    // UNIQUE index plus an upfront existence check absorb repeats), no
+    // LLM calls, never fails plan-accept: per-exemplar failures land in
+    // the returned `MaterializationReport.errors` and are logged once
+    // by the materialiser itself. We deliberately ignore the report
+    // here — the operator-visible signal is the dashboard's Entities
+    // panel lighting up, not an extra log line out of this command.
+    if matches!(new_status, PlanStatus::Accepted) {
+        match build_typed_plan_from_stored(&stored) {
+            Ok(plan) => {
+                let _ = materialize_entity_exemplars(
+                    &plan,
+                    state.store.as_ref(),
+                    chrono::Utc::now(),
+                );
+            }
+            Err(e) => {
+                warn!(
+                    plan_id = %parsed,
+                    error = %e,
+                    "accept_plan: entity exemplar materialisation skipped — \
+                     plan deserialisation failed; the per-plan dashboard \
+                     entities panel will stay empty for this plan"
+                );
+            }
+        }
+    }
+
     ResearchPlanDto::from_stored(stored).map_err(|e| CommandError::Storage {
         message: format!("plan deserialization: {e}"),
+    })
+}
+
+/// Reassemble the pipeline-typed [`ResearchPlan`] from a
+/// `StoredResearchPlan` row. Mirrors the JSON-decoding half of
+/// [`ResearchPlanDto::from_stored`] but yields the typed
+/// `pipeline::research::ResearchPlan` rather than the DTO — that's
+/// the shape `entity_synth::materialize_entity_exemplars` accepts.
+///
+/// Kept here (private) rather than in `pipeline::research_plans_store`
+/// because it's an `accept_plan`-local concern: every other caller
+/// either already has the typed plan in hand (the classifier path)
+/// or wants the DTO shape (every other command). Surfacing this in
+/// `research_plans_store` would invite drift between two near-
+/// identical builders.
+fn build_typed_plan_from_stored(
+    s: &situation_room_storage::research_plans::StoredResearchPlan,
+) -> Result<situation_room_pipeline::research::ResearchPlan, serde_json::Error> {
+    use situation_room_pipeline::research::{GeoScope, RecordExpectations, ResearchPlan};
+    let topic_tags: Vec<situation_room_core::vocab::Topic> =
+        serde_json::from_str(&s.topic_tags_json)?;
+    let geographic_scope: Vec<GeoScope> = serde_json::from_str(&s.geographic_scope_json)?;
+    let expectations: RecordExpectations = serde_json::from_str(&s.expectations_json)?;
+
+    Ok(ResearchPlan {
+        id: s.id,
+        topic: s.topic.clone(),
+        interpretation: s.interpretation.clone(),
+        topic_tags,
+        geographic_scope,
+        historical_window_days: s.historical_window_days,
+        expectations,
+        created_at: s.created_at,
     })
 }
 
@@ -2008,6 +2079,38 @@ pub async fn sources_memory(
     Ok(typed
         .into_iter()
         .map(SourcesMemoryEntryDto::from_typed)
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Command 17 — llm_cost_ledger (Session 75)
+// ---------------------------------------------------------------------------
+
+/// Snapshot of the LLM cost ledger — one row per `(provider, tier)`
+/// bucket the binary has seen completion responses for. Pure read; no
+/// LLM call, no fetch.
+///
+/// The ledger lives in [`AppState::cost_ledger`] and is populated by
+/// the `MeteredProvider` wrap installed in the desktop composition
+/// root. Rows accumulate across the whole binary session and reset on
+/// restart; persistence is intentionally out of scope (see the
+/// cost_ledger module docs).
+///
+/// **No source-specific routing.** The ledger is keyed on
+/// (provider_id, tier) — neither field carries host or model-name
+/// detail; the closed-vocabulary discipline holds.
+///
+/// Errors: none. Lock poisoning recovers in-band; missing per-call
+/// usage data surfaces as zeros without erroring (see Tally docs).
+#[tauri::command]
+pub async fn llm_cost_ledger(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<crate::types_export::LlmCostLedgerEntryDto>, CommandError> {
+    Ok(state
+        .cost_ledger
+        .snapshot()
+        .into_iter()
+        .map(crate::types_export::LlmCostLedgerEntryDto::from_typed)
         .collect())
 }
 

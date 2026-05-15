@@ -65,6 +65,7 @@
   import NominationAttempts from '$components/panels/NominationAttempts.svelte';
   import RecordCard from '$components/panels/RecordCard.svelte';
   import RecordsDashboard from '$components/RecordsDashboard.svelte';
+  import CostByTierPanel from '$components/CostByTierPanel.svelte';
   import RunFetchButton from '$components/RunFetchButton.svelte';
   import FetchReport from '$components/FetchReport.svelte';
   import RecipesPanel from '$components/RecipesPanel.svelte';
@@ -350,6 +351,11 @@
        for?". For the latter, flip to `buckets`. -->
   {#if recordsLoaded && totalRecords > 0 && recordsViewMode === 'dashboard' && plans.records}
     <RecordsDashboard records={plans.records} />
+    <!-- Session 75 — cost-by-tier ledger underneath the dashboard. Same
+         polling component used on the home view; it auto-refreshes on
+         its own interval so this drill-in surface and the home view stay
+         coherent. -->
+    <CostByTierPanel />
   {/if}
 
   <!-- Six bucket panels (legacy default, now toggle-gated).

@@ -27,6 +27,7 @@ import type { RecipeOutcomesHistoryEntryDto } from './types/RecipeOutcomesHistor
 import type { ExpectationCoverageRowDto } from './types/ExpectationCoverageRowDto';
 import type { HostBackoffSnapshotDto } from './types/HostBackoffSnapshotDto';
 import type { SourcesMemoryEntryDto } from './types/SourcesMemoryEntryDto';
+import type { LlmCostLedgerEntryDto } from './types/LlmCostLedgerEntryDto';
 
 /**
  * Run Level-1 classification on a topic. Persists the resulting plan
@@ -463,6 +464,27 @@ export async function hostBackoffState(): Promise<HostBackoffSnapshotDto[]> {
  */
 export async function sourcesMemory(): Promise<SourcesMemoryEntryDto[]> {
   return invoke<SourcesMemoryEntryDto[]>('sources_memory');
+}
+
+/**
+ * Snapshot of the LLM cost-by-tier ledger — one entry per
+ * `(provider, tier)` bucket the binary has seen completion responses
+ * for (Session 75). Pure read; no LLM call, no fetch.
+ *
+ * Entries arrive sorted (provider asc, tier in Frontier→Workhorse→
+ * Cheap order). Counts are cumulative for the current process; the
+ * ledger resets on every binary restart by design — the operator-
+ * visible value is intra-session ("does the v1.22 cache lever work
+ * right now?") and a process-restart-clean ledger is honest about
+ * that scope.
+ *
+ * `calls_with_cache_data == 0` means the provider didn't report any
+ * cache metadata; the dashboard tile renders that as "—" rather than
+ * "0%" so the operator can tell "provider doesn't expose it" apart
+ * from "cold prefix, true zero".
+ */
+export async function llmCostLedger(): Promise<LlmCostLedgerEntryDto[]> {
+  return invoke<LlmCostLedgerEntryDto[]>('llm_cost_ledger');
 }
 
 /**

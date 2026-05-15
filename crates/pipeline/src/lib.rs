@@ -69,6 +69,17 @@ pub mod url_pagination;
 // on the per-plan dashboard. Called from each `run_X_recipe` after
 // `fetch_recipe_bytes` returns Ok.
 pub mod document_synth;
+// Session 76 — plan-accept-time Entity exemplar materialisation.
+// The classifier already attaches `exemplars: Vec<EntityId>` to each
+// `EntityKindExpectation` (concrete actors the topic revolves around).
+// Pre-Session-76 those exemplars were dead weight — the recipe author
+// prompt explicitly blocks `entity_kind` production bindings, pointing
+// at a "registry lookup" path that never existed. This module promotes
+// each exemplar to an `Entity` row at plan-accept time so the
+// dashboard's Entities panel lights up before any fetching runs.
+// Closed-vocabulary, no LLM calls, idempotent via the
+// `entities.entity_id` UNIQUE constraint.
+pub mod entity_synth;
 // Session 70 / ADR 0009 amendment 2 — host-class-aware User-Agent
 // policy. A closed `UaPolicy` enum mirrors the `FetchOutcomeClass`
 // vocabulary in `fetch_classes`; each variant maps to one UA string

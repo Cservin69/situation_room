@@ -26,6 +26,16 @@ path = "src/main.rs"
 name = "host-probe"
 path = "src/bin/host_probe.rs"
 
+# Session 75 groundwork for ADR 0009 amendment 2 activation. Reads a
+# host-probe TSV on stdin and emits a Rust-syntax `HOST_CLASS_OVERRIDES`
+# snippet on stdout — the operator pastes the proposed entries into
+# `crates/pipeline/src/fetch_classes.rs` after reviewing them. No live
+# probe runs; no cargo invocations from the script itself. See the
+# binary's module docs for the column → class mapping.
+[[bin]]
+name = "host-probe-to-overrides"
+path = "src/bin/host_probe_to_overrides.rs"
+
 [dependencies]
 # Core workspace crates — same set the desktop binary uses, because
 # the harness is a non-Tauri composition root that mirrors the

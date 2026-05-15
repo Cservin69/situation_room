@@ -39,6 +39,7 @@
   import TopicInput from '$components/TopicInput.svelte';
   import RecentPlansList from '$components/RecentPlansList.svelte';
   import PlanReview from '$components/PlanReview.svelte';
+  import CostByTierPanel from '$components/CostByTierPanel.svelte';
 
   onMount(() => {
     // Populate the listing on app open. No LLM call. The cross-plan
@@ -88,6 +89,15 @@
                 an existing plan from the list to drill in.
               {/if}
             </p>
+            <!-- Session 75 — cost-by-tier ledger. Shows on the blank-
+                 canvas home so the operator sees the v1.22 prompt-cache
+                 lever working without grepping INFO logs. Renders
+                 nothing visually-disruptive when the ledger is empty —
+                 the "no LLM calls yet" hint matches the home view's
+                 minimal aesthetic. -->
+            <div class="home-cost-panel">
+              <CostByTierPanel />
+            </div>
           </div>
         </section>
       {/if}
@@ -169,8 +179,16 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
-    max-width: 480px;
+    max-width: 640px;
     text-align: center;
+  }
+  /* Session 75 — cost-by-tier panel sits below the centered headline,
+     left-aligned so the per-row tabular numbers read cleanly. Bumps
+     the vertical breathing room slightly so the panel doesn't crowd
+     the headline. */
+  .home-cost-panel {
+    margin-top: 24px;
+    text-align: left;
   }
   .home-headline {
     margin: 0;

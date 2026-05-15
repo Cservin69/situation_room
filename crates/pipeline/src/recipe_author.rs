@@ -748,12 +748,15 @@ pub struct AuthoredProductionBinding {
 /// The three record types a recipe may produce at authoring time.
 ///
 /// `Document` and `Entity` are excluded because they come from other
-/// paths (ingest and registry lookup respectively). `Assertion` is
-/// excluded because it carries a `claimant` and `stance` that a
-/// recipe's `field_mappings` don't populate — assertions are the
-/// LLM extraction layer's job (ADR 0004, ADR 0007). If we later
-/// want recipe-shaped assertions we'll need a separate binding
-/// shape for them.
+/// paths: documents from per-fetch synthesis (Session 69,
+/// `pipeline::document_synth`); entities from plan-accept-time
+/// materialisation of `entity_kinds[*].exemplars[*]` (Session 76,
+/// `pipeline::entity_synth`). `Assertion` is excluded because it
+/// carries a `claimant` and `stance` that a recipe's
+/// `field_mappings` don't populate — assertions are the LLM
+/// extraction layer's job (ADR 0004, ADR 0007). If we later want
+/// recipe-shaped assertions we'll need a separate binding shape
+/// for them.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthoredRecordType {

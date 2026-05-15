@@ -1831,7 +1831,10 @@ fn build_record(
                 index,
                 reason: format!(
                     "record_type {:?} is not producible from a recipe. \
-                     Documents come from ingest; entities come from registry lookup. \
+                     Documents come from ingest (per-fetch Document synthesis, \
+                     Session 69); entities are materialised at plan-accept time \
+                     from the classifier's entity_kinds[*].exemplars[*] \
+                     (Session 76 — see crates/pipeline/src/entity_synth.rs). \
                      Assertions come from the LLM extraction layer (they carry a \
                      claimant and stance that recipe field-mappings don't populate). \
                      See ADR 0007 and ADR 0004.",

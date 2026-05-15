@@ -261,10 +261,57 @@ impl AnthropicProvider {
     /// Build the JSON request body for a given tier + request. Pure —
     /// factored out so tests can assert the wire shape without a
     /// network call.
+    ///
+    /// ## Prompt-caching breakpoints (Session 75)
+    ///
+    /// Anthropic's prompt cache activates only when at least one
+    /// `cache_control: {type: "ephemeral"}` block appears on the
+    /// request. Today we place breakpoints in two positions, both
+    /// chosen so a future change can't accidentally invalidate the
+    /// cache by introducing per-call variability above the boundary:
+    ///
+    ///   - **tools[0]**: when the caller asks for structured output,
+    ///     the tool definition (name + description + input_schema)
+    ///     is large, identical across calls in the same campaign,
+    ///     and lives in a stable wire position. Always safe to mark
+    ///     cacheable.
+    ///   - **user content prefix**: the v1.22 recipe-author prompt
+    ///     (Session 74) puts every `{{VAR}}` substitution below a
+    ///     literal `## Concrete inputs` heading. When that marker
+    ///     appears in `req.user`, we split the user turn into two
+    ///     text blocks and mark the prefix cacheable. If the marker
+    ///     is absent (e.g. a legacy prompt or a small one-off call),
+    ///     we emit the user turn as a single uncached string —
+    ///     same wire shape as pre-Session-75, no behavioural change.
+    ///
+    /// Breakpoints below Anthropic's minimum-cacheable-prefix
+    /// threshold (1024 input tokens on the documented free tier
+    /// today) are silently ignored by the server, so adding a
+    /// breakpoint to a small call wastes the wire bytes but
+    /// produces a correctly uncached response — not a failure mode.
+    /// The recipe-author prompt is multiple orders of magnitude
+    /// above the threshold; for the classifier (~1k tokens) the
+    /// breakpoint may or may not bite depending on plan-line
+    /// length.
+    ///
+    /// ## What this is NOT
+    ///
+    /// - **Not source-specific.** The split rule is "look for a
+    ///   literal marker"; no host, no model, no plan. Closed-vocab
+    ///   discipline holds.
+    /// - **Not a guarantee of cache hits.** The wire shape only
+    ///   declares "this prefix is eligible for caching." The
+    ///   server decides whether it has matching bytes in its cache
+    ///   pool. The cost-by-tier ledger (Session 75 piece 1)
+    ///   surfaces the observed hit ratio.
     fn build_body(&self, tier: ModelTier, req: &CompletionRequest) -> Value {
-        // Anthropic messages array — system is NOT a message.
+        // Build the user content. Either a plain string (legacy
+        // path) or an array of text blocks with cache_control on the
+        // prefix.
+        let user_content = build_user_content_with_cache_breakpoint(&req.user);
+
         let messages = json!([
-            { "role": "user", "content": req.user }
+            { "role": "user", "content": user_content }
         ]);
 
         let mut body = json!({
@@ -275,7 +322,11 @@ impl AnthropicProvider {
         });
 
         if let Some(system) = &req.system {
-            // Top-level field, distinct from messages.
+            // Top-level field, distinct from messages. Today we leave
+            // system as a plain string — the production system text
+            // is small (~20 tokens) and well below the cache-prefix
+            // threshold, so converting it to the array form for
+            // cache_control would be performative.
             body["system"] = json!(system);
         }
 
@@ -288,11 +339,19 @@ impl AnthropicProvider {
             // The structured payload comes back as the tool_use's
             // `input` field — already a JSON object, no client-side
             // string parsing required.
+            //
+            // Session 75: mark the tool block cacheable. The schema
+            // is identical across every call in the same authoring
+            // campaign, so this is a free cache lever. The marker is
+            // safe even for small schemas — if the byte count is
+            // below the server-side threshold, the breakpoint is
+            // ignored without error.
             body["tools"] = json!([
                 {
                     "name": schema.name,
                     "description": "Return the requested structured output.",
                     "input_schema": schema.schema,
+                    "cache_control": { "type": "ephemeral" },
                 }
             ]);
             body["tool_choice"] = json!({
@@ -427,6 +486,68 @@ impl AnthropicProvider {
     fn last_requested_schema_name(&self) -> Option<&str> {
         None
     }
+}
+
+/// Literal marker that signals the per-call inputs section of the
+/// v1.22 recipe-author prompt (Session 74). When present in the user
+/// content, [`build_user_content_with_cache_breakpoint`] splits the
+/// text at the marker and marks the prefix cacheable.
+///
+/// The choice of marker matches the recipe-author prompt's
+/// changelog entry word-for-word; a documentation change that
+/// renames the heading must update both sides in the same commit, or
+/// the breakpoint silently stops firing and the cache lever
+/// regresses to "no cacheable prefix declared." See
+/// `config/prompts/recipe_author.md`.
+const CONCRETE_INPUTS_MARKER: &str = "## Concrete inputs";
+
+/// Convert the user turn's string into one of:
+///
+///   - a plain JSON string (no marker, legacy path, no cache breakpoint),
+///   - a 1-element array of one text block when the marker sits at
+///     the very start (degenerate — prefix would be empty so we don't
+///     bother declaring a breakpoint),
+///   - a 2-element array of two text blocks: a cacheable prefix
+///     ending immediately before the marker, and an uncached tail
+///     starting at the marker.
+///
+/// The marker is included with the **tail** block (not the prefix)
+/// so the prefix bytes are identical across calls: every call's
+/// prefix ends at the same byte sequence, immediately before
+/// `"## Concrete inputs"`. Including the marker on the prefix side
+/// would be wrong only if a future revision wanted to insert text
+/// after the marker but keep the same prefix — moving the marker
+/// to the tail side is the simpler invariant.
+fn build_user_content_with_cache_breakpoint(user: &str) -> Value {
+    // Look for the marker. If absent, ship the legacy plain-string
+    // shape — same wire bytes as pre-Session-75 builds, so this
+    // function is byte-for-byte non-disruptive on callsites whose
+    // prompts don't carry the marker.
+    let Some(idx) = user.find(CONCRETE_INPUTS_MARKER) else {
+        return Value::String(user.to_string());
+    };
+
+    if idx == 0 {
+        // Pathological: marker is at byte 0. No prefix to cache;
+        // emit the legacy plain-string form rather than a 1-element
+        // cache_control'd array whose declared prefix is empty.
+        return Value::String(user.to_string());
+    }
+
+    let prefix = &user[..idx];
+    let tail = &user[idx..];
+
+    json!([
+        {
+            "type": "text",
+            "text": prefix,
+            "cache_control": { "type": "ephemeral" },
+        },
+        {
+            "type": "text",
+            "text": tail,
+        }
+    ])
 }
 
 /// Predicate for the truncation-retry path. Pulled out so the borrow
@@ -790,6 +911,140 @@ mod tests {
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], json!("user"));
+    }
+
+    // -----------------------------------------------------------------
+    // Session 75 — Anthropic cache_control breakpoint plumbing
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_body_user_content_stays_plain_string_when_marker_absent() {
+        // No `## Concrete inputs` marker → legacy plain-string shape.
+        // Byte-for-byte compatible with pre-Session-75 builds; this
+        // test pins the absence-of-regression for callsites whose
+        // prompts don't carry the v1.22 marker.
+        let p = test_provider();
+        let req = CompletionRequest {
+            system: None,
+            user: "hello world, no marker here".into(),
+            schema: None,
+            max_tokens: 8,
+            temperature: 0.0,
+            reasoning_effort: None,
+        };
+        let body = p.build_body(ModelTier::Workhorse, &req);
+        let content = &body["messages"][0]["content"];
+        assert!(
+            content.is_string(),
+            "no marker → user content stays a plain string; got {content}"
+        );
+        assert_eq!(content.as_str().unwrap(), "hello world, no marker here");
+    }
+
+    #[test]
+    fn build_body_user_content_splits_around_marker_when_present() {
+        // The v1.22 prompt path: `## Concrete inputs` marker splits
+        // the user turn into a cacheable prefix and an uncached
+        // tail. Confirm the wire shape and the cache_control
+        // placement.
+        let p = test_provider();
+        let prompt = "Authoring rules go here.\n\nMore rules.\n\n## Concrete inputs\nplan_id=abc\n";
+        let req = CompletionRequest {
+            system: None,
+            user: prompt.into(),
+            schema: None,
+            max_tokens: 64,
+            temperature: 0.0,
+            reasoning_effort: None,
+        };
+        let body = p.build_body(ModelTier::Frontier, &req);
+        let content = &body["messages"][0]["content"];
+        let blocks = content.as_array().expect("array shape when marker present");
+        assert_eq!(blocks.len(), 2);
+        // Prefix block — cache_control attached, ends immediately
+        // before the marker.
+        assert_eq!(blocks[0]["type"], json!("text"));
+        assert_eq!(
+            blocks[0]["text"].as_str().unwrap(),
+            "Authoring rules go here.\n\nMore rules.\n\n"
+        );
+        assert_eq!(
+            blocks[0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        // Tail block — starts at the marker, no cache_control.
+        assert_eq!(blocks[1]["type"], json!("text"));
+        assert!(blocks[1]["text"].as_str().unwrap().starts_with("## Concrete inputs"));
+        assert!(blocks[1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn build_body_user_content_marker_at_start_falls_back_to_string() {
+        // Pathological: marker is at byte 0. No prefix to cache; fall
+        // back to legacy plain-string form rather than ship a 1-block
+        // array whose declared prefix is empty.
+        let p = test_provider();
+        let prompt = "## Concrete inputs\nplan_id=abc\n";
+        let req = CompletionRequest {
+            system: None,
+            user: prompt.into(),
+            schema: None,
+            max_tokens: 8,
+            temperature: 0.0,
+            reasoning_effort: None,
+        };
+        let body = p.build_body(ModelTier::Cheap, &req);
+        let content = &body["messages"][0]["content"];
+        assert!(content.is_string(), "marker-at-start falls back to string");
+    }
+
+    #[test]
+    fn build_body_tool_block_carries_cache_control_when_schema_set() {
+        // Symmetric lever: the tool definition is identical across
+        // every call in a campaign; mark it cacheable always.
+        let p = test_provider();
+        let schema = StructuredOutputSchema {
+            name: "Answer".into(),
+            schema: json!({
+                "type": "object",
+                "properties": { "answer": { "type": "string" } },
+                "required": ["answer"],
+                "additionalProperties": false,
+            }),
+        };
+        let req = CompletionRequest {
+            system: None,
+            user: "give me a json answer".into(),
+            schema: Some(schema),
+            max_tokens: 128,
+            temperature: 0.0,
+            reasoning_effort: None,
+        };
+        let body = p.build_body(ModelTier::Frontier, &req);
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0]["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "tool block must carry cache_control: ephemeral"
+        );
+    }
+
+    #[test]
+    fn build_user_content_with_cache_breakpoint_unit() {
+        // Direct unit test on the helper, complementing the
+        // through-build_body integration tests above.
+        let v = build_user_content_with_cache_breakpoint("just text");
+        assert!(v.is_string());
+
+        let v = build_user_content_with_cache_breakpoint(
+            "PREFIX\n## Concrete inputs\nTAIL",
+        );
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["text"].as_str().unwrap(), "PREFIX\n");
+        assert_eq!(arr[0]["cache_control"], json!({ "type": "ephemeral" }));
+        assert!(arr[1]["text"].as_str().unwrap().starts_with("## Concrete inputs"));
     }
 
     #[test]

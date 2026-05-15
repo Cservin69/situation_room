@@ -350,7 +350,9 @@ pub struct ProductionBinding {
     ///
     /// Only four are valid targets in practice — `Document` is
     /// produced directly by ingestion (it *is* the fetch), and
-    /// `Entity` is produced by registry lookup rather than by recipe.
+    /// `Entity` is materialised at plan-accept time from the
+    /// classifier's `entity_kinds[*].exemplars[*]` (Session 76;
+    /// see `entity_synth.rs`) rather than by recipe field-mappings.
     /// The other four (`Observation`, `Event`, `Relation`, `Assertion`)
     /// are the realistic targets. Validation of which types are
     /// actually permitted happens in the apply stage, not here.
