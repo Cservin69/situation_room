@@ -73,6 +73,16 @@ const DOCUMENT_ASSERTIONS_PROMPT: &str =
 const DOCUMENT_EVENTS_PROMPT: &str =
     include_str!("../../../../config/prompts/document_events.md");
 
+/// Session 79 — per-Document Observation extractor prompt. Third
+/// sibling of `DOCUMENT_ASSERTIONS_PROMPT` and
+/// `DOCUMENT_EVENTS_PROMPT`; same loading pattern. Consumed by
+/// `pipeline::extract::extract_and_persist_observations` once per
+/// fetched article-kind Document, gated upstream on plan-declared
+/// `observation_metrics` (cost-bounded for plans that don't track
+/// numeric observations).
+const DOCUMENT_OBSERVATIONS_PROMPT: &str =
+    include_str!("../../../../config/prompts/document_observations.md");
+
 fn main() -> Result<()> {
     // .env is a dev convenience; the real environment always wins.
     // Walks up from CWD to find .env at the workspace root and
@@ -223,6 +233,7 @@ fn main() -> Result<()> {
         PROPOSE_URL_PROMPT,
         DOCUMENT_ASSERTIONS_PROMPT,
         DOCUMENT_EVENTS_PROMPT,
+        DOCUMENT_OBSERVATIONS_PROMPT,
         sources,
     );
 

@@ -40,13 +40,16 @@
 //!   (future work) will dedup at the cross-source consensus layer.
 
 use chrono::{DateTime, Utc};
-use situation_room_core::schema::content::{AssertedContent, EventContent, RelationContent};
+use situation_room_core::schema::content::{
+    AssertedContent, EventContent, ObservationContent, RelationContent,
+};
 use situation_room_core::schema::envelope::{Envelope, Provenance, Subjects};
-use situation_room_core::schema::records::{Assertion, Event};
+use situation_room_core::schema::records::{Assertion, Event, Observation};
 use situation_room_core::vocab::Confidence;
 use situation_room_llm::{
-    extract_assertions_from_document, extract_events_from_document, AssertionDraft, EventDraft,
-    ExtractionConfig, LlmProvider,
+    extract_assertions_from_document, extract_events_from_document,
+    extract_observations_from_document, AssertionDraft, EventDraft, ExtractionConfig, LlmProvider,
+    ObservationDraft,
 };
 use situation_room_storage::Store;
 use tracing::{info, warn};
@@ -472,6 +475,229 @@ pub fn build_event(
     };
 
     Event::new(envelope, content)
+}
+
+// ---------------------------------------------------------------------------
+// Per-Document Observation extraction orchestrator (Session 79)
+// ---------------------------------------------------------------------------
+//
+// Third sibling to `extract_and_persist_assertions` (Session 77) and
+// `extract_and_persist_events` (Session 78). The fetch executor calls
+// this once per persisted Document, gated identically to the other
+// two (article-kind + non-empty body). The orchestrator:
+//
+//   1. Reads the plan's declared `observation_metrics[].name` list and
+//      hands it to the LLM extractor as the closed-vocab gate.
+//   2. Calls `llm::extraction::extract_observations_from_document`. If
+//      the plan declared no metrics, the LLM call is skipped entirely
+//      (the extractor short-circuits before touching the provider) —
+//      so plans-without-observations don't burn workhorse tokens.
+//   3. Wraps each returned [`ObservationDraft`] in an `Observation`
+//      envelope provenanced to the recipe (same source_id shape
+//      `recipe_apply` and `build_assertion` use, so
+//      `records_for_plan`'s LIKE join surfaces the Observation under
+//      the originating plan's dashboard).
+//   4. Persists each `Observation` via `Store::insert_observation`.
+//
+// ## Scope (v1)
+//
+// - **Strict closed-vocabulary.** The extractor only emits metrics
+//   in `plan.expectations.observation_metrics[].name` — out-of-vocab
+//   names are dropped at the LLM layer and counted via warn logs
+//   there. The runtime path here trusts that filter.
+// - **No retry.** Same posture as the two earlier extractors: a
+//   failed LLM call or parse error warn-logs and returns an empty
+//   report.
+// - **Persistence failures don't fail the recipe.** Per-observation
+//   insert failures warn-log and the loop continues.
+//
+// ## What this orchestrator does NOT do
+//
+// - Dedup observations across re-fetches. Each fetch produces a
+//   fresh batch of Observation rows; the promote stage (future work)
+//   will dedup at the cross-source consensus layer.
+// - Fall through to the assertion or event extractor or vice versa.
+//   The three are independent LLM calls so a regression in one
+//   doesn't take the others down.
+// - Carry the `MetricExpectation.unit_hint` through to the
+//   extractor. The hint is a classifier-time estimate; the LLM emits
+//   whatever unit the document reports, and a future promote stage
+//   will reconcile across hints. Today's surface keeps the closed-vocab
+//   gate on `name` only — the same shape the dashboard's per-metric
+//   tile keys off.
+
+/// Per-Document observation extraction entry point. Called by each
+/// `run_X_recipe` in `fetch_executor.rs` after the assertion + event
+/// extraction calls, with the same inputs.
+///
+/// Returns an [`ExtractionReport`] for observability; the caller
+/// ignores it today (the operator-visible signal is the dashboard
+/// per-metric tiles ticking up). Errors are absorbed into the report;
+/// this function never returns `Err`.
+pub async fn extract_and_persist_observations(
+    store: &Store,
+    provider: &dyn LlmProvider,
+    extraction_prompt: &str,
+    plan: &crate::research::ResearchPlan,
+    recipe: &FetchRecipe,
+    bytes: &[u8],
+    response_content_type: Option<&str>,
+    fetched_at: DateTime<Utc>,
+) -> ExtractionReport {
+    let mut report = ExtractionReport::default();
+
+    let mime = response_content_type.map(normalise_mime).unwrap_or_default();
+    if !should_extract_from(&mime, bytes.len()) {
+        return report;
+    }
+
+    // Collect the plan's declared metric names. Empty list short-
+    // circuits the LLM call inside `extract_observations_from_document`
+    // so plans that don't track observations don't burn workhorse
+    // tokens.
+    let allowed_owned: Vec<String> = plan
+        .expectations
+        .observation_metrics
+        .iter()
+        .map(|m| m.name.clone())
+        .collect();
+    if allowed_owned.is_empty() {
+        return report;
+    }
+    let allowed_refs: Vec<&str> = allowed_owned.iter().map(|s| s.as_str()).collect();
+
+    let body = document_synth::body_preview_for_mime(&mime, bytes);
+    if body.trim().is_empty() {
+        return report;
+    }
+
+    let cfg = ExtractionConfig::default();
+    let topic = plan.topic.as_str();
+    let source_url = recipe.source_url.as_str();
+
+    let drafts = match extract_observations_from_document(
+        provider,
+        &cfg,
+        extraction_prompt,
+        topic,
+        source_url,
+        &mime,
+        &body,
+        &allowed_refs,
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(
+                recipe_id = %recipe.id,
+                error = %e,
+                "document observation extraction LLM call failed; skipping this Document's observations"
+            );
+            report.call_error = Some(e.to_string());
+            return report;
+        }
+    };
+
+    report.extracted = drafts.len() as u32;
+    if drafts.is_empty() {
+        info!(
+            recipe_id = %recipe.id,
+            "document observation extraction returned no observations (empty list is a legal outcome)"
+        );
+        return report;
+    }
+
+    for draft in drafts {
+        let observation = build_observation(plan, recipe, &draft, fetched_at);
+        match store.insert_observation(&observation) {
+            Ok(()) => report.persisted += 1,
+            Err(e) => {
+                report.insert_failures += 1;
+                warn!(
+                    recipe_id = %recipe.id,
+                    observation_id = %observation.id,
+                    error = %e,
+                    "failed to persist extracted Observation; continuing with the rest of the batch"
+                );
+            }
+        }
+    }
+
+    info!(
+        recipe_id = %recipe.id,
+        extracted = report.extracted,
+        persisted = report.persisted,
+        insert_failures = report.insert_failures,
+        "document observation extraction complete"
+    );
+
+    report
+}
+
+/// Build one [`Observation`] from a validated [`ObservationDraft`].
+/// Pure function — no I/O — so tests can pin the envelope shape.
+///
+/// `source_id` follows the same `{source}#recipe:{id}@v{ver}` format
+/// as `build_assertion` / `build_event` / `recipe_apply::build_record`,
+/// so `records_for_plan`'s LIKE join surfaces the Observation under
+/// the originating plan.
+///
+/// When the LLM extracted a `when` timestamp, it lands on
+/// `envelope.valid_at` — the dashboard's per-metric tile renders
+/// against valid_at. When `when` is `None`, valid_at stays `None` and
+/// downstream consumers fall back to `observed_at` for ordering (the
+/// timestamp the document was fetched).
+pub fn build_observation(
+    plan: &crate::research::ResearchPlan,
+    recipe: &FetchRecipe,
+    draft: &ObservationDraft,
+    fetched_at: DateTime<Utc>,
+) -> Observation {
+    let provenance = Provenance {
+        source_id: format!(
+            "{}#recipe:{}@v{}",
+            recipe.source_id, recipe.id, recipe.version
+        ),
+        source_url: Some(recipe.source_url.to_string()),
+        source_published_at: None,
+        license: "extracted".into(),
+        derived_from: vec![],
+    };
+
+    let subjects = Subjects {
+        // Observations don't carry actors the way Events do; topics
+        // alone are enough to route the row to the plan dashboard via
+        // the topic_tags LIKE join. A future session may decide to
+        // prompt the LLM for a single subject entity (e.g. the
+        // company a `revenue` observation belongs to); today's v1
+        // keeps the surface narrow.
+        entities: vec![],
+        places: vec![],
+        time: None,
+        topics: plan.topic_tags.clone(),
+    };
+
+    let envelope = Envelope {
+        provenance,
+        subjects,
+        tags: vec![],
+        valid_at: draft.when,
+        observed_at: fetched_at,
+        confidence: draft.confidence,
+    };
+
+    let content = ObservationContent {
+        metric: draft.metric.clone(),
+        value: draft.value,
+        unit: draft.unit.clone(),
+        value_uncertainty: draft.value_uncertainty,
+        currency: draft.currency.clone(),
+        period: draft.period.clone(),
+        geometry: None,
+    };
+
+    Observation::new(envelope, content)
 }
 
 // ---------------------------------------------------------------------------

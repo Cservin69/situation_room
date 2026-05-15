@@ -180,6 +180,15 @@ pub struct AppState {
     /// declared `event_kinds` short-circuit before the workhorse-tier
     /// call.
     pub document_events_prompt: &'static str,
+    /// Session 79 — per-Document Observation extraction prompt.
+    /// Third sibling of the assertion + event extraction prompts.
+    /// Consumed by `pipeline::extract::extract_and_persist_observations`,
+    /// called by each run_X_recipe runner immediately after the
+    /// event extraction call. Same loading pattern (compile-time
+    /// `include_str!`). Cost is gated upstream: plans with no
+    /// declared `observation_metrics` short-circuit before the
+    /// workhorse-tier call.
+    pub document_observations_prompt: &'static str,
     /// Doc-narrowed under ADR 0015 (Session 37). The classifier no
     /// longer consults this list; only the executor's `#[ignore]`
     /// live tests do (against `csv_demo` / `json_demo`). Production
@@ -224,6 +233,7 @@ impl AppState {
         propose_url_prompt: &'static str,
         document_assertions_prompt: &'static str,
         document_events_prompt: &'static str,
+        document_observations_prompt: &'static str,
         sources: Vec<PipelineSourceDescriptor>,
     ) -> Self {
         Self {
@@ -245,6 +255,7 @@ impl AppState {
             propose_url_prompt,
             document_assertions_prompt,
             document_events_prompt,
+            document_observations_prompt,
             sources,
         }
     }
@@ -1081,6 +1092,11 @@ pub async fn run_fetch_for_plan(
         // `Some(_)`; the eval harness composition root passes
         // `None` to keep cost bounded for repeat trials.
         document_events_prompt: Some(state.document_events_prompt),
+        // Session 79 — per-Document Observation extraction prompt.
+        // Same posture as the assertion + event prompts above:
+        // production passes `Some(_)`; the eval harness composition
+        // root passes `None` to keep cost bounded for repeat trials.
+        document_observations_prompt: Some(state.document_observations_prompt),
         // The same slice the classifier sees, threaded through to
         // the executor. Doc-narrowed under ADR 0015 (Session 37) and
         // further under Session 39: production authoring no longer

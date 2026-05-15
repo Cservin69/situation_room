@@ -38,6 +38,21 @@
     /** One-line representative sample (headline, canonical_name, etc.). May be empty. */
     sample: string;
     /**
+     * Session 79 — optional multi-sample list. When the underlying
+     * group contains multiple records that each have a distinct
+     * sample line (entities of kind `company`: rusal, alcoa, …;
+     * relations of kind `supplies_to`: rio_tinto → tsla,
+     * panasonic → tsla, …), pass the full list here so all rows
+     * surface, not just the first.
+     *
+     * The card deduplicates and caps to `SAMPLES_RENDER_CAP`; a
+     * count of distinct sample strings beyond the cap is surfaced
+     * as `+ N more`. Empty / null / single-entry arrays fall through
+     * to the single-string `sample` rendering, which keeps existing
+     * call sites unchanged.
+     */
+    samples?: string[] | null;
+    /**
      * Short timestamp label for the latest record in this group.
      * Year-only for annual, ISO date otherwise. Empty when no
      * usable timestamp is available.
@@ -81,12 +96,44 @@
     kind,
     count,
     sample,
+    samples = null,
     when = '',
     sourceHost = '',
     sourceUrl = '',
     chartSeries = null,
     onOpen = null,
   }: Props = $props();
+
+  /*
+    Session 79 — render-cap on the multi-sample list. Plans that
+    extracted dozens of entities of the same kind (a global supply-
+    chain plan with many companies, say) shouldn't blow up the card
+    height; we cap at 8 visible lines and surface the overflow as a
+    single `+ N more` row. The cap is intentionally above 5 so plans
+    with realistic kind-cardinality (5-7 companies, 3-5 mines) show
+    in full without an overflow indicator at all — the indicator only
+    appears when the cap actually bites.
+  */
+  const SAMPLES_RENDER_CAP = 8;
+
+  let dedupedSamples = $derived.by(() => {
+    if (!samples) return [] as string[];
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const s of samples) {
+      const t = (s ?? '').trim();
+      if (t.length === 0) continue;
+      if (seen.has(t)) continue;
+      seen.add(t);
+      out.push(t);
+    }
+    return out;
+  });
+  let visibleSamples = $derived(dedupedSamples.slice(0, SAMPLES_RENDER_CAP));
+  let samplesOverflow = $derived(
+    Math.max(0, dedupedSamples.length - visibleSamples.length),
+  );
+  let useSamplesList = $derived(dedupedSamples.length > 1);
 
   // Click handler that ignores clicks on the source-copy button and
   // any links/buttons nested inside the card. Without this guard,
@@ -143,7 +190,25 @@
     <span class="count" title="{count} record{count === 1 ? '' : 's'}">×{count}</span>
   </header>
 
-  {#if chartSeries && chartSeries.points.length > 0}
+  {#if useSamplesList}
+    <!-- Session 79 — multi-sample list. The card surfaces every
+         distinct sample line in the group (deduped, capped at
+         SAMPLES_RENDER_CAP), so a `COMPANY ×4` group shows all four
+         company names rather than just the first. Overflow beyond the
+         cap is surfaced as a single `+ N more` row. The chart-preview
+         branch takes precedence for Documents (where the chart is the
+         load-bearing first-doc affordance); panels that don't pass
+         `samples` fall through to the original single-`sample`
+         render. -->
+    <ul class="samples">
+      {#each visibleSamples as s (s)}
+        <li class="sample-line" title={s}>{s}</li>
+      {/each}
+      {#if samplesOverflow > 0}
+        <li class="sample-overflow">+ {samplesOverflow} more</li>
+      {/if}
+    </ul>
+  {:else if chartSeries && chartSeries.points.length > 0}
     <!-- Session 69 — chart preview (Path B). Renders when the
          caller detected a time-series shape in the underlying
          record's body. The sparkline scales freely inside the
@@ -249,6 +314,35 @@
   .sample.missing {
     color: var(--fg-tertiary);
     font-style: italic;
+  }
+
+  /* Session 79 — multi-sample list. Stacked, no bullets, monospace
+     for symbols-and-IDs readability (entity slugs and relation
+     `from → to` pairs both look better in mono). Each line ellipses
+     individually so a long canonical_name doesn't force a wider card.
+     The overflow row uses the same tertiary-color treatment as
+     `.sample.missing` so it reads as metadata, not as another row. */
+  .samples {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--fg-primary);
+    font-family: var(--font-mono);
+  }
+  .sample-line {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sample-overflow {
+    color: var(--fg-tertiary);
+    font-style: italic;
+    font-family: var(--font-sans, inherit);
   }
 
   /* Session 69 — chart preview (Path B). Sits where the .sample

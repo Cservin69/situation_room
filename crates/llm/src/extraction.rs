@@ -709,6 +709,367 @@ fn event_extraction_schema_value(allowed_event_types: &[&str]) -> serde_json::Va
 }
 
 // ---------------------------------------------------------------------------
+// Per-Document Observation extraction (Session 79)
+// ---------------------------------------------------------------------------
+//
+// Third sibling path alongside the relation-shaped assertion extractor
+// (Session 77) and the discrete-event extractor (Session 78). Where
+// the relation extractor emits SPO triples and the event extractor
+// emits dated occurrences, the observation extractor emits
+// `(metric, value, unit, period, when)` numeric measurements that the
+// pipeline orchestrator wraps in `Observation` rows.
+//
+// **Closed-vocabulary `metric`.** The caller hands the extractor the
+// plan's declared `observation_metrics[].name` list; the schema bakes
+// those as a JSON-Schema `enum` so a schema-respecting provider rejects
+// out-of-vocab metric names upstream. The validator defends against
+// lax providers by re-checking membership. This mirrors the same
+// closed-vocab discipline the event extractor enforces — the dashboard's
+// per-metric tiles can only light up for metrics the plan declared.
+
+/// Wire shape for one observation the LLM emits, before validation.
+/// Like [`RawExtractedEvent`], loosely-typed; the validator
+/// ([`validate_observation_one`]) projects to typed
+/// [`ObservationDraft`] and drops malformed rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawExtractedObservation {
+    /// Metric name. Must be one of the plan's declared
+    /// `observation_metrics[].name` strings (see
+    /// `extract_observations_from_document`'s `allowed_metrics`
+    /// argument). Out-of-vocab names fail the closed-vocab gate in
+    /// [`validate_observation_one`].
+    pub metric: String,
+    /// The measured numeric value. Free-form; range checking is left
+    /// to the consumer (a negative price should not silently drop —
+    /// downstream consensus is responsible for outlier detection).
+    pub value: f64,
+    /// UCUM-style unit string (`USD/t`, `%`, `t`, `MWh`, `1`).
+    /// Validated via [`Unit::new`] in the validator; rows whose unit
+    /// fails the constructor are dropped (a value with no unit is
+    /// useless downstream).
+    pub unit: String,
+    /// Optional symmetric uncertainty bound (absolute, same unit as
+    /// value). Most narrative documents don't supply uncertainty;
+    /// `None` is the common case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_uncertainty: Option<f64>,
+    /// Optional ISO 4217 currency code (`USD`, `EUR`, `JPY`).
+    /// Validated via [`Currency::new`]; bad values map to `None`
+    /// without dropping the row (the unit usually carries currency
+    /// info via `USD/t`-style composites, so a malformed standalone
+    /// currency is non-fatal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// Period the measurement covers. Closed vocabulary matching
+    /// [`ObservationPeriod`]'s `instant`/`daily`/`weekly`/`monthly`/
+    /// `quarterly`/`annual` snake_case wire forms. Unknown values
+    /// drop the row (the period is structurally required on
+    /// `ObservationContent` and there is no safe default).
+    pub period: String,
+    /// Optional ISO-8601 / RFC-3339 datetime the measurement was
+    /// taken (or for a forecast, the date the value applies to).
+    /// Parsed via `chrono::DateTime::parse_from_rfc3339`; parse
+    /// failures map to `None` and the row still emits with the
+    /// fetched-at timestamp as `observed_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+    /// 0.0..=1.0 confidence. Clamped in [`validate_observation_one`].
+    pub confidence: f64,
+}
+
+/// LLM wire envelope for the observation extractor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawExtractedObservations {
+    #[serde(default)]
+    pub observations: Vec<RawExtractedObservation>,
+}
+
+/// Typed projection of one extracted observation, ready for the
+/// pipeline orchestrator to wrap in an
+/// [`Observation`](situation_room_core::schema::records::Observation)
+/// envelope.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservationDraft {
+    pub metric: String,
+    pub value: f64,
+    pub unit: situation_room_core::vocab::Unit,
+    pub value_uncertainty: Option<f64>,
+    pub currency: Option<situation_room_core::vocab::Currency>,
+    pub period: situation_room_core::schema::content::ObservationPeriod,
+    pub when: Option<DateTime<Utc>>,
+    pub confidence: situation_room_core::vocab::Confidence,
+}
+
+/// Run one observation-extraction pass against a Document body.
+///
+/// `allowed_metrics` is the plan's declared
+/// `observation_metrics[].name` list — the schema enum + the
+/// validator's closed-vocab gate both key off it. If the slice is
+/// empty the function returns `Ok(vec![])` without calling the
+/// provider: a plan that declared no metrics is a plan that doesn't
+/// want observations from this Document. Cost-bounded by design,
+/// matching the event-extractor posture.
+///
+/// Returns **valid** drafts only. Invalid rows (out-of-vocab metric,
+/// invalid unit, unknown period) are warn-logged and dropped. An
+/// empty Vec is a legal outcome.
+pub async fn extract_observations_from_document(
+    provider: &dyn LlmProvider,
+    cfg: &ExtractionConfig,
+    prompt_template: &str,
+    topic: &str,
+    source_url: &str,
+    mime: &str,
+    body: &str,
+    allowed_metrics: &[&str],
+) -> Result<Vec<ObservationDraft>, ExtractionError> {
+    if allowed_metrics.is_empty() {
+        // No declared metrics → nothing to extract under the
+        // closed-vocab discipline. The orchestrator surfaces this as
+        // a silent skip; logs at the call site if the operator wants
+        // visibility.
+        return Ok(Vec::new());
+    }
+
+    let user = build_observation_extraction_prompt(
+        prompt_template,
+        topic,
+        source_url,
+        mime,
+        body,
+        allowed_metrics,
+    );
+    let schema = observation_extraction_schema_value(allowed_metrics);
+
+    let req = CompletionRequest {
+        system: Some(
+            "You are the situation_room document-extraction layer. \
+             Read the supplied document body and emit only numeric \
+             observations whose metric is one of the allowed names. \
+             Output only JSON conforming to the provided schema. \
+             No prose outside the JSON."
+                .to_string(),
+        ),
+        user,
+        schema: Some(StructuredOutputSchema {
+            name: "DocumentObservations".to_string(),
+            schema,
+        }),
+        // Output is a small JSON list; 2048 covers ~25 observations
+        // comfortably (per-row payload is a touch lighter than events
+        // — no actors[] array — so headroom is similar).
+        max_tokens: 2048,
+        // Extraction is mechanical: low temperature, deterministic.
+        temperature: 0.0,
+        // Tier mapping picks the per-tier default; no per-call override.
+        reasoning_effort: None,
+    };
+
+    let resp = provider.complete(cfg.tier, req).await?;
+    let drafts = parse_observations_response(&resp, allowed_metrics)?;
+    Ok(drafts)
+}
+
+/// Pure helper: render the observation prompt template. Adds the
+/// `{{ALLOWED_METRICS}}` substitution on top of the four substitutions
+/// [`build_extraction_prompt`] already does — the closed-vocab list
+/// is comma-separated so the LLM sees it inline in the prompt body,
+/// not buried in the JSON schema.
+pub fn build_observation_extraction_prompt(
+    template: &str,
+    topic: &str,
+    source_url: &str,
+    mime: &str,
+    body: &str,
+    allowed_metrics: &[&str],
+) -> String {
+    let allowed_joined = allowed_metrics.join(", ");
+    build_extraction_prompt(template, topic, source_url, mime, body)
+        .replace("{{ALLOWED_METRICS}}", &allowed_joined)
+}
+
+/// Parse a [`CompletionResponse`] into validated observation drafts.
+/// Split out for testability: synthetic responses exercise the
+/// closed-vocab + parse branches without standing up a provider.
+pub fn parse_observations_response(
+    resp: &CompletionResponse,
+    allowed_metrics: &[&str],
+) -> Result<Vec<ObservationDraft>, ExtractionError> {
+    let raw_value = resp
+        .structured
+        .as_ref()
+        .ok_or(ExtractionError::NoStructuredOutput)?;
+
+    let parsed: RawExtractedObservations = serde_json::from_value(raw_value.clone())
+        .map_err(|e| ExtractionError::OutputParse(e.to_string()))?;
+
+    let mut drafts = Vec::with_capacity(parsed.observations.len());
+    for raw in parsed.observations {
+        match validate_observation_one(raw, allowed_metrics) {
+            Ok(draft) => drafts.push(draft),
+            Err(reason) => {
+                warn!(
+                    reason = %reason,
+                    "document extractor dropped malformed observation"
+                );
+            }
+        }
+    }
+    Ok(drafts)
+}
+
+/// Project one [`RawExtractedObservation`] to [`ObservationDraft`].
+/// Drops the row when:
+///   - `metric` is empty after trim
+///   - `metric` is not in `allowed_metrics` (closed-vocab gate)
+///   - `unit` fails [`Unit::new`] (empty, too long, contains
+///     whitespace/control chars)
+///   - `period` is not one of the closed vocabulary names
+///
+/// `value_uncertainty` passes through. `currency` parses leniently —
+/// bad values become `None` without dropping the row. `when` parses
+/// RFC-3339; bad input becomes `None`. Confidence is clamped to
+/// `[0.0, 1.0]`.
+fn validate_observation_one(
+    raw: RawExtractedObservation,
+    allowed_metrics: &[&str],
+) -> Result<ObservationDraft, String> {
+    use situation_room_core::vocab::{Confidence, Currency, Unit};
+
+    let metric_s = raw.metric.trim();
+    if metric_s.is_empty() {
+        return Err("empty metric".into());
+    }
+    if !allowed_metrics.iter().any(|m| *m == metric_s) {
+        return Err(format!(
+            "metric `{metric_s}` not in plan's declared observation_metrics; \
+             dropping under closed-vocab discipline"
+        ));
+    }
+
+    let unit = Unit::new(raw.unit.trim())
+        .map_err(|e| format!("invalid unit `{}`: {e:?}", raw.unit))?;
+
+    let period = parse_observation_period(&raw.period)
+        .ok_or_else(|| format!("unknown period `{}`", raw.period))?;
+
+    let currency = raw
+        .currency
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| Currency::new(s).ok());
+
+    let when = raw
+        .when
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+
+    let confidence = Confidence::clamp(raw.confidence as f32);
+
+    Ok(ObservationDraft {
+        metric: metric_s.to_string(),
+        value: raw.value,
+        unit,
+        value_uncertainty: raw.value_uncertainty,
+        currency,
+        period,
+        when,
+        confidence,
+    })
+}
+
+/// Closed-vocab parser for the LLM's `period` string. Lowercase
+/// match against the snake_case wire forms of
+/// [`ObservationPeriod`]'s non-`Custom` variants. We deliberately do
+/// not surface the `Custom(String)` variant from this path — letting
+/// the LLM emit arbitrary ISO-8601 period strings would widen the
+/// extractor's surface area beyond what closed-vocab discipline
+/// admits, and downstream rollups would have to special-case the
+/// shape. A future session can add a structured `custom_iso8601`
+/// emission path if a real source needs it.
+fn parse_observation_period(
+    raw: &str,
+) -> Option<situation_room_core::schema::content::ObservationPeriod> {
+    use situation_room_core::schema::content::ObservationPeriod;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "instant" => Some(ObservationPeriod::Instant),
+        "daily" => Some(ObservationPeriod::Daily),
+        "weekly" => Some(ObservationPeriod::Weekly),
+        "monthly" => Some(ObservationPeriod::Monthly),
+        "quarterly" => Some(ObservationPeriod::Quarterly),
+        "annual" => Some(ObservationPeriod::Annual),
+        _ => None,
+    }
+}
+
+/// The JSON Schema constraint we hand the provider for observation
+/// extraction. Bakes `allowed_metrics` as a closed `enum` on the
+/// `metric` field so a schema-respecting provider rejects out-of-vocab
+/// names upstream. The validator still defends against lax providers
+/// (see [`validate_observation_one`]).
+///
+/// `period` is enum-constrained at the schema level (matches
+/// `ObservationPeriod`'s non-`Custom` snake_case wire forms);
+/// `currency` and `when` are free-form strings parsed in the validator.
+fn observation_extraction_schema_value(allowed_metrics: &[&str]) -> serde_json::Value {
+    let allowed_json: Vec<serde_json::Value> = allowed_metrics
+        .iter()
+        .map(|s| serde_json::Value::String((*s).to_string()))
+        .collect();
+
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "observations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "metric": {
+                            "type": "string",
+                            "enum": allowed_json
+                        },
+                        "value": { "type": "number" },
+                        "unit": { "type": "string" },
+                        "value_uncertainty": { "type": "number" },
+                        "currency": { "type": "string" },
+                        "period": {
+                            "type": "string",
+                            "enum": [
+                                "instant",
+                                "daily",
+                                "weekly",
+                                "monthly",
+                                "quarterly",
+                                "annual"
+                            ]
+                        },
+                        "when": { "type": "string" },
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0
+                        }
+                    },
+                    "required": [
+                        "metric",
+                        "value",
+                        "unit",
+                        "period",
+                        "confidence"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["observations"],
+        "additionalProperties": false
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1195,6 +1556,316 @@ mod tests {
             .unwrap();
         let drafts = rt
             .block_on(extract_events_from_document(
+                &provider,
+                &cfg,
+                "template",
+                "topic",
+                "url",
+                "text/html",
+                "body",
+                &[],
+            ))
+            .expect("should succeed without calling provider");
+        assert!(drafts.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Per-Document Observation extraction tests (Session 79)
+    // -------------------------------------------------------------------
+
+    use situation_room_core::schema::content::ObservationPeriod;
+    use situation_room_core::vocab::{Currency, Unit};
+
+    #[test]
+    fn build_observation_extraction_prompt_substitutes_all_placeholders() {
+        let template = "topic=`{{TOPIC}}` url=`{{SOURCE_URL}}` mime=`{{MIME}}` \
+                        body=`{{BODY}}` metrics=`{{ALLOWED_METRICS}}`";
+        let out = build_observation_extraction_prompt(
+            template,
+            "nvidia stock price",
+            "https://example.test/p",
+            "text/html",
+            "Hello",
+            &["price", "volume"],
+        );
+        assert!(out.contains("topic=`nvidia stock price`"));
+        assert!(out.contains("url=`https://example.test/p`"));
+        assert!(out.contains("mime=`text/html`"));
+        assert!(out.contains("body=`Hello`"));
+        assert!(out.contains("metrics=`price, volume`"));
+    }
+
+    #[test]
+    fn parse_observation_period_accepts_all_closed_variants() {
+        assert_eq!(
+            parse_observation_period("instant"),
+            Some(ObservationPeriod::Instant)
+        );
+        assert_eq!(
+            parse_observation_period("daily"),
+            Some(ObservationPeriod::Daily)
+        );
+        assert_eq!(
+            parse_observation_period("weekly"),
+            Some(ObservationPeriod::Weekly)
+        );
+        assert_eq!(
+            parse_observation_period("monthly"),
+            Some(ObservationPeriod::Monthly)
+        );
+        assert_eq!(
+            parse_observation_period("quarterly"),
+            Some(ObservationPeriod::Quarterly)
+        );
+        assert_eq!(
+            parse_observation_period("annual"),
+            Some(ObservationPeriod::Annual)
+        );
+        // Case + whitespace tolerance.
+        assert_eq!(
+            parse_observation_period("  INSTANT  "),
+            Some(ObservationPeriod::Instant)
+        );
+    }
+
+    #[test]
+    fn parse_observation_period_rejects_unknown_and_custom() {
+        assert!(parse_observation_period("yearly").is_none());
+        assert!(parse_observation_period("").is_none());
+        // We deliberately do not surface the `Custom(String)` variant
+        // — see parse_observation_period docs.
+        assert!(parse_observation_period("P3M").is_none());
+    }
+
+    #[test]
+    fn validate_observation_one_builds_draft_for_well_formed_input() {
+        let raw = RawExtractedObservation {
+            metric: "price".into(),
+            value: 875.42,
+            unit: "USD".into(),
+            value_uncertainty: None,
+            currency: Some("USD".into()),
+            period: "instant".into(),
+            when: Some("2026-05-15T16:00:00Z".into()),
+            confidence: 0.95,
+        };
+        let allowed = ["price", "volume"];
+        let draft =
+            validate_observation_one(raw, &allowed).expect("should validate");
+        assert_eq!(draft.metric, "price");
+        assert_eq!(draft.value, 875.42);
+        assert_eq!(draft.unit, Unit::new("USD").unwrap());
+        assert_eq!(draft.currency, Some(Currency::new("USD").unwrap()));
+        assert_eq!(draft.period, ObservationPeriod::Instant);
+        assert!(draft.when.is_some());
+    }
+
+    #[test]
+    fn validate_observation_one_drops_out_of_vocab_metric() {
+        // The LLM emitted a clean numeric observation but with a
+        // metric the plan didn't declare — closed-vocab gate must
+        // drop the row regardless of how clean the rest looks.
+        let raw = RawExtractedObservation {
+            metric: "market_cap".into(),
+            value: 4_000_000_000_000.0,
+            unit: "USD".into(),
+            value_uncertainty: None,
+            currency: Some("USD".into()),
+            period: "instant".into(),
+            when: None,
+            confidence: 0.9,
+        };
+        let allowed = ["price", "volume"];
+        let result = validate_observation_one(raw, &allowed);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("not in plan's declared observation_metrics"));
+    }
+
+    #[test]
+    fn validate_observation_one_drops_invalid_unit() {
+        // Empty unit fails Unit::new — values without units can't be
+        // joined across sources, so the row is useless downstream.
+        let raw = RawExtractedObservation {
+            metric: "price".into(),
+            value: 100.0,
+            unit: "".into(),
+            value_uncertainty: None,
+            currency: None,
+            period: "instant".into(),
+            when: None,
+            confidence: 0.5,
+        };
+        let allowed = ["price"];
+        assert!(validate_observation_one(raw, &allowed).is_err());
+    }
+
+    #[test]
+    fn validate_observation_one_drops_unknown_period() {
+        let raw = RawExtractedObservation {
+            metric: "price".into(),
+            value: 100.0,
+            unit: "USD".into(),
+            value_uncertainty: None,
+            currency: None,
+            period: "fortnightly".into(),
+            when: None,
+            confidence: 0.5,
+        };
+        let allowed = ["price"];
+        let result = validate_observation_one(raw, &allowed);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown period"));
+    }
+
+    #[test]
+    fn validate_observation_one_tolerates_bad_currency_and_when() {
+        let raw = RawExtractedObservation {
+            metric: "price".into(),
+            value: 100.0,
+            unit: "USD".into(),
+            value_uncertainty: None,
+            currency: Some("dollars".into()),
+            period: "daily".into(),
+            when: Some("yesterday".into()),
+            confidence: 0.6,
+        };
+        let allowed = ["price"];
+        let draft =
+            validate_observation_one(raw, &allowed).expect("should validate");
+        // Both bad fields → None; row still emits.
+        assert!(draft.currency.is_none());
+        assert!(draft.when.is_none());
+    }
+
+    #[test]
+    fn validate_observation_one_clamps_confidence_to_unit_range() {
+        let raw = RawExtractedObservation {
+            metric: "price".into(),
+            value: 100.0,
+            unit: "USD".into(),
+            value_uncertainty: None,
+            currency: None,
+            period: "instant".into(),
+            when: None,
+            confidence: 1.7,
+        };
+        let allowed = ["price"];
+        let draft = validate_observation_one(raw, &allowed).expect("should clamp");
+        assert!((draft.confidence.value() - 1.0_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_observations_response_drops_invalid_keeps_valid() {
+        let body = serde_json::json!({
+            "observations": [
+                {
+                    "metric": "price",
+                    "value": 875.42,
+                    "unit": "USD",
+                    "currency": "USD",
+                    "period": "instant",
+                    "when": "2026-05-15T16:00:00Z",
+                    "confidence": 0.95
+                },
+                {
+                    // Out-of-vocab metric → drop.
+                    "metric": "market_cap",
+                    "value": 4000000000000.0,
+                    "unit": "USD",
+                    "period": "instant",
+                    "confidence": 0.9
+                },
+                {
+                    // Empty unit → drop.
+                    "metric": "volume",
+                    "value": 12345678.0,
+                    "unit": "",
+                    "period": "daily",
+                    "confidence": 0.8
+                }
+            ]
+        });
+        let resp = CompletionResponse {
+            text: "".into(),
+            structured: Some(body),
+            provider: "test".into(),
+            model: "test".into(),
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+        };
+        let allowed = ["price", "volume"];
+        let drafts =
+            parse_observations_response(&resp, &allowed).expect("parse should succeed");
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].metric, "price");
+    }
+
+    #[test]
+    fn parse_observations_response_returns_empty_for_empty_list() {
+        let body = serde_json::json!({ "observations": [] });
+        let resp = CompletionResponse {
+            text: "".into(),
+            structured: Some(body),
+            provider: "test".into(),
+            model: "test".into(),
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+        };
+        let allowed = ["price"];
+        let drafts =
+            parse_observations_response(&resp, &allowed).expect("parse should succeed");
+        assert!(drafts.is_empty());
+    }
+
+    #[test]
+    fn observation_extraction_schema_bakes_allowed_metrics_as_enum() {
+        let schema = observation_extraction_schema_value(&["price", "volume"]);
+        let enum_vals =
+            &schema["properties"]["observations"]["items"]["properties"]["metric"]["enum"];
+        assert!(enum_vals.is_array());
+        let arr = enum_vals.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], serde_json::Value::String("price".into()));
+        assert_eq!(arr[1], serde_json::Value::String("volume".into()));
+    }
+
+    #[test]
+    fn extract_observations_from_document_with_empty_allowed_returns_empty() {
+        // Cost-bounded by design: no declared metrics → no provider
+        // call. Mirrors the event-extractor test pattern with a
+        // panic-on-use provider; if the early-return holds we never
+        // touch the provider.
+        struct PanickyProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for PanickyProvider {
+            fn id(&self) -> &'static str {
+                "panicky"
+            }
+            fn supported_tiers(&self) -> &[ModelTier] {
+                &[ModelTier::Workhorse]
+            }
+            async fn complete(
+                &self,
+                _tier: ModelTier,
+                _req: CompletionRequest,
+            ) -> std::result::Result<CompletionResponse, LlmError> {
+                panic!(
+                    "extract_observations_from_document must not call provider when allowed is empty"
+                )
+            }
+        }
+        let provider = PanickyProvider;
+        let cfg = ExtractionConfig::default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let drafts = rt
+            .block_on(extract_observations_from_document(
                 &provider,
                 &cfg,
                 "template",

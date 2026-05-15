@@ -672,6 +672,12 @@ async fn run_one_trial(
             // Session 78 — event extraction also skipped in eval
             // harness to keep wall-clock measurements clean.
             document_events_prompt: None,
+            // Session 79 — observation extraction skipped for the
+            // same reason: the extra workhorse-tier call per
+            // Document distorts wall-clock and cost measurements,
+            // and the harness's observable signal (records produced)
+            // doesn't change with extracted observations.
+            document_observations_prompt: None,
             sources,
         };
 

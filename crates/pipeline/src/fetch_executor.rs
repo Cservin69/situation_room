@@ -121,7 +121,9 @@ use crate::propose_source_url::{
     propose_source_url, PriorAttempt, ProposalError, ProposalOutcome,
 };
 use crate::document_synth::insert_fetch_document;
-use crate::extract::{extract_and_persist_assertions, extract_and_persist_events};
+use crate::extract::{
+    extract_and_persist_assertions, extract_and_persist_events, extract_and_persist_observations,
+};
 use crate::recipe_apply::{apply, ApplyContext, ApplyError, MAX_RECORDS_PER_RECIPE};
 use crate::recipe_author::{author_recipe, AuthoringContext, AuthoringError};
 use crate::recipes::{ExpectationRef, ExtractionSpec, FetchRecipe};
@@ -373,6 +375,18 @@ pub struct ExecutorContext<'a> {
     /// plans that don't track events). Eval harness and test
     /// contexts pass `None` to skip event extraction wholesale.
     pub document_events_prompt: Option<&'a str>,
+    /// Session 79 — per-Document Observation extraction prompt.
+    /// Third sibling of `document_assertions_prompt` /
+    /// `document_events_prompt`. Consumed by
+    /// `crate::extract::extract_and_persist_observations`, called by
+    /// each runner immediately after the event extraction call. Same
+    /// gating posture: production passes `Some(prompt)` so the
+    /// dashboard's per-metric Observations panel populates on every
+    /// plan run; eval harness and test contexts pass `None`. Cost
+    /// is bounded upstream — plans with no declared
+    /// `observation_metrics` short-circuit before the workhorse-tier
+    /// call.
+    pub document_observations_prompt: Option<&'a str>,
     /// Source descriptors for the executor.
     ///
     /// **Doc-narrowed under ADR 0015 (Session 37) and further under
@@ -4067,6 +4081,30 @@ async fn run_csv_recipe(
         .await;
     }
 
+    // Session 79 — per-Document Observation extraction. Third
+    // sibling of the assertion + event paths. Skipped when
+    // `document_observations_prompt` is None (eval harness, test
+    // contexts). The extract module gates internally on MIME + body
+    // + plan-declared observation_metrics — plans that declared no
+    // metrics short-circuit before the LLM call so cost stays
+    // bounded. Errors and per-observation insert failures are
+    // warn-logged inside `extract_and_persist_observations`; we
+    // ignore the report here (operator-visible signal is the
+    // per-metric Observations panel ticking up on the dashboard).
+    if let Some(prompt) = ctx.document_observations_prompt {
+        let _ = extract_and_persist_observations(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
     // Apply.
     let apply_ctx = ApplyContext {
         recipe,
@@ -4223,6 +4261,30 @@ async fn run_json_recipe(
         .await;
     }
 
+    // Session 79 — per-Document Observation extraction. Third
+    // sibling of the assertion + event paths. Skipped when
+    // `document_observations_prompt` is None (eval harness, test
+    // contexts). The extract module gates internally on MIME + body
+    // + plan-declared observation_metrics — plans that declared no
+    // metrics short-circuit before the LLM call so cost stays
+    // bounded. Errors and per-observation insert failures are
+    // warn-logged inside `extract_and_persist_observations`; we
+    // ignore the report here (operator-visible signal is the
+    // per-metric Observations panel ticking up on the dashboard).
+    if let Some(prompt) = ctx.document_observations_prompt {
+        let _ = extract_and_persist_observations(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
     // Apply.
     let apply_ctx = ApplyContext {
         recipe,
@@ -4361,6 +4423,30 @@ async fn run_css_recipe(
     // Events panel ticking up on the dashboard).
     if let Some(prompt) = ctx.document_events_prompt {
         let _ = extract_and_persist_events(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
+    // Session 79 — per-Document Observation extraction. Third
+    // sibling of the assertion + event paths. Skipped when
+    // `document_observations_prompt` is None (eval harness, test
+    // contexts). The extract module gates internally on MIME + body
+    // + plan-declared observation_metrics — plans that declared no
+    // metrics short-circuit before the LLM call so cost stays
+    // bounded. Errors and per-observation insert failures are
+    // warn-logged inside `extract_and_persist_observations`; we
+    // ignore the report here (operator-visible signal is the
+    // per-metric Observations panel ticking up on the dashboard).
+    if let Some(prompt) = ctx.document_observations_prompt {
+        let _ = extract_and_persist_observations(
             ctx.store,
             ctx.provider,
             prompt,
@@ -4529,6 +4615,30 @@ async fn run_regex_recipe(
         .await;
     }
 
+    // Session 79 — per-Document Observation extraction. Third
+    // sibling of the assertion + event paths. Skipped when
+    // `document_observations_prompt` is None (eval harness, test
+    // contexts). The extract module gates internally on MIME + body
+    // + plan-declared observation_metrics — plans that declared no
+    // metrics short-circuit before the LLM call so cost stays
+    // bounded. Errors and per-observation insert failures are
+    // warn-logged inside `extract_and_persist_observations`; we
+    // ignore the report here (operator-visible signal is the
+    // per-metric Observations panel ticking up on the dashboard).
+    if let Some(prompt) = ctx.document_observations_prompt {
+        let _ = extract_and_persist_observations(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
     // Apply.
     let apply_ctx = ApplyContext {
         recipe,
@@ -4664,6 +4774,30 @@ async fn run_pdf_recipe(
     // Events panel ticking up on the dashboard).
     if let Some(prompt) = ctx.document_events_prompt {
         let _ = extract_and_persist_events(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
+    // Session 79 — per-Document Observation extraction. Third
+    // sibling of the assertion + event paths. Skipped when
+    // `document_observations_prompt` is None (eval harness, test
+    // contexts). The extract module gates internally on MIME + body
+    // + plan-declared observation_metrics — plans that declared no
+    // metrics short-circuit before the LLM call so cost stays
+    // bounded. Errors and per-observation insert failures are
+    // warn-logged inside `extract_and_persist_observations`; we
+    // ignore the report here (operator-visible signal is the
+    // per-metric Observations panel ticking up on the dashboard).
+    if let Some(prompt) = ctx.document_observations_prompt {
+        let _ = extract_and_persist_observations(
             ctx.store,
             ctx.provider,
             prompt,
@@ -5150,6 +5284,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -5232,6 +5367,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -5307,6 +5443,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -5381,6 +5518,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -5447,6 +5585,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -5509,6 +5648,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -5561,6 +5701,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -5594,6 +5735,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -5632,6 +5774,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -5708,6 +5851,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -5762,6 +5906,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -5805,6 +5950,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -5863,6 +6009,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -5904,6 +6051,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -5970,6 +6118,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -6018,6 +6167,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -6104,6 +6254,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -6183,6 +6334,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -6244,6 +6396,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -6287,6 +6440,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -6485,6 +6639,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -6610,6 +6765,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -6772,6 +6928,7 @@ mod tests {
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &sources,
         };
 
@@ -6841,6 +6998,7 @@ mod tests {
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &sources,
         };
 
@@ -6910,6 +7068,7 @@ mod tests {
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &sources,
         };
 
@@ -6977,6 +7136,7 @@ mod tests {
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &sources,
         };
 
@@ -7153,6 +7313,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -7297,6 +7458,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -7881,6 +8043,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -7925,6 +8088,7 @@ mod tests {
             propose_url_prompt: "",
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &[],
         };
 
@@ -8453,6 +8617,7 @@ mod tests {
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &sources,
         };
 
@@ -8583,6 +8748,7 @@ mod tests {
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &sources,
         };
 
@@ -8726,6 +8892,7 @@ mod tests {
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &sources,
         };
 
@@ -9311,6 +9478,7 @@ mod tests {
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
             document_assertions_prompt: None,
             document_events_prompt: None,
+            document_observations_prompt: None,
             sources: &sources,
         };
 

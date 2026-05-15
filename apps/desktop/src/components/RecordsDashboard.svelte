@@ -709,6 +709,7 @@
             kind={g.key}
             count={g.records.length}
             sample={eventSampleOf(g.records[0])}
+            samples={g.records.map(eventSampleOf)}
             when={whenOf(g.records[0].envelope)}
             sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
             sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}
@@ -737,6 +738,7 @@
             kind={g.key}
             count={g.records.length}
             sample={entitySampleOf(g.records[0])}
+            samples={g.records.map(entitySampleOf)}
             when={whenOf(g.records[0].envelope)}
             sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
             sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}
@@ -765,6 +767,7 @@
             kind={g.key}
             count={g.records.length}
             sample={relationSampleOf(g.records[0])}
+            samples={g.records.map(relationSampleOf)}
             when={whenOf(g.records[0].envelope)}
             sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
             sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}
@@ -823,6 +826,7 @@
             kind={g.key}
             count={g.records.length}
             sample={assertionSampleOf(g.records[0])}
+            samples={g.records.map(assertionSampleOf)}
             when={whenOf(g.records[0].envelope)}
             sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
             sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}
