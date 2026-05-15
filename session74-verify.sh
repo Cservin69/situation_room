@@ -30,18 +30,34 @@
 #         `cache_read_input_tokens` (no-op in practice until
 #         request-side cache_control breakpoints land).
 #
+#   4. apps/desktop/src/lib/dashboard/document_table.ts + .test.mjs
+#         Session 74.5 mid-session hot-fix: extend the detector to
+#         recognise object-of-scalars (JSON-stat / lookup-map shape)
+#         alongside array-of-objects, so Eurostat-style
+#         `{value: {key: scalar}}` payloads render as a 2-col
+#         Key/Value table instead of dropping to raw-JSON fallback.
+#         array-of-objects still wins when both shapes are present.
+#
 # What this runs:
-#   [1/3] cargo check -p situation_room-pipeline -p situation_room-llm
-#         — catches the obvious "did you remember to add the field at
-#           every stub site?" regression and verifies the new
-#           `fetch_with_backoff_ua` / `fetch_bytes_with_meta_ua` paths
-#           compile end-to-end.
-#   [2/3] cargo test -p situation_room-pipeline -p situation_room-llm
+#   [1/4] cargo check --workspace
+#         — workspace-wide check; catches stub-construction-site
+#           drift in any downstream crate that builds a
+#           CompletionResponse in a test fixture this session
+#           didn't enumerate. Verifies the new
+#           `fetch_with_backoff_ua` / `fetch_bytes_with_meta_ua`
+#           paths compile end-to-end.
+#   [2/4] cargo test -p situation_room-pipeline -p situation_room-llm
 #         — runs the new ua_policy_for_host test plus the new
 #           fetch_with_backoff_ua identity + override-tolerance tests,
 #           and confirms the pre-existing test suite still passes
 #           after the CompletionResponse field addition.
-#   [3/3] cd apps/desktop && npm run check
+#   [3/4] tsc + node detector regression
+#         — compiles document_table.ts to /tmp/dt-build and runs the
+#           extended node assertions (Session 73 originals + Session
+#           74.5 object-of-scalars cases: Eurostat shape, mixed-shape
+#           preference, bare object-of-scalars, single-entry rejection,
+#           mixed-scalar+object rejection).
+#   [4/4] cd apps/desktop && npm run check
 #         — operator-run on Mac (sandbox node_modules has Mac-built
 #           rollup binaries that can't load on Linux). The prompt edit
 #           is markdown, but the desktop tauri main embeds the prompt
@@ -75,13 +91,26 @@ echo "[1/3] cargo check --workspace"
   | tee "logs/session74-cargo-check-${STAMP}.log"
 
 echo
-echo "[2/3] cargo test -p situation_room-pipeline -p situation_room-llm"
+echo "[2/4] cargo test -p situation_room-pipeline -p situation_room-llm"
 (cargo test -p situation_room-pipeline -p situation_room-llm 2>&1; \
   echo "EXIT=$?") \
   | tee "logs/session74-cargo-test-${STAMP}.log"
 
 echo
-echo "[3/3] svelte-check (apps/desktop)"
+echo "[3/4] tsc + node detector regression (Session 74.5)"
+rm -rf /tmp/dt-build
+(cd apps/desktop && \
+  ./node_modules/.bin/tsc \
+    --target es2022 --moduleResolution bundler --module esnext \
+    --strict --skipLibCheck \
+    --outDir /tmp/dt-build \
+    src/lib/dashboard/document_table.ts 2>&1 && \
+  node src/lib/dashboard/document_table.test.mjs 2>&1; \
+  echo "EXIT=$?") \
+  | tee "logs/session74-detector-test-${STAMP}.log"
+
+echo
+echo "[4/4] svelte-check (apps/desktop)"
 (cd apps/desktop && npm run check 2>&1; echo "EXIT=$?") \
   | tee "logs/session74-svelte-check-${STAMP}.log"
 
@@ -89,6 +118,7 @@ echo
 echo "Done. Logs:"
 echo "  logs/session74-cargo-check-${STAMP}.log"
 echo "  logs/session74-cargo-test-${STAMP}.log"
+echo "  logs/session74-detector-test-${STAMP}.log"
 echo "  logs/session74-svelte-check-${STAMP}.log"
 echo
 echo "Look for EXIT=0 on the last line of each."
