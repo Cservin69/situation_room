@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.21
+# Recipe Author Prompt — v1.22
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -116,23 +116,28 @@ sources you imagine others might fail on.
 
 ## The plan you are authoring for
 
-```json
-{{PLAN_JSON}}
-```
+The plan JSON, the target expectation for this authoring call, any
+standing operator feedback on prior recipes for this `(plan,
+source)` pair, the verbatim failure reason from the prior attempt,
+and any one-off operator guidance for this re-author are collected
+in the **Concrete inputs** section at the end of this prompt.
+v1.22 moved the per-call inputs to the end so the rules and
+vocabulary above them form a stable prefix the LLM provider's
+prompt cache matches across calls. The rules apply to whatever the
+inputs section carries.
 
-Read the `expectations` field carefully. Your recipe must target one
-specific expectation (by index), and the field mappings must
-populate the fields of the target record type. The `topic_tags` will
-be attached automatically to every produced record — do not include
-them in your mappings.
-
-{{TARGET_EXPECTATION}}
+Read the `expectations` field of the plan carefully. Your recipe
+must target one specific expectation (by index), and the field
+mappings must populate the fields of the target record type. The
+`topic_tags` will be attached automatically to every produced
+record — do not include them in your mappings.
 
 **Before reading the closed vocabulary or the source context
 below, name to yourself:**
 
 - the metric name / event_type / entity_kind / relation_kind from
-  the target expectation (named in the section above when present),
+  the target expectation (named in the Concrete inputs section
+  at the end of this prompt when present),
 - the unit hint (for observations) or the rationale (for the
   others),
 - the geographic scope codes you'll need to substitute,
@@ -140,12 +145,6 @@ below, name to yourself:**
 
 These are what your recipe must serve. The source either fits
 them or it doesn't.
-
-{{RECIPE_FEEDBACK}}
-
-{{PREVIOUS_FAILURE_REASON}}
-
-{{OPERATOR_GUIDANCE}}
 
 ## The closed extraction vocabulary
 
@@ -716,13 +715,10 @@ from a missed attempt.
 The runtime takes your recipe's `produces` bindings and stamps the
 extracted values into typed records of the bound `record_type`
 (observation, event, or relation). The record types' actual JSON
-shapes are reproduced below — **read them**. Field names, optional
-vs required fields, and the closed enums for `period` and
-`direction` are wire-truth, not prompt prose.
-
-```json
-{{TARGET_RECORD_SCHEMA}}
-```
+shapes appear in the **Concrete inputs** section at the end of
+this prompt — **read them**. Field names, optional vs required
+fields, and the closed enums for `period` and `direction` are
+wire-truth, not prompt prose.
 
 Use these schemas to ground your `field_mappings`: the `path` of
 each mapping must name a field that actually exists on the target
@@ -877,13 +873,16 @@ narrower, more honest target.
 
 ## The source context
 
-**Source id**: `{{SOURCE_ID}}`
-**Sample URL** (the runtime fetches this URL on each refresh):
-`{{SOURCE_URL}}`
+The `source_id` and the `Sample URL` for this authoring call
+appear in the **Concrete inputs** section at the end of this
+prompt. The discipline below applies to whichever URL is shown
+there. The `Sample URL` is the URL the runtime fetches on each
+refresh.
 
 ### URL discipline — read this carefully
 
-The `Sample URL` above is **the URL you must base your recipe on**.
+The `Sample URL` named in the Concrete inputs section is **the URL
+you must base your recipe on**.
 There are two cases:
 
 1. **It looks like a real, documented endpoint** of the source
@@ -1037,7 +1036,8 @@ source-specific reason.
 ### Hunt the URL end-to-end
 
 The pre-fetched URL the runtime handed you is a starting clue,
-not a constraint. Sometimes the excerpt below shows you exactly
+not a constraint. Sometimes the document excerpt (in the Concrete
+inputs section at the end of this prompt) shows you exactly
 the structure your recipe needs — listing rows, JSON arrays of
 items, CSV with a clean header. Sometimes it doesn't. The
 common ways the prefetch falls short:
@@ -1129,7 +1129,8 @@ not a signal to ship and hope.
    record schema expects (`f64`, `String`, closed enums)? *(See
    "Type honesty — numeric strings where a number was expected".)*
 6. **Required fields.** Walk the target content type's required
-   field list (visible in `{{TARGET_RECORD_SCHEMA}}` above). For
+   field list (visible in the target record schemas, in the
+   **Concrete inputs** section at the end of this prompt). For
    each required field, does the binding have a `field_mappings`
    entry that populates it? *(See "What the records you produce
    look like" — the pre-flight paragraph at the end of that
@@ -1319,9 +1320,9 @@ or `(pre-fetch failed)`, the runtime could not retrieve a sample.
 Author from the description and your knowledge of the source's
 public API.
 
-```
-{{DOCUMENT_EXCERPT}}
-```
+The excerpt itself appears in the **Concrete inputs** section at
+the end of this prompt — read this section's framing first, then
+scroll to the inputs.
 
 ## What to produce
 
@@ -1392,8 +1393,9 @@ The top-level shape is:
   emitting selectors. Up to 4 096 characters; longer is rejected.
 
 - `source_url`: string — an HTTPS URL the runtime will fetch. Usually
-  the same as the sample URL above, or a more specific URL on the
-  same host. Must not be `example.invalid` or any other synthetic
+  the same as the `Sample URL` named in the Concrete inputs section
+  at the end of this prompt, or a more specific URL on the same
+  host. Must not be `example.invalid` or any other synthetic
   placeholder. Must not include query parameters that rotate
   (session ids, nonces).
 - `extraction`: object — the extraction spec (one of the five modes).
@@ -1857,6 +1859,51 @@ you pick.
 ---
 
 ### Changelog
+
+- **v1.22** (2026-05-15) — Session 74, prompt-cache-friendly
+  restructure. No output contract change; no schema change; no
+  Rust changes. Every `{{VAR}}` substitution moves out of the body
+  prose into a single `## Concrete inputs` section at the very end
+  of the file, below the changelog. The body sections that used to
+  contain placeholders now carry a one-paragraph forward reference
+  to the Concrete inputs section (e.g. *"The plan JSON appears in
+  the **Concrete inputs** section at the end of this prompt"*),
+  preserving the narrative flow while leaving the upstream bytes
+  constant across calls. References to placeholder content via
+  `"above"` (line ~1132 for `TARGET_RECORD_SCHEMA`, line ~1395 for
+  `Sample URL`, line ~1039 for `document excerpt`) become
+  `"in the Concrete inputs section at the end of this prompt"`.
+
+  The motivation is xAI's automatic prefix-matching prompt cache
+  (Session 72 plumbed the `x-grok-conv-id` routing hint + the
+  `cached_tokens` projection). Before v1.22 the first `{{VAR}}`
+  appeared at line ~120 — only ~3% of the prompt's bytes formed a
+  stable prefix across calls, because anything that varies (the
+  plan JSON, the operator's feedback, the document excerpt, …) had
+  to land in that prefix to reach the LLM in narrative order. v1.22
+  inverts the layout: the prefix is the entire rules / vocabulary /
+  schema-discussion body (~92% of the file), and only the
+  per-call inputs section at the tail varies. For exploratory
+  single-plan runs that call this prompt many times against the
+  same source family, the cache lever is large.
+
+  Output contract is unchanged — same `RecipeAuthoringOutput`
+  shape, same field-source kinds, same closed enums, same
+  validator behaviour. `build_prompt` in
+  `crates/pipeline/src/recipe_author.rs` is unchanged: the
+  `.replace()` chain is position-agnostic, so the variable
+  substitution mechanics work the same whether placeholders sit at
+  line 120 or line 2540. Existing recipes are unaffected; this is
+  a prompt-prose-only edit.
+
+  Verification path: a `cached_tokens > 0` reading on the second
+  authoring call in a session validates the prefix is matching;
+  comparing prompt-token bills across two consecutive calls against
+  the same source-family before-and-after v1.22 quantifies the
+  cache-hit ratio. Eval-harness gating: Session 72's calls-only
+  posture stays — this is a structural change with no expected
+  output-quality delta, so a 5-trial A/B isn't warranted; the cost
+  curve on the next non-eval live run is the verification.
 
 - **v1.21** (2026-05-13) — Session 66, reasoning-block-before-JSON
   prompt experiment. Adds `selector_trace` as a new top-level field
@@ -2456,3 +2503,44 @@ you pick.
   invent a real URL, not as something to echo back. The output
   contract is unchanged — same schema, same shape — so existing
   recipes don't need re-authoring.
+
+---
+
+## Concrete inputs
+
+The variable per-call inputs to this authoring call are collected
+here, at the end of the prompt, so that everything above is a
+stable prefix across calls. The rules and vocabulary you just read
+apply to whatever values appear below.
+
+### Plan
+
+```json
+{{PLAN_JSON}}
+```
+
+{{TARGET_EXPECTATION}}
+
+{{RECIPE_FEEDBACK}}
+
+{{PREVIOUS_FAILURE_REASON}}
+
+{{OPERATOR_GUIDANCE}}
+
+### Target record schemas
+
+```json
+{{TARGET_RECORD_SCHEMA}}
+```
+
+### Source
+
+**Source id**: `{{SOURCE_ID}}`
+**Sample URL** (the runtime fetches this URL on each refresh):
+`{{SOURCE_URL}}`
+
+### Document excerpt
+
+```
+{{DOCUMENT_EXCERPT}}
+```

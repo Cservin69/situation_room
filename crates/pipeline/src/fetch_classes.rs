@@ -172,7 +172,15 @@ const HOST_CLASS_OVERRIDES: &[(&str, FetchOutcomeClass)] = &[
 /// insensitive and suffix-anchored: `www.sec.gov` matches an entry
 /// for `sec.gov`. Returns `None` when no override is set; callers
 /// fall back to the default policy in [`classify_error`].
-fn host_class_override(host: &str) -> Option<FetchOutcomeClass> {
+///
+/// **Visibility:** `pub(crate)` since Session 74 / ADR 0009
+/// amendment 2 wire-up. `ua_policies::ua_policy_for_host` reads
+/// the same override table so the host → UA-policy decision sits
+/// behind the same single source of host-class knowledge as the
+/// host → classifier-class decision. The override map itself
+/// (`HOST_CLASS_OVERRIDES`) remains private and empty until probe
+/// evidence justifies entries.
+pub(crate) fn host_class_override(host: &str) -> Option<FetchOutcomeClass> {
     let host_lc = host.to_ascii_lowercase();
     for (suffix, class) in HOST_CLASS_OVERRIDES {
         let suffix_lc = suffix.to_ascii_lowercase();

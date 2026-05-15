@@ -547,6 +547,14 @@ impl XaiProvider {
             model,
             input_tokens,
             output_tokens,
+            // Session 74: thread cached_tokens onto the response so the
+            // cost-by-tier dashboard tile and the eval-harness cache-
+            // hit ratio can read it without re-parsing the upstream
+            // usage block. `None` is preserved as "we don't know"
+            // (usage absent or details absent); `Some(0)` is preserved
+            // as "cold prefix, no cache hit." See the field's doc
+            // comment in `trait_def::CompletionResponse`.
+            cached_input_tokens: cached_tokens,
         })
     }
 }
@@ -1441,6 +1449,7 @@ mod tests {
             model: "test".into(),
             input_tokens: None,
             output_tokens: None,
+            cached_input_tokens: None,
         }
     }
 

@@ -397,6 +397,18 @@ impl AnthropicProvider {
                 model: parsed.model.unwrap_or_default(),
                 input_tokens: parsed.usage.as_ref().and_then(|u| u.input_tokens),
                 output_tokens: parsed.usage.as_ref().and_then(|u| u.output_tokens),
+                // Session 74: thread Anthropic's
+                // `cache_read_input_tokens` onto the response. `None`
+                // when the usage block is absent or doesn't carry the
+                // field (the API only emits it when cache_control
+                // breakpoints are active on the request); `Some(0)`
+                // when present but cold; `Some(n)` when the prefix
+                // matched the prompt cache. Same shape contract as
+                // grok.rs.
+                cached_input_tokens: parsed
+                    .usage
+                    .as_ref()
+                    .and_then(|u| u.cache_read_input_tokens),
             },
             was_truncated,
         ))
@@ -685,6 +697,16 @@ struct AnthropicUsage {
     input_tokens: Option<u32>,
     #[serde(default)]
     output_tokens: Option<u32>,
+    /// Session 74 — Anthropic's cached-input projection. The
+    /// Messages API ships `cache_read_input_tokens` on the usage
+    /// block when prompt-caching cache_control breakpoints are in
+    /// effect; absent or zero on uncached requests. This crate
+    /// doesn't yet declare `cache_control` blocks on its requests,
+    /// so today the field is `None` in practice — the projection is
+    /// here so when the cache-control plumbing lands, surfacing it
+    /// is a one-line build_body change rather than a parser change.
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1058,6 +1080,7 @@ mod tests {
             model: "test".into(),
             input_tokens: None,
             output_tokens: None,
+            cached_input_tokens: None,
         }
     }
 

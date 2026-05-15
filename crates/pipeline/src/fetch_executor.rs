@@ -112,7 +112,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::fetch_backoff::{fetch_with_backoff, format_retry_after, host_of, BackoffOutcome};
+use crate::fetch_backoff::{
+    fetch_with_backoff, fetch_with_backoff_ua, format_retry_after, host_of, BackoffOutcome,
+};
 use crate::fetch_classes::FetchOutcomeClass;
 use crate::http_fetcher::{FetchError as HttpFetchError, HttpFetcher};
 use crate::propose_source_url::{
@@ -3617,7 +3619,43 @@ async fn fetch_recipe_bytes(
         );
     }
 
-    match fetch_with_backoff(ctx.http, fetch_url.as_ref(), "runtime").await {
+    // Session 74 / ADR 0009 amendment 2 wire-up. Resolve the host's
+    // UA policy from the closed override table in `fetch_classes`
+    // (today empty, so the policy is always `Default` for every
+    // host — wire-up is plumbing, not activation). `Default` means
+    // "no per-request override; the secure client's built-in UA
+    // fires"; any other policy resolves to the class's UA string
+    // and we pass it through the per-request override path.
+    //
+    // The override map is keyed on host; populating an entry there
+    // is what activates UA policy across the pipeline without
+    // further code changes. The fetch URL (post-pagination
+    // rewrite) is used for the host extraction so the policy
+    // applies to whichever host actually goes on the wire.
+    let host = host_of(fetch_url.as_ref());
+    let policy = crate::ua_policies::ua_policy_for_host(&host);
+    let ua_override: Option<String> = match policy {
+        crate::ua_policies::UaPolicy::Default => None,
+        non_default => Some(non_default.resolve("")),
+    };
+    if ua_override.is_some() {
+        info!(
+            recipe_id = %recipe.id,
+            source_id = %recipe.source_id,
+            host = %host,
+            ua_label = %policy.label(),
+            "ua_policy: applying per-request override (ADR 0009 amendment 2)"
+        );
+    }
+
+    match fetch_with_backoff_ua(
+        ctx.http,
+        fetch_url.as_ref(),
+        "runtime",
+        ua_override.as_deref(),
+    )
+    .await
+    {
         BackoffOutcome::Bytes { body, content_type } => Ok((body, content_type)),
         BackoffOutcome::RateLimited {
             retry_after_seconds,
@@ -6404,6 +6442,7 @@ mod tests {
                 model: "declining-test".into(),
                 input_tokens: None,
                 output_tokens: None,
+                cached_input_tokens: None,
             })
         }
     }
@@ -8059,6 +8098,7 @@ mod tests {
                     model: "test".into(),
                     input_tokens: None,
                     output_tokens: None,
+                    cached_input_tokens: None,
                 })
             }
         }
@@ -8199,6 +8239,7 @@ mod tests {
                     model: "test".into(),
                     input_tokens: None,
                     output_tokens: None,
+                    cached_input_tokens: None,
                 })
             }
         }
@@ -8324,6 +8365,7 @@ mod tests {
                     model: "test".into(),
                     input_tokens: None,
                     output_tokens: None,
+                    cached_input_tokens: None,
                 })
             }
         }
@@ -8906,6 +8948,7 @@ mod tests {
                         model: "test".into(),
                         input_tokens: None,
                         output_tokens: None,
+                        cached_input_tokens: None,
                     });
                 }
                 // Workhorse — recipe author. Should not be reached
@@ -8917,6 +8960,7 @@ mod tests {
                     model: "test".into(),
                     input_tokens: None,
                     output_tokens: None,
+                    cached_input_tokens: None,
                 })
             }
         }

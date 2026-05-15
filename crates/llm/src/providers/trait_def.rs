@@ -106,6 +106,21 @@ pub struct CompletionResponse {
     /// Token usage (best effort — providers report differently).
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
+    /// How many of the `input_tokens` were served from the
+    /// provider's prompt cache. Session 74 surface — `Some(n)` when
+    /// the provider reports a cached-token count on the completion
+    /// usage block (xAI's `prompt_tokens_details.cached_tokens`,
+    /// Anthropic's `usage.cache_read_input_tokens`); `None` when the
+    /// provider doesn't report cache hits or didn't return a usage
+    /// block.
+    ///
+    /// `0` means "the provider reported the field and it was zero"
+    /// (cold prefix, no cache hit) — distinct from `None` ("we
+    /// don't know"). The cost-by-tier dashboard tile and the
+    /// eval-harness cache-hit ratio both depend on the
+    /// `Some(0)` / `None` distinction; collapsing them would falsely
+    /// inflate the "no cache support" denominator.
+    pub cached_input_tokens: Option<u32>,
 }
 
 #[derive(Debug, Error)]

@@ -116,6 +116,28 @@ impl UaPolicy {
     }
 }
 
+/// Map a host string to the UA policy that addresses its known
+/// fetch-outcome class. Session 74 wire-up of ADR 0009 amendment 2.
+///
+/// Reads through `fetch_classes::host_class_override` so the single
+/// source of host-class knowledge in the codebase
+/// (`HOST_CLASS_OVERRIDES`) drives both the classifier's decision
+/// surface and the UA-override decision surface. Hosts without an
+/// override entry — every host today, because the override map is
+/// empty until probe evidence justifies entries — return
+/// [`UaPolicy::Default`] so the fetcher's built-in UA is used.
+///
+/// Behaviour is deliberately a no-op until the override map is
+/// populated; the wire-up exists so populating the map suffices to
+/// activate UA policy across the pipeline without further code
+/// changes.
+pub fn ua_policy_for_host(host: &str) -> UaPolicy {
+    match crate::fetch_classes::host_class_override(host) {
+        Some(class) => policy_for_class(class),
+        None => UaPolicy::Default,
+    }
+}
+
 /// Map a fetch-outcome class to the policy that addresses it.
 ///
 /// `HostUnreachable`, `RateLimited`, `UrlShapeMismatch`,
@@ -316,5 +338,25 @@ mod tests {
         assert_eq!(json, "\"browser_like\"");
         let parsed: UaPolicy = serde_json::from_str("\"research_tool_with_contact\"").unwrap();
         assert_eq!(parsed, UaPolicy::ResearchToolWithContact);
+    }
+
+    // -- ua_policy_for_host wire-up (Session 74 / ADR 0009 amend. 2) -----
+
+    /// Today every host returns `Default` because the override table
+    /// in `fetch_classes::HOST_CLASS_OVERRIDES` is empty. This test
+    /// locks the no-op-until-populated property: if anyone adds an
+    /// entry to the override table without also updating eval-harness
+    /// host-probe data, the failure shows up here as well as in
+    /// `fetch_classes::production_override_table_stays_empty`.
+    #[test]
+    fn ua_policy_for_host_returns_default_for_arbitrary_hosts() {
+        assert_eq!(ua_policy_for_host(""), UaPolicy::Default);
+        assert_eq!(ua_policy_for_host("example.com"), UaPolicy::Default);
+        assert_eq!(ua_policy_for_host("www.sec.gov"), UaPolicy::Default);
+        assert_eq!(ua_policy_for_host("bloomberg.com"), UaPolicy::Default);
+        // Case-insensitive: ASCII uppercase host yields the same
+        // answer as its lowercase peer (the underlying override
+        // lookup is case-insensitive).
+        assert_eq!(ua_policy_for_host("EXAMPLE.COM"), UaPolicy::Default);
     }
 }

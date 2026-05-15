@@ -321,6 +321,35 @@ pub trait HttpFetcher: Send + Sync {
             content_type: None,
         })
     }
+
+    /// Same as [`Self::fetch_bytes_with_meta`] but with a per-request
+    /// User-Agent override. Session 74 / ADR 0009 amendment 2.
+    ///
+    /// `ua = None` means "use the fetcher's built-in UA" — byte-for-
+    /// byte equivalent to calling [`Self::fetch_bytes_with_meta`].
+    /// `ua = Some(s)` means "send `s` as the `User-Agent` header on
+    /// this request only," produced by
+    /// [`crate::ua_policies::UaPolicy::resolve`] from the host's
+    /// classified policy. Implementations that cannot honor an
+    /// override (the test [`testing::StaticFetcher`]) fall through
+    /// to the meta path; the override is best-effort, not load-
+    /// bearing for correctness.
+    ///
+    /// Default impl ignores the override and routes to
+    /// [`Self::fetch_bytes_with_meta`], so every existing
+    /// implementation compiles without changes. Only
+    /// [`SecureHttpClient`] (production) overrides; tests don't need
+    /// to model UA-specific behaviour because the override map
+    /// (`fetch_classes::HOST_CLASS_OVERRIDES`) is empty until probe
+    /// evidence justifies entries.
+    async fn fetch_bytes_with_meta_ua(
+        &self,
+        url: &str,
+        ua: Option<&str>,
+    ) -> Result<FetchedBytes, FetchError> {
+        let _ = ua;
+        self.fetch_bytes_with_meta(url).await
+    }
 }
 
 #[async_trait]
@@ -362,6 +391,35 @@ impl HttpFetcher for SecureHttpClient {
             Err(e) => return Err(FetchError::Http(format!("invalid url: {e}"))),
         };
         match self.get_with_headers(&parsed).await {
+            Ok(resp) => {
+                let content_type = resp.headers.content_type().map(|s| s.to_string());
+                Ok(FetchedBytes {
+                    body: resp.body,
+                    content_type,
+                })
+            }
+            Err(e) => Err(FetchError::from(e)),
+        }
+    }
+
+    /// Override of the trait's default impl to route the per-request
+    /// UA through `SecureHttpClient::get_with_headers_ua` (Session 70
+    /// amendment 2). When `ua` is `None`, behaviour is byte-for-byte
+    /// the same as [`Self::fetch_bytes_with_meta`] — the secure
+    /// client's built-in UA fires. When `ua` is `Some(s)`, the
+    /// request carries `User-Agent: s` and the rest of the header
+    /// allow-list is unchanged. Response handling (status, body,
+    /// content-type extraction) is identical to the no-override path.
+    async fn fetch_bytes_with_meta_ua(
+        &self,
+        url: &str,
+        ua: Option<&str>,
+    ) -> Result<FetchedBytes, FetchError> {
+        let parsed = match Url::parse(url) {
+            Ok(u) => u,
+            Err(e) => return Err(FetchError::Http(format!("invalid url: {e}"))),
+        };
+        match self.get_with_headers_ua(&parsed, ua).await {
             Ok(resp) => {
                 let content_type = resp.headers.content_type().map(|s| s.to_string());
                 Ok(FetchedBytes {

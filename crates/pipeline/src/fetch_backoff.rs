@@ -103,20 +103,53 @@ pub enum BackoffOutcome {
 /// can tell pre-fetch backoff from runtime backoff (`"prefetch"` vs
 /// `"runtime"`). It's not load-bearing for behaviour — purely a
 /// human-legibility hook.
+///
+/// UA-default convenience wrapper. Calls [`fetch_with_backoff_ua`]
+/// with `ua = None`. Session 74 left this name in place so the
+/// existing call sites (and tests) keep compiling without churn;
+/// only call sites that need a per-request UA override
+/// (`fetch_executor::fetch_recipe_bytes` after ADR 0009 amendment
+/// 2 wire-up) reach for the `_ua` variant.
 pub async fn fetch_with_backoff(
     http: &dyn HttpFetcher,
     url: &str,
     context: &str,
 ) -> BackoffOutcome {
+    fetch_with_backoff_ua(http, url, context, None).await
+}
+
+/// Fetch with the Track-D backoff policy plus a per-request User-
+/// Agent override. Session 74 / ADR 0009 amendment 2.
+///
+/// `ua = None` is byte-for-byte equivalent to [`fetch_with_backoff`].
+/// `ua = Some(s)` sends `s` as the `User-Agent` header on the
+/// request and on any inline rate-limit retry; the rest of the
+/// header allow-list is unchanged. Implementations that don't
+/// override `fetch_bytes_with_meta_ua` fall through to the meta
+/// path, which means the override is honored by `SecureHttpClient`
+/// and silently ignored by `StaticFetcher` — acceptable because
+/// `HOST_CLASS_OVERRIDES` is empty until probe evidence justifies
+/// entries, so no production call site computes a non-`None` `ua`
+/// yet.
+pub async fn fetch_with_backoff_ua(
+    http: &dyn HttpFetcher,
+    url: &str,
+    context: &str,
+    ua: Option<&str>,
+) -> BackoffOutcome {
     // Session 32: route through the meta-aware path so the response
     // Content-Type travels with the body. Implementations that don't
     // override `fetch_bytes_with_meta` get the trait's default impl,
     // which calls `fetch_bytes` and returns `content_type: None` —
-    // backward-compat is byte-for-byte for those callers.
-    match http.fetch_bytes_with_meta(url).await {
+    // backward-compat is byte-for-byte for those callers. Session 74
+    // adds the per-request UA override hop; default impl of
+    // `fetch_bytes_with_meta_ua` routes back through
+    // `fetch_bytes_with_meta`, so the byte-for-byte property holds
+    // for non-overriding implementations.
+    match http.fetch_bytes_with_meta_ua(url, ua).await {
         Ok(FetchedBytes { body, content_type }) => BackoffOutcome::Bytes { body, content_type },
         Err(FetchError::RateLimited { retry_after_seconds }) => {
-            handle_rate_limit(http, url, context, retry_after_seconds).await
+            handle_rate_limit(http, url, context, retry_after_seconds, ua).await
         }
         Err(other) => BackoffOutcome::Failed(other),
     }
@@ -131,6 +164,7 @@ async fn handle_rate_limit(
     url: &str,
     context: &str,
     retry_after_seconds: Option<u64>,
+    ua: Option<&str>,
 ) -> BackoffOutcome {
     match retry_after_seconds {
         Some(secs) if secs <= SHORT_BACKOFF_CEILING_SECS => {
@@ -144,7 +178,10 @@ async fn handle_rate_limit(
             // Session 32: the inline retry also goes through
             // `fetch_bytes_with_meta` so a recovered fetch carries
             // the same Content-Type discipline as the first-try path.
-            match http.fetch_bytes_with_meta(url).await {
+            // Session 74: the inline retry also honors the per-request
+            // UA override so the second try doesn't silently revert to
+            // the default UA after the first try used a policy override.
+            match http.fetch_bytes_with_meta_ua(url, ua).await {
                 Ok(FetchedBytes { body, content_type }) => {
                     info!(
                         context = %context,
@@ -567,6 +604,23 @@ impl<'a> HttpFetcher for BackoffFetcher<'a> {
         self.after_request(&host, &result);
         result
     }
+
+    /// Session 74: thread the per-request UA override to the inner
+    /// fetcher. The before/after host-backoff bookkeeping is the same
+    /// as the no-override path — the host is the cache key, not the
+    /// UA. A UA-policy host that 429s still increments the host's
+    /// failure counter and pushes `next_allowed_at`; the override is
+    /// orthogonal to throttling.
+    async fn fetch_bytes_with_meta_ua(
+        &self,
+        url: &str,
+        ua: Option<&str>,
+    ) -> Result<FetchedBytes, FetchError> {
+        let host = self.before_request(url).await;
+        let result = self.inner.fetch_bytes_with_meta_ua(url, ua).await;
+        self.after_request(&host, &result);
+        result
+    }
 }
 
 /// Best-effort URL → host string for the per-host adaptation key.
@@ -686,6 +740,46 @@ mod tests {
                 assert_eq!(body, b"{\"k\": 1}");
                 assert_eq!(content_type.as_deref(), Some("application/json"));
             }
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+    }
+
+    /// Session 74: `fetch_with_backoff_ua` with `ua = None` is the
+    /// byte-for-byte same path as `fetch_with_backoff`. Locks the
+    /// identity property the convenience wrapper relies on so any
+    /// future divergence (extra arg, side effect) surfaces in tests
+    /// rather than silently at the prefetch / runtime call sites.
+    #[tokio::test]
+    async fn fetch_with_backoff_ua_none_matches_default_path() {
+        let f = StaticFetcher::new().with("https://example.com/x", b"hello");
+        let out = fetch_with_backoff_ua(&f, "https://example.com/x", "test", None).await;
+        match out {
+            BackoffOutcome::Bytes { body, content_type } => {
+                assert_eq!(body, b"hello");
+                assert_eq!(content_type, None);
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+    }
+
+    /// Session 74: `fetch_with_backoff_ua` with a `Some(_)` override
+    /// still works against the trait's default `_ua` impl (which
+    /// silently ignores the UA). The override path becomes
+    /// behaviour-observable only on `SecureHttpClient` in
+    /// production; tests assert structural reachability — the
+    /// override doesn't break the happy path.
+    #[tokio::test]
+    async fn fetch_with_backoff_ua_some_does_not_break_happy_path() {
+        let f = StaticFetcher::new().with("https://example.com/x", b"hello");
+        let out = fetch_with_backoff_ua(
+            &f,
+            "https://example.com/x",
+            "test",
+            Some("BrowserLike/1.0 (+test)"),
+        )
+        .await;
+        match out {
+            BackoffOutcome::Bytes { body, .. } => assert_eq!(body, b"hello"),
             other => panic!("expected Bytes, got {other:?}"),
         }
     }
