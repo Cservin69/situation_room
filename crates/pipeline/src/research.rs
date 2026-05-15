@@ -239,7 +239,53 @@ pub struct EntityKindExpectation {
 pub struct RelationKindExpectation {
     /// Relation kind (e.g. `supply_contract`, `fab_operator`).
     pub kind: String,
+
+    /// Known prototype triples the classifier can name from prior
+    /// knowledge — concrete `(from, to)` pairs whose `kind` is the
+    /// one named above. Pre-Session-77 this field did not exist;
+    /// the classifier emitted only the relation kind and the
+    /// Relations panel stayed empty regardless of how relation-rich
+    /// the topic was (same shape Session 76's entity exemplars
+    /// addressed for the Entities panel).
+    ///
+    /// `#[serde(default)]` means plans persisted before Session 77
+    /// load with an empty Vec — no migration required. The plan-accept
+    /// hook in `accept_plan` (sibling to
+    /// `materialize_entity_exemplars`) walks this Vec and writes one
+    /// Relation row per triple, idempotently keyed on `(plan_id, kind,
+    /// from, to)` via the relation's `dedup_key`.
+    ///
+    /// The classifier prompt explicitly marks this field optional —
+    /// only emit triples the model is confident about from prior
+    /// knowledge. Empty is the default; a wrong triple is worse than
+    /// no triple.
+    #[serde(default)]
+    pub exemplar_triples: Vec<RelationTripleExemplar>,
+
     pub rationale: String,
+}
+
+/// One prototype `(from, kind, to)` relation triple a classifier may
+/// emit alongside a [`RelationKindExpectation`]. `kind` lives on the
+/// parent expectation — every triple under a single expectation
+/// shares the same kind. The two `EntityId`s are validated through
+/// [`EntityId::new`] at classify time so they carry the same `prefix:slug`
+/// discipline the classifier's entity exemplars already use.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationTripleExemplar {
+    /// Source end of the directed edge. For `supply_contract`, this
+    /// is the supplier.
+    pub from: EntityId,
+
+    /// Target end of the directed edge. For `supply_contract`, this
+    /// is the buyer.
+    pub to: EntityId,
+
+    /// Optional one-line classifier-supplied rationale. Empty (or
+    /// absent) is fine — the dashboard shows the kind + endpoints
+    /// without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

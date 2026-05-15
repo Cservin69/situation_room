@@ -216,8 +216,25 @@ pub enum AttributeValue {
 /// entities are about their *attributes*, not the entity itself), and
 /// you can't assert a Document (a document is raw content, not a claim).
 /// You can't assert an Assertion (no meta-claims).
+// **Session 78 fix.** The discriminator field was previously named
+// `"kind"`, which collided with `RelationContent.kind` once serde
+// flattened the variant payload into the parent object:
+// `{"kind": "relation", "kind": "supplies_to", ...}` produced
+// duplicate keys, breaking deserialization in stricter JSON parsers
+// (`serde_json::from_str` errors on duplicate fields by default).
+// The collision only fired for `Relation` — the other three variants
+// don't define a `kind` field of their own — but it appeared as soon
+// as Session 77's per-Document Assertion extraction wrote the first
+// Relation-shaped `AssertedContent` rows to disk.
+//
+// The tag is now `asserted_kind`. New rows serialize cleanly; the
+// storage decode layer (`storage::queries::decode_assertion_row`)
+// is tolerant of pre-fix poison rows so the dashboard doesn't error
+// when the historical table still carries them. Operators should
+// `DELETE FROM assertions WHERE content LIKE '{\"kind\":\"relation\"%'`
+// to flush the v1 poison rows once they've verified the fix.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "asserted_kind", rename_all = "snake_case")]
 pub enum AssertedContent {
     Observation(ObservationContent),
     Event(EventContent),
@@ -261,10 +278,56 @@ mod tests {
             geometry: None,
         });
         let json = serde_json::to_string(&obs).unwrap();
-        // Tagged-union serialization — the "kind" field is present
-        assert!(json.contains("\"kind\":\"observation\""));
+        // Tagged-union serialization — the `asserted_kind` field is
+        // present (Session 78 rename — was `"kind"`, but the inner
+        // `RelationContent.kind` collided once Session 77 began
+        // writing `AssertedContent::Relation` rows to disk).
+        assert!(json.contains("\"asserted_kind\":\"observation\""));
         let back: AssertedContent = serde_json::from_str(&json).unwrap();
         assert_eq!(obs, back);
+    }
+
+    #[test]
+    fn relation_assertion_roundtrips_without_duplicate_keys() {
+        // Session 78 regression guard. Pre-Session-78, the
+        // `Relation(RelationContent)` variant of `AssertedContent`
+        // serialized to JSON with two `"kind"` keys at the same
+        // level: one from the enum's discriminator and one from
+        // `RelationContent.kind`. `serde_json::from_str` errors on
+        // duplicate fields, so any `AssertedContent::Relation` row
+        // persisted to disk became unreadable. The fix renames the
+        // discriminator tag to `asserted_kind`; this test pins the
+        // round-trip and the absence of duplicate `"kind"`.
+        let rel = AssertedContent::Relation(RelationContent {
+            kind: "supplies_to".into(),
+            from: EntityId::new("company:panasonic").unwrap(),
+            to: EntityId::new("company:tsla").unwrap(),
+            magnitude: None,
+            valid_until: None,
+        });
+        let json = serde_json::to_string(&rel).unwrap();
+        // Outer tag has the new name.
+        assert!(
+            json.contains("\"asserted_kind\":\"relation\""),
+            "outer discriminator should be asserted_kind: {json}"
+        );
+        // Inner RelationContent.kind is preserved verbatim.
+        assert!(
+            json.contains("\"kind\":\"supplies_to\""),
+            "inner relation kind must survive: {json}"
+        );
+        // Critical: there is now only one `"kind":` occurrence in
+        // the serialized form. Counting substring matches is enough
+        // — the inner value is unique to this test fixture.
+        let kind_field_occurrences = json.matches("\"kind\":").count();
+        assert_eq!(
+            kind_field_occurrences, 1,
+            "exactly one `kind:` field in the wire form: {json}"
+        );
+        // Round-trip survives. Pre-fix this would fail with
+        // "duplicate field `kind`".
+        let back: AssertedContent = serde_json::from_str(&json).unwrap();
+        assert_eq!(rel, back);
     }
 
     #[test]

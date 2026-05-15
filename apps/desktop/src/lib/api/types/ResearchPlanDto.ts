@@ -37,4 +37,21 @@ rejection_reason: string,
  * for the same reason `id` is — ts-rs doesn't have a Uuid
  * primitive at the TS side.
  */
-reclassified_from: string, };
+reclassified_from: string, 
+/**
+ * Session 77 — the raw `research_plans.classified_by` value as
+ * persisted. Post-Session-77 this is `"{provider}@{version}"`
+ * (e.g. `"xai@2.2"`); pre-Session-77 plans carry just the
+ * provider id (e.g. `"xai"`). The frontend parses the optional
+ * `@version` suffix to drive the stale-prompt re-classify
+ * banner — see `classifier_prompt_version` Tauri command for
+ * the current shipping version.
+ *
+ * Empty string from `from_typed_pending` (which builds the DTO
+ * before the row is read back from disk); `from_stored`
+ * populates it from the storage row. The empty form should not
+ * reach the frontend on any post-classify load path; it's the
+ * type-safe default that lets the DTO satisfy `Default::default`-
+ * style construction in tests.
+ */
+classified_by: string, };

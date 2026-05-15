@@ -37,5 +37,10 @@ pub use providers::{LlmProvider, LlmError, ModelTier, ReasoningEffort, Completio
 pub use providers::{XaiProvider, XaiConfig, XAI_API_KEY_ENV};
 pub use providers::{AnthropicProvider, AnthropicConfig, ANTHROPIC_API_KEY_ENV};
 pub use cost_ledger::{CostLedger, LedgerEntry, MeteredProvider, Tally};
+pub use extraction::{
+    extract_assertions_from_document, extract_events_from_document, AssertionDraft, EventDraft,
+    ExtractionConfig, ExtractionError, RawExtractedAssertion, RawExtractedAssertions,
+    RawExtractedEvent, RawExtractedEvents,
+};
 
 pub type Result<T> = std::result::Result<T, LlmError>;

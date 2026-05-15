@@ -294,6 +294,16 @@ const HTML_STRIP_INPUT_CAP_BYTES: usize = 4 * BODY_PREVIEW_CAP_BYTES;
 /// - **Plain (`text/plain` and the catch-all)** — capped at
 ///   `BODY_PREVIEW_CAP_BYTES` (32 KiB) as before. A human reading
 ///   prose doesn't need 128 KiB.
+/// Session 77 — public alias of the internal `body_preview` helper,
+/// exposed for `pipeline::extract`. The extraction orchestrator
+/// feeds the LLM the same body the dashboard shows, which means it
+/// has to route through this function rather than slice the raw
+/// bytes. The function below is the canonical implementation; the
+/// alias name signals the public-API call shape.
+pub fn body_preview_for_mime(mime: &str, bytes: &[u8]) -> String {
+    body_preview(mime, bytes)
+}
+
 fn body_preview(mime: &str, bytes: &[u8]) -> String {
     if is_binary_mime(mime) {
         return String::new();

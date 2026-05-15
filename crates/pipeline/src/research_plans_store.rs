@@ -194,6 +194,7 @@ mod tests {
                 }],
                 relation_kinds: vec![RelationKindExpectation {
                     kind: "operator_of".into(),
+                    exemplar_triples: vec![],
                     rationale: "Operator-asset link".into(),
                 }],
                 document_sources: vec![DocumentSourceEntry::Nomination(

@@ -53,6 +53,37 @@ impl Store {
         Ok(())
     }
 
+    /// Session 77 — cheap existence probe used by
+    /// `pipeline::relation_synth` to drive idempotent plan-accept-time
+    /// triple materialisation. The `relations` schema (migration
+    /// 0001) declares `dedup_key TEXT` nullable with an index from
+    /// migration 0002 (`idx_relations_dedup_key`), so the lookup is
+    /// indexed but not constraint-enforced. Returning `Ok(true)` /
+    /// `Ok(false)` lets the caller distinguish "already present" from
+    /// "absent" without classifying either as an error — both are
+    /// expected outcomes on re-accept.
+    ///
+    /// Lives in this module rather than as ad-hoc SQL in the
+    /// pipeline crate because `Store::conn` is `pub(crate)`; the
+    /// storage layer keeps its connection encapsulated and exposes
+    /// typed methods. Sibling of the entity-side
+    /// `get_entity_by_business_id` Session 76 leans on for the
+    /// equivalent check.
+    pub fn relation_exists_by_dedup_key(&self, dedup_key: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Other(format!("connection poisoned: {e}")))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM relations WHERE dedup_key = ?",
+                params![dedup_key],
+                |r| r.get(0),
+            )
+            .map_err(StorageError::DuckDb)?;
+        Ok(count > 0)
+    }
+
     pub fn get_relation(&self, id: Uuid) -> Result<Relation> {
         let conn = self
             .conn
@@ -164,5 +195,37 @@ mod tests {
         assert_eq!(back.id, rel.id);
         assert_eq!(back.content, rel.content);
         assert_eq!(back.envelope.subjects.entities.len(), 2);
+    }
+
+    // Session 77 — existence-probe contract.
+    #[test]
+    fn relation_exists_by_dedup_key_distinguishes_present_and_absent() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        // Before any inserts, every dedup_key is absent.
+        assert_eq!(
+            store
+                .relation_exists_by_dedup_key("plan:nope#relation_exemplar:x:y:z")
+                .unwrap(),
+            false
+        );
+
+        // Insert a relation with a known dedup_key; the probe finds it.
+        let mut rel = sample_relation();
+        rel.dedup_key = Some("test-dedup-key-77".into());
+        store.insert_relation(&rel).unwrap();
+
+        assert_eq!(
+            store.relation_exists_by_dedup_key("test-dedup-key-77").unwrap(),
+            true
+        );
+        // Different key still absent — the probe doesn't false-positive.
+        assert_eq!(
+            store
+                .relation_exists_by_dedup_key("test-dedup-key-OTHER")
+                .unwrap(),
+            false
+        );
     }
 }

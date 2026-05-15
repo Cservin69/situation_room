@@ -62,6 +62,108 @@ use crate::research::{
 };
 
 // ---------------------------------------------------------------------------
+// Prompt-version surface (Session 77)
+// ---------------------------------------------------------------------------
+
+/// The prompt-version string currently shipping in
+/// `config/prompts/research_classifier.md`. Bumped whenever the
+/// prompt's output contract (or a major prose-only section that
+/// changes classifier behaviour) changes. Embedded in
+/// `research_plans.classified_by` via [`format_classifier_id`] so a
+/// plan persisted under v2.1 can be distinguished from one persisted
+/// under v2.2 without a schema migration. The plan-review surface
+/// reads this via the `classifier_prompt_version` Tauri command and
+/// renders a "re-classify" banner on plans whose stored version
+/// trails the current one (or is missing entirely — pre-Session-77
+/// plans were persisted with just the bare provider id).
+///
+/// **Bump checklist.** When you bump this constant:
+///   1. Add a `### Changelog` entry at the bottom of
+///      `config/prompts/research_classifier.md` with the dated
+///      summary of the change.
+///   2. Update the file's top-of-file title heading
+///      (`# Research Classifier Prompt — v…`).
+///   3. Both must move together — if they drift, the frontend banner
+///      will fire on every plan or on no plan, depending on which
+///      side is stale.
+pub const CLASSIFIER_PROMPT_VERSION: &str = "2.2";
+
+/// Combine an [`LlmProvider::id`] (`"xai"`, `"anthropic"`, …) with
+/// [`CLASSIFIER_PROMPT_VERSION`] into the stored
+/// `research_plans.classified_by` value: `"xai@2.2"`,
+/// `"anthropic@2.2"`. The `@` separator is the parse surface
+/// [`parse_classifier_id`] uses; pre-Session-77 plans persisted as
+/// just `"xai"` deserialise with `prompt_version: None` and trigger
+/// the frontend's stale-prompt banner.
+///
+/// Lives here (and not in the api crate) because the version
+/// constant is owned by this module — the prompt the constant
+/// describes is what this module loads at classify time. Call sites
+/// in `crates/api/src/commands.rs` pass the rendered string into
+/// `save_research_plan` / `save_research_plan_with_lineage`.
+pub fn format_classifier_id(provider_id: &str) -> String {
+    format!("{provider_id}@{CLASSIFIER_PROMPT_VERSION}")
+}
+
+/// Projection of a `research_plans.classified_by` value.
+///
+/// Pre-Session-77 plans were stored as the bare provider id
+/// (`"xai"`). Post-Session-77 plans are stored as
+/// `"{provider}@{version}"` via [`format_classifier_id`]. This
+/// struct unifies both shapes — `prompt_version: None` is the
+/// pre-Session-77 case (and is the trigger for the stale-prompt
+/// banner; absent is treated as "older than current"). Newer plans
+/// carry `Some(version)` and the frontend compares it character-wise
+/// against [`CLASSIFIER_PROMPT_VERSION`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedClassifierId {
+    pub provider: String,
+    pub prompt_version: Option<String>,
+}
+
+/// Parse a stored `classified_by` value into provider + optional
+/// prompt version. Lenient by design — any unparseable shape falls
+/// through to `provider = stored, prompt_version = None` so a
+/// future format change doesn't break plan loading.
+///
+/// The split rule is the first `@` in the string: everything before
+/// is the provider, everything after is the version. Empty version
+/// (`"xai@"`) maps to `None` so the banner still fires; empty
+/// provider (`"@2.2"`) keeps the whole string under `provider` as
+/// a defensive fallback (a classifier_id with no provider is
+/// nonsensical — we'd rather not lose the wire value entirely).
+pub fn parse_classifier_id(stored: &str) -> ParsedClassifierId {
+    match stored.split_once('@') {
+        Some((provider, version)) if !provider.is_empty() && !version.is_empty() => {
+            ParsedClassifierId {
+                provider: provider.to_string(),
+                prompt_version: Some(version.to_string()),
+            }
+        }
+        Some((provider, _)) if !provider.is_empty() => ParsedClassifierId {
+            provider: provider.to_string(),
+            prompt_version: None,
+        },
+        _ => ParsedClassifierId {
+            provider: stored.to_string(),
+            prompt_version: None,
+        },
+    }
+}
+
+/// Convenience predicate the frontend banner needs: is this plan's
+/// stored `classified_by` value pinned to the current prompt
+/// version? Pre-Session-77 plans (no version) and any plan whose
+/// stored version differs from [`CLASSIFIER_PROMPT_VERSION`] return
+/// `false` — both should display the re-classify banner.
+pub fn is_current_classifier_version(stored: &str) -> bool {
+    matches!(
+        parse_classifier_id(stored).prompt_version,
+        Some(v) if v == CLASSIFIER_PROMPT_VERSION
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -405,7 +507,29 @@ pub struct AuthoredEntityKindExpectation {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AuthoredRelationKindExpectation {
     pub kind: String,
+    /// Session 77 — optional prototype triples the model is confident
+    /// about from prior knowledge. Empty is the default; a wrong
+    /// triple is worse than no triple. Conversion to the typed
+    /// [`RelationTripleExemplar`] in [`convert_expectations`] walks
+    /// each `from`/`to` through [`EntityId::new`], so a malformed
+    /// `prefix:slug` string fails the whole plan (same posture as
+    /// the entity-exemplar conversion that ships above).
+    #[serde(default)]
+    pub exemplar_triples: Vec<AuthoredRelationTripleExemplar>,
     pub rationale: String,
+}
+
+/// Authored shape for one prototype `(from, kind, to)` triple. The
+/// kind lives on the parent [`AuthoredRelationKindExpectation`];
+/// every triple under one parent shares it. The two endpoints arrive
+/// as plain strings and get validated into [`EntityId`] in
+/// [`convert_expectations`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AuthoredRelationTripleExemplar {
+    pub from: String,
+    pub to: String,
+    #[serde(default)]
+    pub rationale: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -623,11 +747,34 @@ fn convert_expectations(
     let relation_kinds = raw
         .relation_kinds
         .into_iter()
-        .map(|r| RelationKindExpectation {
-            kind: r.kind,
-            rationale: r.rationale,
+        .map(|r| {
+            let exemplar_triples = r
+                .exemplar_triples
+                .into_iter()
+                .map(|t| {
+                    Ok::<_, ClassificationError>(crate::research::RelationTripleExemplar {
+                        from: EntityId::new(t.from.as_str())?,
+                        to: EntityId::new(t.to.as_str())?,
+                        rationale: t
+                            .rationale
+                            .and_then(|s| {
+                                let trimmed = s.trim();
+                                if trimmed.is_empty() {
+                                    None
+                                } else {
+                                    Some(trimmed.to_string())
+                                }
+                            }),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, ClassificationError>(RelationKindExpectation {
+                kind: r.kind,
+                exemplar_triples,
+                rationale: r.rationale,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let document_sources = raw
         .document_sources
@@ -932,6 +1079,81 @@ fn sanitize_for_fence(s: &str, fence_id: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod classifier_version_tests {
+    use super::*;
+
+    #[test]
+    fn format_classifier_id_appends_current_version() {
+        assert_eq!(
+            format_classifier_id("xai"),
+            format!("xai@{}", CLASSIFIER_PROMPT_VERSION)
+        );
+        assert_eq!(
+            format_classifier_id("anthropic"),
+            format!("anthropic@{}", CLASSIFIER_PROMPT_VERSION)
+        );
+    }
+
+    #[test]
+    fn parse_classifier_id_splits_on_at_sign() {
+        let parsed = parse_classifier_id("xai@2.2");
+        assert_eq!(parsed.provider, "xai");
+        assert_eq!(parsed.prompt_version.as_deref(), Some("2.2"));
+    }
+
+    #[test]
+    fn parse_classifier_id_returns_none_for_pre_session77_shape() {
+        // Pre-Session-77 the column was just the provider id.
+        let parsed = parse_classifier_id("xai");
+        assert_eq!(parsed.provider, "xai");
+        assert_eq!(parsed.prompt_version, None);
+    }
+
+    #[test]
+    fn parse_classifier_id_handles_empty_version() {
+        // Defensive: a malformed `xai@` shape still classifies as
+        // "provider known, version missing" so the banner fires.
+        let parsed = parse_classifier_id("xai@");
+        assert_eq!(parsed.provider, "xai");
+        assert_eq!(parsed.prompt_version, None);
+    }
+
+    #[test]
+    fn parse_classifier_id_handles_empty_provider() {
+        // `@2.2` is nonsensical (no provider) — fall back to
+        // stashing the whole string under `provider` so the wire
+        // value isn't lost.
+        let parsed = parse_classifier_id("@2.2");
+        assert_eq!(parsed.provider, "@2.2");
+        assert_eq!(parsed.prompt_version, None);
+    }
+
+    #[test]
+    fn is_current_classifier_version_distinguishes_current_and_stale() {
+        let current = format_classifier_id("xai");
+        assert!(is_current_classifier_version(&current));
+
+        // Pre-Session-77 shape.
+        assert!(!is_current_classifier_version("xai"));
+
+        // A wire value with a stale version.
+        assert!(!is_current_classifier_version("xai@2.1"));
+        assert!(!is_current_classifier_version("anthropic@1.6"));
+    }
+
+    #[test]
+    fn format_and_parse_round_trip() {
+        let formatted = format_classifier_id("anthropic");
+        let parsed = parse_classifier_id(&formatted);
+        assert_eq!(parsed.provider, "anthropic");
+        assert_eq!(
+            parsed.prompt_version.as_deref(),
+            Some(CLASSIFIER_PROMPT_VERSION)
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
@@ -974,6 +1196,7 @@ mod tests {
                 }],
                 relation_kinds: vec![AuthoredRelationKindExpectation {
                     kind: "operator_of".into(),
+                    exemplar_triples: vec![],
                     rationale: "Operator-asset link".into(),
                 }],
                 document_sources: vec![AuthoredDocumentSourceNomination {

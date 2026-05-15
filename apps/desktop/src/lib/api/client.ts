@@ -28,6 +28,7 @@ import type { ExpectationCoverageRowDto } from './types/ExpectationCoverageRowDt
 import type { HostBackoffSnapshotDto } from './types/HostBackoffSnapshotDto';
 import type { SourcesMemoryEntryDto } from './types/SourcesMemoryEntryDto';
 import type { LlmCostLedgerEntryDto } from './types/LlmCostLedgerEntryDto';
+import type { ClassifierPromptVersionDto } from './types/ClassifierPromptVersionDto';
 
 /**
  * Run Level-1 classification on a topic. Persists the resulting plan
@@ -485,6 +486,60 @@ export async function sourcesMemory(): Promise<SourcesMemoryEntryDto[]> {
  */
 export async function llmCostLedger(): Promise<LlmCostLedgerEntryDto[]> {
   return invoke<LlmCostLedgerEntryDto[]>('llm_cost_ledger');
+}
+
+/**
+ * Session 77 — return the classifier prompt version currently
+ * loaded in the binary. The frontend compares this against each
+ * plan's `classified_by` field (`"{provider}@{version}"` for
+ * post-Session-77 plans, bare provider id for pre-Session-77 plans)
+ * to decide whether to render the per-plan re-classify banner.
+ *
+ * Pure read of a compile-time constant; no LLM call, no DB. The
+ * call is cached at the store level so PlanReview doesn't refetch
+ * on every plan selection.
+ */
+export async function classifierPromptVersion(): Promise<ClassifierPromptVersionDto> {
+  return invoke<ClassifierPromptVersionDto>('classifier_prompt_version');
+}
+
+/**
+ * Session 77 — parse the `classified_by` wire value into provider +
+ * optional version. Lenient by design (mirrors the Rust-side
+ * `parse_classifier_id`): any unparseable shape falls through to
+ * `{ provider: input, promptVersion: null }` so the banner fires
+ * (we'd rather over-warn than miss a stale plan).
+ *
+ * The split rule is the first `@` in the string. Empty version
+ * (`"xai@"`) maps to `null`; empty provider (`"@2.2"`) keeps the
+ * whole string under `provider`.
+ */
+export function parseClassifierId(
+  stored: string,
+): { provider: string; promptVersion: string | null } {
+  const at = stored.indexOf('@');
+  if (at <= 0) {
+    return { provider: stored, promptVersion: null };
+  }
+  const version = stored.slice(at + 1);
+  if (version === '') {
+    return { provider: stored.slice(0, at), promptVersion: null };
+  }
+  return { provider: stored.slice(0, at), promptVersion: version };
+}
+
+/**
+ * Session 77 — true when the plan's stored `classified_by` value is
+ * pinned to `current`. Drives the re-classify banner: any plan whose
+ * parsed version differs from current (or is missing entirely) is
+ * "stale" and shows the banner.
+ */
+export function isCurrentClassifierVersion(
+  classifiedBy: string,
+  current: string,
+): boolean {
+  const { promptVersion } = parseClassifierId(classifiedBy);
+  return promptVersion === current;
 }
 
 /**

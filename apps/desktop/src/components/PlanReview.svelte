@@ -56,7 +56,13 @@
     acceptSelected,
     rejectSelected,
     reclassifySelected,
+    classifyTopic,
   } from '$stores/plans.svelte';
+  import {
+    classifierPromptVersion,
+    isCurrentClassifierVersion,
+    parseClassifierId,
+  } from '$lib/api/client';
   import Chip from '$components/common/Chip.svelte';
   import StatusPill from '$components/common/StatusPill.svelte';
   import Bucket from '$components/panels/Bucket.svelte';
@@ -131,6 +137,62 @@
     if (ok) reclassifyDialogOpen = false;
   }
   function onReclassifyCancel() { reclassifyDialogOpen = false; }
+
+  // Session 77 — stale-prompt-version banner. The Tauri command
+  // returns the version string the binary currently loaded; we
+  // compare it against the `@version` suffix parsed off the plan's
+  // `classified_by` field. Pre-Session-77 plans carry just the
+  // provider id (no `@`), so they parse to `promptVersion: null`
+  // and are treated as "stale" — the banner fires.
+  //
+  // We fetch the constant once per component instance and cache it;
+  // a future session can lift this into the plans store if multiple
+  // components start needing it (the call is free, but each
+  // PlanReview re-fetching on every navigation is unnecessary
+  // churn).
+  let currentPromptVersion = $state<string | null>(null);
+  $effect(() => {
+    // Capture in a local so the async resolution doesn't race against
+    // a later effect-run (Svelte may re-run the effect if its
+    // dependencies change; we don't have any here, but defensively
+    // assign only the first successful response).
+    let cancelled = false;
+    classifierPromptVersion()
+      .then((dto) => {
+        if (!cancelled) currentPromptVersion = dto.current;
+      })
+      .catch(() => {
+        // Command failure (Tauri not up, bug, etc.) — leave the
+        // version null and the banner stays hidden. Surfacing a
+        // toast here would be more noise than signal.
+      });
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  let stalePromptVersion = $derived.by(() => {
+    if (currentPromptVersion === null) return false;
+    if (!plan.classified_by || plan.classified_by.length === 0) return false;
+    return !isCurrentClassifierVersion(plan.classified_by, currentPromptVersion);
+  });
+
+  let storedPromptVersion = $derived(parseClassifierId(plan.classified_by ?? '').promptVersion);
+
+  /// Session 77 — banner action. The backend's `reclassify_plan`
+  /// command requires the plan to be in Rejected status; the
+  /// stale-prompt banner needs to work on Pending and Accepted
+  /// plans too. So instead of routing through the
+  /// reject-then-reclassify flow, we kick off a fresh `classify`
+  /// on the same topic. The result is a new Pending plan that
+  /// shares the topic but carries the current prompt's framing;
+  /// the original plan stays untouched (the operator can decide
+  /// what to do with it). Same flow as `classifyTopic` from the
+  /// topic input.
+  async function onReclassifyUnderCurrentPrompt() {
+    if (!plan.topic) return;
+    await classifyTopic(plan.topic);
+  }
 
   // Records-loaded sentinel + per-bucket counts. Reading these in
   // derived values keeps the template short and makes the empty-
@@ -252,6 +314,39 @@
     <span class="trust-label">interpretation</span>
     <p>{plan.interpretation}</p>
   </section>
+
+  <!-- Stale classifier prompt banner (Session 77).
+
+       Shown when the version embedded in `plan.classified_by`
+       (`"{provider}@{version}"`, post-Session-77) doesn't match the
+       version constant the binary currently ships, OR when the plan
+       predates Session 77 and carries just the provider id with no
+       `@version` suffix. The user's one click hands the plan to the
+       re-classify dialog — same flow the rejected-plan re-classify
+       button uses, so the dialog logic is reused rather than
+       re-implemented.
+
+       Why not auto-reclassify: re-classification spends an LLM
+       completion. The operator owns that decision per
+       `feedback_eval_cost_discipline`; the banner surfaces the
+       option without forcing it. -->
+  {#if stalePromptVersion}
+    <section class="stale-prompt-banner" data-testid="stale-prompt-banner">
+      <span class="stale-prompt-label">stale classifier prompt</span>
+      <p class="stale-prompt-text">
+        This plan was classified under prompt version
+        <code>{storedPromptVersion ?? '(pre-Session-77)'}</code>.
+        The binary now ships <code>{currentPromptVersion}</code>.
+        Re-classify to apply the newer prompt's framing.
+      </p>
+      <button
+        type="button"
+        class="stale-prompt-action"
+        onclick={onReclassifyUnderCurrentPrompt}
+        disabled={plans.classifying}
+      >Re-classify</button>
+    </section>
+  {/if}
 
   <!-- Lineage banner: surfaces when this plan was produced by
        re-classifying a rejected predecessor. The id link is
@@ -828,6 +923,56 @@
     font-family: var(--font-mono);
     color: var(--fg-secondary);
     font-size: 10px;
+  }
+
+  /* Stale-prompt banner (Session 77) — warning-tone strip slotted
+     between interpretation and lineage. Same border-left signal-color
+     idiom as the rejection panel, with a right-aligned action button.
+     Compact (single row in the common case, wraps on narrow widths). */
+  .stale-prompt-banner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    background: var(--bg-panel-alt);
+    border: 1px solid var(--border-subtle);
+    border-left: 2px solid var(--signal-warning);
+    border-radius: 2px;
+    padding: 8px 12px;
+    font-size: 12px;
+  }
+  .stale-prompt-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--signal-warning);
+  }
+  .stale-prompt-text {
+    margin: 0;
+    color: var(--fg-secondary);
+    line-height: 1.55;
+    flex: 1 1 240px;
+  }
+  .stale-prompt-text code {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--fg-primary);
+    background: var(--bg-panel);
+    padding: 1px 4px;
+    border-radius: 2px;
+  }
+  .stale-prompt-action {
+    flex: 0 0 auto;
+    padding: 4px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 2px;
+    background: var(--bg-panel);
+    color: var(--fg-primary);
+    font: inherit;
+    cursor: pointer;
+  }
+  .stale-prompt-action:hover {
+    background: var(--bg-hover);
   }
 
   /* Rejection note panel — dimmer than the trust paragraph because

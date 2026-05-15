@@ -121,6 +121,7 @@ use crate::propose_source_url::{
     propose_source_url, PriorAttempt, ProposalError, ProposalOutcome,
 };
 use crate::document_synth::insert_fetch_document;
+use crate::extract::{extract_and_persist_assertions, extract_and_persist_events};
 use crate::recipe_apply::{apply, ApplyContext, ApplyError, MAX_RECORDS_PER_RECIPE};
 use crate::recipe_author::{author_recipe, AuthoringContext, AuthoringError};
 use crate::recipes::{ExpectationRef, ExtractionSpec, FetchRecipe};
@@ -351,6 +352,27 @@ pub struct ExecutorContext<'a> {
     /// pattern. Consumed by [`propose_source_url`] inside the retry
     /// loop in `author_one`.
     pub propose_url_prompt: &'a str,
+    /// Session 77 — per-Document Assertion extraction prompt.
+    /// Consumed by `crate::extract::extract_and_persist_assertions`
+    /// which the per-recipe runners call once per successful fetch,
+    /// gated to article-kind Documents (the gate lives in the
+    /// extract module). When `None`, extraction is skipped silently
+    /// — the eval harness and test contexts that don't care about
+    /// Phase-3 assertion synthesis pass `None` here so they don't
+    /// have to ship a real prompt. The desktop binary passes
+    /// `Some(prompt)` so the dashboard's Assertions panel
+    /// populates on every plan run.
+    pub document_assertions_prompt: Option<&'a str>,
+    /// Session 78 — per-Document Event extraction prompt. Sibling of
+    /// `document_assertions_prompt`. Consumed by
+    /// `crate::extract::extract_and_persist_events`, called by each
+    /// runner right after the assertion extraction call. Same
+    /// gating (article-kind + non-empty body) lives in the extract
+    /// module; an additional gate fires upstream of the LLM call
+    /// when the plan declared no `event_kinds` (zero spend for
+    /// plans that don't track events). Eval harness and test
+    /// contexts pass `None` to skip event extraction wholesale.
+    pub document_events_prompt: Option<&'a str>,
     /// Source descriptors for the executor.
     ///
     /// **Doc-narrowed under ADR 0015 (Session 37) and further under
@@ -3998,6 +4020,53 @@ async fn run_csv_recipe(
         fetched_at,
     );
 
+    // Session 77 — per-Document Assertion extraction. Skipped when
+    // `document_assertions_prompt` is None (eval harness, test
+    // contexts that don't want an LLM call per fetched URL). The
+    // extract module gates internally on MIME (article-kind only)
+    // and body length (non-empty) so JSON/CSV/PDF feeds don't burn
+    // tokens. Errors and per-assertion insert failures are
+    // warn-logged inside `extract_and_persist_assertions` and
+    // returned in the `ExtractionReport`; we deliberately ignore
+    // the report here (the operator-visible signal is the dashboard
+    // Assertions panel lighting up).
+    if let Some(prompt) = ctx.document_assertions_prompt {
+        let _ = extract_and_persist_assertions(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
+    // Session 78 — per-Document Event extraction. Sibling of the
+    // assertion path. Skipped when `document_events_prompt` is None
+    // (eval harness, test contexts). The extract module gates
+    // internally on MIME + body + plan-declared event_kinds — plans
+    // that declared no event kinds short-circuit before the LLM
+    // call, so cost stays bounded. Errors and per-event insert
+    // failures are warn-logged inside `extract_and_persist_events`;
+    // we ignore the report here (operator-visible signal is the
+    // Events panel ticking up on the dashboard).
+    if let Some(prompt) = ctx.document_events_prompt {
+        let _ = extract_and_persist_events(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
     // Apply.
     let apply_ctx = ApplyContext {
         recipe,
@@ -4107,6 +4176,53 @@ async fn run_json_recipe(
         fetched_at,
     );
 
+    // Session 77 — per-Document Assertion extraction. Skipped when
+    // `document_assertions_prompt` is None (eval harness, test
+    // contexts that don't want an LLM call per fetched URL). The
+    // extract module gates internally on MIME (article-kind only)
+    // and body length (non-empty) so JSON/CSV/PDF feeds don't burn
+    // tokens. Errors and per-assertion insert failures are
+    // warn-logged inside `extract_and_persist_assertions` and
+    // returned in the `ExtractionReport`; we deliberately ignore
+    // the report here (the operator-visible signal is the dashboard
+    // Assertions panel lighting up).
+    if let Some(prompt) = ctx.document_assertions_prompt {
+        let _ = extract_and_persist_assertions(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
+    // Session 78 — per-Document Event extraction. Sibling of the
+    // assertion path. Skipped when `document_events_prompt` is None
+    // (eval harness, test contexts). The extract module gates
+    // internally on MIME + body + plan-declared event_kinds — plans
+    // that declared no event kinds short-circuit before the LLM
+    // call, so cost stays bounded. Errors and per-event insert
+    // failures are warn-logged inside `extract_and_persist_events`;
+    // we ignore the report here (operator-visible signal is the
+    // Events panel ticking up on the dashboard).
+    if let Some(prompt) = ctx.document_events_prompt {
+        let _ = extract_and_persist_events(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
     // Apply.
     let apply_ctx = ApplyContext {
         recipe,
@@ -4209,6 +4325,53 @@ async fn run_css_recipe(
         response_content_type.as_deref(),
         fetched_at,
     );
+
+    // Session 77 — per-Document Assertion extraction. Skipped when
+    // `document_assertions_prompt` is None (eval harness, test
+    // contexts that don't want an LLM call per fetched URL). The
+    // extract module gates internally on MIME (article-kind only)
+    // and body length (non-empty) so JSON/CSV/PDF feeds don't burn
+    // tokens. Errors and per-assertion insert failures are
+    // warn-logged inside `extract_and_persist_assertions` and
+    // returned in the `ExtractionReport`; we deliberately ignore
+    // the report here (the operator-visible signal is the dashboard
+    // Assertions panel lighting up).
+    if let Some(prompt) = ctx.document_assertions_prompt {
+        let _ = extract_and_persist_assertions(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
+    // Session 78 — per-Document Event extraction. Sibling of the
+    // assertion path. Skipped when `document_events_prompt` is None
+    // (eval harness, test contexts). The extract module gates
+    // internally on MIME + body + plan-declared event_kinds — plans
+    // that declared no event kinds short-circuit before the LLM
+    // call, so cost stays bounded. Errors and per-event insert
+    // failures are warn-logged inside `extract_and_persist_events`;
+    // we ignore the report here (operator-visible signal is the
+    // Events panel ticking up on the dashboard).
+    if let Some(prompt) = ctx.document_events_prompt {
+        let _ = extract_and_persist_events(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
 
     // Apply.
     let apply_ctx = ApplyContext {
@@ -4319,6 +4482,53 @@ async fn run_regex_recipe(
         fetched_at,
     );
 
+    // Session 77 — per-Document Assertion extraction. Skipped when
+    // `document_assertions_prompt` is None (eval harness, test
+    // contexts that don't want an LLM call per fetched URL). The
+    // extract module gates internally on MIME (article-kind only)
+    // and body length (non-empty) so JSON/CSV/PDF feeds don't burn
+    // tokens. Errors and per-assertion insert failures are
+    // warn-logged inside `extract_and_persist_assertions` and
+    // returned in the `ExtractionReport`; we deliberately ignore
+    // the report here (the operator-visible signal is the dashboard
+    // Assertions panel lighting up).
+    if let Some(prompt) = ctx.document_assertions_prompt {
+        let _ = extract_and_persist_assertions(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
+    // Session 78 — per-Document Event extraction. Sibling of the
+    // assertion path. Skipped when `document_events_prompt` is None
+    // (eval harness, test contexts). The extract module gates
+    // internally on MIME + body + plan-declared event_kinds — plans
+    // that declared no event kinds short-circuit before the LLM
+    // call, so cost stays bounded. Errors and per-event insert
+    // failures are warn-logged inside `extract_and_persist_events`;
+    // we ignore the report here (operator-visible signal is the
+    // Events panel ticking up on the dashboard).
+    if let Some(prompt) = ctx.document_events_prompt {
+        let _ = extract_and_persist_events(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
     // Apply.
     let apply_ctx = ApplyContext {
         recipe,
@@ -4418,6 +4628,53 @@ async fn run_pdf_recipe(
         response_content_type.as_deref(),
         fetched_at,
     );
+
+    // Session 77 — per-Document Assertion extraction. Skipped when
+    // `document_assertions_prompt` is None (eval harness, test
+    // contexts that don't want an LLM call per fetched URL). The
+    // extract module gates internally on MIME (article-kind only)
+    // and body length (non-empty) so JSON/CSV/PDF feeds don't burn
+    // tokens. Errors and per-assertion insert failures are
+    // warn-logged inside `extract_and_persist_assertions` and
+    // returned in the `ExtractionReport`; we deliberately ignore
+    // the report here (the operator-visible signal is the dashboard
+    // Assertions panel lighting up).
+    if let Some(prompt) = ctx.document_assertions_prompt {
+        let _ = extract_and_persist_assertions(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
+    // Session 78 — per-Document Event extraction. Sibling of the
+    // assertion path. Skipped when `document_events_prompt` is None
+    // (eval harness, test contexts). The extract module gates
+    // internally on MIME + body + plan-declared event_kinds — plans
+    // that declared no event kinds short-circuit before the LLM
+    // call, so cost stays bounded. Errors and per-event insert
+    // failures are warn-logged inside `extract_and_persist_events`;
+    // we ignore the report here (operator-visible signal is the
+    // Events panel ticking up on the dashboard).
+    if let Some(prompt) = ctx.document_events_prompt {
+        let _ = extract_and_persist_events(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
 
     let apply_ctx = ApplyContext {
         recipe,
@@ -4532,6 +4789,7 @@ mod tests {
                 }],
                 relation_kinds: vec![RelationKindExpectation {
                     kind: "operator_of".into(),
+                    exemplar_triples: vec![],
                     rationale: "Asset link".into(),
                 }],
                 document_sources: vec![DocumentSourceEntry::Nomination(
@@ -4890,6 +5148,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -4970,6 +5230,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "unused — legacy entries are not authored",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5043,6 +5305,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5115,6 +5379,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "unused — recipe already authored",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5179,6 +5445,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5239,6 +5507,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "unused — recipe already authored",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5289,6 +5559,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5320,6 +5592,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5356,6 +5630,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5430,6 +5706,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5482,6 +5760,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5523,6 +5803,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5579,6 +5861,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5618,6 +5902,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5682,6 +5968,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5728,6 +6016,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5812,6 +6102,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5889,6 +6181,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "unused — recipes already authored",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5948,6 +6242,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -5989,6 +6285,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -6185,6 +6483,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "unused — recipe pre-authored",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -6308,6 +6608,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "unused — recipe pre-authored",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -6468,6 +6770,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &sources,
         };
 
@@ -6535,6 +6839,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &sources,
         };
 
@@ -6602,6 +6908,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &sources,
         };
 
@@ -6667,6 +6975,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &sources,
         };
 
@@ -6841,6 +7151,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "unused — recipe pre-authored",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -6983,6 +7295,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "unused — recipe pre-authored",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -7565,6 +7879,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -7607,6 +7923,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "",
             propose_url_prompt: "",
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &[],
         };
 
@@ -8133,6 +8451,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &sources,
         };
 
@@ -8261,6 +8581,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &sources,
         };
 
@@ -8402,6 +8724,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: TEST_AUTHOR_PROMPT,
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &sources,
         };
 
@@ -8985,6 +9309,8 @@ mod tests {
             provider: &provider,
             recipe_author_prompt: "unused — first propose 404s, second declines",
             propose_url_prompt: TEST_PROPOSE_URL_PROMPT,
+            document_assertions_prompt: None,
+            document_events_prompt: None,
             sources: &sources,
         };
 

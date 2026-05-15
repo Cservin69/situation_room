@@ -120,6 +120,22 @@ pub struct ResearchPlanDto {
     /// primitive at the TS side.
     #[serde(default)]
     pub reclassified_from: String,
+    /// Session 77 — the raw `research_plans.classified_by` value as
+    /// persisted. Post-Session-77 this is `"{provider}@{version}"`
+    /// (e.g. `"xai@2.2"`); pre-Session-77 plans carry just the
+    /// provider id (e.g. `"xai"`). The frontend parses the optional
+    /// `@version` suffix to drive the stale-prompt re-classify
+    /// banner — see `classifier_prompt_version` Tauri command for
+    /// the current shipping version.
+    ///
+    /// Empty string from `from_typed_pending` (which builds the DTO
+    /// before the row is read back from disk); `from_stored`
+    /// populates it from the storage row. The empty form should not
+    /// reach the frontend on any post-classify load path; it's the
+    /// type-safe default that lets the DTO satisfy `Default::default`-
+    /// style construction in tests.
+    #[serde(default)]
+    pub classified_by: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -173,6 +189,28 @@ pub struct EntityKindExpectationDto {
 #[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
 pub struct RelationKindExpectationDto {
     pub kind: String,
+    /// Session 77 — prototype `(from, to)` triples the classifier
+    /// nominated for this kind. Empty for plans classified before
+    /// Session 77 and for kinds the classifier didn't seed from
+    /// prior knowledge. The plan-review surface renders these as
+    /// chips under the kind tile so the operator can spot which
+    /// concrete edges materialised on accept.
+    pub exemplar_triples: Vec<RelationTripleExemplarDto>,
+    pub rationale: String,
+}
+
+/// Wire shape for one prototype `(from, to)` relation triple.
+/// Endpoints arrive as plain strings (the typed `EntityId`'s inner
+/// `prefix:slug` form). The kind lives on the parent
+/// [`RelationKindExpectationDto`].
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct RelationTripleExemplarDto {
+    pub from: String,
+    pub to: String,
+    /// Empty string when the classifier didn't attach a rationale.
+    /// Matches the empty-string-as-absent convention used elsewhere
+    /// in this DTO file (`unit_hint`, `display`, …).
     pub rationale: String,
 }
 
@@ -446,6 +484,7 @@ impl ResearchPlanDto {
             status,
             rejection_reason: String::new(),
             reclassified_from: String::new(),
+            classified_by: String::new(),
         }
     }
 
@@ -478,9 +517,11 @@ impl ResearchPlanDto {
             expectations,
             created_at: s.created_at,
         };
+        let classified_by = s.classified_by;
         let mut dto = Self::from_typed_with_status(plan, status);
         dto.rejection_reason = rejection_reason;
         dto.reclassified_from = reclassified_from;
+        dto.classified_by = classified_by;
         Ok(dto)
     }
 }
@@ -563,7 +604,24 @@ impl From<RelationKindExpectation> for RelationKindExpectationDto {
     fn from(r: RelationKindExpectation) -> Self {
         Self {
             kind: r.kind,
+            exemplar_triples: r
+                .exemplar_triples
+                .into_iter()
+                .map(RelationTripleExemplarDto::from)
+                .collect(),
             rationale: r.rationale,
+        }
+    }
+}
+
+impl From<situation_room_pipeline::research::RelationTripleExemplar>
+    for RelationTripleExemplarDto
+{
+    fn from(t: situation_room_pipeline::research::RelationTripleExemplar) -> Self {
+        Self {
+            from: t.from.as_str().to_string(),
+            to: t.to.as_str().to_string(),
+            rationale: t.rationale.unwrap_or_default(),
         }
     }
 }
@@ -1531,6 +1589,25 @@ impl LlmCostLedgerEntryDto {
 }
 
 // ---------------------------------------------------------------------------
+// ClassifierPromptVersionDto — Session 77
+// ---------------------------------------------------------------------------
+
+/// Wire shape for the `classifier_prompt_version` command. One field
+/// today (`current`) — the version string of the classifier prompt
+/// the binary loaded. Wrapped in a struct rather than returned bare
+/// so a future addition (e.g. a `changelog_summary` field, or a
+/// per-provider version mapping) doesn't break the wire contract.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct ClassifierPromptVersionDto {
+    /// The shipping prompt version (e.g. `"2.2"`). The frontend
+    /// compares this character-wise against the `@version` suffix
+    /// parsed off each plan's `classified_by` field to decide
+    /// whether to render the re-classify banner.
+    pub current: String,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1579,6 +1656,7 @@ mod tests {
                 }],
                 relation_kinds: vec![P_RKE {
                     kind: "operator_of".into(),
+                    exemplar_triples: vec![],
                     rationale: "Asset link".into(),
                 }],
                 document_sources: vec![P_DSE::Nomination(P_DSN {

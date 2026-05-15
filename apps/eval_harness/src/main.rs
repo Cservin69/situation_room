@@ -661,6 +661,17 @@ async fn run_one_trial(
             provider,
             recipe_author_prompt: RECIPE_AUTHOR_PROMPT,
             propose_url_prompt: PROPOSE_URL_PROMPT,
+            // Session 77 — the eval harness measures fetch + apply
+            // outcomes; per-Document Assertion extraction is an
+            // additional LLM call per article that would distort
+            // wall-clock measurements without changing the harness's
+            // observable signal (it's measuring records, not
+            // assertions). Skip explicitly here so the harness path
+            // stays cost-bounded for repeat trials.
+            document_assertions_prompt: None,
+            // Session 78 — event extraction also skipped in eval
+            // harness to keep wall-clock measurements clean.
+            document_events_prompt: None,
             sources,
         };
 

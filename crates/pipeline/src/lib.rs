@@ -80,6 +80,15 @@ pub mod document_synth;
 // Closed-vocabulary, no LLM calls, idempotent via the
 // `entities.entity_id` UNIQUE constraint.
 pub mod entity_synth;
+// Session 77 — plan-accept-time Relation triple materialisation.
+// Sibling of `entity_synth`. The classifier now emits optional
+// `exemplar_triples: Vec<(EntityId, EntityId)>` on each
+// `RelationKindExpectation`; this module promotes each
+// `(plan, kind, from, to)` to a `Relation` row at plan-accept time so
+// the dashboard's Relations panel lights up before any fetching runs.
+// Closed-vocabulary, no LLM calls, idempotent via a deterministic
+// `dedup_key` derived from `(plan_id, kind, from, to)`.
+pub mod relation_synth;
 // Session 70 / ADR 0009 amendment 2 — host-class-aware User-Agent
 // policy. A closed `UaPolicy` enum mirrors the `FetchOutcomeClass`
 // vocabulary in `fetch_classes`; each variant maps to one UA string

@@ -15,8 +15,10 @@ claimant: string,
 stance: string, 
 /**
  * The asserted content as opaque JSON. The
- * [`AssertedContent`] enum has a `kind` discriminator with
- * per-variant payload; the frontend reads the `kind` and
+ * [`AssertedContent`] enum has an `asserted_kind`
+ * discriminator (renamed in Session 78 from `kind` to avoid a
+ * collision with `RelationContent.kind`) with per-variant
+ * payload; the frontend reads `content.asserted_kind` and
  * dispatches.
  */
 content: unknown, envelope: EnvelopeDto, };

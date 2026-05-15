@@ -1,4 +1,4 @@
-# Research Classifier Prompt — v2.0
+# Research Classifier Prompt — v2.2
 
 <!--
     This file is the Level-1 research classifier prompt for situation_room.
@@ -183,6 +183,33 @@ formats is rejected and the user sees a classification error.
   `lowercase_snake_case` predicate. Good: `operator_of`,
   `supplies_to`, `subsidiary_of`, `subject_to_sanction`,
   `licenses_from`. Bad: `is related to`, `does business with`.
+
+- **Relation exemplar triples (`relation_kinds[].exemplar_triples`,
+  Session 77, optional)** — when you can name concrete edges from
+  prior knowledge, emit them as `{from, to}` pairs whose `kind` is
+  the parent expectation's kind. Each endpoint is a fully-prefixed
+  `EntityId` in the same `prefix:slug` shape `entity_kinds[].exemplars`
+  uses (`company:panasonic`, `company:tsla`, `agency:ofac`). These
+  triples are promoted to `Relation` rows at plan-accept time, so
+  the dashboard's Relations panel lights up before any fetching
+  runs — the same way `entity_kinds[].exemplars` already lights up
+  the Entities panel.
+
+  **Triples are optional. Empty is the default.** Emit a triple
+  only when you are confident the edge holds in the real world.
+  Wrong triples are worse than no triples — the dashboard will
+  display them as Relation rows and the operator has to remove
+  them. If the kind is `supplies_to` but you're not sure which
+  supplier sends to which buyer, leave the list empty.
+
+  Good: under `relation_kinds.kind = "supplies_to"` for a Tesla
+  stock-price plan, `{from: "company:panasonic", to: "company:tsla"}`
+  and `{from: "company:catl", to: "company:tsla"}` — both
+  well-known supply relationships.
+
+  Bad: emitting `{from: "company:tsla", to: "company:gm"}` under
+  `competitor_of` just because both are automakers — competition
+  is not a typed edge the topic asks the workstation to track.
 
 ## Existing topics — substantive reuse only
 
@@ -542,11 +569,16 @@ User topic: `lithium supply chain`
     "relation_kinds": [
       {
         "kind": "operator_of",
+        "exemplar_triples": [
+          {"from": "company:talison_lithium", "to": "mine:greenbushes"},
+          {"from": "company:sqm", "to": "mine:salar_de_atacama"}
+        ],
         "rationale": "Links companies to specific mines and refineries."
       },
       {
         "kind": "supplies_to",
-        "rationale": "Links upstream lithium to downstream cell makers."
+        "exemplar_triples": [],
+        "rationale": "Links upstream lithium to downstream cell makers. No high-confidence prior-knowledge triples — the contract topology shifts contract by contract."
       }
     ],
     "document_sources": [
@@ -863,6 +895,24 @@ honest about what the workstation will surface.
 
 ### Changelog
 
+- **v2.2** (2026-05-15) — Session 77. Schema extension:
+  `relation_kinds[].exemplar_triples: Vec<{from, to}>` is now an
+  optional emission shape alongside the existing `kind` +
+  `rationale`. New prose subsection "Relation exemplar triples"
+  under the *"What goes in each `expectations` bucket"* section
+  teaches the convention (fully-prefixed `EntityId` endpoints, kind
+  inherited from parent, empty default, wrong-triple > no-triple
+  discipline). Lithium worked example updated to carry two triples
+  on `operator_of` (`talison_lithium → greenbushes`,
+  `sqm → salar_de_atacama`) and to keep `supplies_to` triples
+  empty with an explanatory rationale. Triples are promoted to
+  `Relation` rows at plan-accept time by
+  `pipeline::relation_synth::materialize_relation_exemplars`
+  (sibling of Session 76's `entity_synth`); the dashboard's
+  Relations panel populates before any fetching runs. Plans
+  classified pre-Session-77 deserialize with empty
+  `exemplar_triples` (the field carries `#[serde(default)]`); no
+  migration required.
 - **v2.1** (2026-05-15) — Session 76. New section
   "Don't let `observation_metrics` crowd out `event_types`"
   addresses a recurring failure mode where

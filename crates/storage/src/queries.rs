@@ -693,7 +693,20 @@ const ASSERTIONS_COLUMNS: &str =
      source_id, source_url, source_published_at, \
      license, tags, subject_time, observed_at, valid_at, confidence";
 
-fn decode_assertion_row(conn: &duckdb::Connection, row: &duckdb::Row<'_>) -> Result<Assertion> {
+/// Decode one assertion row. Returns `Ok(None)` if the row's
+/// `content` JSON fails to deserialize — almost always the
+/// Session-77 duplicate-`kind` poison shape (see content.rs
+/// AssertedContent docs). Logging happens here so list callers
+/// stay terse; the dashboard sees the rest of the table instead
+/// of a hard error.
+///
+/// Hard errors (DuckDB row-access failures, bad envelope columns,
+/// invalid claimant `EntityId`) still propagate — those signal
+/// real corruption rather than the known v1 serialization gap.
+fn decode_assertion_row(
+    conn: &duckdb::Connection,
+    row: &duckdb::Row<'_>,
+) -> Result<Option<Assertion>> {
     let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
     let dedup_key: Option<String> = row.get(1).map_err(StorageError::DuckDb)?;
     let claimant_s: String = row.get(2).map_err(StorageError::DuckDb)?;
@@ -716,15 +729,32 @@ fn decode_assertion_row(conn: &duckdb::Connection, row: &duckdb::Row<'_>) -> Res
         .map_err(|e| StorageError::Other(format!("claimant round-trip: {e}")))?;
     let stance: Stance = serde_json::from_value(serde_json::Value::String(stance_s))
         .map_err(StorageError::Serde)?;
-    let content: AssertedContent = serde_json::from_str(&content_json)?;
-    Ok(Assertion {
+    // Session 78: tolerate the v1 duplicate-`kind` poison shape. The
+    // schema fix landed in content.rs (`tag = "asserted_kind"`); rows
+    // produced under the old tag may still sit in `assertions` for
+    // operators who haven't run the cleanup SQL yet. Log + skip
+    // rather than fail the whole list query.
+    let content: AssertedContent = match serde_json::from_str(&content_json) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                assertion_id = %row_id,
+                error = %e,
+                content_preview = %content_json.chars().take(80).collect::<String>(),
+                "skipping assertion row whose content JSON failed to deserialize \
+                 (likely Session-77 duplicate-`kind` poison; cleanup SQL in session78-verify.sh)"
+            );
+            return Ok(None);
+        }
+    };
+    Ok(Some(Assertion {
         id: row_id,
         dedup_key,
         claimant,
         stance,
         content,
         envelope,
-    })
+    }))
 }
 
 fn list_assertions(
@@ -745,7 +775,9 @@ fn list_assertions(
 
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
-        out.push(decode_assertion_row(conn, row)?);
+        if let Some(a) = decode_assertion_row(conn, row)? {
+            out.push(a);
+        }
     }
     Ok(out)
 }
@@ -764,7 +796,9 @@ fn list_assertions_recent(conn: &duckdb::Connection, limit: i64) -> Result<Vec<A
 
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(StorageError::DuckDb)? {
-        out.push(decode_assertion_row(conn, row)?);
+        if let Some(a) = decode_assertion_row(conn, row)? {
+            out.push(a);
+        }
     }
     Ok(out)
 }
@@ -1139,6 +1173,68 @@ mod tests {
         let result_b = store.records_for_plan(plan_b).unwrap();
         assert_eq!(result_a.entities.len(), 1);
         assert!(result_b.entities.is_empty());
+    }
+
+    #[test]
+    fn records_for_plan_returns_plan_keyed_relation_with_no_recipes() {
+        // Session 77 — relation triple materialisation produces
+        // Relation rows whose `provenance.source_id` is
+        // `plan:<plan_id>#relation_exemplar`, NOT the recipe-keyed
+        // shape. The Session-76 plan-keyed LIKE pattern matches
+        // `plan:<plan_id>#%`, so Relations route the same way
+        // Entities do. This test pins the shape so a future
+        // tightening of the pattern doesn't silently drop the
+        // Relations panel back to zero.
+        use situation_room_core::schema::content::RelationContent;
+        use situation_room_core::schema::records::Relation;
+        use situation_room_core::vocab::EntityId;
+
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan_id = Uuid::now_v7();
+
+        let envelope = Envelope {
+            provenance: Provenance {
+                source_id: format!("plan:{plan_id}#relation_exemplar"),
+                source_url: None,
+                source_published_at: None,
+                license: "classifier-emitted".into(),
+                derived_from: vec![],
+            },
+            subjects: Subjects {
+                entities: vec![
+                    EntityId::new("company:panasonic").unwrap(),
+                    EntityId::new("company:tsla").unwrap(),
+                ],
+                places: vec![],
+                time: None,
+                topics: vec![Topic::new("test_topic").unwrap()],
+            },
+            tags: vec![],
+            valid_at: None,
+            observed_at: Utc::now(),
+            confidence: Confidence::ONE,
+        };
+
+        let content = RelationContent {
+            kind: "supplies_to".into(),
+            from: EntityId::new("company:panasonic").unwrap(),
+            to: EntityId::new("company:tsla").unwrap(),
+            magnitude: None,
+            valid_until: None,
+        };
+
+        let mut rel = Relation::new(envelope, content);
+        rel.dedup_key = Some(format!(
+            "plan:{plan_id}#relation_exemplar:supplies_to:company:panasonic:company:tsla"
+        ));
+        store.insert_relation(&rel).unwrap();
+
+        let result = store.records_for_plan(plan_id).unwrap();
+        assert_eq!(result.relations.len(), 1);
+        assert_eq!(result.relations[0].id, rel.id);
+        assert_eq!(result.relations[0].content.kind, "supplies_to");
     }
 
     #[test]

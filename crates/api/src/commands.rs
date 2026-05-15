@@ -49,6 +49,7 @@ use serde::Serialize;
 use situation_room_llm::{CostLedger, LlmProvider, ModelTier};
 use situation_room_pipeline::fetch_backoff::{BackoffFetcher, HostBackoff};
 use situation_room_pipeline::entity_synth::materialize_entity_exemplars;
+use situation_room_pipeline::relation_synth::materialize_relation_exemplars;
 use situation_room_pipeline::fetch_executor::{
     run_fetch_for_plan as run_fetch_for_plan_impl, ExecutorContext, FetchExecutorError,
 };
@@ -59,8 +60,9 @@ use situation_room_pipeline::recipes_store::{
     load_recipe as load_recipe_impl, save_recipe as save_recipe_impl, RecipeStoreError,
 };
 use situation_room_pipeline::research_classifier::{
-    classify_topic, ClassificationContext, ClassificationError,
+    classify_topic, format_classifier_id, ClassificationContext, ClassificationError,
     SourceDescriptor as PipelineSourceDescriptor, TopicUsage as ClassifierTopicUsage,
+    CLASSIFIER_PROMPT_VERSION,
 };
 use situation_room_pipeline::research_plans_store::{
     load_research_plan as load_research_plan_impl, save_research_plan,
@@ -162,6 +164,22 @@ pub struct AppState {
     /// executor's per-attempt URL-discovery step. Loaded the same way
     /// as the other prompts (binary `include_str!`).
     pub propose_url_prompt: &'static str,
+    /// Session 77 — per-Document Assertion extraction prompt.
+    /// Consumed by `pipeline::extract::extract_and_persist_assertions`,
+    /// which the fetch executor calls once per article-kind Document
+    /// (gated on MIME + non-empty body) right after the
+    /// Session-69 `insert_fetch_document` hook. Loaded with the same
+    /// `include_str!` pattern as the other prompts.
+    pub document_assertions_prompt: &'static str,
+    /// Session 78 — per-Document Event extraction prompt. Sibling of
+    /// `document_assertions_prompt`. Consumed by
+    /// `pipeline::extract::extract_and_persist_events`, called by
+    /// each run_X_recipe runner immediately after the assertion
+    /// extraction call. Same loading pattern (compile-time
+    /// `include_str!`). Cost is gated upstream: plans with no
+    /// declared `event_kinds` short-circuit before the workhorse-tier
+    /// call.
+    pub document_events_prompt: &'static str,
     /// Doc-narrowed under ADR 0015 (Session 37). The classifier no
     /// longer consults this list; only the executor's `#[ignore]`
     /// live tests do (against `csv_demo` / `json_demo`). Production
@@ -204,6 +222,8 @@ impl AppState {
         classifier_prompt: &'static str,
         recipe_author_prompt: &'static str,
         propose_url_prompt: &'static str,
+        document_assertions_prompt: &'static str,
+        document_events_prompt: &'static str,
         sources: Vec<PipelineSourceDescriptor>,
     ) -> Self {
         Self {
@@ -223,6 +243,8 @@ impl AppState {
             classifier_prompt,
             recipe_author_prompt,
             propose_url_prompt,
+            document_assertions_prompt,
+            document_events_prompt,
             sources,
         }
     }
@@ -472,7 +494,14 @@ pub async fn classify(
     // 4. Persist. Failure here means the user's classification effort
     //    is lost on refresh; surface it as an error rather than
     //    silently returning a non-persisted plan.
-    if let Err(e) = save_research_plan(state.store.as_ref(), &plan, state.provider.id()) {
+    // Session 77 — stamp the prompt version alongside the provider id
+    // (`"xai@2.2"`) so the per-plan dashboard can render a re-classify
+    // banner when the persisted version trails the shipping prompt.
+    // `format_classifier_id` is the single source of truth; the parser
+    // sibling `parse_classifier_id` handles pre-Session-77 plans (bare
+    // provider id, no `@`) and surfaces them as "stale version" too.
+    let classifier_id = format_classifier_id(state.provider.id());
+    if let Err(e) = save_research_plan(state.store.as_ref(), &plan, &classifier_id) {
         warn!(error = %e, plan_id = %plan.id, "failed to persist plan");
         return Err(CommandError::from(e));
     }
@@ -729,19 +758,34 @@ async fn set_status_and_load(
     if matches!(new_status, PlanStatus::Accepted) {
         match build_typed_plan_from_stored(&stored) {
             Ok(plan) => {
+                let accepted_at = chrono::Utc::now();
+                // Session 76 — entity exemplars to populate the
+                // dashboard's Entities panel.
                 let _ = materialize_entity_exemplars(
                     &plan,
                     state.store.as_ref(),
-                    chrono::Utc::now(),
+                    accepted_at,
+                );
+                // Session 77 — relation triples (sibling materialiser).
+                // Same posture as the entity hook: we deliberately
+                // ignore the returned `MaterializationReport` because
+                // the operator-visible signal is the dashboard's
+                // Relations panel lighting up, not an extra log line
+                // out of this command. Per-triple failures are warn-
+                // logged inside the materialiser itself.
+                let _ = materialize_relation_exemplars(
+                    &plan,
+                    state.store.as_ref(),
+                    accepted_at,
                 );
             }
             Err(e) => {
                 warn!(
                     plan_id = %parsed,
                     error = %e,
-                    "accept_plan: entity exemplar materialisation skipped — \
+                    "accept_plan: entity/relation exemplar materialisation skipped — \
                      plan deserialisation failed; the per-plan dashboard \
-                     entities panel will stay empty for this plan"
+                     entities + relations panels will stay empty for this plan"
                 );
             }
         }
@@ -922,10 +966,12 @@ pub async fn reclassify_plan(
     // 6. Persist with lineage. We use the lineage-aware constructor
     //    so the new plan's `reclassified_from` column points back to
     //    the rejected predecessor.
+    // Session 77 — same provider-with-version stamping as `classify`.
+    let classifier_id = format_classifier_id(state.provider.id());
     if let Err(e) = save_research_plan_with_lineage(
         state.store.as_ref(),
         &new_plan,
-        state.provider.id(),
+        &classifier_id,
         Some(parsed),
     ) {
         warn!(
@@ -1023,6 +1069,18 @@ pub async fn run_fetch_for_plan(
         provider: state.provider.as_ref(),
         recipe_author_prompt: state.recipe_author_prompt,
         propose_url_prompt: state.propose_url_prompt,
+        // Session 77 — per-Document Assertion synthesis. Pass the
+        // loaded prompt here; the executor will call into
+        // `pipeline::extract::extract_and_persist_assertions` once
+        // per article-kind Document. Test contexts that don't want
+        // an LLM call per fetched URL pass `None` (see eval_harness
+        // composition root for the rationale).
+        document_assertions_prompt: Some(state.document_assertions_prompt),
+        // Session 78 — per-Document Event extraction prompt. Same
+        // posture as the assertion prompt above: production passes
+        // `Some(_)`; the eval harness composition root passes
+        // `None` to keep cost bounded for repeat trials.
+        document_events_prompt: Some(state.document_events_prompt),
         // The same slice the classifier sees, threaded through to
         // the executor. Doc-narrowed under ADR 0015 (Session 37) and
         // further under Session 39: production authoring no longer
@@ -2115,12 +2173,47 @@ pub async fn llm_cost_ledger(
 }
 
 // ---------------------------------------------------------------------------
+// Command 18 — classifier_prompt_version (Session 77)
+// ---------------------------------------------------------------------------
+
+/// Return the version string of the classifier prompt currently
+/// loaded in the binary. The frontend compares this against the
+/// `@version` suffix parsed off each plan's `classified_by` field to
+/// decide whether to render a "re-classify" banner.
+///
+/// Pure read of a compile-time constant; no LLM call, no fetch, no
+/// DB. The constant
+/// [`situation_room_pipeline::research_classifier::CLASSIFIER_PROMPT_VERSION`]
+/// is the single source of truth — bumping it in pipeline cascades
+/// to this command, to `format_classifier_id`, and (via the matching
+/// `### Changelog` entry in `config/prompts/research_classifier.md`)
+/// to the loaded prompt. The three move together; if they drift, the
+/// banner fires on every plan or on no plan.
+#[tauri::command]
+pub async fn classifier_prompt_version(
+) -> Result<crate::types_export::ClassifierPromptVersionDto, CommandError> {
+    Ok(crate::types_export::ClassifierPromptVersionDto {
+        current: CLASSIFIER_PROMPT_VERSION.to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn classifier_prompt_version_matches_pipeline_constant() {
+        // The wire surface must surface the same constant the pipeline
+        // crate stamps onto `classified_by`. Drift between them is the
+        // failure mode that would make every plan look "stale" (or
+        // none of them, depending on the direction).
+        let dto = classifier_prompt_version().await.unwrap();
+        assert_eq!(dto.current, CLASSIFIER_PROMPT_VERSION);
+    }
 
     #[test]
     fn command_error_serializes_with_kind_tag() {
@@ -2254,6 +2347,7 @@ mod tests {
                 }],
                 relation_kinds: vec![RelationKindExpectationDto {
                     kind: "supplies_to".into(),
+                    exemplar_triples: vec![],
                     rationale: "test".into(),
                 }],
                 document_sources: Vec::<DocumentSourceEntryDto>::new(),
@@ -2263,6 +2357,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             rejection_reason: String::new(),
             reclassified_from: String::new(),
+            classified_by: String::new(),
         }
     }
 

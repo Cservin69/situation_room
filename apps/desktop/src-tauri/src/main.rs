@@ -56,6 +56,23 @@ const RECIPE_AUTHOR_PROMPT: &str =
 const PROPOSE_URL_PROMPT: &str =
     include_str!("../../../../config/prompts/propose_source_url.md");
 
+/// Session 77 — per-Document Assertion extractor prompt. Same
+/// loading pattern (include_str! at compile time, single source of
+/// truth at the workspace `config/prompts/` location). Consumed by
+/// `pipeline::extract::extract_and_persist_assertions` once per
+/// fetched article-kind Document.
+const DOCUMENT_ASSERTIONS_PROMPT: &str =
+    include_str!("../../../../config/prompts/document_assertions.md");
+
+/// Session 78 — per-Document Event extractor prompt. Sibling of
+/// `DOCUMENT_ASSERTIONS_PROMPT`; same loading pattern. Consumed by
+/// `pipeline::extract::extract_and_persist_events` once per
+/// fetched article-kind Document, gated upstream on
+/// plan-declared `event_kinds` (cost-bounded for plans that don't
+/// track events).
+const DOCUMENT_EVENTS_PROMPT: &str =
+    include_str!("../../../../config/prompts/document_events.md");
+
 fn main() -> Result<()> {
     // .env is a dev convenience; the real environment always wins.
     // Walks up from CWD to find .env at the workspace root and
@@ -204,6 +221,8 @@ fn main() -> Result<()> {
         CLASSIFIER_PROMPT,
         RECIPE_AUTHOR_PROMPT,
         PROPOSE_URL_PROMPT,
+        DOCUMENT_ASSERTIONS_PROMPT,
+        DOCUMENT_EVENTS_PROMPT,
         sources,
     );
 
@@ -293,7 +312,15 @@ fn main() -> Result<()> {
             // (provider_id, tier). Drives the CostByTierPanel on the
             // dashboard so the operator can see the Session-74 v1.22
             // prompt-cache lever working without grepping INFO logs.
-            situation_room_api::commands::llm_cost_ledger
+            situation_room_api::commands::llm_cost_ledger,
+            // Session 77 — surfaces the classifier prompt version
+            // currently loaded in the binary. Drives the per-plan
+            // "re-classify under newer prompt" banner: the frontend
+            // compares this against the @version suffix parsed off
+            // `ResearchPlanDto.classified_by` and shows the banner
+            // when they differ (or when the plan predates Session 77
+            // and has no @version suffix at all).
+            situation_room_api::commands::classifier_prompt_version,
         ])
         .build(tauri::generate_context!())
         .context("building tauri")?;

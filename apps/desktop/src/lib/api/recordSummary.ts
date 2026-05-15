@@ -118,7 +118,9 @@ export function summarizeDocument(d: DocumentDto): string {
 
 /**
  * One-line summary for an Assertion: `claimant {stance}`.
- * The actual content is dispatched on `content.kind`, but for the
+ * The actual content is dispatched on `content.asserted_kind`
+ * (Session 78 — was `content.kind` until the duplicate-field
+ * collision with `RelationContent.kind` surfaced), but for the
  * card-level summary the claimant + stance is the most identifying
  * pair.
  */
