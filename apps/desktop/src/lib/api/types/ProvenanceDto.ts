@@ -31,4 +31,20 @@ recipe_id: string, source_url: string | null, source_published_at: string | null
  * derive from others until ADR 0004 assertion promotion is
  * implemented); typing it would be premature.
  */
-derived_from: unknown, };
+derived_from: unknown, 
+/**
+ * Session 87: closed-vocabulary selector_path. `None` for
+ * promoted / derived / LLM-synthesized rows. The pipeline
+ * (`recipe_apply::render_selector_path`) owns the format —
+ * `"css:<sel>"`, `"json:<path>"`, `"csv:<col>@<filter>"`,
+ * `"pdf:p<n>/t<n>/r<n>/c<n>"`, `"regex:group=<n>"`. Iterator-
+ * mode recipes prefix `"<iter> >> "`.
+ */
+selector_path: string | null, 
+/**
+ * Session 87: short UTF-8 excerpt of the leaf bytes the recipe
+ * extracted. `None` for non-recipe-derived rows. Capped at
+ * `RAW_BYTES_EXCERPT_CAP` (256) codepoints inside the stamper;
+ * a trailing `"…"` marks where the excerpt was truncated.
+ */
+raw_bytes_excerpt: string | null, };

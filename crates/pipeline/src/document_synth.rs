@@ -156,6 +156,8 @@ pub fn build_fetch_document(
         source_published_at: None,
         license: "unknown".into(),
         derived_from: vec![],
+        selector_path: None,
+        raw_bytes_excerpt: None,
     };
 
     let subjects = Subjects {

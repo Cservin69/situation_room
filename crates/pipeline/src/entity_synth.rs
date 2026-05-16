@@ -209,6 +209,8 @@ pub fn build_exemplar_entity(
         source_published_at: None,
         license: "classifier-emitted".to_string(),
         derived_from: vec![],
+        selector_path: None,
+        raw_bytes_excerpt: None,
     };
 
     let subjects = Subjects {

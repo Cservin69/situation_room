@@ -23,8 +23,8 @@ impl Store {
             "INSERT INTO relations (
                 id, dedup_key, source_id, source_url, source_published_at,
                 license, tags, subject_time, observed_at, valid_at, confidence,
-                content
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                content, selector_path, raw_bytes_excerpt
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 rel.id,
                 rel.dedup_key,
@@ -38,6 +38,8 @@ impl Store {
                 cols.valid_at,
                 cols.confidence,
                 content_json,
+                cols.selector_path,
+                cols.raw_bytes_excerpt,
             ],
         )
         .map_err(StorageError::DuckDb)?;
@@ -100,7 +102,7 @@ impl Store {
             .query_row(
                 "SELECT id, dedup_key, source_id, source_url, source_published_at,
                         license, tags, subject_time, observed_at, valid_at, confidence,
-                        content
+                        content, selector_path, raw_bytes_excerpt
                  FROM relations
                  WHERE id = ?",
                 params![id],
@@ -118,6 +120,8 @@ impl Store {
                             observed_at: r.get(8)?,
                             valid_at: r.get(9)?,
                             confidence_f: r.get(10)?,
+                            selector_path: r.get(12)?,
+                            raw_bytes_excerpt: r.get(13)?,
                         },
                         r.get(11)?,
                     ))
@@ -158,6 +162,8 @@ mod tests {
                 source_published_at: None,
                 license: "public_domain".into(),
                 derived_from: vec![],
+                selector_path: None,
+                raw_bytes_excerpt: None,
             },
             subjects: Subjects {
                 entities: vec![

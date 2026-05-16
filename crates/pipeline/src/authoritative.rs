@@ -384,7 +384,11 @@ fn check_schema_warnings(toml_text: &str) {
 /// dependency weight for a leaf decoration. The bound below operates
 /// over up to len*allowlist character comparisons — measured in
 /// nanoseconds for any plausible config file.
-fn distance_1_suggestion<'a>(unknown: &str, allowlist: &'a [&'a str]) -> Option<&'a str> {
+///
+/// Session 87: exposed `pub` so apps_common's `sources.toml` loader
+/// (and other future TOML loaders that follow the lossy-continue +
+/// warn-with-suggestion posture) can reuse it without re-implementing.
+pub fn distance_1_suggestion<'a>(unknown: &str, allowlist: &'a [&'a str]) -> Option<&'a str> {
     let mut matches = Vec::new();
     for candidate in allowlist {
         if is_within_edit_distance_1(unknown, candidate) {
@@ -555,6 +559,8 @@ mod tests {
                 source_published_at: None,
                 license: "extracted".into(),
                 derived_from: vec![],
+                selector_path: None,
+                raw_bytes_excerpt: None,
             },
             subjects: Subjects {
                 entities: vec![],

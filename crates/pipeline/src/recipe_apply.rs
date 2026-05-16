@@ -1715,6 +1715,60 @@ fn tokenize_line(s: &str) -> Vec<String> {
 // Binding stage: turn an extracted value + mappings into a record.
 // ---------------------------------------------------------------------------
 
+/// Session 87: render the recipe's outer extraction as a closed-vocabulary
+/// selector_path string. Format:
+///
+///   - `"css:#price"` (CssSelect, no attribute)
+///   - `"css:#price[data-v]"` (CssSelect with attribute)
+///   - `"json:$.close"` (JsonPath)
+///   - `"csv:close@row=3"` (CsvCell + Equals filter)
+///   - `"csv:close@label=Asia"` (CsvCell + LabeledAs filter)
+///   - `"csv:close"` (CsvCell, no filter — single-row source)
+///   - `"pdf:p1/t0/r2/c3"` (PdfTable)
+///   - `"regex:group=1"` (RegexCapture)
+///
+/// Centralised so storage/DTO/frontend can match against a stable
+/// shape. Used by `build_record` to stamp `Provenance::selector_path`.
+fn render_selector_path(spec: &ExtractionSpec) -> String {
+    match spec {
+        ExtractionSpec::CssSelect { selector, attribute } => match attribute {
+            Some(a) => format!("css:{selector}[{a}]"),
+            None => format!("css:{selector}"),
+        },
+        ExtractionSpec::JsonPath { path } => format!("json:{path}"),
+        ExtractionSpec::CsvCell { column, row_filter } => match row_filter {
+            None => format!("csv:{column}"),
+            Some(RowFilter::Equals { column: c, value }) => {
+                format!("csv:{column}@{c}={value}")
+            }
+            Some(RowFilter::LabeledAs { label_column, label }) => {
+                format!("csv:{column}@{label_column}={label}")
+            }
+        },
+        ExtractionSpec::PdfTable { page, table_index, row, col } => {
+            format!("pdf:p{page}/t{table_index}/r{row}/c{col}")
+        }
+        ExtractionSpec::RegexCapture { group, .. } => format!("regex:group={group}"),
+    }
+}
+
+/// Session 87: codepoint-cap an excerpt of the leaf bytes for the
+/// `raw_bytes_excerpt` Provenance field. Truncation appends `"…"` so
+/// the operator-facing display marks where the excerpt stops. The cap
+/// itself lives in core (`RAW_BYTES_EXCERPT_CAP`).
+fn truncate_excerpt(s: &str) -> String {
+    let cap = situation_room_core::schema::envelope::RAW_BYTES_EXCERPT_CAP;
+    // count codepoints; `chars().count()` is O(n) but n ≤ extracted leaf
+    // length which is bounded by the per-fetch byte cap upstream.
+    let cp_count = s.chars().count();
+    if cp_count <= cap {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(cap).collect();
+        format!("{head}…")
+    }
+}
+
 fn build_record(
     binding: &ProductionBinding,
     index: usize,
@@ -1753,6 +1807,24 @@ fn build_record(
         })?;
     }
 
+    // Session 87: render the per-record selector_path. Iterator-mode
+    // recipes prefix `"<iter> >> "` so the operator can see both
+    // selectors in one string (`ctx.recipe.iterator` carries the iter
+    // spec; the inner spec is `ctx.recipe.extraction`). For scalar
+    // recipes the iter half is absent.
+    let inner_selector = render_selector_path(&ctx.recipe.extraction);
+    let selector_path = match ctx.recipe.iterator.as_ref() {
+        Some(iter) => Some(format!("{} >> {}", render_selector_path(iter), inner_selector)),
+        None => Some(inner_selector),
+    };
+    // Session 87: stamp the leaf bytes excerpt. For multi-leaf bindings
+    // (ADR 0019 Phase 2A) `extracted` is unused at the FieldMap level
+    // but still carries the *outer* extraction's scalar; for the
+    // operator-facing diagnostic this is the right scope — they want
+    // to see what the recipe matched, which is the outer scope in
+    // both scalar and iterator modes.
+    let raw_bytes_excerpt = Some(truncate_excerpt(extracted));
+
     let provenance = Provenance {
         source_id: format!(
             "{}#recipe:{}@v{}",
@@ -1763,6 +1835,8 @@ fn build_record(
         license: "unknown".into(), // the caller (ingest) can override
                                    // with the registry's license string.
         derived_from: vec![],
+        selector_path,
+        raw_bytes_excerpt,
     };
 
     let subjects = Subjects {
@@ -2875,6 +2949,115 @@ mod tests {
         ExpectationRef, ExtractionSpec, FetchRecipe, FieldMap, FieldValueSource,
         ProductionBinding, RowFilter,
     };
+
+    // ---- Session 87: render_selector_path + truncate_excerpt ----------
+
+    #[test]
+    fn render_selector_path_css_without_attribute() {
+        let s = render_selector_path(&ExtractionSpec::CssSelect {
+            selector: "#price".into(),
+            attribute: None,
+        });
+        assert_eq!(s, "css:#price");
+    }
+
+    #[test]
+    fn render_selector_path_css_with_attribute() {
+        let s = render_selector_path(&ExtractionSpec::CssSelect {
+            selector: ".quote".into(),
+            attribute: Some("data-value".into()),
+        });
+        assert_eq!(s, "css:.quote[data-value]");
+    }
+
+    #[test]
+    fn render_selector_path_json() {
+        let s = render_selector_path(&ExtractionSpec::JsonPath {
+            path: "$.prices[-1].close".into(),
+        });
+        assert_eq!(s, "json:$.prices[-1].close");
+    }
+
+    #[test]
+    fn render_selector_path_csv_no_filter() {
+        let s = render_selector_path(&ExtractionSpec::CsvCell {
+            column: "close".into(),
+            row_filter: None,
+        });
+        assert_eq!(s, "csv:close");
+    }
+
+    #[test]
+    fn render_selector_path_csv_equals_filter() {
+        let s = render_selector_path(&ExtractionSpec::CsvCell {
+            column: "close".into(),
+            row_filter: Some(RowFilter::Equals {
+                column: "date".into(),
+                value: "2026-05-15".into(),
+            }),
+        });
+        assert_eq!(s, "csv:close@date=2026-05-15");
+    }
+
+    #[test]
+    fn render_selector_path_csv_labeled_as() {
+        let s = render_selector_path(&ExtractionSpec::CsvCell {
+            column: "production".into(),
+            row_filter: Some(RowFilter::LabeledAs {
+                label_column: "country".into(),
+                label: "Australia".into(),
+            }),
+        });
+        assert_eq!(s, "csv:production@country=Australia");
+    }
+
+    #[test]
+    fn render_selector_path_pdf_table() {
+        let s = render_selector_path(&ExtractionSpec::PdfTable {
+            page: 7,
+            table_index: 0,
+            row: 2,
+            col: 3,
+        });
+        assert_eq!(s, "pdf:p7/t0/r2/c3");
+    }
+
+    #[test]
+    fn render_selector_path_regex() {
+        let s = render_selector_path(&ExtractionSpec::RegexCapture {
+            pattern: "(\\d+)".into(),
+            group: 1,
+        });
+        assert_eq!(s, "regex:group=1");
+    }
+
+    #[test]
+    fn truncate_excerpt_short_string_passes_through() {
+        let s = truncate_excerpt("613.99");
+        assert_eq!(s, "613.99");
+    }
+
+    #[test]
+    fn truncate_excerpt_long_string_gets_ellipsis() {
+        let s = "x".repeat(500);
+        let truncated = truncate_excerpt(&s);
+        let cap = situation_room_core::schema::envelope::RAW_BYTES_EXCERPT_CAP;
+        // 256 'x' codepoints + 1 ellipsis codepoint
+        assert_eq!(truncated.chars().count(), cap + 1);
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_excerpt_multibyte_codepoint_safe() {
+        // Each character is a 3-byte codepoint in UTF-8; cap counts
+        // codepoints not bytes so this should NOT split mid-character.
+        let s = "日".repeat(500);
+        let truncated = truncate_excerpt(&s);
+        // round-trips through UTF-8 cleanly
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(truncated.ends_with('…'));
+    }
+
     use crate::research::{
         DocumentSourceEntry, DocumentSourceNomination, EntityKindExpectation,
         EventTypeExpectation, GeoScope, MetricExpectation, PriorityTier, RecordExpectations,

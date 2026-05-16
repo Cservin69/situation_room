@@ -129,6 +129,20 @@ pub struct ProvenanceDto {
     /// implemented); typing it would be premature.
     #[ts(type = "unknown")]
     pub derived_from: serde_json::Value,
+    /// Session 87: closed-vocabulary selector_path. `None` for
+    /// promoted / derived / LLM-synthesized rows. The pipeline
+    /// (`recipe_apply::render_selector_path`) owns the format —
+    /// `"css:<sel>"`, `"json:<path>"`, `"csv:<col>@<filter>"`,
+    /// `"pdf:p<n>/t<n>/r<n>/c<n>"`, `"regex:group=<n>"`. Iterator-
+    /// mode recipes prefix `"<iter> >> "`.
+    #[serde(default)]
+    pub selector_path: Option<String>,
+    /// Session 87: short UTF-8 excerpt of the leaf bytes the recipe
+    /// extracted. `None` for non-recipe-derived rows. Capped at
+    /// `RAW_BYTES_EXCERPT_CAP` (256) codepoints inside the stamper;
+    /// a trailing `"…"` marks where the excerpt was truncated.
+    #[serde(default)]
+    pub raw_bytes_excerpt: Option<String>,
 }
 
 impl ProvenanceDto {
@@ -143,6 +157,8 @@ impl ProvenanceDto {
             source_published_at: p.source_published_at,
             license: p.license,
             derived_from,
+            selector_path: p.selector_path,
+            raw_bytes_excerpt: p.raw_bytes_excerpt,
         }
     }
 }
@@ -451,6 +467,8 @@ mod tests {
                 source_published_at: None,
                 license: "unknown".into(),
                 derived_from: vec![],
+                selector_path: None,
+                raw_bytes_excerpt: None,
             },
             subjects: Subjects {
                 entities: vec![],
@@ -558,6 +576,8 @@ mod tests {
                 source_published_at: None,
                 license: "unknown".into(),
                 derived_from: vec![],
+                selector_path: None,
+                raw_bytes_excerpt: None,
             },
             subjects: Subjects {
                 entities: vec![],
@@ -600,6 +620,8 @@ mod tests {
                 source_published_at: None,
                 license: "unknown".into(),
                 derived_from: vec![],
+                selector_path: None,
+                raw_bytes_excerpt: None,
             },
             subjects: Subjects {
                 entities: vec![],

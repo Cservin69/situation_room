@@ -299,7 +299,7 @@ fn build_or_likes(col: &str, n: usize) -> String {
 const OBSERVATIONS_COLUMNS: &str =
     "id, dedup_key, source_id, source_url, source_published_at, \
      license, tags, subject_time, observed_at, valid_at, confidence, \
-     content";
+     content, selector_path, raw_bytes_excerpt";
 
 /// Decode one observation row produced by [`OBSERVATIONS_COLUMNS`].
 /// Shared between the WHERE-filtered ([`list_observations`]) and
@@ -321,6 +321,8 @@ fn decode_observation_row(
         observed_at: row.get(8).map_err(StorageError::DuckDb)?,
         valid_at: row.get(9).map_err(StorageError::DuckDb)?,
         confidence_f: row.get(10).map_err(StorageError::DuckDb)?,
+        selector_path: row.get(12).map_err(StorageError::DuckDb)?,
+        raw_bytes_excerpt: row.get(13).map_err(StorageError::DuckDb)?,
     };
     let content_json: String = row.get(11).map_err(StorageError::DuckDb)?;
     let content: ObservationContent = serde_json::from_str(&content_json)?;
@@ -384,7 +386,7 @@ fn list_observations_recent(
 const EVENTS_COLUMNS: &str =
     "id, dedup_key, source_id, source_url, source_published_at, \
      license, tags, subject_time, observed_at, valid_at, confidence, \
-     content";
+     content, selector_path, raw_bytes_excerpt";
 
 fn decode_event_row(conn: &duckdb::Connection, row: &duckdb::Row<'_>) -> Result<Event> {
     let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
@@ -399,6 +401,8 @@ fn decode_event_row(conn: &duckdb::Connection, row: &duckdb::Row<'_>) -> Result<
         observed_at: row.get(8).map_err(StorageError::DuckDb)?,
         valid_at: row.get(9).map_err(StorageError::DuckDb)?,
         confidence_f: row.get(10).map_err(StorageError::DuckDb)?,
+        selector_path: row.get(12).map_err(StorageError::DuckDb)?,
+        raw_bytes_excerpt: row.get(13).map_err(StorageError::DuckDb)?,
     };
     let content_json: String = row.get(11).map_err(StorageError::DuckDb)?;
     let content: EventContent = serde_json::from_str(&content_json)?;
@@ -456,7 +460,8 @@ fn list_events_recent(conn: &duckdb::Connection, limit: i64) -> Result<Vec<Event
 const ENTITIES_COLUMNS: &str =
     "id, entity_id, kind, canonical_name, geometry, \
      source_id, source_url, source_published_at, \
-     license, tags, subject_time, observed_at, valid_at, confidence";
+     license, tags, subject_time, observed_at, valid_at, confidence, \
+     selector_path, raw_bytes_excerpt";
 
 fn decode_entity_row(conn: &duckdb::Connection, row: &duckdb::Row<'_>) -> Result<Entity> {
     let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
@@ -474,6 +479,8 @@ fn decode_entity_row(conn: &duckdb::Connection, row: &duckdb::Row<'_>) -> Result
         observed_at: row.get(11).map_err(StorageError::DuckDb)?,
         valid_at: row.get(12).map_err(StorageError::DuckDb)?,
         confidence_f: row.get(13).map_err(StorageError::DuckDb)?,
+        selector_path: row.get(14).map_err(StorageError::DuckDb)?,
+        raw_bytes_excerpt: row.get(15).map_err(StorageError::DuckDb)?,
     };
     let envelope = reconstruct_envelope(conn, row_id, raw)?;
     let entity_id = EntityId::new(entity_id_s)
@@ -537,7 +544,7 @@ fn list_entities_recent(conn: &duckdb::Connection, limit: i64) -> Result<Vec<Ent
 const RELATIONS_COLUMNS: &str =
     "id, dedup_key, source_id, source_url, source_published_at, \
      license, tags, subject_time, observed_at, valid_at, confidence, \
-     content";
+     content, selector_path, raw_bytes_excerpt";
 
 fn decode_relation_row(conn: &duckdb::Connection, row: &duckdb::Row<'_>) -> Result<Relation> {
     let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
@@ -552,6 +559,8 @@ fn decode_relation_row(conn: &duckdb::Connection, row: &duckdb::Row<'_>) -> Resu
         observed_at: row.get(8).map_err(StorageError::DuckDb)?,
         valid_at: row.get(9).map_err(StorageError::DuckDb)?,
         confidence_f: row.get(10).map_err(StorageError::DuckDb)?,
+        selector_path: row.get(12).map_err(StorageError::DuckDb)?,
+        raw_bytes_excerpt: row.get(13).map_err(StorageError::DuckDb)?,
     };
     let content_json: String = row.get(11).map_err(StorageError::DuckDb)?;
     let content: RelationContent = serde_json::from_str(&content_json)?;
@@ -609,7 +618,8 @@ fn list_relations_recent(conn: &duckdb::Connection, limit: i64) -> Result<Vec<Re
 const DOCUMENTS_COLUMNS: &str =
     "id, dedup_key, title, doc_kind, mime, body, published_at, author, \
      source_id, source_url, source_published_at, \
-     license, tags, subject_time, observed_at, valid_at, confidence";
+     license, tags, subject_time, observed_at, valid_at, confidence, \
+     selector_path, raw_bytes_excerpt";
 
 fn decode_document_row(conn: &duckdb::Connection, row: &duckdb::Row<'_>) -> Result<Document> {
     let row_id: Uuid = row.get(0).map_err(StorageError::DuckDb)?;
@@ -631,6 +641,8 @@ fn decode_document_row(conn: &duckdb::Connection, row: &duckdb::Row<'_>) -> Resu
         observed_at: row.get(14).map_err(StorageError::DuckDb)?,
         valid_at: row.get(15).map_err(StorageError::DuckDb)?,
         confidence_f: row.get(16).map_err(StorageError::DuckDb)?,
+        selector_path: row.get(17).map_err(StorageError::DuckDb)?,
+        raw_bytes_excerpt: row.get(18).map_err(StorageError::DuckDb)?,
     };
     let envelope = reconstruct_envelope(conn, row_id, raw)?;
     Ok(Document {
@@ -691,7 +703,8 @@ fn list_documents_recent(conn: &duckdb::Connection, limit: i64) -> Result<Vec<Do
 const ASSERTIONS_COLUMNS: &str =
     "id, dedup_key, claimant, stance, content_kind, content, \
      source_id, source_url, source_published_at, \
-     license, tags, subject_time, observed_at, valid_at, confidence";
+     license, tags, subject_time, observed_at, valid_at, confidence, \
+     selector_path, raw_bytes_excerpt";
 
 /// Decode one assertion row. Returns `Ok(None)` if the row's
 /// `content` JSON fails to deserialize — almost always the
@@ -723,6 +736,8 @@ fn decode_assertion_row(
         observed_at: row.get(12).map_err(StorageError::DuckDb)?,
         valid_at: row.get(13).map_err(StorageError::DuckDb)?,
         confidence_f: row.get(14).map_err(StorageError::DuckDb)?,
+        selector_path: row.get(15).map_err(StorageError::DuckDb)?,
+        raw_bytes_excerpt: row.get(16).map_err(StorageError::DuckDb)?,
     };
     let envelope = reconstruct_envelope(conn, row_id, raw)?;
     let claimant = EntityId::new(claimant_s)
@@ -826,6 +841,8 @@ mod tests {
                 source_published_at: None,
                 license: "public_domain".into(),
                 derived_from: vec![],
+                selector_path: None,
+                raw_bytes_excerpt: None,
             },
             subjects: Subjects {
                 entities: vec![],
@@ -967,6 +984,8 @@ mod tests {
                 source_published_at: None,
                 license: "unknown".into(),
                 derived_from: vec![],
+                selector_path: None,
+                raw_bytes_excerpt: None,
             },
             subjects: Subjects {
                 entities: vec![],
@@ -1099,6 +1118,8 @@ mod tests {
                 source_published_at: None,
                 license: "classifier-emitted".into(),
                 derived_from: vec![],
+                selector_path: None,
+                raw_bytes_excerpt: None,
             },
             subjects: Subjects {
                 entities: vec![EntityId::new("company:tsla").unwrap()],
@@ -1148,6 +1169,8 @@ mod tests {
                 source_published_at: None,
                 license: "classifier-emitted".into(),
                 derived_from: vec![],
+                selector_path: None,
+                raw_bytes_excerpt: None,
             },
             subjects: Subjects {
                 entities: vec![EntityId::new("company:tsla").unwrap()],
@@ -1201,6 +1224,8 @@ mod tests {
                 source_published_at: None,
                 license: "classifier-emitted".into(),
                 derived_from: vec![],
+                selector_path: None,
+                raw_bytes_excerpt: None,
             },
             subjects: Subjects {
                 entities: vec![

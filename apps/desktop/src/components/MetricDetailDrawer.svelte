@@ -42,6 +42,16 @@
   Deeper provenance (selector path that matched, raw bytes excerpt)
   still requires a schema change — left to a future session.
 
+  ## Session 87 — selector trace columns
+
+  Provenance now carries `selector_path` + `raw_bytes_excerpt`
+  (stamped by `recipe_apply::build_record`). The drawer surfaces
+  them as two extra rendered columns: a closed-vocabulary
+  selector tag (`css:#price` / `json:$.close` / …) and the
+  truncated leaf bytes the recipe actually pulled. Both are
+  `None` for pre-Session-87 records and for promoted /
+  LLM-synthesized rows; the drawer shows `—` in that case.
+
   ## What this component does NOT do
 
   - **No edit / re-fetch.** Recipes are edited from RecipesPanel.
@@ -174,6 +184,14 @@
     recipeShort: string | null;
     recipeVersion: string | null;
     sourceId: string;
+    /** Session 87: closed-vocabulary selector tag from
+     * `provenance.selector_path`, or `null` for pre-Sn-87 / promoted
+     * / synthesized rows. */
+    selectorPath: string | null;
+    /** Session 87: truncated leaf-bytes excerpt from
+     * `provenance.raw_bytes_excerpt`, or `null` for non-recipe-
+     * derived rows. */
+    rawBytesExcerpt: string | null;
   };
 
   let rows: Row[] = $derived.by(() => {
@@ -189,6 +207,11 @@
       const w = whenOf(r);
       const url = r.envelope.provenance.source_url ?? '';
       const ref = parseRecipeRef(r.envelope.provenance.source_id);
+      // Session 87: selector_path / raw_bytes_excerpt are optional
+      // on the wire (ts-rs emits `string | null | undefined`); guard
+      // both absence shapes via `?? null` so the row shape is uniform.
+      const selectorPath = r.envelope.provenance.selector_path ?? null;
+      const rawBytesExcerpt = r.envelope.provenance.raw_bytes_excerpt ?? null;
       return {
         id: r.id,
         value: v,
@@ -203,8 +226,36 @@
         recipeShort: ref.recipeId === null ? null : shortRecipeId(ref.recipeId),
         recipeVersion: ref.version,
         sourceId: ref.sourceId,
+        selectorPath,
+        rawBytesExcerpt,
       };
     });
+  });
+
+  /** Session 87: distinct selector_path count — surfaces the
+   * "three metric_kinds all binding the same DOM scalar" case from
+   * the Session-86 kickoff. When `distinctValues === 1` but
+   * `distinctSelectors > 1` the recipes differ in stated intent but
+   * land on the same leaf — the operator's signal that a selector
+   * needs to be tightened. */
+  let distinctSelectors: number = $derived.by(() => {
+    const seen = new Set<string>();
+    for (const r of rows) {
+      seen.add(r.selectorPath ?? '∅');
+    }
+    return seen.size;
+  });
+
+  /** Session 87: distinct raw_bytes_excerpt count. When it's 1
+   * across N fetches the recipe is locked onto a static element
+   * (same leaf every fetch); when it equals rows.length the leaf
+   * drifts as expected for live metrics. */
+  let distinctExcerpts: number = $derived.by(() => {
+    const seen = new Set<string>();
+    for (const r of rows) {
+      seen.add(r.rawBytesExcerpt ?? '∅');
+    }
+    return seen.size;
   });
 
   /** Distinct (recipeId, sourceId) pairs across the rows — this is
@@ -267,10 +318,12 @@
       <div class="head-main">
         <span class="title">metric</span>
         <span class="metric-name" title={metric}>{metric}</span>
-        <span class="counts" title="rows · distinct values · distinct recipe-sources">
+        <span class="counts" title="rows · distinct values · distinct recipe-sources · distinct selectors · distinct excerpts">
           {rows.length} row{rows.length === 1 ? '' : 's'} ·
           {distinctValues} value{distinctValues === 1 ? '' : 's'} ·
-          {distinctRecipes} recipe{distinctRecipes === 1 ? '' : 's'}
+          {distinctRecipes} recipe{distinctRecipes === 1 ? '' : 's'} ·
+          {distinctSelectors} sel ·
+          {distinctExcerpts} exc
         </span>
       </div>
       <button
@@ -291,6 +344,14 @@
         from RecipesPanel to inspect.
       </p>
     {/if}
+    {#if rows.length > 1 && distinctSelectors === 1 && distinctRecipes > 1}
+      <p class="warn-banner">
+        {distinctRecipes} different recipes all bound to the same selector
+        ({rows[0].selectorPath ?? 'unknown'}). The recipes claim distinct
+        intent but the per-fetch leaves identify the same DOM scalar —
+        tighten one of the selectors so the metric_kinds disentangle.
+      </p>
+    {/if}
 
     <div class="rows-wrap">
       <table class="rows">
@@ -300,6 +361,8 @@
             <th scope="col">when</th>
             <th scope="col">source</th>
             <th scope="col">recipe</th>
+            <th scope="col">selector</th>
+            <th scope="col">excerpt</th>
             <th scope="col" class="url-col">url</th>
           </tr>
         </thead>
@@ -329,6 +392,20 @@
                   {/if}
                 {:else}
                   <span class="recipe-none" title="no recipe stamp on this record (older promotion or derived path)">—</span>
+                {/if}
+              </td>
+              <td class="selector-cell" title={r.selectorPath ?? 'no selector trace (pre-Session-87 record or non-recipe-derived)'}>
+                {#if r.selectorPath}
+                  <span class="selector-path">{r.selectorPath}</span>
+                {:else}
+                  <span class="selector-none">—</span>
+                {/if}
+              </td>
+              <td class="excerpt-cell" title={r.rawBytesExcerpt ?? 'no excerpt'}>
+                {#if r.rawBytesExcerpt}
+                  <span class="excerpt-bytes">{r.rawBytesExcerpt}</span>
+                {:else}
+                  <span class="excerpt-none">—</span>
                 {/if}
               </td>
               <td class="url-cell">
@@ -515,6 +592,31 @@
     font-size: 10px;
   }
   .recipe-none {
+    color: var(--fg-quaternary);
+  }
+  .selector-cell {
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .selector-path {
+    color: var(--fg-secondary);
+  }
+  .selector-none {
+    color: var(--fg-quaternary);
+  }
+  .excerpt-cell {
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .excerpt-bytes {
+    color: var(--fg-secondary);
+    font-variant-numeric: tabular-nums;
+  }
+  .excerpt-none {
     color: var(--fg-quaternary);
   }
   .url-col,

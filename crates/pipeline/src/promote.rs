@@ -161,6 +161,22 @@ pub struct PromoteReport {
     /// per-shape counters cover both pathways. This field surfaces the
     /// fraction attributable to the authoritative half.
     pub authoritative_promoted: u32,
+    /// Session 87 — ids of the records this pass produced (observations,
+    /// events, relations, entity_attribute Assertions). Ordered by
+    /// insert sequence within the pass. Empty for pre-Session-87 rows
+    /// loaded from `promote_history` — that table's `report` column
+    /// is plain JSON-serialised `PromoteReport`, so the new field
+    /// arrives via `#[serde(default)]` and pre-existing entries
+    /// deserialize cleanly with an empty Vec.
+    ///
+    /// Closed-vocabulary discipline: the Vec stores raw `Uuid`s with
+    /// no per-id type tag because the storage layer's `record_dispatch`
+    /// already binds an id to exactly one of the six tables; the
+    /// frontend looks the id up across tables on demand. Adding a
+    /// kind tag here would couple two layers' RecordType enums
+    /// (this crate's `RecordType` and the api crate's DTO union).
+    #[serde(default)]
+    pub promoted_record_ids: Vec<uuid::Uuid>,
 }
 
 /// Errors that can propagate out of the promote stage.
@@ -333,6 +349,10 @@ fn promote_consensus_from_assertions_with_report(
                     match store.insert_observation(&obs) {
                         Ok(()) => {
                             report.observations_emitted += 1;
+                            // Session 87: capture per-pass promoted ids
+                            // for the PromoteDetailDrawer's "what
+                            // assertions did this promote?" click-through.
+                            report.promoted_record_ids.push(obs.id);
                             InsertResult::Inserted
                         }
                         Err(e) => classify_insert_error(&dedup_key, e),
@@ -350,6 +370,7 @@ fn promote_consensus_from_assertions_with_report(
                     match store.insert_event(&ev) {
                         Ok(()) => {
                             report.events_emitted += 1;
+                            report.promoted_record_ids.push(ev.id);
                             InsertResult::Inserted
                         }
                         Err(e) => classify_insert_error(&dedup_key, e),
@@ -367,6 +388,7 @@ fn promote_consensus_from_assertions_with_report(
                     match store.insert_relation(&rel) {
                         Ok(()) => {
                             report.relations_emitted += 1;
+                            report.promoted_record_ids.push(rel.id);
                             InsertResult::Inserted
                         }
                         Err(e) => classify_insert_error(&dedup_key, e),
@@ -384,6 +406,7 @@ fn promote_consensus_from_assertions_with_report(
                     match store.insert_assertion(&assertion) {
                         Ok(()) => {
                             report.entity_attributes_emitted += 1;
+                            report.promoted_record_ids.push(assertion.id);
                             InsertResult::Inserted
                         }
                         Err(e) => classify_insert_error(&dedup_key, e),
@@ -512,6 +535,7 @@ fn promote_authoritative_pass(
                     match store.insert_observation(&obs) {
                         Ok(()) => {
                             report.observations_emitted += 1;
+                            report.promoted_record_ids.push(obs.id);
                             InsertResult::Inserted
                         }
                         Err(e) => classify_insert_error(&dedup_key, e),
@@ -529,6 +553,7 @@ fn promote_authoritative_pass(
                     match store.insert_event(&ev) {
                         Ok(()) => {
                             report.events_emitted += 1;
+                            report.promoted_record_ids.push(ev.id);
                             InsertResult::Inserted
                         }
                         Err(e) => classify_insert_error(&dedup_key, e),
@@ -546,6 +571,7 @@ fn promote_authoritative_pass(
                     match store.insert_relation(&rel) {
                         Ok(()) => {
                             report.relations_emitted += 1;
+                            report.promoted_record_ids.push(rel.id);
                             InsertResult::Inserted
                         }
                         Err(e) => classify_insert_error(&dedup_key, e),
@@ -563,6 +589,7 @@ fn promote_authoritative_pass(
                     match store.insert_assertion(&attr) {
                         Ok(()) => {
                             report.entity_attributes_emitted += 1;
+                            report.promoted_record_ids.push(attr.id);
                             InsertResult::Inserted
                         }
                         Err(e) => classify_insert_error(&dedup_key, e),
@@ -630,6 +657,14 @@ fn merge_consensus_into(report: &mut PromoteReport, consensus: PromoteReport) {
     report.insert_failures = report.insert_failures.saturating_add(consensus.insert_failures);
     // authoritative_promoted stays from the auth pass; consensus has none.
     // assertions_considered: keep auth-pass value (= input size).
+
+    // Session 87: merge per-pass promoted record ids. Order: auth
+    // first (already in `report`), then consensus. Consumers that
+    // care about ordering (the drawer's "what assertions did this
+    // promote?" list) see auth-pathway hits before consensus-pathway
+    // hits — useful when the same plan triggered both pathways in
+    // one promote pass.
+    report.promoted_record_ids.extend(consensus.promoted_record_ids);
 }
 
 // Authoritative-pathway record builders. Mirror the consensus
@@ -644,6 +679,8 @@ fn authoritative_provenance(supports: &[DerivedFrom]) -> Provenance {
         source_published_at: None,
         license: "derived".into(),
         derived_from: supports.to_vec(),
+        selector_path: None,
+        raw_bytes_excerpt: None,
     }
 }
 
@@ -959,6 +996,8 @@ fn promoted_provenance(supports: &[DerivedFrom]) -> Provenance {
         source_published_at: None,
         license: "derived".into(),
         derived_from: supports.to_vec(),
+        selector_path: None,
+        raw_bytes_excerpt: None,
     }
 }
 
@@ -1082,6 +1121,8 @@ mod tests {
                 source_published_at: None,
                 license: "extracted".into(),
                 derived_from: vec![],
+                selector_path: None,
+                raw_bytes_excerpt: None,
             },
             subjects: Subjects {
                 entities: vec![],

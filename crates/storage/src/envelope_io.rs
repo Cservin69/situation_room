@@ -32,6 +32,12 @@ pub(crate) struct EnvelopeColumns {
     pub observed_at: chrono::DateTime<chrono::Utc>,
     pub valid_at: Option<chrono::DateTime<chrono::Utc>>,
     pub confidence: f32,
+    /// Session 87: per-record selector trace. `None` for promoted /
+    /// derived / LLM-synthesized rows.
+    pub selector_path: Option<String>,
+    /// Session 87: short UTF-8 excerpt of the leaf bytes. `None` for
+    /// non-recipe-derived rows.
+    pub raw_bytes_excerpt: Option<String>,
 }
 
 impl EnvelopeColumns {
@@ -51,6 +57,8 @@ impl EnvelopeColumns {
             observed_at: env.observed_at,
             valid_at: env.valid_at,
             confidence: env.confidence.value(),
+            selector_path: env.provenance.selector_path.clone(),
+            raw_bytes_excerpt: env.provenance.raw_bytes_excerpt.clone(),
         })
     }
 }
@@ -132,6 +140,10 @@ pub(crate) struct EnvelopeRow {
     pub observed_at: chrono::DateTime<chrono::Utc>,
     pub valid_at: Option<chrono::DateTime<chrono::Utc>>,
     pub confidence_f: f64,
+    /// Session 87: selector_path column. NULL → `None`.
+    pub selector_path: Option<String>,
+    /// Session 87: raw_bytes_excerpt column. NULL → `None`.
+    pub raw_bytes_excerpt: Option<String>,
 }
 
 /// Read subjects + derivation for a record and reconstruct the full
@@ -244,6 +256,8 @@ pub(crate) fn reconstruct_envelope(
             source_published_at: raw.source_published_at,
             license: raw.license,
             derived_from,
+            selector_path: raw.selector_path,
+            raw_bytes_excerpt: raw.raw_bytes_excerpt,
         },
         subjects: Subjects {
             entities,

@@ -120,6 +120,8 @@ mod tests {
                     source_published_at: None,
                     license: "public_domain".into(),
                     derived_from: vec![],
+                    selector_path: None,
+                    raw_bytes_excerpt: None,
                 },
                 subjects: Subjects {
                     entities: vec![],

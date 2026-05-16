@@ -6,4 +6,16 @@
  * (the Rust type derives `Serialize` but not `TS`; mirroring it
  * here keeps the desktop binary's ts-rs export self-contained).
  */
-export type PromoteReportFlatDto = { assertions_considered: number, groups_promoted: number, skipped_already_promoted: number, observations_emitted: number, events_emitted: number, relations_emitted: number, entity_attributes_emitted: number, insert_failures: number, authoritative_promoted: number, };
+export type PromoteReportFlatDto = { assertions_considered: number, groups_promoted: number, skipped_already_promoted: number, observations_emitted: number, events_emitted: number, relations_emitted: number, entity_attributes_emitted: number, insert_failures: number, authoritative_promoted: number, 
+/**
+ * Session 87: ids of the records this pass produced. Empty for
+ * pre-Session-87 history rows (the `report` JSON column in
+ * `promote_history` deserializes those with a default empty Vec
+ * via `#[serde(default)]` on the pipeline-side struct).
+ *
+ * String-typed on the wire because TypeScript's `string` is the
+ * natural UUID carrier and ts-rs emits `string` for `Uuid`. The
+ * frontend looks each id up across the six per-type record DTOs
+ * on demand — no per-id kind tag (see PromoteReport docs).
+ */
+promoted_record_ids: Array<string>, };

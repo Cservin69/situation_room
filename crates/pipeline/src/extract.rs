@@ -232,6 +232,8 @@ pub fn build_assertion(
         source_published_at: None,
         license: "extracted".into(),
         derived_from: vec![],
+        selector_path: None,
+        raw_bytes_excerpt: None,
     };
 
     let subjects = Subjects {
@@ -462,6 +464,8 @@ pub fn build_event(
         source_published_at: None,
         license: "extracted".into(),
         derived_from: vec![],
+        selector_path: None,
+        raw_bytes_excerpt: None,
     };
 
     let subjects = Subjects {
@@ -678,6 +682,8 @@ pub fn build_observation(
         source_published_at: None,
         license: "extracted".into(),
         derived_from: vec![],
+        selector_path: None,
+        raw_bytes_excerpt: None,
     };
 
     let subjects = Subjects {
@@ -899,6 +905,8 @@ pub fn build_entity_attribute_assertion(
         source_published_at: None,
         license: "extracted".into(),
         derived_from: vec![],
+        selector_path: None,
+        raw_bytes_excerpt: None,
     };
 
     let subjects = Subjects {

@@ -1763,6 +1763,16 @@ pub struct PromoteReportFlatDto {
     pub entity_attributes_emitted: u32,
     pub insert_failures: u32,
     pub authoritative_promoted: u32,
+    /// Session 87: ids of the records this pass produced. Empty for
+    /// pre-Session-87 history rows (the `report` JSON column in
+    /// `promote_history` deserializes those with a default empty Vec
+    /// via `#[serde(default)]` on the pipeline-side struct).
+    ///
+    /// String-typed on the wire because TypeScript's `string` is the
+    /// natural UUID carrier and ts-rs emits `string` for `Uuid`. The
+    /// frontend looks each id up across the six per-type record DTOs
+    /// on demand — no per-id kind tag (see PromoteReport docs).
+    pub promoted_record_ids: Vec<String>,
 }
 
 impl PromoteReportFlatDto {
@@ -1777,6 +1787,11 @@ impl PromoteReportFlatDto {
             entity_attributes_emitted: r.entity_attributes_emitted,
             insert_failures: r.insert_failures,
             authoritative_promoted: r.authoritative_promoted,
+            promoted_record_ids: r
+                .promoted_record_ids
+                .iter()
+                .map(|u| u.to_string())
+                .collect(),
         }
     }
 }

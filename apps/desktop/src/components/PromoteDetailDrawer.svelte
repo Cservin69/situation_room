@@ -23,6 +23,16 @@
   established way to break out of the dashboard for one record's
   full body — same posture here.
 
+  ## Session 87 — Promoted record-id list
+
+  PromoteReport now carries `promoted_record_ids`: the per-pass
+  list of record ids each insert produced (stamped at insert-time
+  inside `crates/pipeline/src/promote.rs`). The drawer surfaces
+  those ids as a tail section ("records produced by this pass")
+  with a copy button per id. The Sn-86-vintage history rows that
+  don't carry the field (deserialised with an empty Vec via
+  `#[serde(default)]`) just don't render the section.
+
   ## What this component does NOT do
 
   - **No editing.** Promote reports are immutable historical artifacts.
@@ -30,11 +40,11 @@
     promote button; re-running from a historical-pass cell would
     invite operator confusion ("did this re-run write a new entry?
     Yes it did, but to the strip's left, not in place").
-  - **No per-Assertion list.** PromoteReport carries counters only;
-    individual Assertion ids aren't surfaced today (would require a
-    schema change to migration 0017's `report` column, which trades
-    storage simplicity for a detail surface that hasn't earned its
-    weight yet).
+  - **No record-id → record-type cross-resolution.** The id list
+    is opaque on the wire; the operator copies an id and uses it
+    in DuckDB or the records dashboard. A future session might
+    join across the six per-type tables to colour-code ids by
+    record_type, but that's product-shape work, not infra-debt.
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
@@ -244,6 +254,25 @@
         </li>
       {/each}
     </ul>
+
+    {#if entry.report.promoted_record_ids && entry.report.promoted_record_ids.length > 0}
+      <section class="ids" aria-label="records produced by this pass">
+        <h3 class="ids-title">
+          records produced
+          <span class="ids-count">
+            {entry.report.promoted_record_ids.length}
+          </span>
+        </h3>
+        <ul class="ids-list">
+          {#each entry.report.promoted_record_ids as recordId (recordId)}
+            <li class="id-row">
+              <span class="id-value" title={recordId}>{recordId}</span>
+              <CopyButton value={recordId} />
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/if}
   </article>
 </div>
 
@@ -412,5 +441,61 @@
   }
   .counter-row[data-emphasise='warn'] .counter-value {
     color: var(--signal-warning, var(--signal-negative));
+  }
+
+  .ids {
+    margin-top: 6px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .ids-title {
+    margin: 0;
+    font-size: 9px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-tertiary);
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .ids-count {
+    font-family: var(--font-mono);
+    color: var(--fg-quaternary);
+    font-variant-numeric: tabular-nums;
+  }
+  .ids-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    overflow-y: auto;
+    max-height: 30vh;
+  }
+  .id-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 6px;
+    background: var(--bg-panel-alt);
+    border: 1px solid var(--border-subtle);
+    border-radius: 2px;
+  }
+  .id-value {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--fg-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1 1 auto;
+    min-width: 0;
   }
 </style>

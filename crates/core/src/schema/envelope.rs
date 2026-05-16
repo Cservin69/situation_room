@@ -259,7 +259,51 @@ pub struct Provenance {
     /// Empty for directly-fetched records.
     #[serde(default)]
     pub derived_from: Vec<DerivedFrom>,
+
+    /// Session 87: which selector / path / cell matched the leaf
+    /// inside the fetched bytes. Populated by `recipe_apply::build_record`
+    /// at apply-time; `None` for promoted / derived / LLM-synthesized
+    /// records (no recipe selector applies).
+    ///
+    /// **Format is a closed-vocabulary tag plus the operator-facing
+    /// rendering of the selector**:
+    ///
+    ///   - `"css:#price"`        — CssSelect with selector `#price`
+    ///   - `"css:#price[data-v]"` — CssSelect with attribute `data-v`
+    ///   - `"json:$.close"`       — JsonPath at path `$.close`
+    ///   - `"csv:close@row=3"`     — CsvCell column `close`, row 3
+    ///   - `"pdf:p1/t0/r2/c3"`     — PdfTable page/table/row/col
+    ///   - `"regex:group=1"`       — RegexCapture group index
+    ///
+    /// Iterator-mode recipes stamp `"<iter> >> <inner>"` so the
+    /// operator can see both selectors at once.
+    ///
+    /// Closed-vocabulary discipline (no source/host strings, no
+    /// human-author free text): the strings above are mode-derived
+    /// and stable across recipes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_path: Option<String>,
+
+    /// Session 87: short UTF-8 excerpt of the raw bytes that the
+    /// recipe extracted, *as the leaf seen by the binding*. Populated
+    /// by `recipe_apply::build_record`; truncated to
+    /// [`RAW_BYTES_EXCERPT_CAP`] codepoints. `None` for promoted /
+    /// derived / LLM-synthesized records.
+    ///
+    /// This is the operator-visible answer to "what did the recipe
+    /// actually pull from the page?" — useful when the rendered value
+    /// (e.g. `613.99`) looks wrong and the operator needs to know
+    /// whether the recipe matched the right DOM scalar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_bytes_excerpt: Option<String>,
 }
+
+/// Codepoint cap on `Provenance::raw_bytes_excerpt`. Tuned for the
+/// MetricDetailDrawer's per-row excerpt cell: 256 codepoints is enough
+/// to fit a short scalar (a price, a date, a headline) without
+/// inflating the per-record wire payload. Long excerpts get truncated
+/// with a trailing `"…"` marker inside the stamper.
+pub const RAW_BYTES_EXCERPT_CAP: usize = 256;
 
 /// A link from a derived record back to an input record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -302,7 +346,51 @@ mod tests {
             source_published_at: None,
             license: "public_domain".into(),
             derived_from: Vec::new(),
+            selector_path: None,
+            raw_bytes_excerpt: None,
         }
+    }
+
+    /// Session 87: legacy JSON (pre-selector_path / raw_bytes_excerpt)
+    /// must still deserialize. `#[serde(default)]` carries this.
+    #[test]
+    fn provenance_legacy_json_deserializes_without_new_fields() {
+        let legacy = serde_json::json!({
+            "source_id": "usgs_mcs",
+            "source_url": "https://pubs.usgs.gov/x.pdf",
+            "license": "public_domain",
+            "derived_from": []
+        });
+        let p: Provenance = serde_json::from_value(legacy).expect("legacy JSON");
+        assert!(p.selector_path.is_none());
+        assert!(p.raw_bytes_excerpt.is_none());
+    }
+
+    /// Session 87: new fields round-trip through serde when populated.
+    #[test]
+    fn provenance_with_selector_trace_roundtrips() {
+        let p = Provenance {
+            source_id: "cnbc".into(),
+            source_url: None,
+            source_published_at: None,
+            license: "fair_use".into(),
+            derived_from: Vec::new(),
+            selector_path: Some("css:#last-price".into()),
+            raw_bytes_excerpt: Some("$613.99".into()),
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: Provenance = serde_json::from_str(&s).unwrap();
+        assert_eq!(p, back);
+    }
+
+    /// Session 87: `skip_serializing_if = "Option::is_none"` keeps the
+    /// new fields out of the wire shape when unpopulated.
+    #[test]
+    fn provenance_omits_none_selector_trace_from_json() {
+        let p = test_provenance();
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(!s.contains("selector_path"));
+        assert!(!s.contains("raw_bytes_excerpt"));
     }
 
     #[test]

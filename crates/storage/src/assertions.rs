@@ -45,8 +45,9 @@ impl Store {
             "INSERT INTO assertions (
                 id, dedup_key, claimant, stance, content_kind, content,
                 source_id, source_url, source_published_at,
-                license, tags, subject_time, observed_at, valid_at, confidence
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                license, tags, subject_time, observed_at, valid_at, confidence,
+                selector_path, raw_bytes_excerpt
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 a.id,
                 a.dedup_key,
@@ -63,6 +64,8 @@ impl Store {
                 cols.observed_at,
                 cols.valid_at,
                 cols.confidence,
+                cols.selector_path,
+                cols.raw_bytes_excerpt,
             ],
         )
         .map_err(StorageError::DuckDb)?;
@@ -117,7 +120,8 @@ impl Store {
             .query_row(
                 "SELECT id, dedup_key, claimant, stance, content_kind, content,
                         source_id, source_url, source_published_at,
-                        license, tags, subject_time, observed_at, valid_at, confidence
+                        license, tags, subject_time, observed_at, valid_at, confidence,
+                        selector_path, raw_bytes_excerpt
                  FROM assertions
                  WHERE id = ?",
                 params![id],
@@ -139,6 +143,8 @@ impl Store {
                             observed_at: r.get(12)?,
                             valid_at: r.get(13)?,
                             confidence_f: r.get(14)?,
+                            selector_path: r.get(15)?,
+                            raw_bytes_excerpt: r.get(16)?,
                         },
                     ))
                 },
@@ -184,6 +190,8 @@ mod tests {
                 source_published_at: None,
                 license: "fair_use".into(),
                 derived_from: vec![],
+                selector_path: None,
+                raw_bytes_excerpt: None,
             },
             subjects: Subjects {
                 entities: vec![],

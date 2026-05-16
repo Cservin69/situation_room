@@ -113,6 +113,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "promote_history table",
         sql: include_str!("../../../migrations/0017_promote_history.sql"),
     },
+    Migration {
+        version: 18,
+        description: "provenance selector_path + raw_bytes_excerpt columns",
+        sql: include_str!("../../../migrations/0018_provenance_selector_trace.sql"),
+    },
 ];
 
 /// Apply every migration whose version is not yet in
