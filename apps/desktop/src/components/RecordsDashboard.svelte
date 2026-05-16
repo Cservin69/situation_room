@@ -80,6 +80,8 @@
   import KindCard from '$components/panels/KindCard.svelte';
   import DocumentDrawer from '$components/DocumentDrawer.svelte';
   import SamplesModal from '$components/SamplesModal.svelte';
+  import type { ChartCatalog, ChartPreview } from '$lib/dashboard/document_chart';
+  import { detectChartCatalog, pickPreviewSeries } from '$lib/dashboard/document_chart';
 
   interface Props {
     /**
@@ -251,306 +253,32 @@
   /**
    * Session 69 — Path B time-series chart preview.
    *
-   * Detect "this Document body is a time series" by structural shape,
-   * not by host/source. Rule:
+   * The shape detector and truncation-recovery routines moved to
+   * `$lib/dashboard/document_chart` in Session 83 so the expanded
+   * `DocumentDrawer` can consume the *catalog* of all numeric
+   * series (close + volume + open + high + low + …) for its metric
+   * dropdown. The KindCard tile still gets a single-series preview
+   * via `pickPreviewSeries` — same shape (and rendering) as
+   * pre-Session-83.
    *
-   *  1. Body parses as JSON.
-   *  2. Somewhere in the tree there's an array named (case-insensitively)
-   *     `timestamp` or `timestamps`, length >= 2, all elements numeric.
-   *  3. Somewhere else in the tree there's another numeric array of
-   *     the same length. Among multiple candidates we prefer keys that
-   *     name a primary value series (close, price, value, rate, yield)
-   *     over secondaries (open, high, low, volume). The preference list
-   *     is generic to time-series shapes, not source-specific.
-   *
-   * A friendly `label` falls out of common identity keys
-   * (`symbol`, `longName`, `name`) when present, with a generic
-   * fallback. This is presentation, not routing — see
-   * `project_sr_no_source_routing` memory.
-   *
-   * Returns `null` when no time-series shape is detectable. The
-   * caller (`documentSeriesOf`) then leaves the KindCard rendering
-   * the text sample as before.
+   * See `apps/desktop/src/lib/dashboard/document_chart.ts` for the
+   * closed-vocabulary rule set and the recovery algorithm.
    */
-  interface TimeSeries {
-    timestamps: number[];
-    values: number[];
-    label: string;
-    valueKey: string;
-  }
-
-  // Keys that, when found, indicate a "primary" value series.
-  // First match wins; if none match, fall back to any same-length
-  // numeric array. Lowercased for case-insensitive comparison.
-  const PRIMARY_SERIES_KEYS = [
-    'close', 'price', 'value', 'rate', 'yield', 'level',
-  ];
-  // Keys we recognise but rank lower — useful as fallbacks but not
-  // first-choice for a one-line chart preview.
-  const SECONDARY_SERIES_KEYS = [
-    'open', 'high', 'low', 'volume', 'count',
-  ];
-  // Keys for friendly chart labels (entity name / ticker / metric id).
-  const LABEL_KEYS = ['symbol', 'longname', 'shortname', 'name', 'series_id', 'id'];
-
-  function detectTimeSeriesShape(body: string): TimeSeries | null {
-    const trimmed = body.trim();
-    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return null;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch (e) {
-      /*
-        Session 71 — truncation recovery.
-
-        Body comes from `document_synth::body_preview` which caps at
-        128 KiB for structured-text MIMEs. A 2y daily-bars Yahoo
-        Finance feed sits comfortably under that cap, but if a future
-        feed (5y / minute bars / very wide indicators block) overruns,
-        the body lands mid-array and `JSON.parse` throws.
-
-        Rather than silently dropping back to the text preview (the
-        Session 70 regression mode — chart card showed raw JSON
-        instead of a sparkline), we make one repair attempt: walk
-        back from the end of the body to the last position that looks
-        like a structural close (`]` followed by enough closers to
-        balance the open braces / brackets seen so far), close the
-        outstanding scopes, and try parsing the patched string.
-
-        If recovery still doesn't parse we return null and the
-        KindCard renders the text sample as before — same outcome as
-        pre-Session-71, just on a strictly smaller set of inputs.
-
-        The console.warn surfaces what happened in DevTools so the
-        next time chart-preview regresses (e.g. a feed shape changes)
-        the operator sees the diagnostic directly instead of having
-        to query the documents table by hand.
-      */
-      const recovered = recoverTruncatedJson(trimmed);
-      if (recovered !== null) {
-        try {
-          parsed = JSON.parse(recovered);
-          // eslint-disable-next-line no-console
-          console.warn(
-            'situation_room: recovered truncated JSON for chart preview ' +
-              '(body was over the preview cap; consider raising STRUCTURED_BODY_CAP_BYTES). ' +
-              'Original length=' + trimmed.length + ', recovered length=' + recovered.length,
-          );
-        } catch {
-          // eslint-disable-next-line no-console
-          console.warn(
-            'situation_room: chart preview failed — JSON.parse threw and recovery also failed. ' +
-              'Body length=' + trimmed.length + ', first error=' + String(e),
-          );
-          return null;
-        }
-      } else {
-        // eslint-disable-next-line no-console
-        console.warn(
-          'situation_room: chart preview failed — JSON.parse threw and no recovery point found. ' +
-            'Body length=' + trimmed.length + ', first error=' + String(e),
-        );
-        return null;
-      }
-    }
-    return findSeries(parsed);
-  }
-
-  /**
-   * Session 71 — best-effort recovery of a truncated JSON string.
-   *
-   * Walks the string left-to-right tracking open-brace / open-bracket
-   * depth (ignoring string contents — quotes toggle a "in-string" flag
-   * and escapes are skipped). At each top-level structural close
-   * (`]` or `}`) we record a "safe truncation point" — the index just
-   * after that close.
-   *
-   * After the walk we slice at the last recorded safe point and
-   * append enough closing punctuation to balance the depth that was
-   * open at that point (computed during the walk by snapshotting the
-   * brace/bracket stack at each close). For Yahoo-shaped feeds this
-   * typically lands inside `chart.result[0]` after a complete inner
-   * array, then closes the remaining `}]}`.
-   *
-   * Returns the repaired string, or `null` if no safe point exists
-   * (body has no balanced subtree to recover from).
-   */
-  function recoverTruncatedJson(input: string): string | null {
-    // Snapshots of (sliceEnd, closingTail) at each recoverable point.
-    // We keep the *last* one — that gives us the maximum data
-    // preserved while still being syntactically closable.
-    let lastSafeEnd = 0;
-    let lastSafeTail = '';
-    const stack: string[] = [];
-    let inString = false;
-    let escape = false;
-    for (let i = 0; i < input.length; i++) {
-      const c = input[i];
-      if (escape) {
-        escape = false;
-        continue;
-      }
-      if (inString) {
-        if (c === '\\') {
-          escape = true;
-        } else if (c === '"') {
-          inString = false;
-        }
-        continue;
-      }
-      if (c === '"') {
-        inString = true;
-        continue;
-      }
-      if (c === '{') {
-        stack.push('}');
-      } else if (c === '[') {
-        stack.push(']');
-      } else if (c === '}' || c === ']') {
-        // Pop and record a safe point *after* this close.
-        const expected = stack[stack.length - 1];
-        if (expected !== c) {
-          // Malformed input — bail; not our problem to fix beyond
-          // the truncation case.
-          return null;
-        }
-        stack.pop();
-        // Only record at "top-level-ish" closes (depth > 0 means we
-        // closed an inner scope but the document isn't done yet).
-        // We snapshot the closing tail we'd need at this depth.
-        lastSafeEnd = i + 1;
-        lastSafeTail = stack
-          .slice()
-          .reverse()
-          .join('');
-        if (stack.length === 0) {
-          // Body is already complete — caller would have parsed
-          // directly; nothing for us to do.
-          return null;
-        }
-      }
-    }
-    if (lastSafeEnd === 0) return null;
-    return input.slice(0, lastSafeEnd) + lastSafeTail;
-  }
-
-  function isAllNumeric(arr: unknown[]): boolean {
-    if (arr.length < 2) return false;
-    for (const v of arr) {
-      if (typeof v !== 'number' || !Number.isFinite(v)) return false;
-    }
-    return true;
-  }
-
-  function findSeries(root: unknown): TimeSeries | null {
-    // First pass — collect timestamp arrays and value-candidate
-    // arrays in one walk. Each candidate carries the key name and the
-    // array, so the preference filter can rank them after the walk.
-    const timestampArrays: number[][] = [];
-    const valueCandidates: { key: string; values: number[] }[] = [];
-    const labelCandidates: { key: string; value: string }[] = [];
-
-    function walk(node: unknown, key: string | null): void {
-      if (Array.isArray(node)) {
-        if (isAllNumeric(node)) {
-          if (key !== null) {
-            const lc = key.toLowerCase();
-            if (lc === 'timestamp' || lc === 'timestamps') {
-              timestampArrays.push(node as number[]);
-            } else {
-              valueCandidates.push({ key: lc, values: node as number[] });
-            }
-          } else {
-            // Top-level numeric array — treat as a value candidate
-            // with an empty key (lowest priority).
-            valueCandidates.push({ key: '', values: node as number[] });
-          }
-        } else {
-          for (const item of node) walk(item, null);
-        }
-        return;
-      }
-      if (node !== null && typeof node === 'object') {
-        for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-          // Capture label candidates from string-valued keys.
-          if (typeof v === 'string' && LABEL_KEYS.includes(k.toLowerCase())) {
-            labelCandidates.push({ key: k.toLowerCase(), value: v });
-          }
-          walk(v, k);
-        }
-      }
-    }
-    walk(root, null);
-
-    if (timestampArrays.length === 0 || valueCandidates.length === 0) {
-      return null;
-    }
-
-    // Pair the first timestamp array with the best-ranked value
-    // candidate of matching length. Most Yahoo-shaped feeds have one
-    // timestamp array per result; for the rare multi-result payload,
-    // the first one usually carries the primary series. A future
-    // session can revisit if we hit a case where the first isn't.
-    const timestamps = timestampArrays[0];
-
-    const sameLength = valueCandidates.filter((c) => c.values.length === timestamps.length);
-    if (sameLength.length === 0) return null;
-
-    // Rank: primary keys (close, price, …) > secondary (open, high, …)
-    // > everything else. Within a tier, first-seen wins.
-    function rank(key: string): number {
-      const i1 = PRIMARY_SERIES_KEYS.indexOf(key);
-      if (i1 >= 0) return i1;
-      const i2 = SECONDARY_SERIES_KEYS.indexOf(key);
-      if (i2 >= 0) return PRIMARY_SERIES_KEYS.length + i2;
-      return PRIMARY_SERIES_KEYS.length + SECONDARY_SERIES_KEYS.length + 1;
-    }
-    sameLength.sort((a, b) => rank(a.key) - rank(b.key));
-    const chosen = sameLength[0];
-
-    // Label preference: first LABEL_KEYS hit (symbol > longName > name).
-    let label = '';
-    for (const lk of LABEL_KEYS) {
-      const hit = labelCandidates.find((l) => l.key === lk);
-      if (hit) {
-        label = hit.value;
-        break;
-      }
-    }
-
-    return {
-      timestamps,
-      values: chosen.values,
-      label,
-      valueKey: chosen.key,
-    };
-  }
-
-  /**
-   * Convert a Document into MiniSparkline-shaped points, or `null`
-   * when the body has no time-series structure. The KindCard
-   * conditionally renders the chart when this returns non-null.
-   *
-   * Cap at 500 points to keep the SVG polyline path string bounded —
-   * MiniSparkline's reduce loop scales fine to many thousands, but
-   * 500 is more than enough resolution for a tile-sized preview and
-   * keeps per-record render cost predictable.
-   */
-  function documentSeriesOf(d: DocumentDto): { points: Array<{ x: number; y: number }>; label: string; valueKey: string } | null {
+  function documentCatalogOf(d: DocumentDto): ChartCatalog | null {
     if (!d.body || d.body.length === 0) return null;
-    const ts = detectTimeSeriesShape(d.body);
-    if (ts === null) return null;
-    const n = ts.timestamps.length;
-    const stride = n > 500 ? Math.ceil(n / 500) : 1;
-    const points: Array<{ x: number; y: number }> = [];
-    for (let i = 0; i < n; i += stride) {
-      points.push({ x: ts.timestamps[i], y: ts.values[i] });
-    }
-    // Always include the last point even if stride'd.
-    if (points.length > 0 && points[points.length - 1].x !== ts.timestamps[n - 1]) {
-      points.push({ x: ts.timestamps[n - 1], y: ts.values[n - 1] });
-    }
-    return { points, label: ts.label, valueKey: ts.valueKey };
+    return detectChartCatalog(d.body);
+  }
+
+  /**
+   * Single-series adapter for the KindCard tile preview. Returns
+   * the same `{ points, label, valueKey } | null` shape the
+   * pre-Session-83 `documentSeriesOf` returned, so the KindCard
+   * wiring at the bottom of this file is unchanged.
+   */
+  function documentSeriesOf(d: DocumentDto): ChartPreview | null {
+    const catalog = documentCatalogOf(d);
+    if (catalog === null) return null;
+    return pickPreviewSeries(catalog);
   }
 
   function assertionKindOf(a: AssertionDto): string {
@@ -713,19 +441,20 @@
   // Clicking a Document KindCard sets the selection; the drawer's
   // close handler clears it.
   let selectedDocument = $state<DocumentDto | null>(null);
-  let selectedDocumentSeries = $state<{
-    points: Array<{ x: number; y: number }>;
-    label: string;
-    valueKey: string;
-  } | null>(null);
+  // Session 83 — drawer receives the full ChartCatalog (every numeric
+  // series the detector found, ranked primary-first) so its metric
+  // dropdown can switch between close / volume / open / high / low /
+  // adjclose without re-running the parse. The KindCard tile keeps
+  // its single-series preview via `documentSeriesOf` below.
+  let selectedDocumentCatalog = $state<ChartCatalog | null>(null);
 
   function openDocumentDrawer(doc: DocumentDto): void {
     selectedDocument = doc;
-    selectedDocumentSeries = documentSeriesOf(doc);
+    selectedDocumentCatalog = documentCatalogOf(doc);
   }
   function closeDocumentDrawer(): void {
     selectedDocument = null;
-    selectedDocumentSeries = null;
+    selectedDocumentCatalog = null;
   }
 
   // Session 80 — SamplesModal state. When non-null, the modal renders
@@ -969,7 +698,7 @@
 {#if selectedDocument !== null}
   <DocumentDrawer
     document={selectedDocument}
-    chartSeries={selectedDocumentSeries}
+    chartCatalog={selectedDocumentCatalog}
     onClose={closeDocumentDrawer}
   />
 {/if}

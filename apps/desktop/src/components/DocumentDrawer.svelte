@@ -42,7 +42,8 @@
 -->
 <script lang="ts">
   import type { DocumentDto } from '$lib/api/types/DocumentDto';
-  import MiniSparkline from '$components/charts/MiniSparkline.svelte';
+  import type { ChartCatalog } from '$lib/dashboard/document_chart';
+  import DrawerChart from '$components/DrawerChart.svelte';
   import CopyButton from '$components/common/CopyButton.svelte';
   import DocumentTable from '$components/DocumentTable.svelte';
   import { detectTableShape } from '$lib/dashboard/document_table';
@@ -53,22 +54,19 @@
      * renders this component when a Document has been selected. */
     document: DocumentDto;
     /**
-     * Pre-computed time-series shape, if `RecordsDashboard`'s
-     * detector found one. The dashboard already runs the detection
-     * for the KindCard preview, so we pass the result through rather
-     * than re-detecting. `null` = no chart shape, body renders as
-     * pretty-printed text only.
+     * Session 83 — full chart catalog from `detectChartCatalog`. The
+     * dashboard runs detection once on drawer-open and passes the
+     * catalog through; `DrawerChart` renders one series at a time and
+     * lets the operator switch via its dropdown. `null` = no chart
+     * shape detected; the body renders as pretty-printed text only
+     * (or as a `DocumentTable` when the table-shape detector matches).
      */
-    chartSeries: {
-      points: Array<{ x: number; y: number }>;
-      label?: string;
-      valueKey?: string;
-    } | null;
+    chartCatalog: ChartCatalog | null;
     /** Close-the-drawer callback. Wired to backdrop click, Escape
      * key, and the explicit close button. */
     onClose: () => void;
   }
-  let { document: doc, chartSeries, onClose }: Props = $props();
+  let { document: doc, chartCatalog, onClose }: Props = $props();
 
   // ---- Body rendering ---------------------------------------------
 
@@ -114,7 +112,7 @@
     before — pre-Session-73 behaviour, no regression.
   */
   let tableShape = $derived.by(() => {
-    if (chartSeries !== null) return null;
+    if (chartCatalog !== null && chartCatalog.series.length > 0) return null;
     if (!doc.body || doc.body.length === 0) return null;
     return detectTableShape(doc.body);
   });
@@ -211,19 +209,15 @@
       </div>
     {/if}
 
-    {#if chartSeries && chartSeries.points.length > 0}
-      <!-- Same MiniSparkline as the KindCard preview, but rendered
-           at full-drawer width so the operator can read the trend
-           shape instead of just glancing at it. -->
+    {#if chartCatalog && chartCatalog.series.length > 0}
+      <!-- Session 83 — DrawerChart replaces the Session-70
+           MiniSparkline. Same intent (full-drawer-width chart
+           between header and body) but with a metric dropdown and
+           hover crosshair + tooltip. The dropdown sources from
+           `chartCatalog.series` so every numeric series the detector
+           found is selectable. -->
       <div class="chart-wrap">
-        <div class="chart">
-          <MiniSparkline points={chartSeries.points} />
-        </div>
-        <p class="chart-caption">
-          {#if chartSeries.valueKey}{chartSeries.valueKey}{/if}
-          {#if chartSeries.label} · {chartSeries.label}{/if}
-          · {chartSeries.points.length} pt{chartSeries.points.length === 1 ? '' : 's'}
-        </p>
+        <DrawerChart catalog={chartCatalog} />
       </div>
     {/if}
 
@@ -236,6 +230,19 @@
         <!-- Session 73 — table-shape detected; render the rows
              inline and tuck the raw JSON behind a toggle. -->
         <DocumentTable table={tableShape} />
+        <div class="raw-row">
+          <button type="button" class="raw-toggle" onclick={toggleRaw}>
+            {rawExpanded ? 'hide raw JSON' : 'show raw JSON'}
+          </button>
+        </div>
+        {#if rawExpanded}
+          <pre class="body">{prettyBody}</pre>
+        {/if}
+      {:else if chartCatalog && chartCatalog.series.length > 0}
+        <!-- Session 83 — chart is the primary view for time-series
+             payloads. Raw JSON tucked behind the same toggle the
+             table case uses; the chart already answers what the
+             feed contains, so the dense numeric dump is debug-only. -->
         <div class="raw-row">
           <button type="button" class="raw-toggle" onclick={toggleRaw}>
             {rawExpanded ? 'hide raw JSON' : 'show raw JSON'}
@@ -361,22 +368,8 @@
      KindCard chart × ~3 so it actually carries information at this
      scale. */
   .chart-wrap {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
     padding: 8px 0;
     border-bottom: 1px solid var(--border-subtle);
-  }
-  .chart {
-    height: 140px;
-    width: 100%;
-  }
-  .chart-caption {
-    margin: 0;
-    font-size: 11px;
-    color: var(--fg-tertiary);
-    text-transform: lowercase;
-    letter-spacing: 0.02em;
   }
 
   /* Body wrap is the scrollable region. The drawer's max-height is
