@@ -32,13 +32,15 @@
 //!   behavior at use time, not a hard configuration error. ADR
 //!   0014 surfaces the consequence as a `StubExcerpt` chip.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use situation_room_pipeline::authoritative::distance_1_suggestion;
 use situation_room_pipeline::research_classifier::SourceDescriptor;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// On-disk shape of `config/sources.toml`. Mirrors
 /// [`SourceDescriptor`] one-for-one but keeps `authoritative_for`
@@ -116,6 +118,185 @@ pub fn load_source_descriptors(path: &Path, limit: usize) -> Result<Vec<SourceDe
         .collect();
 
     Ok(descriptors)
+}
+
+// ---------------------------------------------------------------------------
+// Session 88 — hot-reload wrapper (Sn-87 candidate 3)
+// ---------------------------------------------------------------------------
+
+/// Default polling cadence for the sources.toml file-mtime watcher.
+/// Matches `authoritative_live::DEFAULT_POLL_INTERVAL` so both
+/// config files reload on the same rhythm — an operator editing both
+/// in one save batch sees both registries refresh in the same beat.
+pub const DEFAULT_SOURCES_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Hot-reload cap. Mirrors the boot-time `limit` parameter on
+/// `load_source_descriptors` (30 at present). Pinned here so the
+/// watcher uses the same effective cap as the boot load without
+/// re-threading the parameter — operators editing the file see the
+/// same N entries land that they'd see after a restart.
+pub const SOURCES_RELOAD_LIMIT: usize = 30;
+
+/// Cheaply-cloneable hot-reload handle for the source-descriptor
+/// list. Mirrors `LiveAuthorityRegistry`'s shape so the boot-time
+/// wiring at `apps/desktop/src-tauri/src/main.rs` reads the same
+/// across both config files.
+///
+/// ## What this is for
+///
+/// `config/sources.toml` is doc-narrowed under ADR 0015: the
+/// classifier no longer reads it (it consults `Store::sources_memory`
+/// instead). The file persists today for the executor's hand-crafted
+/// live tests + as the on-disk schema reference. Hot-reload here
+/// lights the path for future consumers that *do* want to read live
+/// — and meanwhile gives the operator the same "edit-save-takes-
+/// effect" feedback loop the authoritative-source registry already
+/// has, so behaviour across the two TOML files is consistent.
+///
+/// ## Failure posture
+///
+/// Parse errors during a re-read are warn-logged and the previously-
+/// loaded `Vec<SourceDescriptor>` stays installed. The operator sees
+/// the warning in the desktop log without losing the running
+/// descriptor list. Symmetric to `LiveAuthorityRegistry`.
+#[derive(Clone)]
+pub struct LiveSources {
+    inner: Arc<RwLock<Arc<Vec<SourceDescriptor>>>>,
+    /// Snapshot of the path the watcher polls. Surfaced via
+    /// [`Self::source_path`] for diagnostics.
+    source_path: Arc<PathBuf>,
+}
+
+impl LiveSources {
+    /// Build a handle pre-populated with the supplied descriptors.
+    pub fn new(initial: Vec<SourceDescriptor>, source_path: PathBuf) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Arc::new(initial))),
+            source_path: Arc::new(source_path),
+        }
+    }
+
+    /// Empty handle, for test sites + the fallback path when the
+    /// composition root never finds the TOML at all.
+    pub fn empty() -> Self {
+        Self::new(Vec::new(), PathBuf::from("<empty>"))
+    }
+
+    /// Snapshot the current descriptor list. Cheap (single
+    /// `Arc::clone`). The returned `Arc` is detached from the inner
+    /// lock so callers don't keep the read lock held while running
+    /// downstream logic.
+    pub fn snapshot(&self) -> Arc<Vec<SourceDescriptor>> {
+        match self.inner.read() {
+            Ok(guard) => Arc::clone(&*guard),
+            Err(poison) => Arc::clone(&*poison.into_inner()),
+        }
+    }
+
+    /// The path the watcher is configured against. Surfaced by
+    /// diagnostic IPC for "loaded from {path}" copy.
+    pub fn source_path(&self) -> &Path {
+        self.source_path.as_path()
+    }
+
+    /// Re-read the TOML and swap the inner Arc atomically. Public so
+    /// test sites and the boot path can trigger a reload without
+    /// going through the watcher thread.
+    pub fn reload(&self) -> Result<()> {
+        let path = self.source_path.as_path();
+        let fresh = load_source_descriptors(path, SOURCES_RELOAD_LIMIT)?;
+        self.install(fresh);
+        Ok(())
+    }
+
+    /// Replace the inner descriptor list with `next`. Used by
+    /// `reload` and by tests that want to inject a pre-built list
+    /// without touching the filesystem.
+    pub fn install(&self, next: Vec<SourceDescriptor>) {
+        let next_arc = Arc::new(next);
+        match self.inner.write() {
+            Ok(mut guard) => *guard = next_arc,
+            Err(poison) => {
+                let mut guard = poison.into_inner();
+                *guard = next_arc;
+            }
+        }
+    }
+
+    /// Spawn the polling watcher thread. Re-checks the TOML file's
+    /// `mtime` at `interval` cadence; parses and swaps the inner Arc
+    /// on change. Returns immediately; the thread is detached.
+    pub fn spawn_watcher(&self, interval: Duration) {
+        let handle = self.clone();
+        let path = self.source_path.as_path().to_path_buf();
+        let cadence = if interval.is_zero() {
+            DEFAULT_SOURCES_POLL_INTERVAL
+        } else {
+            interval
+        };
+
+        std::thread::Builder::new()
+            .name("sr-sources-watch".to_string())
+            .spawn(move || {
+                run_sources_watch_loop(handle, &path, cadence);
+            })
+            .map(|_| ())
+            .unwrap_or_else(|e| {
+                warn!(
+                    error = %e,
+                    "failed to spawn sources.toml watch thread — hot-reload disabled"
+                );
+            });
+    }
+}
+
+/// Body of the watch thread. Pulled out so tests can exercise the
+/// mtime-change detection without spawning an OS thread.
+fn run_sources_watch_loop(handle: LiveSources, path: &Path, interval: Duration) {
+    let mut last_seen: Option<SystemTime> = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok();
+    info!(
+        path = %path.display(),
+        cadence_ms = interval.as_millis(),
+        "sources.toml watcher started"
+    );
+    loop {
+        std::thread::sleep(interval);
+        match std::fs::metadata(path).and_then(|m| m.modified()) {
+            Ok(mtime) => {
+                if last_seen != Some(mtime) {
+                    match handle.reload() {
+                        Ok(()) => {
+                            let snapshot = handle.snapshot();
+                            info!(
+                                path = %path.display(),
+                                entries = snapshot.len(),
+                                "sources.toml reloaded"
+                            );
+                            last_seen = Some(mtime);
+                        }
+                        Err(e) => {
+                            warn!(
+                                path = %path.display(),
+                                error = %e,
+                                "sources.toml reload failed — keeping previous"
+                            );
+                            // Update last_seen anyway so we don't
+                            // spam the warn log every poll cycle on
+                            // a syntactically broken edit. Symmetric
+                            // to LiveAuthorityRegistry.
+                            last_seen = Some(mtime);
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // File missing/unreadable. Don't change last_seen;
+                // when the file reappears we'll pick it up.
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +670,101 @@ endpiont_hint = "https://x.example/data"
             e.endpoint_hint.is_none(),
             "typo'd endpiont_hint should not bind to endpoint_hint"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Session 88 — LiveSources hot-reload tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn live_sources_snapshot_returns_installed_list() {
+        let initial = vec![SourceDescriptor {
+            id: "abc".into(),
+            display_name: "ABC".into(),
+            description: "first".into(),
+            authoritative_for: vec![],
+            endpoint_hint: None,
+        }];
+        let live = LiveSources::new(initial, PathBuf::from("test.toml"));
+        let snap = live.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].id, "abc");
+    }
+
+    #[test]
+    fn live_sources_install_swaps_the_inner_arc() {
+        let live = LiveSources::empty();
+        assert!(live.snapshot().is_empty());
+        live.install(vec![SourceDescriptor {
+            id: "x".into(),
+            display_name: "X".into(),
+            description: "later".into(),
+            authoritative_for: vec![],
+            endpoint_hint: Some("https://example.invalid/x".into()),
+        }]);
+        let snap = live.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].endpoint_hint.as_deref(), Some("https://example.invalid/x"));
+    }
+
+    #[test]
+    fn live_sources_snapshot_clones_independent_of_subsequent_installs() {
+        let live = LiveSources::new(
+            vec![SourceDescriptor {
+                id: "v1".into(),
+                display_name: "v1".into(),
+                description: "".into(),
+                authoritative_for: vec![],
+                endpoint_hint: None,
+            }],
+            PathBuf::from("test.toml"),
+        );
+        let reader = live.snapshot();
+        live.install(vec![SourceDescriptor {
+            id: "v2".into(),
+            display_name: "v2".into(),
+            description: "".into(),
+            authoritative_for: vec![],
+            endpoint_hint: None,
+        }]);
+        let after = live.snapshot();
+        // The reader's earlier snapshot is unaffected by the
+        // subsequent install — load-bearing for code that grabbed an
+        // Arc before a mid-flight reload.
+        assert_eq!(reader[0].id, "v1");
+        assert_eq!(after[0].id, "v2");
+    }
+
+    #[test]
+    fn live_sources_reload_picks_up_edits() {
+        let dir = tempdir();
+        let p = dir.join("sources.toml");
+        std::fs::write(
+            &p,
+            r#"
+[[source]]
+id = "v1"
+display_name = "V1"
+description = "before"
+"#,
+        )
+        .unwrap();
+        let initial = load_source_descriptors(&p, 10).unwrap();
+        let live = LiveSources::new(initial, p.clone());
+        assert_eq!(live.snapshot()[0].id, "v1");
+
+        std::fs::write(
+            &p,
+            r#"
+[[source]]
+id = "v2"
+display_name = "V2"
+description = "after"
+"#,
+        )
+        .unwrap();
+        live.reload().unwrap();
+        assert_eq!(live.snapshot()[0].id, "v2");
     }
 
     /// Tiny in-process tempdir helper. We don't pull in `tempfile`

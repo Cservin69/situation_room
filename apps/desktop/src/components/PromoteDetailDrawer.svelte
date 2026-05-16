@@ -50,6 +50,10 @@
   import { onMount } from 'svelte';
   import CopyButton from '$components/common/CopyButton.svelte';
   import type { LastPromoteSummaryDto } from '$lib/api/types/LastPromoteSummaryDto';
+  import {
+    recordTypesForIds,
+    type RecordTypeTag,
+  } from '$lib/api/client';
 
   interface Props {
     /** The history-strip cell's underlying entry. Required; parent
@@ -181,6 +185,44 @@
     },
   ]);
 
+  // ---- Session 88 — record-id → record-type colour coding ----------
+  //
+  // The per-pass `promoted_record_ids` (Session 87) carry no type tag
+  // on the wire — they're opaque UUIDs. Resolving the type for each
+  // id with one batched IPC call lets the chip strip render each id
+  // with a small `event` / `observation` / `entity` chip beside it,
+  // so the operator can scan a long ids list and pick out "the
+  // Observation rows are these three" at a glance.
+  //
+  // The batch is shape-bounded: pre-Sn-87 history rows have no ids
+  // (the `{#if … > 0}` upstream gates the section), and one
+  // PromoteReport ships at most a few dozen ids in practice. The
+  // server-side cap is 500.
+  //
+  // Resolution is best-effort: ids that resolve nowhere (deleted /
+  // never persisted) simply don't appear in the returned map; we
+  // render an `unknown` chip in that case. This matches the rest of
+  // the dashboard's "missing data is dim, not fatal" posture.
+  let recordTypes = $state<Record<string, RecordTypeTag> | null>(null);
+  let recordTypesError = $state<string | null>(null);
+  // Closed-vocab → short chip label. The four-character upper limit
+  // keeps the chip narrow so it doesn't push the id text below the
+  // 30vh scroll cap.
+  const RECORD_TYPE_CHIP: Record<RecordTypeTag, string> = {
+    observation: 'obs',
+    event: 'ev',
+    entity: 'ent',
+    relation: 'rel',
+    document: 'doc',
+    assertion: 'asrt',
+  };
+  function chipLabelFor(id: string): { label: string; kind: RecordTypeTag | 'unknown' } {
+    if (!recordTypes) return { label: '…', kind: 'unknown' };
+    const kind = recordTypes[id];
+    if (!kind) return { label: '?', kind: 'unknown' };
+    return { label: RECORD_TYPE_CHIP[kind], kind };
+  }
+
   // ---- Close-on-Escape --------------------------------------------
 
   onMount(() => {
@@ -191,6 +233,26 @@
       }
     };
     window.addEventListener('keydown', handler);
+
+    // Kick the batch lookup on mount. The drawer is per-pass; ids
+    // don't change while the modal is open, so a single fetch is
+    // sufficient. Errors are surfaced via `recordTypesError` and
+    // render an unobtrusive "couldn't resolve types" line below the
+    // ids list — the rest of the drawer continues to function.
+    const ids = entry.report.promoted_record_ids ?? [];
+    if (ids.length > 0) {
+      recordTypesForIds(ids)
+        .then((map) => {
+          recordTypes = map;
+        })
+        .catch((err: unknown) => {
+          recordTypesError =
+            err && typeof err === 'object' && 'message' in err
+              ? String((err as { message: unknown }).message)
+              : 'lookup failed';
+        });
+    }
+
     return () => window.removeEventListener('keydown', handler);
   });
 
@@ -265,12 +327,21 @@
         </h3>
         <ul class="ids-list">
           {#each entry.report.promoted_record_ids as recordId (recordId)}
+            {@const chip = chipLabelFor(recordId)}
             <li class="id-row">
+              <span class="type-chip" data-kind={chip.kind} title={chip.kind}>
+                {chip.label}
+              </span>
               <span class="id-value" title={recordId}>{recordId}</span>
               <CopyButton value={recordId} />
             </li>
           {/each}
         </ul>
+        {#if recordTypesError}
+          <p class="ids-error" title={recordTypesError}>
+            couldn't resolve record types — {recordTypesError}
+          </p>
+        {/if}
       </section>
     {/if}
   </article>
@@ -497,5 +568,62 @@
     white-space: nowrap;
     flex: 1 1 auto;
     min-width: 0;
+  }
+  /* Session 88 — record-type chip beside each id. Six closed-vocab
+     colour treatments + an `unknown` fallback for ids that resolve
+     nowhere (deleted / pre-Sn-88 history rows). Treatment matches
+     the type-count strip's visual language on the dashboard so the
+     operator's eye reads the same colour-to-kind mapping in both
+     places. */
+  .type-chip {
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 1px 4px;
+    border-radius: 2px;
+    border: 1px solid var(--border-subtle);
+    color: var(--fg-secondary);
+    background: var(--bg-panel);
+    min-width: 32px;
+    text-align: center;
+  }
+  .type-chip[data-kind='observation'] {
+    color: var(--signal-positive, var(--fg-primary));
+    border-color: rgba(91, 198, 133, 0.35);
+    background: rgba(91, 198, 133, 0.06);
+  }
+  .type-chip[data-kind='event'] {
+    color: var(--signal-info, var(--fg-primary));
+    border-color: rgba(120, 170, 220, 0.35);
+    background: rgba(120, 170, 220, 0.06);
+  }
+  .type-chip[data-kind='entity'] {
+    color: var(--fg-primary);
+    border-color: var(--border-strong);
+  }
+  .type-chip[data-kind='relation'] {
+    color: var(--signal-warn, var(--fg-primary));
+    border-color: rgba(220, 175, 90, 0.35);
+    background: rgba(220, 175, 90, 0.06);
+  }
+  .type-chip[data-kind='document'] {
+    color: var(--fg-tertiary);
+    border-style: dashed;
+  }
+  .type-chip[data-kind='assertion'] {
+    color: var(--fg-quaternary);
+    font-style: italic;
+  }
+  .type-chip[data-kind='unknown'] {
+    color: var(--fg-quaternary);
+    border-style: dotted;
+  }
+  .ids-error {
+    margin: 6px 0 0;
+    font-size: 10px;
+    color: var(--fg-tertiary);
+    font-style: italic;
   }
 </style>

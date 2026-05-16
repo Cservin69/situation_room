@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use situation_room_api::commands::AppState;
-use situation_room_apps_common::sources::load_source_descriptors;
+use situation_room_apps_common::sources::{
+    load_source_descriptors, LiveSources, DEFAULT_SOURCES_POLL_INTERVAL,
+};
 use situation_room_pipeline::authoritative::AuthorityRegistry;
 use situation_room_pipeline::authoritative_live::{
     LiveAuthorityRegistry, DEFAULT_POLL_INTERVAL,
@@ -235,6 +237,18 @@ fn main() -> Result<()> {
         count = sources.len(),
         "source descriptors loaded (post-ADR-0015 demo fixtures only)"
     );
+    // Session 88 — wrap the boot-time descriptor list in a hot-reload
+    // handle and spawn a polling watcher. Symmetric to the
+    // `LiveAuthorityRegistry` watcher below: edits to
+    // `config/sources.toml` propagate within ~2 seconds without
+    // restarting the desktop binary. AppState stores the snapshot
+    // taken at boot today; future call sites that want the live view
+    // can plumb the `LiveSources` handle (left as a follow-on so the
+    // existing classifier + executor paths stay byte-for-byte
+    // unchanged — ADR 0015 already narrowed sources.toml's runtime
+    // consumers to the executor's hand-crafted live tests).
+    let live_sources = LiveSources::new(sources.clone(), sources_path.clone());
+    live_sources.spawn_watcher(DEFAULT_SOURCES_POLL_INTERVAL);
 
     // --- Authoritative-source registry (Session 82) ----------------
     //
@@ -430,6 +444,14 @@ fn main() -> Result<()> {
             // "X runs in the last minute" when an operator fires several
             // fetches in rapid succession.
             situation_room_api::commands::promote_history,
+            // Session 88 — cross-table id → type batch lookup + single-id
+            // record fetch. Powers the PromoteDetailDrawer's per-pass
+            // promoted-record-ids strip (chip colour-coded by record type)
+            // and any future click-through that opens a record from an
+            // opaque id alone (record_types_for_ids resolves the kind,
+            // get_record_by_id fetches the full envelope).
+            situation_room_api::commands_records::record_types_for_ids,
+            situation_room_api::commands_records::get_record_by_id,
         ])
         .build(tauri::generate_context!())
         .context("building tauri")?;

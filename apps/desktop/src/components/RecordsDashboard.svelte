@@ -881,10 +881,57 @@
     border-color: var(--border-strong);
     color: var(--fg-primary);
   }
+  /* Session 88 — horizontal-scroll row per panel.
+     Pre-Session-88 this was a wrapping grid (auto-fill / minmax 220px),
+     which folded a panel's KindCards onto multiple rows when the column
+     count exceeded the available width. Operator-feedback on the
+     `federal reserve rate policy` screenshot: with many event_types or
+     entity kinds, the second+ rows pushed the rest of the dashboard
+     down and competed for the operator's eye against the row above.
+     The situation-room reading order is type → kind → card scanned
+     left-to-right; a single scrollable row preserves that order and
+     hides nothing — overflow is reachable via the native horizontal
+     scrollbar (or trackpad/wheel scroll) rather than collapsed off
+     screen.
+
+     The cards stay min-width 220px (matches the old `minmax(220px, …)`
+     floor) and grow no wider than 280px so the row reads as a strip
+     of uniformly-sized tiles, not as a few stretched paragraphs. The
+     `flex-shrink: 0` is load-bearing — without it, a long event_type
+     name + long sample string would squeeze adjacent cards below
+     min-width and the row would visually collapse instead of scrolling.
+
+     `overflow-x: auto; overflow-y: visible` is also load-bearing —
+     setting overflow-y to anything other than `visible` clips the
+     SamplesModal / DocumentDrawer / MetricDetailDrawer focus rings
+     when they're spawned by a clicked card on a non-current row.
+     `overflow-x: auto` reveals the scrollbar only when needed
+     (single-card rows keep their old look).
+
+     `scrollbar-gutter: stable` reserves the gutter so the row's
+     visual height doesn't shift when the scrollbar appears /
+     disappears across panel-expand toggles. */
   .cards {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    display: flex;
+    flex-direction: row;
     gap: 10px;
+    overflow-x: auto;
+    overflow-y: visible;
+    scrollbar-gutter: stable;
+    /* Negative-margin + padding pair lets the row scroll edge-to-edge
+       of its panel padding without clipping cards' focus rings at the
+       edge. */
+    padding: 2px 0 8px;
+  }
+  .cards > :global(*) {
+    /* MetricCard + KindCard are the only children; both already carry
+       `min-width: 160px` but the dashboard needs a wider floor so the
+       sample / sparkline area reads, not just the header. `0 0 240px`
+       = no grow, no shrink, basis 240px (slightly above the 220px
+       grid floor so the strip is denser when the panel has many
+       short-content cards). */
+    flex: 0 0 240px;
+    max-width: 280px;
   }
 
   /* Session 63 — `.pending` / `.pill*` / `.aspirational-note` styles

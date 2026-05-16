@@ -118,6 +118,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "provenance selector_path + raw_bytes_excerpt columns",
         sql: include_str!("../../../migrations/0018_provenance_selector_trace.sql"),
     },
+    Migration {
+        version: 19,
+        description: "authority_registry table (ADR 0022 scaffold)",
+        sql: include_str!("../../../migrations/0019_authority_registry.sql"),
+    },
 ];
 
 /// Apply every migration whose version is not yet in

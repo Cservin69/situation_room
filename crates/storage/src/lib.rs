@@ -13,6 +13,7 @@
 #![allow(dead_code)]
 
 pub mod assertions;
+pub mod authority_registry;
 pub mod connection;
 pub mod documents;
 pub mod entities;
@@ -32,6 +33,7 @@ pub mod relations;
 pub mod research_plans;
 pub mod sources_memory;
 
+pub use authority_registry::{AuthorityProvenance, AuthorityRegistryRow};
 pub use connection::Store;
 pub use fetch_run_outcomes::{
     ApplyFailureForProposer, FetchRunOutcomeKind, FetchRunOutcomeRow,

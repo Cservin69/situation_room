@@ -21,10 +21,12 @@
 //! (topics in the low hundreds; records per plan in the low
 //! thousands) and the API surface is simpler.
 
+use std::collections::HashMap;
+
 use duckdb::{params, params_from_iter};
 use situation_room_core::{
     AssertedContent, Assertion, Document, Entity, EntityId, Event, EventContent, Observation,
-    ObservationContent, Relation, RelationContent, Stance, Topic,
+    ObservationContent, Record, RecordType, Relation, RelationContent, Stance, Topic,
 };
 use uuid::Uuid;
 
@@ -268,6 +270,141 @@ impl Store {
             documents,
             assertions,
         })
+    }
+
+    // -------------------------------------------------------------------
+    // record_types_for_ids — Session 88 (Sn-87 candidate 4)
+    // -------------------------------------------------------------------
+
+    /// Resolve a batch of record UUIDs to their per-table `RecordType`.
+    ///
+    /// The promoted-record ids surfaced on `PromoteReport.promoted_record_ids`
+    /// (Session 87) are opaque on the wire: they're UUIDs, but the
+    /// drawer rendering them needs to know whether each id resolved to
+    /// an Observation, Event, Relation, etc. so it can show the matching
+    /// record-kind chip. This batch query is the cheapest way to answer
+    /// that — six tiny SELECTs (one per table) with a single
+    /// `IN (?,?,…)` filter each.
+    ///
+    /// Ids that exist in no table simply don't appear in the returned
+    /// map; callers should treat the absence as "id has been deleted /
+    /// never existed". No error is raised for unknown ids — the
+    /// frontend renders an `unknown` chip in that case and moves on,
+    /// which matches the rest of the dashboard's "missing data is
+    /// dim, not fatal" posture.
+    ///
+    /// Ids that exist in MULTIPLE tables (which the schema doesn't
+    /// permit — UUIDs are unique across all six per-type tables by
+    /// construction) would be silently first-seen-wins in
+    /// canonical-enumeration order. The condition is unreachable in
+    /// well-formed stores; the closed-vocab ordering keeps the answer
+    /// stable if it ever happens.
+    ///
+    /// ## Performance
+    ///
+    /// Six `SELECT id FROM <table> WHERE id IN (?,?,…)` scans against
+    /// the per-table primary-key index. On the realistic ≤50 ids per
+    /// promote pass (PromoteReport's typical shape), the total query
+    /// time stays well below 10ms.
+    pub fn record_types_for_ids(&self, ids: &[Uuid]) -> Result<HashMap<Uuid, RecordType>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Other(format!("connection poisoned: {e}")))?;
+
+        let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+        let id_params: Vec<&dyn duckdb::ToSql> =
+            ids.iter().map(|u| u as &dyn duckdb::ToSql).collect();
+
+        // Canonical enumeration order matches ADR 0003 + the
+        // type-count strip's left-to-right reading.
+        let tables: [(&str, RecordType); 6] = [
+            ("observations", RecordType::Observation),
+            ("events", RecordType::Event),
+            ("entities", RecordType::Entity),
+            ("relations", RecordType::Relation),
+            ("documents", RecordType::Document),
+            ("assertions", RecordType::Assertion),
+        ];
+
+        let mut out: HashMap<Uuid, RecordType> = HashMap::with_capacity(ids.len());
+        for (table, kind) in tables {
+            let sql = format!("SELECT id FROM {table} WHERE id IN ({placeholders})");
+            let mut stmt = conn.prepare(&sql).map_err(StorageError::DuckDb)?;
+            let rows = stmt
+                .query_map(&id_params[..], |row| row.get::<_, Uuid>(0))
+                .map_err(StorageError::DuckDb)?;
+            for row in rows {
+                let found_id = row.map_err(StorageError::DuckDb)?;
+                // First-table-wins: skip if a prior table already
+                // claimed this id (defensive — schema invariant
+                // prevents the collision).
+                out.entry(found_id).or_insert(kind);
+            }
+        }
+
+        Ok(out)
+    }
+
+    // -------------------------------------------------------------------
+    // get_record_by_id — Session 88 (Sn-87 candidate 5)
+    // -------------------------------------------------------------------
+
+    /// Fetch a single record by UUID, across all six per-type tables.
+    ///
+    /// Returns `Ok(Some(record))` on a hit, `Ok(None)` on a miss. Unlike
+    /// the per-type `Store::get_observation` / `get_event` / … helpers,
+    /// which surface `StorageError::NotFound` on a miss, this helper
+    /// returns `Option` because the caller (a cross-table click-through
+    /// from the PromoteDetailDrawer, an inspector that pastes an id
+    /// from elsewhere) doesn't know up-front which table the id lives
+    /// in — a miss is normal, not exceptional.
+    ///
+    /// ## Why a separate fn
+    ///
+    /// The per-type getters preserve their existing `Result<T>` shape
+    /// for the call sites that *do* know the type and want the
+    /// not-found-is-an-error semantic. Layering an `Option<Record>`
+    /// helper on top is additive.
+    ///
+    /// ## Closed-vocab return
+    ///
+    /// `Record` is the closed-vocab Either across the six per-type
+    /// shapes (`crates/core/src/schema/records/mod.rs`). The caller
+    /// matches on the variant to render the type-specific drawer.
+    ///
+    /// ## Performance
+    ///
+    /// Worst case: six per-table point queries against the primary
+    /// key. Best case (the id is in the first table checked): one.
+    /// Order matches `record_types_for_ids`: Observation → Event →
+    /// Entity → Relation → Document → Assertion. Plans the operator
+    /// is most likely to click into (Observations from the promote
+    /// pass) hit the fast path.
+    pub fn get_record_by_id(&self, id: Uuid) -> Result<Option<Record>> {
+        // Resolve the type first via the existence-only query so we
+        // only fully-decode the one table that has the id. This is
+        // cheaper than six per-table get_* attempts and avoids
+        // surfacing not-found errors that the caller would have to
+        // catch-and-discard.
+        let kinds = self.record_types_for_ids(&[id])?;
+        let Some(&kind) = kinds.get(&id) else {
+            return Ok(None);
+        };
+
+        let rec = match kind {
+            RecordType::Observation => Record::Observation(self.get_observation(id)?),
+            RecordType::Event => Record::Event(self.get_event(id)?),
+            RecordType::Entity => Record::Entity(self.get_entity(id)?),
+            RecordType::Relation => Record::Relation(self.get_relation(id)?),
+            RecordType::Document => Record::Document(self.get_document(id)?),
+            RecordType::Assertion => Record::Assertion(self.get_assertion(id)?),
+        };
+        Ok(Some(rec))
     }
 }
 

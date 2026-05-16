@@ -586,6 +586,58 @@ export async function promoteHistory(): Promise<PromoteHistoryDto> {
 }
 
 /**
+ * Session 88 — closed-vocabulary record-type tag for the
+ * `record_types_for_ids` wire shape. Matches the Rust `RecordType`
+ * enum's `#[serde(rename_all = "snake_case")]` form so values from
+ * the IPC round-trip can be compared with `===` (no normalising
+ * needed on either side).
+ */
+export type RecordTypeTag =
+  | 'observation'
+  | 'event'
+  | 'entity'
+  | 'relation'
+  | 'document'
+  | 'assertion';
+
+/**
+ * Session 88 — batch resolve a list of record UUIDs to their
+ * per-table record type. Ids that resolve nowhere are simply absent
+ * from the returned record; callers should treat missing entries as
+ * "unknown / deleted" rather than as an error.
+ *
+ * Powers the PromoteDetailDrawer's per-pass `promoted_record_ids`
+ * strip, which colour-codes each id chip by the record type it
+ * resolved to. Generalises to any inspector that ingests a
+ * heterogeneous id list.
+ *
+ * Throws `{ kind: 'invalid_input' }` when the batch exceeds the
+ * server-side cap (500 ids) or one of the strings isn't a valid
+ * UUID.
+ */
+export async function recordTypesForIds(
+  ids: string[],
+): Promise<Record<string, RecordTypeTag>> {
+  return invoke<Record<string, RecordTypeTag>>('record_types_for_ids', { ids });
+}
+
+/**
+ * Session 88 — fetch a single record by UUID across all six
+ * per-type tables. Returns `null` when the id resolves nowhere.
+ *
+ * The return type is the closed-vocab Rust `Record` enum — a
+ * tagged-union shape `{ kind: 'observation', observation: { … } }`
+ * etc. Click-through call sites should match on `.kind` and pick
+ * the matching variant payload.
+ *
+ * Throws `{ kind: 'invalid_input' }` when the id isn't a valid
+ * UUID.
+ */
+export async function getRecordById(id: string): Promise<unknown | null> {
+  return invoke<unknown | null>('get_record_by_id', { id });
+}
+
+/**
  * Session 77 — return the classifier prompt version currently
  * loaded in the binary. The frontend compares this against each
  * plan's `classified_by` field (`"{provider}@{version}"` for

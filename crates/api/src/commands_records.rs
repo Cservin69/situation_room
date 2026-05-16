@@ -10,6 +10,9 @@
 //! `tauri::generate_handler!` registration the binary already
 //! does for the other commands; no separate IPC channel exists.
 
+use std::collections::HashMap;
+
+use situation_room_core::RecordType;
 use situation_room_storage::research_plans::PlanStatus;
 use situation_room_storage::StorageError;
 use tracing::info;
@@ -301,4 +304,123 @@ pub async fn promote_consensus_for_plan(
     );
 
     Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// record_types_for_ids — Session 88 (Sn-87 candidate 4)
+// ---------------------------------------------------------------------------
+
+/// Cap on the batch size for one `record_types_for_ids` call. Promote
+/// reports today carry at most a few dozen ids; this cap is set well
+/// above the realistic ceiling to keep a hostile / accidental
+/// gigantic-batch call from holding the storage mutex for long, while
+/// still being large enough that any single PromoteDetailDrawer row
+/// dump fits in one request.
+const MAX_IDS_PER_BATCH: usize = 500;
+
+/// Resolve a batch of record UUIDs to their per-table record type.
+///
+/// Returns a map `{ id → "observation" | "event" | … }`. Ids that
+/// don't exist in any of the six per-type tables are simply absent
+/// from the map (no error), so the caller can render a placeholder
+/// chip for unknown ids without special-casing the error branch.
+///
+/// Used today by the PromoteDetailDrawer to colour-code the per-pass
+/// `promoted_record_ids` strip (Session 87) by the record type each
+/// id resolves to. Generalises to any future inspector that ingests
+/// a heterogeneous id list and needs to dispatch to the type-specific
+/// drawer.
+///
+/// ## Errors
+///
+/// - `InvalidInput { field: "ids" }` — one of the input strings isn't
+///   a valid UUID, or the batch exceeds `MAX_IDS_PER_BATCH`.
+/// - `Storage` — DB-level failure on one of the six per-table scans.
+#[tauri::command]
+pub async fn record_types_for_ids(
+    ids: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<HashMap<String, String>, CommandError> {
+    if ids.len() > MAX_IDS_PER_BATCH {
+        return Err(CommandError::InvalidInput {
+            field: "ids".into(),
+            message: format!(
+                "batch size {} exceeds cap {MAX_IDS_PER_BATCH}",
+                ids.len()
+            ),
+        });
+    }
+
+    let parsed: Vec<Uuid> = ids
+        .iter()
+        .map(|s| {
+            s.parse::<Uuid>().map_err(|e| CommandError::InvalidInput {
+                field: "ids".into(),
+                message: format!("not a valid UUID `{s}`: {e}"),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    info!(batch_size = parsed.len(), "record_types_for_ids command invoked");
+
+    let resolved: HashMap<Uuid, RecordType> = state
+        .store
+        .record_types_for_ids(&parsed)
+        .map_err(CommandError::from)?;
+
+    // Flatten Uuid → String + RecordType → snake_case string for the
+    // wire. Frontend `Map<string, RecordType>` consumes it directly.
+    let out: HashMap<String, String> = resolved
+        .into_iter()
+        .map(|(id, kind)| (id.to_string(), kind.as_str().to_string()))
+        .collect();
+
+    info!(returned = out.len(), "record_types_for_ids returning");
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// get_record_by_id — Session 88 (Sn-87 candidate 5)
+// ---------------------------------------------------------------------------
+
+/// Fetch a single record by UUID, across all six per-type tables.
+///
+/// Returns the typed `Record` enum (six-variant closed vocab) wrapped
+/// in `Option`: `None` when the id resolves nowhere. Designed for
+/// click-through from an opaque id list (the PromoteDetailDrawer's
+/// per-pass id rows, a future paste-id inspector, …) where the caller
+/// doesn't know the type up-front. Pure read.
+///
+/// ## Errors
+///
+/// - `InvalidInput { field: "id" }` — input isn't a valid UUID.
+/// - `Storage` — DB-level failure on the per-table lookup once the
+///   type was resolved. (A missing id surfaces as `Ok(None)`, not an
+///   error.)
+#[tauri::command]
+pub async fn get_record_by_id(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<situation_room_core::Record>, CommandError> {
+    let parsed: Uuid = id.parse().map_err(|e: uuid::Error| CommandError::InvalidInput {
+        field: "id".into(),
+        message: format!("not a valid UUID: {e}"),
+    })?;
+
+    info!(record_id = %parsed, "get_record_by_id command invoked");
+
+    let rec = state
+        .store
+        .get_record_by_id(parsed)
+        .map_err(CommandError::from)?;
+
+    info!(
+        record_id = %parsed,
+        found = rec.is_some(),
+        record_type = rec.as_ref().map(|r| r.record_type().as_str()).unwrap_or("none"),
+        "get_record_by_id returning"
+    );
+
+    Ok(rec)
 }
