@@ -86,7 +86,7 @@ use crate::research::{
 ///   3. Both must move together — if they drift, the frontend banner
 ///      will fire on every plan or on no plan, depending on which
 ///      side is stale.
-pub const CLASSIFIER_PROMPT_VERSION: &str = "2.2";
+pub const CLASSIFIER_PROMPT_VERSION: &str = "2.3";
 
 /// Combine an [`LlmProvider::id`] (`"xai"`, `"anthropic"`, …) with
 /// [`CLASSIFIER_PROMPT_VERSION`] into the stored
@@ -505,6 +505,13 @@ pub struct AuthoredEntityKindExpectation {
     pub kind: String,
     #[serde(default)]
     pub exemplars: Vec<String>,
+    /// Session 81 — closed-vocabulary attribute keys for this entity
+    /// kind. `lowercase_snake_case`; validated for non-empty + length
+    /// at conversion time. Empty Vec is the open-vocab default for
+    /// plans the classifier leaves unset, matching the Session 80
+    /// entity-attribute extractor behaviour.
+    #[serde(default)]
+    pub attributes: Vec<String>,
     pub rationale: String,
 }
 
@@ -740,9 +747,23 @@ fn convert_expectations(
                 .into_iter()
                 .map(|s| EntityId::new(s.as_str()))
                 .collect::<Result<Vec<_>, _>>()?;
+            // Session 81 — validate attribute keys at conversion
+            // time. Each key must be a non-empty trimmed string of
+            // bounded length; we deliberately don't enforce
+            // `lowercase_snake_case` at this layer because the
+            // extractor's open-vocab path may want to relax later
+            // (the prompt teaches the convention; this layer guards
+            // against the egregious cases — empty strings, whitespace,
+            // runaway-length pathological input).
+            let attributes = k
+                .attributes
+                .into_iter()
+                .map(|s| validate_attribute_key(s.as_str()))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok::<_, ClassificationError>(EntityKindExpectation {
                 kind: k.kind,
                 exemplars,
+                attributes,
                 rationale: k.rationale,
             })
         })
@@ -838,6 +859,42 @@ fn convert_one_nomination(
         description: description.to_string(),
         priority_tier,
     }))
+}
+
+/// Maximum length of one attribute key on
+/// [`AuthoredEntityKindExpectation::attributes`]. 64 chars matches
+/// the surrounding `lowercase_snake_case` discipline (the
+/// `Topic` / `EventType` newtypes use 64 as well) without baking a
+/// validated newtype for what's still an open-vocab key in v1.
+const MAX_ATTRIBUTE_KEY_LEN: usize = 64;
+
+/// Validate one attribute-key string for
+/// [`AuthoredEntityKindExpectation::attributes`]. Enforces non-empty
+/// after trim, length-bound, and rejects whitespace / control chars
+/// in the interior. Does NOT enforce `lowercase_snake_case` — the
+/// prompt teaches the convention; the validator only guards against
+/// pathological inputs (empty strings, leading/trailing whitespace,
+/// runaway-length keys, control characters that would disrupt logs
+/// or UI rendering).
+fn validate_attribute_key(raw: &str) -> Result<String, ClassificationError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ClassificationError::InvalidPlan(
+            "entity_kinds[].attributes entry is empty".into(),
+        ));
+    }
+    if trimmed.chars().count() > MAX_ATTRIBUTE_KEY_LEN {
+        return Err(ClassificationError::InvalidPlan(format!(
+            "entity_kinds[].attributes entry {trimmed:?} is {} chars (limit {MAX_ATTRIBUTE_KEY_LEN})",
+            trimmed.chars().count()
+        )));
+    }
+    if trimmed.chars().any(|c| c.is_control() || c == ' ') {
+        return Err(ClassificationError::InvalidPlan(format!(
+            "entity_kinds[].attributes entry {trimmed:?} contains whitespace or control characters"
+        )));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Parse the LLM's priority-tier string into the closed
@@ -1196,6 +1253,7 @@ mod tests {
                 entity_kinds: vec![AuthoredEntityKindExpectation {
                     kind: "mine".into(),
                     exemplars: vec!["mine:greenbushes".into()],
+                    attributes: vec![],
                     rationale: "Atomic unit of supply".into(),
                 }],
                 relation_kinds: vec![AuthoredRelationKindExpectation {

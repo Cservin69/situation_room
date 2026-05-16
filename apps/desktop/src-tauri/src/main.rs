@@ -336,6 +336,13 @@ fn main() -> Result<()> {
             // dashboard so the operator can see the Session-74 v1.22
             // prompt-cache lever working without grepping INFO logs.
             situation_room_api::commands::llm_cost_ledger,
+            // Session 81 — per-call cost timeline ring buffer. Sibling
+            // to llm_cost_ledger: that command answers "how much have
+            // we spent in this bucket", this one answers "what did the
+            // last 50 LLM calls look like, in order". The frontend
+            // renders a CostTimelinePanel so cost spikes are visible
+            // without grepping the INFO log.
+            situation_room_api::commands::llm_cost_timeline,
             // Session 77 — surfaces the classifier prompt version
             // currently loaded in the binary. Drives the per-plan
             // "re-classify under newer prompt" banner: the frontend
@@ -344,6 +351,14 @@ fn main() -> Result<()> {
             // when they differ (or when the plan predates Session 77
             // and has no @version suffix at all).
             situation_room_api::commands::classifier_prompt_version,
+            // Session 81 — consensus-promotion stage (ADR 0004 /
+            // ADR 0021). Pure read+write: walks the plan's Assertion
+            // rows, promotes any compatible-claim group with ≥ N
+            // independent claimants. Idempotent on re-run via
+            // content-derived dedup_keys. Operator-triggered today;
+            // a future session may schedule this off the fetch-run
+            // completion hook.
+            situation_room_api::commands_records::promote_consensus_for_plan,
         ])
         .build(tauri::generate_context!())
         .context("building tauri")?;

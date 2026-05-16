@@ -182,6 +182,12 @@ pub struct EventTypeExpectationDto {
 pub struct EntityKindExpectationDto {
     pub kind: String,
     pub exemplars: Vec<String>,
+    /// Session 81 — closed-vocabulary attribute keys for this entity
+    /// kind. Empty for plans classified before Session 81 (the field
+    /// carries `#[serde(default)]` in the typed `EntityKindExpectation`
+    /// upstream). The dashboard's entity tiles read this to surface the
+    /// extracted attribute facts that are in scope for the kind.
+    pub attributes: Vec<String>,
     pub rationale: String,
 }
 
@@ -595,6 +601,7 @@ impl From<EntityKindExpectation> for EntityKindExpectationDto {
         Self {
             kind: e.kind,
             exemplars: e.exemplars.into_iter().map(|i| i.as_str().to_string()).collect(),
+            attributes: e.attributes,
             rationale: e.rationale,
         }
     }
@@ -1617,6 +1624,45 @@ pub struct ClassifierPromptVersionDto {
 }
 
 // ---------------------------------------------------------------------------
+// LlmCostTimelineEntryDto — Session 81
+// ---------------------------------------------------------------------------
+
+/// One entry in the per-call cost timeline (Session 81). Mirrors
+/// [`situation_room_llm::TimelineEntry`] across the wire.
+///
+/// `timestamp` is RFC-3339 string for IPC simplicity; the frontend
+/// parses with `new Date(...)` when it needs a Date object.
+/// `input_tokens`/`output_tokens`/`cached_input_tokens` are wrapped
+/// in nullables (mapped from `Option<u32>`) so providers that don't
+/// report a particular field don't have to invent a fake zero.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct LlmCostTimelineEntryDto {
+    pub timestamp: String,
+    pub provider: String,
+    pub tier: ModelTierDto,
+    pub purpose: Option<String>,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+    pub cached_input_tokens: Option<u32>,
+}
+
+impl LlmCostTimelineEntryDto {
+    /// Lift a typed [`situation_room_llm::TimelineEntry`] into wire shape.
+    pub fn from_typed(e: situation_room_llm::TimelineEntry) -> Self {
+        Self {
+            timestamp: e.timestamp.to_rfc3339(),
+            provider: e.provider,
+            tier: e.tier.into(),
+            purpose: e.purpose,
+            input_tokens: e.input_tokens,
+            output_tokens: e.output_tokens,
+            cached_input_tokens: e.cached_input_tokens,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1661,6 +1707,7 @@ mod tests {
                 entity_kinds: vec![P_EKE {
                     kind: "mine".into(),
                     exemplars: vec![EntityId::new("mine:greenbushes").unwrap()],
+                    attributes: vec![],
                     rationale: "Atomic supply unit".into(),
                 }],
                 relation_kinds: vec![P_RKE {

@@ -289,6 +289,7 @@ mod tests {
                     .iter()
                     .map(|s| EntityId::new(*s).expect("valid entity id"))
                     .collect(),
+                attributes: vec![],
                 rationale: "test".into(),
             })
             .collect();

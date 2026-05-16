@@ -567,6 +567,94 @@
   let assertionGroups = $derived(groupBy(records.assertions, assertionKindOf));
 
   /*
+    Session 81 — derive an entity_id → attribute-tiles map from the
+    assertions Vec. Each `AssertedContent::EntityAttribute` row carries
+    `{entity_id, key, value}`; we dedup by latest-observation-wins per
+    (entity_id, key) and project the typed value back to a flat
+    string for the chip. Pre-Session-80 plans (no entity-attribute
+    extraction) produce an empty map; post-Session-80 plans light up
+    the strip on their Entity KindCards.
+
+    The fold is presentational — the underlying assertion rows stay
+    available under the Assertions panel for drill-down. We deliberately
+    don't filter on plan_id here: the dashboard is cross-plan today
+    (Session 63), and an EntityAttribute asserted on `company:tsla` in
+    plan A is still relevant when plan B's entities panel surfaces
+    `company:tsla`.
+  */
+  function formatAttributeValue(raw: unknown): string {
+    // AttributeValue is a tagged enum: `{kind: 'text', value: '...'}`,
+    // `{kind: 'number', value: {value: N, unit: 'persons'}}`, etc. We
+    // pretty-print each shape into a single string; non-conformant
+    // payloads (forward-compat hedge) fall through to JSON.stringify
+    // so the chip never crashes the panel.
+    if (raw && typeof raw === 'object') {
+      const kind = (raw as Record<string, unknown>)['kind'];
+      const value = (raw as Record<string, unknown>)['value'];
+      if (kind === 'text' && typeof value === 'string') return value;
+      if (kind === 'boolean' && typeof value === 'boolean') return value ? 'true' : 'false';
+      if (kind === 'number' && value && typeof value === 'object') {
+        const n = (value as Record<string, unknown>)['value'];
+        const u = (value as Record<string, unknown>)['unit'];
+        const numStr = typeof n === 'number' ? n.toLocaleString() : String(n ?? '');
+        return typeof u === 'string' && u.length > 0 ? `${numStr} ${u}` : numStr;
+      }
+      if (kind === 'country' && typeof value === 'string') return value;
+      if (kind === 'topic' && typeof value === 'string') return value;
+      if (kind === 'entity' && typeof value === 'string') return value;
+      // Future variants (entity_list, topic_list) — fall through.
+    }
+    try {
+      return JSON.stringify(raw);
+    } catch {
+      return '';
+    }
+  }
+
+  let attributeTilesByEntityId = $derived.by(() => {
+    const out = new Map<string, Map<string, string>>();
+    for (const a of records.assertions) {
+      const content = a.content as Record<string, unknown> | null;
+      if (!content || typeof content !== 'object') continue;
+      // Session 78 renamed the discriminator to `asserted_kind` to
+      // resolve a duplicate-`kind` collision with RelationContent;
+      // the entity-attribute shape lives under the same wire form.
+      const ak = content['asserted_kind'];
+      if (ak !== 'entity_attribute') continue;
+      const eid = content['entity_id'];
+      const key = content['key'];
+      const value = content['value'];
+      if (typeof eid !== 'string' || typeof key !== 'string') continue;
+      const formatted = formatAttributeValue(value);
+      if (formatted.length === 0) continue;
+      const inner = out.get(eid) ?? new Map<string, string>();
+      // Records arrive observed_at-DESC from the storage layer, so
+      // first-seen-wins is latest-known-value. (Subsequent rows for
+      // the same key are older.)
+      if (!inner.has(key)) inner.set(key, formatted);
+      out.set(eid, inner);
+    }
+    // Collapse inner maps into ordered arrays. The Map preserves
+    // insertion order so the chip strip reads in observation order
+    // (typically `legal_name` first → `ticker` → …).
+    const flat = new Map<string, Array<{ key: string; value: string }>>();
+    for (const [eid, attrs] of out) {
+      flat.set(
+        eid,
+        Array.from(attrs.entries()).map(([key, value]) => ({ key, value })),
+      );
+    }
+    return flat;
+  });
+
+  function attributeTilesForEntity(e: EntityDto): Array<{ key: string; value: string }> | null {
+    const eid = e.entity_id ?? '';
+    if (!eid) return null;
+    const tiles = attributeTilesByEntityId.get(eid);
+    return tiles && tiles.length > 0 ? tiles : null;
+  }
+
+  /*
     Session 68 — per-panel KindCard rendering cap. Plans that produce
     hundreds of records (FEMA's 872-event hunt fixture is the
     motivating case) can group into many distinct kinds; rendering
@@ -764,6 +852,7 @@
             sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
             sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}
             onSamplesExpand={(all) => openSamplesModal(g.key, g.records.length, all)}
+            attributeTiles={attributeTilesForEntity(g.records[0])}
           />
         {/each}
       </div>

@@ -1176,13 +1176,21 @@ fn observation_extraction_schema_value(allowed_metrics: &[&str]) -> serde_json::
 // attribute facts: "company X has employee_count Y", "company X has
 // headquarters_country US", "agency X has authority cybersecurity".
 //
-// **Open-vocabulary `key` in v1.** Today's `EntityKindExpectation`
-// schema does NOT declare a list of allowed attribute names, so the
-// extractor accepts whatever lowercase_snake_case key the LLM emits.
-// A future session can add `attributes: Vec<String>` to
-// `EntityKindExpectation` (schema rev + classifier-prompt edit) and
-// turn this into a closed-vocab gate matching the event +
-// observation extractor posture.
+// **Closed/open-vocabulary `key`, depending on plan.**
+// Session 81 added `attributes: Vec<String>` to
+// `EntityKindExpectation`. The pipeline orchestrator now hands the
+// union of every kind's declared attributes to the extractor as
+// `allowed_attribute_keys`. Behaviour:
+//
+//   - Empty slice (the Session 80 default for plans the classifier
+//     didn't seed with attributes, plus pre-Session-81 plans whose
+//     `attributes` Vec deserialises to empty by `#[serde(default)]`):
+//     open-vocabulary. The extractor accepts whatever
+//     `lowercase_snake_case` key the LLM emits.
+//   - Non-empty slice: closed-vocabulary. The schema bakes the list as
+//     a JSON-Schema `enum` on the `key` field; the validator
+//     re-checks membership. Matches the relation / event / observation
+//     extractor posture.
 //
 // **Closed-vocabulary `value_kind`.** The wire shape exposes a typed
 // value discriminator that maps onto `AttributeValue`'s tagged-enum
@@ -1205,6 +1213,24 @@ pub struct RawExtractedEntityAttribute {
     /// dropped (the entity_id is the join key for the dashboard's
     /// entity panel).
     pub entity_id: String,
+    /// Optional per-row claimant (Session 81). When set, must be a
+    /// valid `prefix:slug` `EntityId`. When unset / empty / unparseable,
+    /// the orchestrator synthesises `agency:document` (matching the
+    /// Session 80 default — the document is the source by
+    /// construction). Lets the LLM lift Reuters-quoted Tesla
+    /// statements into a `(claimant=agency:reuters, stance=Reported)`
+    /// shape distinct from a Tesla-asserted shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimant: Option<String>,
+    /// Optional per-row stance (Session 81). Must be one of the
+    /// closed `Stance` vocabulary's snake_case wire forms
+    /// (`asserted`, `hedged`, `denied`, `reported`, `predicted`,
+    /// `speculated`). Unparseable values fall back to `Asserted` —
+    /// the Session 80 default — rather than dropping the row, since
+    /// the attribute fact itself is still valid even when the
+    /// stance signal is muddy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stance: Option<String>,
     /// Attribute key. Lowercase snake_case. Open vocabulary in v1 —
     /// the validator only checks `!key.is_empty()` after trim.
     pub key: String,
@@ -1252,15 +1278,31 @@ pub struct EntityAttributeDraft {
     pub key: String,
     pub value: situation_room_core::schema::content::AttributeValue,
     pub confidence: situation_room_core::vocab::Confidence,
+    /// Session 81 — resolved claimant. Falls back to
+    /// `agency:document` when the LLM didn't emit a per-row value
+    /// (or emitted one that failed `EntityId::new`).
+    pub claimant: situation_room_core::vocab::EntityId,
+    /// Session 81 — resolved stance. Falls back to `Asserted` when
+    /// the LLM didn't emit a per-row value or emitted one outside
+    /// the closed `Stance` vocabulary.
+    pub stance: situation_room_core::vocab::Stance,
 }
 
 /// Run one entity-attribute extraction pass against a Document body.
 ///
-/// Open-vocab on `key` (validator only checks non-empty after trim).
+/// `allowed_attribute_keys` is the union of every entity kind's
+/// declared `attributes` on `plan.expectations.entity_kinds[]`
+/// (Session 81). An empty slice preserves the Session 80 open-vocab
+/// behaviour — the schema doesn't enum-constrain `key` and the
+/// validator only checks `!key.is_empty()`. A non-empty slice turns
+/// the schema + validator into a closed-vocab gate matching the
+/// relation / event / observation extractor posture.
+///
 /// Closed-vocab on `value_kind` (must be one of `text`/`number`/
 /// `boolean`). Returns the validated drafts only; malformed rows
-/// (invalid entity id, empty key, unknown value_kind, mismatched
-/// value field) warn-log and drop.
+/// (invalid entity id, empty key, out-of-vocab key when the gate is
+/// active, unknown value_kind, mismatched value field) warn-log and
+/// drop.
 pub async fn extract_entity_attributes_from_document(
     provider: &dyn LlmProvider,
     cfg: &ExtractionConfig,
@@ -1269,6 +1311,7 @@ pub async fn extract_entity_attributes_from_document(
     source_url: &str,
     mime: &str,
     body: &str,
+    allowed_attribute_keys: &[&str],
 ) -> Result<Vec<EntityAttributeDraft>, ExtractionError> {
     let user = build_entity_attribute_extraction_prompt(
         prompt_template,
@@ -1276,8 +1319,9 @@ pub async fn extract_entity_attributes_from_document(
         source_url,
         mime,
         body,
+        allowed_attribute_keys,
     );
-    let schema = entity_attribute_extraction_schema_value();
+    let schema = entity_attribute_extraction_schema_value(allowed_attribute_keys);
 
     let req = CompletionRequest {
         system: Some(
@@ -1304,24 +1348,32 @@ pub async fn extract_entity_attributes_from_document(
     };
 
     let resp = provider.complete(cfg.tier, req).await?;
-    let drafts = parse_entity_attributes_response(&resp)?;
+    let drafts = parse_entity_attributes_response(&resp, allowed_attribute_keys)?;
     Ok(drafts)
 }
 
-/// Pure helper: render the entity-attribute prompt template. Uses the
-/// shared base `build_extraction_prompt` (empty allowed_predicates
-/// since there's no predicate field on this extractor's wire shape).
+/// Pure helper: render the entity-attribute prompt template. Adds the
+/// `{{ALLOWED_ATTRIBUTE_KEYS}}` substitution on top of the four
+/// substitutions [`build_extraction_prompt`] already does. Empty slice
+/// renders as the open-vocab hint inline so plans without declared
+/// attributes keep the Session 80 behaviour.
 pub fn build_entity_attribute_extraction_prompt(
     template: &str,
     topic: &str,
     source_url: &str,
     mime: &str,
     body: &str,
+    allowed_attribute_keys: &[&str],
 ) -> String {
-    // Reuse the shared substitutor; the entity-attribute template has
-    // no `{{ALLOWED_*}}` placeholder (open-vocab in v1) so this just
-    // wires in topic/url/mime/body.
+    let allowed_inline = if allowed_attribute_keys.is_empty() {
+        "(no closed vocabulary — emit any stable lowercase_snake_case \
+         key like `legal_name`, `employee_count`, `headquarters_city`)"
+            .to_string()
+    } else {
+        allowed_attribute_keys.join(", ")
+    };
     build_extraction_prompt(template, topic, source_url, mime, body, &[])
+        .replace("{{ALLOWED_ATTRIBUTE_KEYS}}", &allowed_inline)
 }
 
 /// Parse a [`CompletionResponse`] into validated entity-attribute
@@ -1329,6 +1381,7 @@ pub fn build_entity_attribute_extraction_prompt(
 /// per-row validation failures.
 pub fn parse_entity_attributes_response(
     resp: &CompletionResponse,
+    allowed_attribute_keys: &[&str],
 ) -> Result<Vec<EntityAttributeDraft>, ExtractionError> {
     let raw_value = resp
         .structured
@@ -1340,7 +1393,7 @@ pub fn parse_entity_attributes_response(
 
     let mut drafts = Vec::with_capacity(parsed.attributes.len());
     for raw in parsed.attributes {
-        match validate_entity_attribute_one(raw) {
+        match validate_entity_attribute_one(raw, allowed_attribute_keys) {
             Ok(draft) => drafts.push(draft),
             Err(reason) => {
                 warn!(
@@ -1364,6 +1417,7 @@ pub fn parse_entity_attributes_response(
 /// in the resulting `AttributeValue::Number`.
 fn validate_entity_attribute_one(
     raw: RawExtractedEntityAttribute,
+    allowed_attribute_keys: &[&str],
 ) -> Result<EntityAttributeDraft, String> {
     use situation_room_core::schema::content::AttributeValue;
     use situation_room_core::vocab::{Confidence, EntityId, Unit};
@@ -1378,6 +1432,20 @@ fn validate_entity_attribute_one(
     let key = raw.key.trim().to_string();
     if key.is_empty() {
         return Err("empty key".into());
+    }
+
+    // Session 81 — closed-vocab attribute-key gate. Only enforced when
+    // the caller supplied a non-empty `allowed_attribute_keys`; an
+    // empty slice preserves the Session 80 open-vocab behaviour for
+    // plans that didn't declare any `attributes` on their
+    // `entity_kinds`.
+    if !allowed_attribute_keys.is_empty()
+        && !allowed_attribute_keys.iter().any(|k| *k == key.as_str())
+    {
+        return Err(format!(
+            "attribute key `{key}` not in plan's declared entity_kinds[].attributes; \
+             dropping under closed-vocab discipline"
+        ));
     }
 
     let kind_s = raw.value_kind.trim().to_ascii_lowercase();
@@ -1421,11 +1489,37 @@ fn validate_entity_attribute_one(
 
     let confidence = Confidence::clamp(raw.confidence as f32);
 
+    // Session 81 — resolve optional per-row claimant + stance. Both
+    // fall back to the Session 80 synthesised defaults
+    // (`agency:document` + `Asserted`) when the LLM didn't emit
+    // them or emitted a value the closed vocab rejected. Per the
+    // module-level note we deliberately don't drop the row on
+    // bad stance / claimant — the attribute fact is still
+    // structurally valid; the stance signal is the muddy
+    // optional layer.
+    let claimant = raw
+        .claimant
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| EntityId::new(s).ok())
+        .unwrap_or_else(|| {
+            EntityId::new("agency:document")
+                .expect("static EntityId `agency:document` must parse")
+        });
+    let stance = raw
+        .stance
+        .as_deref()
+        .and_then(parse_stance)
+        .unwrap_or(situation_room_core::vocab::Stance::Asserted);
+
     Ok(EntityAttributeDraft {
         entity_id,
         key,
         value,
         confidence,
+        claimant,
+        stance,
     })
 }
 
@@ -1436,7 +1530,26 @@ fn validate_entity_attribute_one(
 /// `value_*` payload fields are optional at the schema layer; the
 /// validator pulls the right one out based on `value_kind` and
 /// drops the row if it's missing.
-fn entity_attribute_extraction_schema_value() -> serde_json::Value {
+fn entity_attribute_extraction_schema_value(
+    allowed_attribute_keys: &[&str],
+) -> serde_json::Value {
+    // Session 81 — when `allowed_attribute_keys` is non-empty bake it
+    // into the schema as a JSON-Schema `enum` on the `key` field so a
+    // schema-respecting provider rejects out-of-vocab keys upstream
+    // (matches the relation / event / observation extractor posture).
+    // Empty list keeps the open-vocab `{"type":"string"}` shape so
+    // plans without declared `entity_kinds[].attributes` stay at the
+    // Session 80 behaviour.
+    let key_schema = if allowed_attribute_keys.is_empty() {
+        serde_json::json!({ "type": "string" })
+    } else {
+        let allowed_json: Vec<serde_json::Value> = allowed_attribute_keys
+            .iter()
+            .map(|s| serde_json::Value::String((*s).to_string()))
+            .collect();
+        serde_json::json!({ "type": "string", "enum": allowed_json })
+    };
+
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -1446,7 +1559,23 @@ fn entity_attribute_extraction_schema_value() -> serde_json::Value {
                     "type": "object",
                     "properties": {
                         "entity_id": { "type": "string" },
-                        "key": { "type": "string" },
+                        // Session 81 — optional per-row claimant +
+                        // stance. The schema doesn't require either;
+                        // the validator falls back to
+                        // `agency:document` + `Asserted` when missing.
+                        "claimant": { "type": "string" },
+                        "stance": {
+                            "type": "string",
+                            "enum": [
+                                "asserted",
+                                "hedged",
+                                "denied",
+                                "reported",
+                                "predicted",
+                                "speculated"
+                            ]
+                        },
+                        "key": key_schema,
                         "value_kind": {
                             "type": "string",
                             "enum": ["text", "number", "boolean"]
@@ -2459,7 +2588,7 @@ mod tests {
                 "confidence": 0.95
             }
         ]));
-        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        let drafts = parse_entity_attributes_response(&resp, &[]).unwrap();
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].entity_id.as_str(), "company:tsla");
         assert_eq!(drafts[0].key, "legal_name");
@@ -2482,7 +2611,7 @@ mod tests {
                 "confidence": 0.85
             }
         ]));
-        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        let drafts = parse_entity_attributes_response(&resp, &[]).unwrap();
         assert_eq!(drafts.len(), 1);
         match &drafts[0].value {
             AttributeValue::Number { value, unit } => {
@@ -2509,7 +2638,7 @@ mod tests {
                 "confidence": 0.7
             }
         ]));
-        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        let drafts = parse_entity_attributes_response(&resp, &[]).unwrap();
         assert_eq!(drafts.len(), 1);
         match &drafts[0].value {
             AttributeValue::Number { unit, .. } => assert!(unit.is_none()),
@@ -2529,7 +2658,7 @@ mod tests {
                 "confidence": 1.0
             }
         ]));
-        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        let drafts = parse_entity_attributes_response(&resp, &[]).unwrap();
         assert_eq!(drafts.len(), 1);
         assert!(matches!(&drafts[0].value, AttributeValue::Boolean(true)));
     }
@@ -2547,7 +2676,7 @@ mod tests {
                 "confidence": 0.9
             }
         ]));
-        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        let drafts = parse_entity_attributes_response(&resp, &[]).unwrap();
         assert!(drafts.is_empty(), "unknown value_kind must drop");
     }
 
@@ -2562,7 +2691,7 @@ mod tests {
                 "confidence": 0.9
             }
         ]));
-        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        let drafts = parse_entity_attributes_response(&resp, &[]).unwrap();
         assert!(drafts.is_empty());
     }
 
@@ -2585,7 +2714,7 @@ mod tests {
                 "confidence": 0.9
             }
         ]));
-        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        let drafts = parse_entity_attributes_response(&resp, &[]).unwrap();
         assert!(
             drafts.is_empty(),
             "entity_id with whitespace must fail EntityId::new and drop the row"
@@ -2603,7 +2732,7 @@ mod tests {
                 "confidence": 0.9
             }
         ]));
-        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        let drafts = parse_entity_attributes_response(&resp, &[]).unwrap();
         assert!(drafts.is_empty());
     }
 
@@ -2618,14 +2747,156 @@ mod tests {
                 "confidence": 1.5
             }
         ]));
-        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        let drafts = parse_entity_attributes_response(&resp, &[]).unwrap();
         assert_eq!(drafts.len(), 1);
         assert!((drafts[0].confidence.value() - 1.0).abs() < 1e-6);
     }
 
     #[test]
+    fn entity_attribute_closed_vocab_gate_drops_out_of_vocab_keys() {
+        // Session 81 — when allowed_attribute_keys is non-empty the
+        // validator rejects out-of-vocab keys with the same
+        // "dropping under closed-vocab discipline" phrasing the event
+        // + observation + (Session-80) relation extractors emit.
+        let resp = entity_attr_response(serde_json::json!([
+            {
+                "entity_id": "company:tsla",
+                "key": "employee_count",
+                "value_kind": "number",
+                "value_number": 140_473.0,
+                "unit": "persons",
+                "confidence": 0.85
+            },
+            {
+                "entity_id": "company:tsla",
+                "key": "ceo_age",
+                "value_kind": "number",
+                "value_number": 52.0,
+                "confidence": 0.7
+            }
+        ]));
+        let allowed: &[&str] = &["employee_count", "revenue", "ticker"];
+        let drafts = parse_entity_attributes_response(&resp, allowed).unwrap();
+        assert_eq!(drafts.len(), 1, "the out-of-vocab `ceo_age` row drops");
+        assert_eq!(drafts[0].key, "employee_count");
+    }
+
+    #[test]
+    fn entity_attribute_open_vocab_admits_arbitrary_keys() {
+        // Empty allowed slice preserves the Session 80 open-vocab
+        // behaviour for plans that didn't declare any
+        // `entity_kinds[].attributes`.
+        let resp = entity_attr_response(serde_json::json!([
+            {
+                "entity_id": "company:tsla",
+                "key": "anything_at_all",
+                "value_kind": "text",
+                "value_text": "value",
+                "confidence": 0.8
+            }
+        ]));
+        let drafts = parse_entity_attributes_response(&resp, &[]).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].key, "anything_at_all");
+    }
+
+    #[test]
+    fn entity_attribute_schema_bakes_key_enum_when_gate_active() {
+        // Session 81 — non-empty allowed list bakes the JSON-Schema
+        // `enum` on the `key` field so a schema-respecting provider
+        // rejects out-of-vocab keys upstream.
+        let schema =
+            entity_attribute_extraction_schema_value(&["employee_count", "revenue"]);
+        let key_schema = &schema["properties"]["attributes"]["items"]["properties"]["key"];
+        assert_eq!(key_schema["type"], "string");
+        let enum_arr = key_schema["enum"]
+            .as_array()
+            .expect("key enum should be present when allowed list is non-empty");
+        assert_eq!(enum_arr.len(), 2);
+        assert!(enum_arr.iter().any(|v| v == "employee_count"));
+        assert!(enum_arr.iter().any(|v| v == "revenue"));
+    }
+
+    #[test]
+    fn entity_attribute_per_row_claimant_and_stance_round_trip() {
+        // Session 81 — when the LLM emits per-row `claimant` + `stance`,
+        // the validator surfaces them on the draft. A Reuters-reported
+        // Tesla employee-count lands with claimant=agency:reuters,
+        // stance=Reported — distinct from a Tesla-asserted shape.
+        let resp = entity_attr_response(serde_json::json!([
+            {
+                "entity_id": "company:tsla",
+                "claimant": "agency:reuters",
+                "stance": "reported",
+                "key": "employee_count",
+                "value_kind": "number",
+                "value_number": 140_473.0,
+                "unit": "persons",
+                "confidence": 0.85
+            }
+        ]));
+        let drafts = parse_entity_attributes_response(&resp, &[]).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].claimant.as_str(), "agency:reuters");
+        assert!(matches!(drafts[0].stance, Stance::Reported));
+    }
+
+    #[test]
+    fn entity_attribute_missing_claimant_and_stance_fall_back_to_defaults() {
+        // Session 81 — when the LLM doesn't emit either field, the
+        // validator resolves them to the Session 80 defaults
+        // (agency:document + Asserted). The row still emits.
+        let resp = entity_attr_response(serde_json::json!([
+            {
+                "entity_id": "company:tsla",
+                "key": "legal_name",
+                "value_kind": "text",
+                "value_text": "Tesla, Inc.",
+                "confidence": 0.9
+            }
+        ]));
+        let drafts = parse_entity_attributes_response(&resp, &[]).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].claimant.as_str(), "agency:document");
+        assert!(matches!(drafts[0].stance, Stance::Asserted));
+    }
+
+    #[test]
+    fn entity_attribute_unparseable_claimant_falls_back_without_dropping_row() {
+        // Bad claimant string (whitespace inside the slug, the
+        // realistic LLM mistake of emitting "Reuters" instead of
+        // "agency:reuters") doesn't drop the row — the attribute fact
+        // itself is still valid; the stance signal is the muddy
+        // optional layer.
+        let resp = entity_attr_response(serde_json::json!([
+            {
+                "entity_id": "company:tsla",
+                "claimant": "Reuters Inc",
+                "stance": "wonders",
+                "key": "ticker",
+                "value_kind": "text",
+                "value_text": "TSLA",
+                "confidence": 0.95
+            }
+        ]));
+        let drafts = parse_entity_attributes_response(&resp, &[]).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].claimant.as_str(), "agency:document");
+        assert!(matches!(drafts[0].stance, Stance::Asserted));
+    }
+
+    #[test]
+    fn entity_attribute_schema_omits_key_enum_when_gate_inactive() {
+        // Empty list keeps the open-vocab `{"type":"string"}` shape.
+        let schema = entity_attribute_extraction_schema_value(&[]);
+        let key_schema = &schema["properties"]["attributes"]["items"]["properties"]["key"];
+        assert_eq!(key_schema["type"], "string");
+        assert!(key_schema.get("enum").is_none());
+    }
+
+    #[test]
     fn entity_attribute_schema_constrains_value_kind() {
-        let schema = entity_attribute_extraction_schema_value();
+        let schema = entity_attribute_extraction_schema_value(&[]);
         let kind_schema =
             &schema["properties"]["attributes"]["items"]["properties"]["value_kind"];
         assert_eq!(kind_schema["type"], "string");

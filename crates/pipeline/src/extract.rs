@@ -741,12 +741,16 @@ pub fn build_observation(
 //      same destination Session 77 writes to. Records-for-plan's LIKE
 //      join routes via the `{source}#recipe:{id}@v{ver}` provenance.
 //
-// ## Scope (v1)
+// ## Scope (v1/v2)
 //
-// - **Open-vocab `key`.** Matches the `EntityAttributeContent.key`
-//   schema. Closed-vocab requires a schema rev on
-//   `EntityKindExpectation` to add `attributes: Vec<String>`; that's a
-//   future-session ADR call.
+// - **Open- *or* closed-vocab `key`.** Session 81 added
+//   `attributes: Vec<String>` to `EntityKindExpectation`. The
+//   orchestrator collects the union of every kind's declared
+//   attributes and hands the slice to the extractor. Empty slice =
+//   open-vocab (Session 80 behaviour, preserved for plans that
+//   didn't seed any kind with attributes); non-empty = closed-vocab
+//   gate matching the relation / event / observation extractor
+//   posture.
 // - **Closed-vocab `value_kind`.** text / number / boolean only in v1
 //   — the three shapes the most common attribute facts fit. Country /
 //   Topic / Entity / EntityList / TopicList stay as future-session
@@ -789,6 +793,21 @@ pub async fn extract_and_persist_entity_attributes(
     let topic = plan.topic.as_str();
     let source_url = recipe.source_url.as_str();
 
+    // Session 81 — closed-vocab attribute-key gate. Collect the union
+    // of every `EntityKindExpectation`'s declared `attributes`. Empty
+    // Vec preserves Session 80 open-vocab behaviour; non-empty turns
+    // the schema + validator into a closed-vocab gate. We deliberately
+    // don't dedup or sort — small N (typically < 30 keys total) and
+    // membership tests work on the literal slice either way.
+    let allowed_keys_owned: Vec<String> = plan
+        .expectations
+        .entity_kinds
+        .iter()
+        .flat_map(|k| k.attributes.iter().cloned())
+        .collect();
+    let allowed_keys_refs: Vec<&str> =
+        allowed_keys_owned.iter().map(|s| s.as_str()).collect();
+
     let drafts = match extract_entity_attributes_from_document(
         provider,
         &cfg,
@@ -797,6 +816,7 @@ pub async fn extract_and_persist_entity_attributes(
         source_url,
         &mime,
         &body,
+        &allowed_keys_refs,
     )
     .await
     {
@@ -854,12 +874,12 @@ pub async fn extract_and_persist_entity_attributes(
 /// Build one `Assertion` from a validated [`EntityAttributeDraft`].
 /// Pure function — no I/O — so tests can pin the envelope shape.
 ///
-/// **Claimant + stance defaults.** v1 doesn't have the LLM emit per-row
-/// claimant / stance for entity attributes — the document is the
-/// source by construction. Claimant = `agency:document` (a synthetic
-/// `EntityId`); stance = `Asserted`. A future session can extend the
-/// wire shape to carry per-row stance + claimant the way the relation
-/// extractor does.
+/// **Claimant + stance (Session 81).** The draft carries the LLM-
+/// emitted per-row claimant + stance (already resolved by
+/// `validate_entity_attribute_one` — bad / missing values fall back
+/// to `agency:document` + `Stance::Asserted` so the row stays
+/// emitable). This unifies the entity-attribute path with the
+/// relation extractor's per-row attribution shape.
 ///
 /// **Provenance.** Same `{source}#recipe:{id}@v{ver}` shape the three
 /// earlier orchestrators use, so `records_for_plan`'s LIKE join
@@ -870,8 +890,6 @@ pub fn build_entity_attribute_assertion(
     draft: &EntityAttributeDraft,
     fetched_at: DateTime<Utc>,
 ) -> Assertion {
-    use situation_room_core::vocab::{EntityId, Stance};
-
     let provenance = Provenance {
         source_id: format!(
             "{}#recipe:{}@v{}",
@@ -908,14 +926,10 @@ pub fn build_entity_attribute_assertion(
         value: draft.value.clone(),
     });
 
-    // Synthetic claimant — the document itself. A future session can
-    // upgrade to the publisher / agency the way the relation extractor
-    // does. `EntityId::new` accepts `agency:document` (the namespace is
-    // free-form lowercase letters / digits / underscores).
-    let claimant = EntityId::new("agency:document")
-        .expect("static EntityId `agency:document` must parse");
-
-    Assertion::new(claimant, Stance::Asserted, content, envelope)
+    // Session 81 — claimant + stance lift from the draft. The
+    // validator resolved both: `agency:document` + `Asserted`
+    // defaults when the LLM didn't emit per-row values.
+    Assertion::new(draft.claimant.clone(), draft.stance, content, envelope)
 }
 
 // ---------------------------------------------------------------------------
@@ -1162,6 +1176,8 @@ mod tests {
                 unit: Some(situation_room_core::vocab::Unit::new("persons").unwrap()),
             },
             confidence: Confidence::new(0.85).unwrap(),
+            claimant: EntityId::new("agency:document").unwrap(),
+            stance: Stance::Asserted,
         };
         let fetched_at = Utc.with_ymd_and_hms(2026, 5, 15, 12, 0, 0).unwrap();
 

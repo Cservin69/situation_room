@@ -232,6 +232,28 @@ pub struct EntityKindExpectation {
     #[serde(default)]
     pub exemplars: Vec<EntityId>,
 
+    /// Session 81 — closed-vocabulary attribute keys for this kind.
+    /// Each entry is a `lowercase_snake_case` attribute name the
+    /// EntityAttribute extractor should look for on entities of this
+    /// kind (`legal_name`, `headquarters_country`, `employee_count`,
+    /// `founding_year`). Empty is the default for plans classified
+    /// before Session 81 (the field carries `#[serde(default)]`);
+    /// the extractor falls back to open-vocab behaviour on an empty
+    /// list, matching the Session 80 entity-attribute extraction
+    /// posture. Non-empty turns the extractor's schema + validator
+    /// into a closed-vocab gate, mirroring the `relation_kinds[].kind`
+    /// gate the relation extractor enforces.
+    ///
+    /// **Why this lives on `EntityKindExpectation`, not on its own
+    /// expectation type.** Attribute facts are *properties* of
+    /// entities, not a record-type sibling — the schema already
+    /// expresses this via `AssertedContent::EntityAttribute` carrying
+    /// an `entity_id` join. Putting the closed vocab on the entity
+    /// kind keeps related knobs co-located: "a `company` is a thing
+    /// with `kind`/`exemplars`/`attributes`, look for these things".
+    #[serde(default)]
+    pub attributes: Vec<String>,
+
     pub rationale: String,
 }
 
@@ -507,6 +529,10 @@ mod tests {
                 entity_kinds: vec![EntityKindExpectation {
                     kind: "fab".into(),
                     exemplars: vec![EntityId::new("fab:TSMC-Arizona-F21").unwrap()],
+                    attributes: vec![
+                        "wafer_capacity".into(),
+                        "process_node".into(),
+                    ],
                     rationale: "Fabs are the atomic unit of capacity".into(),
                 }],
                 relation_kinds: vec![],

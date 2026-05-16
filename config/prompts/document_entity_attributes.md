@@ -1,4 +1,4 @@
-# Document Entity-Attribute Extraction Prompt — v1.0
+# Document Entity-Attribute Extraction Prompt — v1.2
 
 <!--
     Session 80 — fourth sibling to document_assertions (Session 77),
@@ -9,14 +9,18 @@
     becomes one `Assertion` row in storage, with content shape
     `AssertedContent::EntityAttribute` (entity_id / key / value).
 
-    ## Why open-vocab `key` in v1
+    ## Why open- *or* closed-vocab `key` (Session 81)
 
-    Today's `EntityKindExpectation` schema declares `kind` +
-    `exemplars` + `rationale` — there is no per-kind list of allowed
-    attribute names. Until the operator decides what attribute names
-    are worth tracking (a schema rev + classifier-prompt edit), this
-    extractor accepts whatever lowercase_snake_case `key` the LLM
-    emits. The validator only checks non-empty.
+    Session 81 added `attributes: Vec<String>` to
+    `EntityKindExpectation`. When the plan declared any attribute
+    keys, the runtime hands the union of every kind's declared
+    attributes to this extractor as `{{ALLOWED_ATTRIBUTE_KEYS}}` and
+    bakes the same list as a JSON-Schema `enum` on the `key` field —
+    rows emitting a key outside the list are dropped under the
+    closed-vocabulary discipline. When no kind declared attributes
+    (the Session 80 default, plus pre-Session-81 plans), the slice is
+    empty and the `key` field stays open: any non-empty
+    `lowercase_snake_case` string is accepted.
 
     ## Closed-vocab `value_kind`
 
@@ -72,12 +76,39 @@ Schema details:
   `country:cl`, `person:elon_musk`. Bare names (`Tesla`,
   `Washington`) are not valid — always use `prefix:slug`.
 
+- **`claimant`** *(optional, Session 81)* — who is making the claim,
+  as an `EntityId`. Set this when the document attributes the
+  attribute fact to a specific source: Reuters reporting a Tesla
+  employee-count, an SEC filing stating a company's legal name, an
+  industry analyst's revenue estimate. When the attribute is the
+  document's own framing (a corporate "About" page stating the
+  company's headquarters) leave `claimant` unset; the runtime
+  synthesises `agency:document` — same default as v1.0/1.1.
+
+- **`stance`** *(optional, Session 81)* — closed vocabulary describing
+  the claim's modal shape. Pick one of `asserted` (default; the
+  document states the fact as known), `reported` (the document
+  reports someone else saying it), `hedged` (qualified language —
+  "approximately", "around"), `predicted` (forward-looking — guidance,
+  forecasts), `speculated` ("could", "may"), or `denied` (the
+  document explicitly rejects the attribute). When unset / unknown
+  the runtime falls back to `asserted` — the v1.0/1.1 default — so
+  the row still emits.
+
 - **`key`** — the attribute name, `lowercase_snake_case`.
   Pick a key that names a stable, generic property — not a
   one-off observation. Good: `legal_name`, `headquarters_country`,
   `ticker`, `employee_count`, `revenue`, `is_subsidiary`,
   `founding_year`. Bad: `mentioned_in_q4_call`, `was_named_today`,
   `recently_announced`.
+
+  When the plan declared attribute keys, the **closed vocabulary**
+  is shown inline under "Context for this call". Emit only keys
+  from that list; out-of-vocab keys are dropped at apply time
+  (matching the relation / event / observation extractor
+  posture). When the inline list is `(no closed vocabulary — …)`
+  the field is open and the only constraint is the
+  `lowercase_snake_case` shape.
 
 - **`value_kind`** — discriminator for the value's type. One of:
   - `text` — a free-text value. Set `value_text`.
@@ -208,6 +239,9 @@ strain to fill the array.
 - **Topic** the research session is tracking:
   `{{TOPIC}}`
 
+- **Allowed attribute keys** (closed-vocabulary gate, Session 81):
+  `{{ALLOWED_ATTRIBUTE_KEYS}}`
+
 - **Document source URL**:
   `{{SOURCE_URL}}`
 
@@ -228,6 +262,24 @@ outside the JSON.
 
 ### Changelog
 
+- **v1.2** (2026-05-16) — Session 81 follow-on. Added two optional
+  wire fields, `claimant` (`EntityId`) and `stance` (closed `Stance`
+  vocabulary: asserted / hedged / denied / reported / predicted /
+  speculated). Both default to `agency:document` + `asserted` when
+  the LLM doesn't emit them — preserves v1.0/1.1 behaviour for
+  documents that don't make a per-attribute attribution distinction.
+  Lifts the entity-attribute extractor's wire shape to parity with
+  the relation extractor's per-row attribution surface, so a
+  Reuters-quoted Tesla employee-count surfaces as
+  `(claimant=agency:reuters, stance=reported)` distinct from a
+  Tesla-asserted shape.
+- **v1.1** (2026-05-16) — Session 81. Added the
+  `{{ALLOWED_ATTRIBUTE_KEYS}}` placeholder under "Context for this
+  call" and the matching closed-vocab gate prose under the `key`
+  field. The schema bakes the list as a JSON-Schema `enum` when
+  non-empty; an empty list renders as the open-vocab hint inline
+  (preserves Session 80 behaviour for plans without declared
+  `entity_kinds[].attributes`).
 - **v1.0** (2026-05-16) — Session 80. Initial entity-attribute
   extraction prompt. Open-vocab on `key` (no plan-declared
   attribute names today); closed-vocab on `value_kind` (text /

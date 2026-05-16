@@ -1,4 +1,4 @@
-# Research Classifier Prompt — v2.2
+# Research Classifier Prompt — v2.3
 
 <!--
     This file is the Level-1 research classifier prompt for situation_room.
@@ -178,6 +178,26 @@ formats is rejected and the user sees a classification error.
   specifically**, prefixed with the kind: `mine:greenbushes`,
   `company:tsmc`, `agency:ofac`. Not `mine:Greenbushes Mine` or
   `company:"a major chip producer"`.
+
+- **Entity attributes (`entity_kinds[].attributes`, Session 81,
+  optional)** — the typed properties the workstation should look
+  for on entities of this kind. Each entry is a
+  `lowercase_snake_case` attribute name. Examples for `company`:
+  `legal_name`, `headquarters_country`, `ticker`, `employee_count`,
+  `revenue`, `founding_year`, `is_publicly_traded`. Examples for
+  `mine`: `commodity`, `country`, `operator`, `annual_capacity`,
+  `mine_type`. The downstream document-attribute extractor uses
+  this list as a closed-vocabulary gate: facts the LLM extracts
+  whose `key` is not in the list are dropped.
+
+  **The list is optional. Empty is the default.** Leave it empty
+  when you cannot name a stable, generic property of entities of
+  this kind (e.g. one-off observations, time-series quantities
+  better handled by `observation_metrics`). When you populate it,
+  prefer four to ten keys that name *stable* properties (not
+  measurements that vary over short timescales — those are
+  observations). A wrong key is worse than no key: the extractor
+  will accept anything matching the listed strings literally.
 
 - **Relation kinds (`relation_kinds[].kind`)** —
   `lowercase_snake_case` predicate. Good: `operator_of`,
@@ -553,6 +573,13 @@ User topic: `lithium supply chain`
           "mine:salar_de_atacama",
           "mine:pilgangoora"
         ],
+        "attributes": [
+          "country",
+          "operator",
+          "commodity",
+          "annual_capacity",
+          "mine_type"
+        ],
         "rationale": "Atomic unit of upstream supply."
       },
       {
@@ -562,6 +589,13 @@ User topic: `lithium supply chain`
           "company:sqm",
           "company:tianqi",
           "company:ganfeng"
+        ],
+        "attributes": [
+          "legal_name",
+          "headquarters_country",
+          "ticker",
+          "is_publicly_traded",
+          "primary_commodity"
         ],
         "rationale": "The producers/refiners filing public data."
       }
@@ -895,6 +929,21 @@ honest about what the workstation will surface.
 
 ### Changelog
 
+- **v2.3** (2026-05-16) — Session 81. Schema extension:
+  `entity_kinds[].attributes: Vec<String>` is now an optional
+  emission shape alongside the existing `kind` + `exemplars` +
+  `rationale`. New prose subsection "Entity attributes" under the
+  *"Conventions"* section teaches the convention (closed-vocab
+  `lowercase_snake_case` keys naming stable typed properties of the
+  entity kind, four-to-ten target band, wrong-key > no-key
+  discipline). Lithium worked example updated to carry attributes
+  on both `mine` and `company` entity kinds. The downstream
+  document-attribute extractor (Session 80) treats the union of
+  every kind's `attributes` as the closed-vocabulary gate; an
+  attribute fact whose `key` isn't in the union is dropped under
+  the closed-vocab discipline. Plans classified pre-Session-81
+  deserialize with empty `attributes` (the field carries
+  `#[serde(default)]`); no migration required.
 - **v2.2** (2026-05-15) — Session 77. Schema extension:
   `relation_kinds[].exemplar_triples: Vec<{from, to}>` is now an
   optional emission shape alongside the existing `kind` +

@@ -189,3 +189,102 @@ pub async fn records_recent_global(
 
     Ok(RecordsByPlanDto::from_typed(bucket))
 }
+
+// ---------------------------------------------------------------------------
+// promote_consensus_for_plan — Session 81 (ADR 0004 / ADR 0021)
+// ---------------------------------------------------------------------------
+
+/// Run the consensus-promotion pass for one plan and return the
+/// summary report. The pass walks every persisted `Assertion` tied
+/// to the plan and, for groups of ≥ `min_independent_claimants`
+/// (default 3) distinct claimants making compatible claims, emits a
+/// single promoted record (`Observation` / `Event` / `Relation`) or
+/// a consensus-stamped `EntityAttribute` assertion.
+///
+/// **Idempotent on re-run.** The `dedup_key` for each promoted record
+/// is content-derived (`promotion:{content_hash}:{subject_hash}`); a
+/// second invocation against the same assertion store skips groups
+/// already promoted on a prior run.
+///
+/// ## Status gating
+///
+/// Same as [`records_for_plan`]: the plan must be `accepted` or
+/// `rejected`. A `pending` plan has by definition no Assertion rows
+/// to consense over, so the call surfaces `InvalidInput` instead of
+/// silently returning a zero report.
+///
+/// ## Errors
+///
+/// - `InvalidInput { field: "id" }` — id isn't a valid UUID, or the
+///   plan is `pending`.
+/// - `NotFound` — id not in store.
+/// - `Storage` — DB-level failure during the assertion-load read.
+#[tauri::command]
+pub async fn promote_consensus_for_plan(
+    id: String,
+    min_independent_claimants: Option<u32>,
+    state: tauri::State<'_, AppState>,
+) -> Result<situation_room_pipeline::promote::PromoteReport, CommandError> {
+    let parsed: Uuid = id.parse().map_err(|e: uuid::Error| CommandError::InvalidInput {
+        field: "id".into(),
+        message: format!("not a valid UUID: {e}"),
+    })?;
+
+    info!(plan_id = %parsed, "promote_consensus_for_plan command invoked");
+
+    let stored = state
+        .store
+        .get_research_plan(parsed)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::NotFound { id: id.clone() })?;
+
+    match stored.status {
+        PlanStatus::Pending => {
+            return Err(CommandError::InvalidInput {
+                field: "id".into(),
+                message: "plan must be accepted before consensus promotion (current: pending)"
+                    .into(),
+            });
+        }
+        PlanStatus::Accepted | PlanStatus::Rejected => {}
+    }
+
+    let plan = situation_room_pipeline::research_plans_store::load_research_plan(
+        &state.store,
+        parsed,
+    )
+    .map_err(|e| CommandError::InvalidInput {
+        field: "id".into(),
+        message: format!("plan deserialization failed: {e}"),
+    })?
+    .ok_or_else(|| CommandError::NotFound { id: id.clone() })?;
+
+    let cfg = situation_room_pipeline::promote::PromoteConfig {
+        min_independent_claimants: min_independent_claimants.unwrap_or_else(|| {
+            situation_room_pipeline::promote::PromoteConfig::default().min_independent_claimants
+        }),
+    };
+
+    let report = situation_room_pipeline::promote::promote_consensus_for_plan(
+        &state.store,
+        &plan,
+        &cfg,
+    )
+    .map_err(|e| match e {
+        situation_room_pipeline::promote::PromoteError::Storage(s) => CommandError::from(s),
+    })?;
+
+    info!(
+        plan_id = %parsed,
+        considered = report.assertions_considered,
+        promoted = report.groups_promoted,
+        skipped = report.skipped_already_promoted,
+        observations = report.observations_emitted,
+        events = report.events_emitted,
+        relations = report.relations_emitted,
+        entity_attributes = report.entity_attributes_emitted,
+        "promote_consensus_for_plan returning"
+    );
+
+    Ok(report)
+}

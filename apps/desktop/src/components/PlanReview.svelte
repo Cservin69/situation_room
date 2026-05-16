@@ -72,6 +72,7 @@
   import RecordCard from '$components/panels/RecordCard.svelte';
   import RecordsDashboard from '$components/RecordsDashboard.svelte';
   import CostByTierPanel from '$components/CostByTierPanel.svelte';
+  import CostTimelinePanel from '$components/CostTimelinePanel.svelte';
   import RunFetchButton from '$components/RunFetchButton.svelte';
   import FetchReport from '$components/FetchReport.svelte';
   import RecipesPanel from '$components/RecipesPanel.svelte';
@@ -451,6 +452,7 @@
          its own interval so this drill-in surface and the home view stay
          coherent. -->
     <CostByTierPanel />
+    <CostTimelinePanel />
   {/if}
 
   <!-- Six bucket panels (legacy default, now toggle-gated).

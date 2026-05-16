@@ -105,6 +105,19 @@
      * overflow opens the sample list.
      */
     onSamplesExpand?: ((all: string[]) => void) | null;
+    /**
+     * Session 81 — optional attribute tiles. When non-null, each
+     * entry renders as a small `key: value` chip below the sample
+     * area. Currently wired only on the Entities panel — the dashboard
+     * walks `records.assertions` for `AssertedContent::EntityAttribute`
+     * rows tagged to the first entity in each kind group, and hands
+     * the latest-known value per (entity_id, key) here. Empty / null
+     * arrays render no chip strip.
+     *
+     * The tiles are presentational; the underlying assertions stay
+     * available under the Assertions panel for drill-down.
+     */
+    attributeTiles?: Array<{ key: string; value: string }> | null;
   }
   let {
     kind,
@@ -117,7 +130,21 @@
     chartSeries = null,
     onOpen = null,
     onSamplesExpand = null,
+    attributeTiles = null,
   }: Props = $props();
+
+  // Session 81 — render-cap on the attribute-tile strip. Plans with
+  // many declared attributes (12+ per kind) shouldn't blow up card
+  // height; cap visible chips at 6, surface overflow as `+ N more`.
+  // Six matches the typical four-to-ten classifier-band the prompt
+  // teaches so most realistic entity-kinds render in full.
+  const ATTRIBUTE_TILES_RENDER_CAP = 6;
+  let visibleAttributeTiles = $derived(
+    (attributeTiles ?? []).slice(0, ATTRIBUTE_TILES_RENDER_CAP),
+  );
+  let attributeTilesOverflow = $derived(
+    Math.max(0, (attributeTiles ?? []).length - visibleAttributeTiles.length),
+  );
 
   /*
     Session 79 — render-cap on the multi-sample list. Plans that
@@ -271,6 +298,27 @@
     <p class="sample" title={sample}>{sample}</p>
   {:else}
     <p class="sample missing">— no preview available</p>
+  {/if}
+
+  {#if visibleAttributeTiles.length > 0}
+    <!-- Session 81 — attribute tiles. Renders below the sample area
+         when the caller supplied attribute facts for the entity this
+         card is summarising. Each chip is a `key: value` pair; the
+         strip wraps so a card with 4-6 attributes reads as a compact
+         info panel rather than a tall column. -->
+    <ul class="attribute-tiles" aria-label="extracted attributes">
+      {#each visibleAttributeTiles as t (t.key)}
+        <li class="attribute-tile" title={`${t.key} = ${t.value}`}>
+          <span class="attr-key">{t.key}</span>
+          <span class="attr-value">{t.value}</span>
+        </li>
+      {/each}
+      {#if attributeTilesOverflow > 0}
+        <li class="attribute-tile overflow" title="more attributes available">
+          + {attributeTilesOverflow} more
+        </li>
+      {/if}
+    </ul>
   {/if}
 
   <footer class="foot">
@@ -432,6 +480,54 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* Session 81 — attribute tiles. A compact wrapping chip strip that
+     sits between the sample area and the foot. Each chip is a
+     mono-keyed pair (mono on the left for readability of snake_case
+     attribute names; default font on the right for prose-y values).
+     The chip rolls into multiple lines on narrow tiles; the parent's
+     min-width keeps cards from collapsing the strip into uselessness. */
+  .attribute-tiles {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .attribute-tile {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+    padding: 2px 6px;
+    background: var(--bg-panel-alt);
+    border: 1px solid var(--border-subtle);
+    border-radius: 2px;
+    font-size: 10px;
+    line-height: 1.4;
+    color: var(--fg-primary);
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .attribute-tile .attr-key {
+    font-family: var(--font-mono);
+    color: var(--fg-secondary);
+  }
+  .attribute-tile .attr-value {
+    color: var(--fg-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 22ch;
+  }
+  .attribute-tile.overflow {
+    background: transparent;
+    border-style: dashed;
+    color: var(--fg-tertiary);
+    font-style: italic;
   }
 
   .foot {

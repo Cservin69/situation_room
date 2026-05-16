@@ -2262,6 +2262,7 @@ mod tests {
                 entity_kinds: vec![EntityKindExpectation {
                     kind: "mine".into(),
                     exemplars: vec![EntityId::new("mine:greenbushes").unwrap()],
+                    attributes: vec![],
                     rationale: "Atomic unit of supply".into(),
                 }],
                 relation_kinds: vec![RelationKindExpectation {

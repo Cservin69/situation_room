@@ -5032,6 +5032,7 @@ mod tests {
                 entity_kinds: vec![EntityKindExpectation {
                     kind: "mine".into(),
                     exemplars: vec![EntityId::new("mine:greenbushes").unwrap()],
+                    attributes: vec![],
                     rationale: "Unit of supply".into(),
                 }],
                 relation_kinds: vec![RelationKindExpectation {
@@ -9191,6 +9192,7 @@ mod tests {
             .map(|i| EntityKindExpectation {
                 kind: format!("entity_{i}"),
                 exemplars: vec![EntityId::new(&format!("entity:{i}")).unwrap()],
+                attributes: vec![],
                 rationale: format!("rationale_{i}"),
             })
             .collect();

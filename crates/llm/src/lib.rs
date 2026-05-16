@@ -36,7 +36,9 @@ pub mod cost_ledger;
 pub use providers::{LlmProvider, LlmError, ModelTier, ReasoningEffort, CompletionRequest, CompletionResponse};
 pub use providers::{XaiProvider, XaiConfig, XAI_API_KEY_ENV};
 pub use providers::{AnthropicProvider, AnthropicConfig, ANTHROPIC_API_KEY_ENV};
-pub use cost_ledger::{CostLedger, LedgerEntry, MeteredProvider, Tally};
+pub use cost_ledger::{
+    CostLedger, LedgerEntry, MeteredProvider, Tally, TimelineEntry, TIMELINE_CAP,
+};
 pub use extraction::{
     extract_assertions_from_document, extract_entity_attributes_from_document,
     extract_events_from_document, extract_observations_from_document, AssertionDraft,

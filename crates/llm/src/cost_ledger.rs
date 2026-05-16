@@ -46,15 +46,20 @@
 //!   provider-aware config surface. Tokens (with cache split) is
 //!   the most-stable, provider-portable unit; the operator can
 //!   multiply by the current $/1k-tokens themselves.
-//! - **No per-call timeline.** The ledger is cumulative; a per-call
-//!   stream would belong on tracing, not on the dashboard. The
-//!   xAI `cached_tokens=Some(N)` INFO log line (Session 72) already
-//!   covers the per-call surface.
+//! - ~~**No per-call timeline.**~~ Session 81 added a 50-entry
+//!   ring-buffer of recent calls — see [`CostLedger::timeline`] and
+//!   [`CostLedger::timeline_snapshot`]. The cumulative tallies stay
+//!   the headline number; the ring buffer surfaces *when* cost was
+//!   incurred so operators can spot spikes in real time. Capped at
+//!   50 entries (≈ one fetch run's worth of LLM calls) to keep the
+//!   in-memory footprint trivial; older entries scroll off the back
+//!   the same way `bash`'s history does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use crate::providers::trait_def::{
     CompletionRequest, CompletionResponse, LlmError, LlmProvider, ModelTier,
@@ -105,14 +110,57 @@ pub struct Tally {
 /// purpose lets the operator see "xai · workhorse · extraction:
 /// document_assertions" as its own row, with its own call count and
 /// cache-hit ratio — distinct from the rest of the workhorse traffic.
+/// Cap on the per-call timeline ring-buffer. 50 entries ≈ one fetch
+/// run's worth of completions (5-10 recipes × 4 extraction calls per
+/// article + classifier + author + propose-URL). The cap balances
+/// "enough history to see a recent cost spike" against "small enough
+/// not to grow unboundedly in the binary's memory."
+pub const TIMELINE_CAP: usize = 50;
+
 #[derive(Debug, Clone, Default)]
 pub struct CostLedger {
     inner: Arc<Mutex<HashMap<(String, ModelTier, Option<String>), Tally>>>,
+    /// Session 81 — per-call ring buffer. The cumulative tallies in
+    /// `inner` answer "how much have I spent on this bucket"; this
+    /// VecDeque answers "what did the last N calls look like, in
+    /// order." Capped at [`TIMELINE_CAP`]; older entries are popped
+    /// off the front.
+    timeline: Arc<Mutex<VecDeque<TimelineEntry>>>,
 }
 
 impl CostLedger {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Append one entry to the per-call timeline ring buffer. Pops
+    /// the oldest entry when [`TIMELINE_CAP`] is exceeded. Same
+    /// `std::sync::Mutex` posture as `record`: short critical
+    /// section, no await held across the lock.
+    fn append_timeline(&self, entry: TimelineEntry) {
+        let mut guard = match self.timeline.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "cost_ledger timeline mutex poisoned; recovering and continuing"
+                );
+                poisoned.into_inner()
+            }
+        };
+        guard.push_back(entry);
+        while guard.len() > TIMELINE_CAP {
+            guard.pop_front();
+        }
+    }
+
+    /// Snapshot of the per-call timeline, oldest-first. Caller owns
+    /// the cloned Vec; the ring buffer stays untouched.
+    pub fn timeline_snapshot(&self) -> Vec<TimelineEntry> {
+        let guard = match self.timeline.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.iter().cloned().collect()
     }
 
     /// Record one completion into the appropriate bucket.
@@ -233,6 +281,30 @@ pub struct LedgerEntry {
     pub tally: Tally,
 }
 
+/// One entry in the per-call timeline ring buffer (Session 81).
+///
+/// Each entry captures the cost-bearing fields from one
+/// [`MeteredProvider::complete`] call: `(timestamp, provider, tier,
+/// purpose, input_tokens, output_tokens, cached_input_tokens)`. The
+/// operator-facing surface (the new `CostTimelinePanel`) renders these
+/// as a stack of recent rows so cost spikes are visible without
+/// grepping logs.
+///
+/// **No dollar cost field.** Same reason `Tally` doesn't carry one:
+/// pricing tables drift per provider, and tokens are the more stable
+/// portable unit. A future session may add a `cost_estimate_usd`
+/// field once the pricing table itself lives somewhere stable.
+#[derive(Debug, Clone)]
+pub struct TimelineEntry {
+    pub timestamp: DateTime<Utc>,
+    pub provider: String,
+    pub tier: ModelTier,
+    pub purpose: Option<String>,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+    pub cached_input_tokens: Option<u32>,
+}
+
 // ---------------------------------------------------------------------------
 // MeteredProvider — the decorator that records every completion
 // ---------------------------------------------------------------------------
@@ -294,6 +366,17 @@ impl LlmProvider for MeteredProvider {
         let response = self.inner.complete(tier, request).await?;
         self.ledger
             .record(provider_id, tier, purpose.as_deref(), &response);
+        // Session 81 — also append a timeline entry. Best-effort; same
+        // posture as `record` (short critical section, no I/O).
+        self.ledger.append_timeline(TimelineEntry {
+            timestamp: Utc::now(),
+            provider: provider_id.to_string(),
+            tier,
+            purpose,
+            input_tokens: response.input_tokens,
+            output_tokens: response.output_tokens,
+            cached_input_tokens: response.cached_input_tokens,
+        });
         Ok(response)
     }
 }
@@ -572,6 +655,68 @@ mod tests {
         assert_eq!(e.tier, ModelTier::Workhorse);
         assert_eq!(e.tally.calls, 1);
         assert_eq!(e.tally.cached_input_tokens, 1800);
+    }
+
+    // ---- Session 81 — per-call timeline ring buffer ----
+
+    #[tokio::test]
+    async fn metered_provider_records_into_timeline_oldest_first() {
+        let inner: Arc<dyn LlmProvider + Send + Sync> =
+            Arc::new(StubProvider {
+                next: fake_response(Some(100), Some(20), Some(80)),
+            });
+        let ledger = Arc::new(CostLedger::new());
+        let metered = MeteredProvider::new(inner, Arc::clone(&ledger));
+        for _ in 0..3 {
+            let req = CompletionRequest {
+                system: None,
+                user: "hi".into(),
+                schema: None,
+                max_tokens: 8,
+                temperature: 0.0,
+                reasoning_effort: None,
+                prompt_cache_key: Some("extraction:document_assertions".into()),
+            };
+            let _ = metered.complete(ModelTier::Workhorse, req).await.unwrap();
+        }
+        let timeline = ledger.timeline_snapshot();
+        assert_eq!(timeline.len(), 3);
+        for entry in &timeline {
+            assert_eq!(entry.provider, "stubprov");
+            assert_eq!(entry.tier, ModelTier::Workhorse);
+            assert_eq!(entry.purpose.as_deref(), Some("extraction:document_assertions"));
+            assert_eq!(entry.input_tokens, Some(100));
+        }
+    }
+
+    #[tokio::test]
+    async fn timeline_caps_at_max_entries() {
+        let inner: Arc<dyn LlmProvider + Send + Sync> =
+            Arc::new(StubProvider {
+                next: fake_response(Some(1), Some(1), None),
+            });
+        let ledger = Arc::new(CostLedger::new());
+        let metered = MeteredProvider::new(inner, Arc::clone(&ledger));
+        // Push two extra past the cap; the oldest two should be
+        // evicted.
+        for _ in 0..(TIMELINE_CAP + 2) {
+            let req = CompletionRequest {
+                system: None,
+                user: "hi".into(),
+                schema: None,
+                max_tokens: 1,
+                temperature: 0.0,
+                reasoning_effort: None,
+                prompt_cache_key: None,
+            };
+            let _ = metered.complete(ModelTier::Cheap, req).await.unwrap();
+        }
+        let timeline = ledger.timeline_snapshot();
+        assert_eq!(
+            timeline.len(),
+            TIMELINE_CAP,
+            "ring buffer capped at TIMELINE_CAP entries"
+        );
     }
 
     #[tokio::test]

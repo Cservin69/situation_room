@@ -28,6 +28,7 @@ import type { ExpectationCoverageRowDto } from './types/ExpectationCoverageRowDt
 import type { HostBackoffSnapshotDto } from './types/HostBackoffSnapshotDto';
 import type { SourcesMemoryEntryDto } from './types/SourcesMemoryEntryDto';
 import type { LlmCostLedgerEntryDto } from './types/LlmCostLedgerEntryDto';
+import type { LlmCostTimelineEntryDto } from './types/LlmCostTimelineEntryDto';
 import type { ClassifierPromptVersionDto } from './types/ClassifierPromptVersionDto';
 
 /**
@@ -486,6 +487,19 @@ export async function sourcesMemory(): Promise<SourcesMemoryEntryDto[]> {
  */
 export async function llmCostLedger(): Promise<LlmCostLedgerEntryDto[]> {
   return invoke<LlmCostLedgerEntryDto[]>('llm_cost_ledger');
+}
+
+/**
+ * Session 81 — per-call cost timeline ring buffer. Sibling to
+ * `llmCostLedger`: that command surfaces cumulative bucket tallies,
+ * this one surfaces the 50 newest LLM completions in order, so cost
+ * spikes are visible at a glance.
+ *
+ * Pure read; no LLM call. The ring buffer caps at 50 entries server-
+ * side (`TIMELINE_CAP` on the Rust side).
+ */
+export async function llmCostTimeline(): Promise<LlmCostTimelineEntryDto[]> {
+  return invoke<LlmCostTimelineEntryDto[]>('llm_cost_timeline');
 }
 
 /**

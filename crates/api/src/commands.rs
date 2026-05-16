@@ -2202,6 +2202,30 @@ pub async fn llm_cost_ledger(
 }
 
 // ---------------------------------------------------------------------------
+// Command 17b — llm_cost_timeline (Session 81)
+// ---------------------------------------------------------------------------
+
+/// Return the per-call timeline ring buffer (50 newest LLM
+/// completions, oldest-first). Sibling to [`llm_cost_ledger`] —
+/// that command surfaces cumulative bucket tallies, this one
+/// surfaces *when* the calls happened so operators can spot cost
+/// spikes in real time.
+///
+/// Pure read; no LLM call. Lock-poisoning recovers in-band the same
+/// way `llm_cost_ledger` does.
+#[tauri::command]
+pub async fn llm_cost_timeline(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<crate::types_export::LlmCostTimelineEntryDto>, CommandError> {
+    Ok(state
+        .cost_ledger
+        .timeline_snapshot()
+        .into_iter()
+        .map(crate::types_export::LlmCostTimelineEntryDto::from_typed)
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // Command 18 — classifier_prompt_version (Session 77)
 // ---------------------------------------------------------------------------
 
@@ -2373,6 +2397,7 @@ mod tests {
                     kind: "company".into(),
                     rationale: "test".into(),
                     exemplars: vec![],
+                    attributes: vec![],
                 }],
                 relation_kinds: vec![RelationKindExpectationDto {
                     kind: "supplies_to".into(),
