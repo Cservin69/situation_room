@@ -41,15 +41,15 @@
 
 use chrono::{DateTime, Utc};
 use situation_room_core::schema::content::{
-    AssertedContent, EventContent, ObservationContent, RelationContent,
+    AssertedContent, EntityAttributeContent, EventContent, ObservationContent, RelationContent,
 };
 use situation_room_core::schema::envelope::{Envelope, Provenance, Subjects};
 use situation_room_core::schema::records::{Assertion, Event, Observation};
 use situation_room_core::vocab::Confidence;
 use situation_room_llm::{
-    extract_assertions_from_document, extract_events_from_document,
-    extract_observations_from_document, AssertionDraft, EventDraft, ExtractionConfig, LlmProvider,
-    ObservationDraft,
+    extract_assertions_from_document, extract_entity_attributes_from_document,
+    extract_events_from_document, extract_observations_from_document, AssertionDraft,
+    EntityAttributeDraft, EventDraft, ExtractionConfig, LlmProvider, ObservationDraft,
 };
 use situation_room_storage::Store;
 use tracing::{info, warn};
@@ -135,6 +135,20 @@ pub async fn extract_and_persist_assertions(
     let topic = plan.topic.as_str();
     let source_url = recipe.source_url.as_str();
 
+    // Session 80 — closed-vocab predicate gate. Walk the plan's
+    // `relation_kinds[].kind` and hand the slice to the extractor. An
+    // empty Vec means "the plan declared no relation kinds, accept
+    // whatever the LLM emits" (Session 77's open-vocab behaviour). A
+    // non-empty Vec turns the schema + validator into a closed-vocab
+    // gate matching the event + observation extractor posture.
+    let allowed_owned: Vec<String> = plan
+        .expectations
+        .relation_kinds
+        .iter()
+        .map(|r| r.kind.clone())
+        .collect();
+    let allowed_refs: Vec<&str> = allowed_owned.iter().map(|s| s.as_str()).collect();
+
     let drafts = match extract_assertions_from_document(
         provider,
         &cfg,
@@ -143,6 +157,7 @@ pub async fn extract_and_persist_assertions(
         source_url,
         &mime,
         &body,
+        &allowed_refs,
     )
     .await
     {
@@ -701,6 +716,209 @@ pub fn build_observation(
 }
 
 // ---------------------------------------------------------------------------
+// Per-Document EntityAttribute extraction orchestrator (Session 80)
+// ---------------------------------------------------------------------------
+//
+// Fourth sibling to the assertion (Session 77), event (Session 78), and
+// observation (Session 79) orchestrators. The fetch executor calls this
+// once per persisted Document, gated identically (article-kind +
+// non-empty body). The orchestrator:
+//
+//   1. Calls `llm::extraction::extract_entity_attributes_from_document`
+//      with the Document's body, MIME, source URL, and the plan's topic
+//      for grounding. v1 has no closed-vocab gate on attribute names —
+//      open-vocab matches the schema's `EntityAttributeContent.key`
+//      shape. A future session can plumb `entity_kinds[].attributes[]`
+//      through if the operator wants the gate.
+//   2. Wraps each returned `EntityAttributeDraft` in an `Assertion`
+//      envelope with `AssertedContent::EntityAttribute` — same posture
+//      Session 77 uses for relation triples. Claimant defaults to
+//      `agency:document` (the document is the source of the assertion);
+//      stance defaults to `Stance::Asserted` (the document contains the
+//      attribute by virtue of stating it). Future versions can have
+//      the LLM emit claimant/stance per row.
+//   3. Persists each `Assertion` via `Store::insert_assertion` — the
+//      same destination Session 77 writes to. Records-for-plan's LIKE
+//      join routes via the `{source}#recipe:{id}@v{ver}` provenance.
+//
+// ## Scope (v1)
+//
+// - **Open-vocab `key`.** Matches the `EntityAttributeContent.key`
+//   schema. Closed-vocab requires a schema rev on
+//   `EntityKindExpectation` to add `attributes: Vec<String>`; that's a
+//   future-session ADR call.
+// - **Closed-vocab `value_kind`.** text / number / boolean only in v1
+//   — the three shapes the most common attribute facts fit. Country /
+//   Topic / Entity / EntityList / TopicList stay as future-session
+//   work.
+// - **Synthetic claimant + stance.** `agency:document` + `Asserted`.
+//   No per-row LLM emission today.
+// - **No retry, no dedup.** Same posture as the three earlier
+//   extractors; failures warn-log and the loop continues.
+
+/// Per-Document entity-attribute extraction entry point. Called by
+/// each `run_X_recipe` in `fetch_executor.rs` after the assertion +
+/// event + observation extraction calls, with the same inputs.
+///
+/// Returns an [`ExtractionReport`] for observability. Errors are
+/// absorbed; this function never returns `Err` so the runtime path
+/// can't break on LLM outage.
+pub async fn extract_and_persist_entity_attributes(
+    store: &situation_room_storage::Store,
+    provider: &dyn LlmProvider,
+    extraction_prompt: &str,
+    plan: &crate::research::ResearchPlan,
+    recipe: &FetchRecipe,
+    bytes: &[u8],
+    response_content_type: Option<&str>,
+    fetched_at: DateTime<Utc>,
+) -> ExtractionReport {
+    let mut report = ExtractionReport::default();
+
+    let mime = response_content_type.map(normalise_mime).unwrap_or_default();
+    if !should_extract_from(&mime, bytes.len()) {
+        return report;
+    }
+
+    let body = document_synth::body_preview_for_mime(&mime, bytes);
+    if body.trim().is_empty() {
+        return report;
+    }
+
+    let cfg = ExtractionConfig::default();
+    let topic = plan.topic.as_str();
+    let source_url = recipe.source_url.as_str();
+
+    let drafts = match extract_entity_attributes_from_document(
+        provider,
+        &cfg,
+        extraction_prompt,
+        topic,
+        source_url,
+        &mime,
+        &body,
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(
+                recipe_id = %recipe.id,
+                error = %e,
+                "document entity-attribute extraction LLM call failed; \
+                 skipping this Document's attributes"
+            );
+            report.call_error = Some(e.to_string());
+            return report;
+        }
+    };
+
+    report.extracted = drafts.len() as u32;
+    if drafts.is_empty() {
+        info!(
+            recipe_id = %recipe.id,
+            "document entity-attribute extraction returned no attributes \
+             (empty list is a legal outcome)"
+        );
+        return report;
+    }
+
+    for draft in drafts {
+        let assertion = build_entity_attribute_assertion(plan, recipe, &draft, fetched_at);
+        match store.insert_assertion(&assertion) {
+            Ok(()) => report.persisted += 1,
+            Err(e) => {
+                report.insert_failures += 1;
+                warn!(
+                    recipe_id = %recipe.id,
+                    assertion_id = %assertion.id,
+                    error = %e,
+                    "failed to persist extracted entity attribute; \
+                     continuing with the rest of the batch"
+                );
+            }
+        }
+    }
+
+    info!(
+        recipe_id = %recipe.id,
+        extracted = report.extracted,
+        persisted = report.persisted,
+        insert_failures = report.insert_failures,
+        "document entity-attribute extraction complete"
+    );
+
+    report
+}
+
+/// Build one `Assertion` from a validated [`EntityAttributeDraft`].
+/// Pure function — no I/O — so tests can pin the envelope shape.
+///
+/// **Claimant + stance defaults.** v1 doesn't have the LLM emit per-row
+/// claimant / stance for entity attributes — the document is the
+/// source by construction. Claimant = `agency:document` (a synthetic
+/// `EntityId`); stance = `Asserted`. A future session can extend the
+/// wire shape to carry per-row stance + claimant the way the relation
+/// extractor does.
+///
+/// **Provenance.** Same `{source}#recipe:{id}@v{ver}` shape the three
+/// earlier orchestrators use, so `records_for_plan`'s LIKE join
+/// routes the Assertion under the originating plan.
+pub fn build_entity_attribute_assertion(
+    plan: &crate::research::ResearchPlan,
+    recipe: &FetchRecipe,
+    draft: &EntityAttributeDraft,
+    fetched_at: DateTime<Utc>,
+) -> Assertion {
+    use situation_room_core::vocab::{EntityId, Stance};
+
+    let provenance = Provenance {
+        source_id: format!(
+            "{}#recipe:{}@v{}",
+            recipe.source_id, recipe.id, recipe.version
+        ),
+        source_url: Some(recipe.source_url.to_string()),
+        source_published_at: None,
+        license: "extracted".into(),
+        derived_from: vec![],
+    };
+
+    let subjects = Subjects {
+        // The attribute's subject entity surfaces as a subject so the
+        // cross-record entity join lights up the Assertion alongside
+        // any Entity rows for the same actor.
+        entities: vec![draft.entity_id.clone()],
+        places: vec![],
+        time: None,
+        topics: plan.topic_tags.clone(),
+    };
+
+    let envelope = Envelope {
+        provenance,
+        subjects,
+        tags: vec![],
+        valid_at: None,
+        observed_at: fetched_at,
+        confidence: draft.confidence,
+    };
+
+    let content = AssertedContent::EntityAttribute(EntityAttributeContent {
+        entity_id: draft.entity_id.clone(),
+        key: draft.key.clone(),
+        value: draft.value.clone(),
+    });
+
+    // Synthetic claimant — the document itself. A future session can
+    // upgrade to the publisher / agency the way the relation extractor
+    // does. `EntityId::new` accepts `agency:document` (the namespace is
+    // free-form lowercase letters / digits / underscores).
+    let claimant = EntityId::new("agency:document")
+        .expect("static EntityId `agency:document` must parse");
+
+    Assertion::new(claimant, Stance::Asserted, content, envelope)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -921,5 +1139,67 @@ mod tests {
 
         assert!(event.envelope.valid_at.is_none());
         assert_eq!(event.envelope.observed_at, fetched_at);
+    }
+
+    // -------------------------------------------------------------------
+    // Session 80 — EntityAttribute orchestrator
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn build_entity_attribute_assertion_carries_recipe_provenance() {
+        use situation_room_core::schema::content::AttributeValue;
+        let plan = sample_plan();
+        let recipe = sample_recipe(
+            &plan,
+            "https://example.test/article",
+            "example_news",
+        );
+        let draft = EntityAttributeDraft {
+            entity_id: EntityId::new("company:tsla").unwrap(),
+            key: "employee_count".into(),
+            value: AttributeValue::Number {
+                value: 140_473.0,
+                unit: Some(situation_room_core::vocab::Unit::new("persons").unwrap()),
+            },
+            confidence: Confidence::new(0.85).unwrap(),
+        };
+        let fetched_at = Utc.with_ymd_and_hms(2026, 5, 15, 12, 0, 0).unwrap();
+
+        let assertion = build_entity_attribute_assertion(&plan, &recipe, &draft, fetched_at);
+
+        // Provenance — same `{source}#recipe:{id}@v{ver}` shape as the
+        // assertion / event / observation paths.
+        assert_eq!(
+            assertion.envelope.provenance.source_id,
+            format!("example_news#recipe:{}@v1", recipe.id)
+        );
+        // Synthetic claimant + stance for v1 (the document is the
+        // source by construction; future versions can have the LLM
+        // emit these per row).
+        assert_eq!(assertion.claimant.as_str(), "agency:document");
+        assert!(matches!(assertion.stance, Stance::Asserted));
+        // Content shape — EntityAttribute carries the typed value.
+        match &assertion.content {
+            AssertedContent::EntityAttribute(a) => {
+                assert_eq!(a.entity_id.as_str(), "company:tsla");
+                assert_eq!(a.key, "employee_count");
+                match &a.value {
+                    AttributeValue::Number { value, unit } => {
+                        assert!((value - 140_473.0).abs() < 1e-3);
+                        assert_eq!(unit.as_ref().map(|u| u.as_str()), Some("persons"));
+                    }
+                    other => panic!("expected Number, got: {other:?}"),
+                }
+            }
+            other => panic!("expected EntityAttribute content, got: {other:?}"),
+        }
+        // Subject entities include the attribute's owner so the
+        // cross-record entity join surfaces the assertion alongside
+        // Entity rows for that actor.
+        assert_eq!(assertion.envelope.subjects.entities.len(), 1);
+        assert_eq!(assertion.envelope.subjects.entities[0].as_str(), "company:tsla");
+        // Topics propagate from the plan.
+        assert_eq!(assertion.envelope.subjects.topics.len(), 1);
+        assert_eq!(assertion.envelope.observed_at, fetched_at);
     }
 }

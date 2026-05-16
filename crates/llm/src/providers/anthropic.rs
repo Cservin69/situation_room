@@ -685,6 +685,11 @@ impl LlmProvider for AnthropicProvider {
             // Anthropic provider does not currently map this onto
             // the wire (see comment on `complete`).
             reasoning_effort: request.reasoning_effort,
+            // Session 80 — carry the cache-key hint through to the
+            // retry so any future Anthropic mapping (cache_control on
+            // the system block, say) stays consistent across the
+            // original + retry pair.
+            prompt_cache_key: request.prompt_cache_key.clone(),
         };
         match self.send_one(tier, &retry_req, schema_requested).await {
             Ok((resp, was_truncated_again)) => {
@@ -873,6 +878,7 @@ mod tests {
             // comment on the equivalent xAI test.
             temperature: 0.5,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         let body = p.build_body(ModelTier::Cheap, &req);
 
@@ -902,6 +908,7 @@ mod tests {
             max_tokens: 8,
             temperature: 0.0,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         let body = p.build_body(ModelTier::Workhorse, &req);
         assert!(
@@ -931,6 +938,7 @@ mod tests {
             max_tokens: 8,
             temperature: 0.0,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         let body = p.build_body(ModelTier::Workhorse, &req);
         let content = &body["messages"][0]["content"];
@@ -956,6 +964,7 @@ mod tests {
             max_tokens: 64,
             temperature: 0.0,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         let body = p.build_body(ModelTier::Frontier, &req);
         let content = &body["messages"][0]["content"];
@@ -992,6 +1001,7 @@ mod tests {
             max_tokens: 8,
             temperature: 0.0,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         let body = p.build_body(ModelTier::Cheap, &req);
         let content = &body["messages"][0]["content"];
@@ -1019,6 +1029,7 @@ mod tests {
             max_tokens: 128,
             temperature: 0.0,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         let body = p.build_body(ModelTier::Frontier, &req);
         let tools = body["tools"].as_array().unwrap();
@@ -1066,6 +1077,7 @@ mod tests {
             max_tokens: 128,
             temperature: 0.0,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         let body = p.build_body(ModelTier::Frontier, &req);
 
@@ -1446,6 +1458,7 @@ mod tests {
             max_tokens: 8,
             temperature: 0.0,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         let resp = provider
             .complete(ModelTier::Cheap, req)
@@ -1482,6 +1495,7 @@ mod tests {
             max_tokens: 256,
             temperature: 0.0,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         let resp = provider
             .complete(ModelTier::Workhorse, req)

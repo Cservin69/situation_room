@@ -267,6 +267,34 @@ fn load_conv_id_from_env() -> String {
     }
 }
 
+/// Session 80 — pick the `x-grok-conv-id` value for one call.
+///
+/// `request_hint` is the per-call `CompletionRequest.prompt_cache_key`
+/// (the extraction path sets this; classifier / recipe-author / propose-
+/// URL leave it `None`). `provider_default` is the conv-id the provider
+/// loaded at construction (uuid4 by default, `XAI_CONV_ID` env override).
+///
+/// Rules:
+///   - `Some(non-blank)` → the hint wins; the call routes to a shard
+///     dedicated to the hint string (extraction shards, today).
+///   - `Some("")` or `Some("   ")` → blank-string hint is treated as
+///     "no hint", same `Ok(v) if !v.trim().is_empty()` normalisation
+///     `load_conv_id_from_env` uses for `XAI_CONV_ID`. Keeps the empty-
+///     string-as-unset rule consistent across the provider.
+///   - `None` → fall through to `provider_default`.
+///
+/// Pure function — no state — so tests can pin every branch without
+/// standing up an HTTP layer or a provider instance.
+fn pick_conv_id_for_call<'a>(
+    request_hint: Option<&'a str>,
+    provider_default: &'a str,
+) -> &'a str {
+    match request_hint {
+        Some(k) if !k.trim().is_empty() => k,
+        _ => provider_default,
+    }
+}
+
 /// Parse a [`ReasoningEffort`] from a user-facing string. Accepts
 /// `low`, `medium`, `high` case-insensitively with surrounding
 /// whitespace trimmed. Any other input — typos, alternative spellings
@@ -703,6 +731,10 @@ impl LlmProvider for XaiProvider {
             // reasoning intensity stays whatever the first attempt
             // resolved (request override or per-tier mapping).
             reasoning_effort: request.reasoning_effort,
+            // Session 80 — carry the cache-key hint across the retry
+            // so the second attempt routes to the same xAI cache shard
+            // as the first.
+            prompt_cache_key: request.prompt_cache_key.clone(),
         };
         match self.send_one(tier, &retry_req, schema_requested).await {
             Ok(r) => {
@@ -760,12 +792,25 @@ impl XaiProvider {
         // called once, inside SecureHttpClient::post_json_bytes.
         let bearer_secret = situation_room_secure::secrets::SecretString::new(bearer);
 
+        // Session 80 — per-call `prompt_cache_key` override. When the
+        // request carries `Some(key)` we use that string as the
+        // `x-grok-conv-id` value for this call instead of the per-
+        // provider default. The extraction path uses this to route
+        // per-Document extraction calls to a cache shard distinct from
+        // the classifier / recipe-author calls; the per-process default
+        // (`XAI_CONV_ID`) keeps governing every other call site. See
+        // `pick_conv_id_for_call` for the empty-string-as-unset rule.
+        let conv_id_for_call: &str = pick_conv_id_for_call(
+            request.prompt_cache_key.as_deref(),
+            self.conv_id.as_str(),
+        );
+
         tracing::debug!(
             tier = ?tier,
             model = %self.config.model_for(tier),
             structured = schema_requested,
             max_tokens = request.max_tokens,
-            conv_id = %self.conv_id,
+            conv_id = %conv_id_for_call,
             "xai: sending completion"
         );
 
@@ -777,10 +822,11 @@ impl XaiProvider {
                 &[("authorization", &bearer_secret)],
                 // Session 72 — `x-grok-conv-id` routes requests to the
                 // same xAI server so the per-server prompt cache can be
-                // reused. Stable for the lifetime of `self`. xAI's
-                // chat-completions docs name this header as the
-                // chat-completions equivalent of the Responses API's
-                // `prompt_cache_key` body field.
+                // reused. Stable for the lifetime of `self` *unless* a
+                // call-site overrides via `request.prompt_cache_key`
+                // (Session 80). xAI's chat-completions docs name this
+                // header as the chat-completions equivalent of the
+                // Responses API's `prompt_cache_key` body field.
                 //
                 // No `content-type` here — `SecureHttpClient::post_json_bytes`
                 // calls `.json(body)` on the reqwest builder, which already
@@ -789,7 +835,7 @@ impl XaiProvider {
                 // Content-Type to the wire, and xAI's API gateway returns
                 // `415 Unsupported Media Type` when it sees two of them.
                 // See `SecureHttpClient::post_json_bytes` for the rule.
-                &[("x-grok-conv-id", self.conv_id.as_str())],
+                &[("x-grok-conv-id", conv_id_for_call)],
             )
             .await
             .map_err(map_http_err)?;
@@ -887,6 +933,7 @@ mod tests {
             // representations and would cause a spurious mismatch.
             temperature: 0.5,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         let body = p.build_body(ModelTier::Cheap, &req);
 
@@ -915,6 +962,7 @@ mod tests {
             max_tokens: 8,
             temperature: 0.0,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         let body = p.build_body(ModelTier::Workhorse, &req);
         let messages = body["messages"].as_array().unwrap();
@@ -941,6 +989,7 @@ mod tests {
             max_tokens: 128,
             temperature: 0.0,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         let body = p.build_body(ModelTier::Frontier, &req);
 
@@ -1203,6 +1252,7 @@ mod tests {
             max_tokens: 8,
             temperature: 0.0,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
 
         let frontier_body = p.build_body(ModelTier::Frontier, &req);
@@ -1243,6 +1293,7 @@ mod tests {
             // Request asks Low even though the Frontier tier would
             // otherwise emit High from default config. Override wins.
             reasoning_effort: Some(ReasoningEffort::Low),
+            prompt_cache_key: None,
         };
         let body = p.build_body(ModelTier::Frontier, &req);
         assert_eq!(body["reasoning_effort"], json!("low"));
@@ -1270,6 +1321,7 @@ mod tests {
             max_tokens: 8,
             temperature: 0.0,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         assert_eq!(
             provider.build_body(ModelTier::Frontier, &req)["reasoning_effort"],
@@ -1519,6 +1571,7 @@ mod tests {
             max_tokens: 8,
             temperature: 0.0,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         let resp = provider
             .complete(ModelTier::Cheap, req)
@@ -1552,6 +1605,7 @@ mod tests {
             max_tokens: 64,
             temperature: 0.0,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         let resp = provider
             .complete(ModelTier::Workhorse, req)
@@ -1645,6 +1699,41 @@ mod tests {
         // conv-id) sets it explicitly.
         let p = test_provider().with_conv_id("explicit-test-conv-id");
         assert_eq!(p.conv_id(), "explicit-test-conv-id");
+    }
+
+    // ---- Session 80 — pick_conv_id_for_call -------------------------
+
+    #[test]
+    fn pick_conv_id_for_call_uses_hint_when_present() {
+        // A per-call cache key from the extraction path overrides the
+        // provider's default conv-id. This is the load-bearing branch:
+        // it routes assertion / event / observation extraction calls
+        // to dedicated cache shards.
+        assert_eq!(
+            pick_conv_id_for_call(Some("extraction:document_assertions"), "default-conv"),
+            "extraction:document_assertions"
+        );
+    }
+
+    #[test]
+    fn pick_conv_id_for_call_falls_through_to_provider_default_when_none() {
+        // Classifier / recipe-author / propose-URL pass `None` for the
+        // hint; they share the per-process default conv-id.
+        assert_eq!(
+            pick_conv_id_for_call(None, "default-conv-id"),
+            "default-conv-id"
+        );
+    }
+
+    #[test]
+    fn pick_conv_id_for_call_treats_blank_hint_as_unset() {
+        // Empty / whitespace-only hints fall through to the provider
+        // default — same normalisation `load_conv_id_from_env` uses for
+        // `XAI_CONV_ID`. A blank string is operator intent for "no
+        // hint", not "route to shard ''".
+        assert_eq!(pick_conv_id_for_call(Some(""), "default"), "default");
+        assert_eq!(pick_conv_id_for_call(Some("   "), "default"), "default");
+        assert_eq!(pick_conv_id_for_call(Some("\t\n"), "default"), "default");
     }
 
     #[test]

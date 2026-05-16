@@ -79,6 +79,7 @@
   import MetricCard from '$components/panels/MetricCard.svelte';
   import KindCard from '$components/panels/KindCard.svelte';
   import DocumentDrawer from '$components/DocumentDrawer.svelte';
+  import SamplesModal from '$components/SamplesModal.svelte';
 
   interface Props {
     /**
@@ -638,6 +639,25 @@
     selectedDocument = null;
     selectedDocumentSeries = null;
   }
+
+  // Session 80 — SamplesModal state. When non-null, the modal renders
+  // over the dashboard listing every distinct sample for a KindCard
+  // group. The KindCard fires `onSamplesExpand(all)` with the already-
+  // deduped list when the operator clicks the `+ N more` overflow row;
+  // we pin (kind, count, samples) so the modal's header stays in sync
+  // even if the underlying records change while it's open.
+  let selectedSampleGroup = $state<{
+    kind: string;
+    count: number;
+    samples: string[];
+  } | null>(null);
+
+  function openSamplesModal(kind: string, count: number, all: string[]): void {
+    selectedSampleGroup = { kind, count, samples: all };
+  }
+  function closeSamplesModal(): void {
+    selectedSampleGroup = null;
+  }
 </script>
 
 <section class="dashboard" aria-label="records dashboard">
@@ -713,6 +733,7 @@
             when={whenOf(g.records[0].envelope)}
             sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
             sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}
+            onSamplesExpand={(all) => openSamplesModal(g.key, g.records.length, all)}
           />
         {/each}
       </div>
@@ -742,6 +763,7 @@
             when={whenOf(g.records[0].envelope)}
             sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
             sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}
+            onSamplesExpand={(all) => openSamplesModal(g.key, g.records.length, all)}
           />
         {/each}
       </div>
@@ -771,6 +793,7 @@
             when={whenOf(g.records[0].envelope)}
             sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
             sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}
+            onSamplesExpand={(all) => openSamplesModal(g.key, g.records.length, all)}
           />
         {/each}
       </div>
@@ -830,6 +853,7 @@
             when={whenOf(g.records[0].envelope)}
             sourceHost={hostOf(g.records[0].envelope.provenance.source_url)}
             sourceUrl={g.records[0].envelope.provenance.source_url ?? ''}
+            onSamplesExpand={(all) => openSamplesModal(g.key, g.records.length, all)}
           />
         {/each}
       </div>
@@ -858,6 +882,18 @@
     document={selectedDocument}
     chartSeries={selectedDocumentSeries}
     onClose={closeDocumentDrawer}
+  />
+{/if}
+
+<!-- Session 80 — SamplesModal renders over the dashboard when a
+     KindCard group's overflow row was clicked. Same {#if}-gate
+     posture as DocumentDrawer: off the DOM in the common case. -->
+{#if selectedSampleGroup !== null}
+  <SamplesModal
+    kind={selectedSampleGroup.kind}
+    count={selectedSampleGroup.count}
+    samples={selectedSampleGroup.samples}
+    onClose={closeSamplesModal}
   />
 {/if}
 

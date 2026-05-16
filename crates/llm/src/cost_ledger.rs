@@ -93,9 +93,21 @@ pub struct Tally {
 /// Process-wide ledger. Clone is cheap (an `Arc` clone); every
 /// [`MeteredProvider`] holds a clone, and the Tauri command-handler
 /// reads via another clone.
+///
+/// ## Session 80 — per-purpose bucketing
+///
+/// Bucket keys are `(provider, tier, purpose)` where `purpose` is
+/// derived from the request's `prompt_cache_key` (or `None` when the
+/// call site doesn't set one). The dashboard rendered "what's the
+/// extraction path costing me?" as a single (provider, tier) bucket
+/// pre-Session-80, which lumped extraction calls together with
+/// classifier / recipe-author / propose-URL calls. Splitting by
+/// purpose lets the operator see "xai · workhorse · extraction:
+/// document_assertions" as its own row, with its own call count and
+/// cache-hit ratio — distinct from the rest of the workhorse traffic.
 #[derive(Debug, Clone, Default)]
 pub struct CostLedger {
-    inner: Arc<Mutex<HashMap<(String, ModelTier), Tally>>>,
+    inner: Arc<Mutex<HashMap<(String, ModelTier, Option<String>), Tally>>>,
 }
 
 impl CostLedger {
@@ -105,6 +117,11 @@ impl CostLedger {
 
     /// Record one completion into the appropriate bucket.
     ///
+    /// `purpose` is the request's `prompt_cache_key` (set by the
+    /// extraction path on Session 80; `None` for classifier /
+    /// recipe-author / propose-URL calls that share the per-process
+    /// default cache shard).
+    ///
     /// Lock posture: short critical section (a `HashMap::entry` and a
     /// handful of u64 adds). The lock is `std::sync::Mutex`, not a
     /// `tokio::sync::Mutex`, because the work doesn't await; holding a
@@ -113,9 +130,14 @@ impl CostLedger {
         &self,
         provider_id: &str,
         tier: ModelTier,
+        purpose: Option<&str>,
         response: &CompletionResponse,
     ) {
-        let key = (provider_id.to_string(), tier);
+        let key = (
+            provider_id.to_string(),
+            tier,
+            purpose.map(|s| s.to_string()),
+        );
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => {
@@ -146,10 +168,10 @@ impl CostLedger {
         }
     }
 
-    /// Snapshot of every bucket, sorted (provider asc, tier asc) for
-    /// stable wire ordering. The dashboard caller renders rows in the
-    /// order returned; a stable order means the panel doesn't jiggle
-    /// between refreshes.
+    /// Snapshot of every bucket, sorted (provider asc, tier asc,
+    /// purpose asc — None before Some(_)) for stable wire ordering. The
+    /// dashboard caller renders rows in the order returned; a stable
+    /// order means the panel doesn't jiggle between refreshes.
     pub fn snapshot(&self) -> Vec<LedgerEntry> {
         let guard = match self.inner.lock() {
             Ok(g) => g,
@@ -157,9 +179,10 @@ impl CostLedger {
         };
         let mut out: Vec<LedgerEntry> = guard
             .iter()
-            .map(|((provider, tier), tally)| LedgerEntry {
+            .map(|((provider, tier, purpose), tally)| LedgerEntry {
                 provider: provider.clone(),
                 tier: *tier,
+                purpose: purpose.clone(),
                 tally: tally.clone(),
             })
             .collect();
@@ -167,6 +190,16 @@ impl CostLedger {
             a.provider
                 .cmp(&b.provider)
                 .then_with(|| tier_sort_key(a.tier).cmp(&tier_sort_key(b.tier)))
+                .then_with(|| match (&a.purpose, &b.purpose) {
+                    (None, None) => std::cmp::Ordering::Equal,
+                    // None (default shard) sorts before Some(_) so the
+                    // panel reads "default → extraction:* → other purposes"
+                    // — same top-down "generic → specific" feel as tier
+                    // ordering.
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (Some(x), Some(y)) => x.cmp(y),
+                })
         });
         out
     }
@@ -186,10 +219,17 @@ fn tier_sort_key(t: ModelTier) -> u8 {
 
 /// One bucket's contents as it leaves the ledger. The API crate's
 /// wire DTO lifts this into ts-rs-exported form.
+///
+/// `purpose` (Session 80) carries the request's `prompt_cache_key`
+/// when one was set — the extraction path uses this to break out
+/// per-Document extraction calls from the other workhorse traffic.
+/// `None` means "default shard" (classifier / recipe-author /
+/// propose-URL all share the per-process `XAI_CONV_ID`).
 #[derive(Debug, Clone)]
 pub struct LedgerEntry {
     pub provider: String,
     pub tier: ModelTier,
+    pub purpose: Option<String>,
     pub tally: Tally,
 }
 
@@ -245,11 +285,15 @@ impl LlmProvider for MeteredProvider {
         tier: ModelTier,
         request: CompletionRequest,
     ) -> Result<CompletionResponse, LlmError> {
-        // Capture provider id before the inner call so we don't have to
-        // re-borrow `self.inner` after the move into `complete`.
+        // Capture provider id + the per-call `prompt_cache_key` before
+        // the move into `complete`. Session 80: the ledger buckets
+        // (provider, tier, purpose=prompt_cache_key) so extraction
+        // calls get their own row in the cost panel.
         let provider_id = self.inner.id();
+        let purpose = request.prompt_cache_key.clone();
         let response = self.inner.complete(tier, request).await?;
-        self.ledger.record(provider_id, tier, &response);
+        self.ledger
+            .record(provider_id, tier, purpose.as_deref(), &response);
         Ok(response)
     }
 }
@@ -286,11 +330,13 @@ mod tests {
         ledger.record(
             "xai",
             ModelTier::Workhorse,
+            None,
             &fake_response(Some(1000), Some(200), Some(900)),
         );
         ledger.record(
             "xai",
             ModelTier::Workhorse,
+            None,
             &fake_response(Some(1100), Some(150), Some(1000)),
         );
         let snap = ledger.snapshot();
@@ -311,11 +357,13 @@ mod tests {
         ledger.record(
             "anthropic",
             ModelTier::Frontier,
+            None,
             &fake_response(Some(100), Some(50), None),
         );
         ledger.record(
             "anthropic",
             ModelTier::Cheap,
+            None,
             &fake_response(Some(200), Some(10), Some(0)),
         );
         let snap = ledger.snapshot();
@@ -331,16 +379,19 @@ mod tests {
         ledger.record(
             "xai",
             ModelTier::Cheap,
+            None,
             &fake_response(Some(1), Some(1), None),
         );
         ledger.record(
             "anthropic",
             ModelTier::Workhorse,
+            None,
             &fake_response(Some(1), Some(1), None),
         );
         ledger.record(
             "anthropic",
             ModelTier::Frontier,
+            None,
             &fake_response(Some(1), Some(1), None),
         );
         let snap = ledger.snapshot();
@@ -365,6 +416,7 @@ mod tests {
         ledger.record(
             "anthropic",
             ModelTier::Workhorse,
+            None,
             &fake_response(Some(500), Some(50), None),
         );
         let snap = ledger.snapshot();
@@ -383,12 +435,75 @@ mod tests {
         ledger.record(
             "xai",
             ModelTier::Workhorse,
+            None,
             &fake_response(Some(500), Some(50), Some(0)),
         );
         let snap = ledger.snapshot();
         let e = &snap[0];
         assert_eq!(e.tally.calls_with_cache_data, 1);
         assert_eq!(e.tally.cached_input_tokens, 0);
+    }
+
+    // ---- Session 80 — purpose-bucketed ledger ----
+
+    #[test]
+    fn distinct_purposes_get_their_own_buckets() {
+        // Same (provider, tier), three different purposes: a default
+        // shard (None — classifier / recipe-author / propose-URL) and
+        // two extraction shards (assertions, events). The ledger
+        // produces three rows so the dashboard can show extraction
+        // calls separately from authoring calls.
+        let ledger = CostLedger::new();
+        ledger.record(
+            "xai",
+            ModelTier::Workhorse,
+            None,
+            &fake_response(Some(500), Some(50), Some(400)),
+        );
+        ledger.record(
+            "xai",
+            ModelTier::Workhorse,
+            Some("extraction:document_assertions"),
+            &fake_response(Some(800), Some(200), Some(600)),
+        );
+        ledger.record(
+            "xai",
+            ModelTier::Workhorse,
+            Some("extraction:document_events"),
+            &fake_response(Some(900), Some(180), Some(700)),
+        );
+        let snap = ledger.snapshot();
+        assert_eq!(snap.len(), 3, "three buckets — one per distinct purpose");
+        // Sort order: provider asc, tier asc, then None < Some(asc).
+        assert!(snap[0].purpose.is_none());
+        assert_eq!(snap[1].purpose.as_deref(), Some("extraction:document_assertions"));
+        assert_eq!(snap[2].purpose.as_deref(), Some("extraction:document_events"));
+    }
+
+    #[test]
+    fn same_purpose_accumulates_into_one_bucket() {
+        // Two assertion-extraction calls land in the same bucket; the
+        // tally aggregates calls + tokens.
+        let ledger = CostLedger::new();
+        ledger.record(
+            "xai",
+            ModelTier::Workhorse,
+            Some("extraction:document_assertions"),
+            &fake_response(Some(800), Some(100), Some(500)),
+        );
+        ledger.record(
+            "xai",
+            ModelTier::Workhorse,
+            Some("extraction:document_assertions"),
+            &fake_response(Some(900), Some(150), Some(700)),
+        );
+        let snap = ledger.snapshot();
+        assert_eq!(snap.len(), 1);
+        let e = &snap[0];
+        assert_eq!(e.purpose.as_deref(), Some("extraction:document_assertions"));
+        assert_eq!(e.tally.calls, 2);
+        assert_eq!(e.tally.input_tokens, 1700);
+        assert_eq!(e.tally.cached_input_tokens, 1200);
     }
 
     #[test]
@@ -399,6 +514,7 @@ mod tests {
         ledger.record(
             "stub",
             ModelTier::Cheap,
+            None,
             &fake_response(None, None, None),
         );
         let snap = ledger.snapshot();
@@ -446,6 +562,7 @@ mod tests {
             max_tokens: 8,
             temperature: 0.0,
             reasoning_effort: None,
+            prompt_cache_key: None,
         };
         let _ = metered.complete(ModelTier::Workhorse, req).await.unwrap();
         let snap = ledger.snapshot();

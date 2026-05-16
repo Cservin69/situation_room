@@ -411,6 +411,10 @@ pub async fn classify_topic(
         // default on xAI). Per-call overrides are not used for
         // classification.
         reasoning_effort: None,
+        // Classifier calls share the provider's default cache shard
+        // (per-process `XAI_CONV_ID`). Session 80 reserves per-call
+        // cache keys for the extraction path.
+        prompt_cache_key: None,
     };
 
     let resp = provider.complete(tier, req).await?;

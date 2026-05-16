@@ -678,6 +678,9 @@ async fn run_one_trial(
             // and the harness's observable signal (records produced)
             // doesn't change with extracted observations.
             document_observations_prompt: None,
+            // Session 80 — entity-attribute extraction skipped for the
+            // same reason: cost discipline.
+            document_entity_attributes_prompt: None,
             sources,
         };
 

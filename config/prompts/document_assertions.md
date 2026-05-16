@@ -1,4 +1,4 @@
-# Document Assertions Extraction Prompt — v1.0
+# Document Assertions Extraction Prompt — v1.1
 
 <!--
     Session 77 — Phase-3 minimal landing.
@@ -101,6 +101,17 @@ Schema details:
   `competitor_of`. Bad: `recently_announced_that`, `said_about`,
   `is_doing_business_with`.
 
+  **Session 80 — closed-vocab gate.** The research session may
+  declare a list of relation kinds it is tracking. When such a list
+  is provided (see `{{ALLOWED_PREDICATES}}` under "Context for this
+  call"), the `predicate` field on every emitted item must be one
+  of those exact strings. Triples whose underlying relationship
+  doesn't fit any of the declared kinds should be dropped rather
+  than coerced into a near-match — closed-vocab discipline says a
+  wrong predicate is worse than no predicate. Empty output is the
+  right answer for documents whose only relation-shaped content
+  falls outside the plan's declared vocabulary.
+
 - **`object`** — the target end of the relation, same shape as
   subject.
 
@@ -188,6 +199,10 @@ strain to fill the array.
 - **Topic** the research session is tracking:
   `{{TOPIC}}`
 
+- **Allowed predicates** (closed vocabulary the research plan
+  declared; pick `predicate` from this list only):
+  `{{ALLOWED_PREDICATES}}`
+
 - **Document source URL**:
   `{{SOURCE_URL}}`
 
@@ -216,3 +231,12 @@ outside the JSON.
   Worked example covers the Reuters / Panasonic / Tesla shape;
   empty-output case explicitly named for documents without
   relation-shaped content.
+
+- **v1.1** (2026-05-16) — Session 80. Closed-vocabulary predicate
+  gate. Added `{{ALLOWED_PREDICATES}}` placeholder + an explicit
+  paragraph under the `predicate` field documenting the gate. Empty
+  list = open vocab (Session-77 behaviour preserved for plans
+  without declared `relation_kinds`); non-empty list = the schema
+  bakes the list as a JSON-Schema enum and the validator drops
+  out-of-vocab predicates with the same phrasing the event and
+  observation extractors emit.

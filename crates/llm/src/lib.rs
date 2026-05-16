@@ -38,10 +38,14 @@ pub use providers::{XaiProvider, XaiConfig, XAI_API_KEY_ENV};
 pub use providers::{AnthropicProvider, AnthropicConfig, ANTHROPIC_API_KEY_ENV};
 pub use cost_ledger::{CostLedger, LedgerEntry, MeteredProvider, Tally};
 pub use extraction::{
-    extract_assertions_from_document, extract_events_from_document,
-    extract_observations_from_document, AssertionDraft, EventDraft, ExtractionConfig,
-    ExtractionError, ObservationDraft, RawExtractedAssertion, RawExtractedAssertions,
-    RawExtractedEvent, RawExtractedEvents, RawExtractedObservation, RawExtractedObservations,
+    extract_assertions_from_document, extract_entity_attributes_from_document,
+    extract_events_from_document, extract_observations_from_document, AssertionDraft,
+    EntityAttributeDraft, EventDraft, ExtractionConfig, ExtractionError, ObservationDraft,
+    RawExtractedAssertion, RawExtractedAssertions, RawExtractedEntityAttribute,
+    RawExtractedEntityAttributes, RawExtractedEvent, RawExtractedEvents,
+    RawExtractedObservation, RawExtractedObservations, EXTRACTION_CACHE_KEY_ASSERTIONS,
+    EXTRACTION_CACHE_KEY_ENTITY_ATTRIBUTES, EXTRACTION_CACHE_KEY_EVENTS,
+    EXTRACTION_CACHE_KEY_OBSERVATIONS,
 };
 
 pub type Result<T> = std::result::Result<T, LlmError>;

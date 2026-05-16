@@ -91,6 +91,20 @@
      * without a destination would be a noop affordance.
      */
     onOpen?: (() => void) | null;
+    /**
+     * Session 80 — optional callback fired when the operator clicks
+     * the `+ N more` overflow row at the bottom of the multi-sample
+     * list. Receives the full deduped sample list (the same list the
+     * card itself deduped from `samples`), so the parent doesn't have
+     * to re-run the in-card dedup logic to populate its modal.
+     *
+     * Independent of `onOpen`: the modal is the discoverability
+     * affordance for the long-tail samples, whereas `onOpen` opens a
+     * type-specific drawer (Documents today). A future panel might
+     * wire both — clicking the card body opens a drawer, clicking the
+     * overflow opens the sample list.
+     */
+    onSamplesExpand?: ((all: string[]) => void) | null;
   }
   let {
     kind,
@@ -102,6 +116,7 @@
     sourceUrl = '',
     chartSeries = null,
     onOpen = null,
+    onSamplesExpand = null,
   }: Props = $props();
 
   /*
@@ -151,6 +166,25 @@
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
       onOpen();
+    }
+  }
+
+  // Session 80 — overflow-row click. Surfaces the full deduped sample
+  // list to the parent so it can open a modal listing every row in the
+  // group. Stops propagation so the click doesn't also bubble up to
+  // `onCardClick` and fire `onOpen` on a card that has both wired.
+  function onSamplesOverflowClick(e: MouseEvent) {
+    if (!onSamplesExpand) return;
+    e.stopPropagation();
+    onSamplesExpand(dedupedSamples);
+  }
+
+  function onSamplesOverflowKeydown(e: KeyboardEvent) {
+    if (!onSamplesExpand) return;
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      e.stopPropagation();
+      onSamplesExpand(dedupedSamples);
     }
   }
 
@@ -205,7 +239,20 @@
         <li class="sample-line" title={s}>{s}</li>
       {/each}
       {#if samplesOverflow > 0}
-        <li class="sample-overflow">+ {samplesOverflow} more</li>
+        {#if onSamplesExpand}
+          <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+          <!-- svelte-ignore a11y_no_noninteractive_element_to_interactive_role -->
+          <li
+            class="sample-overflow clickable"
+            role="button"
+            tabindex={0}
+            onclick={onSamplesOverflowClick}
+            onkeydown={onSamplesOverflowKeydown}
+            title="show all {dedupedSamples.length} samples"
+          >+ {samplesOverflow} more</li>
+        {:else}
+          <li class="sample-overflow">+ {samplesOverflow} more</li>
+        {/if}
       {/if}
     </ul>
   {:else if chartSeries && chartSeries.points.length > 0}
@@ -343,6 +390,22 @@
     color: var(--fg-tertiary);
     font-style: italic;
     font-family: var(--font-sans, inherit);
+  }
+  /* Session 80 — interactive overflow row when `onSamplesExpand` is
+     wired. Visually nudges that it's clickable without forcing a full
+     button affordance (the overflow row reads as inline meta, not as a
+     primary action — the dotted underline matches the rest of the
+     dashboard's "this is a destination" cue). */
+  .sample-overflow.clickable {
+    cursor: pointer;
+    text-decoration: underline dotted;
+    text-underline-offset: 2px;
+    transition: color var(--duration-ui) var(--ease);
+  }
+  .sample-overflow.clickable:hover,
+  .sample-overflow.clickable:focus-visible {
+    color: var(--fg-primary);
+    outline: none;
   }
 
   /* Session 69 — chart preview (Path B). Sits where the .sample

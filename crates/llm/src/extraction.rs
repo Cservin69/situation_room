@@ -162,9 +162,26 @@ pub async fn extract_assertions_from_document(
     source_url: &str,
     mime: &str,
     body: &str,
+    allowed_predicates: &[&str],
 ) -> Result<Vec<AssertionDraft>, ExtractionError> {
-    let user = build_extraction_prompt(prompt_template, topic, source_url, mime, body);
-    let schema = extraction_schema_value();
+    // Session 80 — closed-vocabulary predicate gate. Mirrors the
+    // posture of `extract_events_from_document` (`allowed_event_types`)
+    // and `extract_observations_from_document` (`allowed_metrics`).
+    //
+    // Empty slice = "open vocabulary, accept whatever the LLM emits"
+    // (the Session 77 → 79 behaviour; the plan declared no relation
+    // kinds so the closed-vocab gate is structurally a no-op). Non-empty
+    // slice = "the LLM must emit one of these strings as `predicate`";
+    // the schema bakes the list as a JSON-Schema `enum` and the
+    // validator re-checks membership as a defence against lax providers.
+    //
+    // This pins extraction-derived relations to the same kinds the
+    // classifier nominated on `relation_kinds[].kind`, so the
+    // dashboard's per-kind Relations panel ties together exemplar
+    // triples (from `relation_synth`) and document-extracted triples
+    // (from this path).
+    let user = build_extraction_prompt(prompt_template, topic, source_url, mime, body, allowed_predicates);
+    let schema = extraction_schema_value(allowed_predicates);
 
     let req = CompletionRequest {
         system: Some(
@@ -187,12 +204,29 @@ pub async fn extract_assertions_from_document(
         temperature: 0.0,
         // Tier mapping picks the per-tier default; no per-call override.
         reasoning_effort: None,
+        // Session 80 — extraction-specific cache shard. xAI routes the
+        // request to a server keyed on this string (overriding the
+        // per-process `XAI_CONV_ID`); since the three extractors
+        // (assertion / event / observation) carry distinct templates
+        // they'd never share cache content anyway, so a per-extractor
+        // shard avoids forcing them to evict each other on a shared
+        // shard with the classifier / recipe-author calls.
+        prompt_cache_key: Some(EXTRACTION_CACHE_KEY_ASSERTIONS.to_string()),
     };
 
     let resp = provider.complete(cfg.tier, req).await?;
-    let drafts = parse_response(&resp)?;
+    let drafts = parse_response(&resp, allowed_predicates)?;
     Ok(drafts)
 }
+
+/// Session 80 — cache-shard keys for the three per-Document extractors.
+/// Routed to the xAI `x-grok-conv-id` header by `XaiProvider::complete`
+/// when the request carries `prompt_cache_key: Some(_)`. Other providers
+/// ignore the hint today; future provider work may map these onto
+/// provider-native cache controls.
+pub const EXTRACTION_CACHE_KEY_ASSERTIONS: &str = "extraction:document_assertions";
+pub const EXTRACTION_CACHE_KEY_EVENTS: &str = "extraction:document_events";
+pub const EXTRACTION_CACHE_KEY_OBSERVATIONS: &str = "extraction:document_observations";
 
 /// Pure helper: render the prompt template against the call inputs.
 /// Lifted out of [`extract_assertions_from_document`] so tests can
@@ -204,18 +238,35 @@ pub fn build_extraction_prompt(
     source_url: &str,
     mime: &str,
     body: &str,
+    allowed_predicates: &[&str],
 ) -> String {
+    // Session 80 — `{{ALLOWED_PREDICATES}}` carries the plan's declared
+    // relation kinds inline to the prompt body. Empty list renders as
+    // `(no closed vocabulary — emit a stable lowercase_snake_case
+    // predicate like `supplies_to`)` so the prompt still teaches the
+    // open-vocab guidance for plans that didn't declare relation_kinds.
+    let allowed_inline = if allowed_predicates.is_empty() {
+        "(no closed vocabulary — emit a stable lowercase_snake_case \
+         predicate like `supplies_to`, `subsidiary_of`, `operator_of`)"
+            .to_string()
+    } else {
+        allowed_predicates.join(", ")
+    };
     template
         .replace("{{TOPIC}}", topic)
         .replace("{{SOURCE_URL}}", source_url)
         .replace("{{MIME}}", mime)
         .replace("{{BODY}}", body)
+        .replace("{{ALLOWED_PREDICATES}}", &allowed_inline)
 }
 
 /// Parse a [`CompletionResponse`] into validated drafts. Split out
 /// for testability: synthetic responses exercise the validation
 /// branches without standing up a provider.
-pub fn parse_response(resp: &CompletionResponse) -> Result<Vec<AssertionDraft>, ExtractionError> {
+pub fn parse_response(
+    resp: &CompletionResponse,
+    allowed_predicates: &[&str],
+) -> Result<Vec<AssertionDraft>, ExtractionError> {
     let raw_value = resp
         .structured
         .as_ref()
@@ -226,7 +277,7 @@ pub fn parse_response(resp: &CompletionResponse) -> Result<Vec<AssertionDraft>, 
 
     let mut drafts = Vec::with_capacity(parsed.assertions.len());
     for raw in parsed.assertions {
-        match validate_one(raw) {
+        match validate_one(raw, allowed_predicates) {
             Ok(draft) => drafts.push(draft),
             Err(reason) => {
                 warn!(
@@ -249,7 +300,10 @@ pub fn parse_response(resp: &CompletionResponse) -> Result<Vec<AssertionDraft>, 
 /// (matching the [`Confidence`] newtype's `new` semantics for
 /// in-range values; out-of-range values would otherwise fail the
 /// constructor and drop the whole assertion).
-fn validate_one(raw: RawExtractedAssertion) -> Result<AssertionDraft, String> {
+fn validate_one(
+    raw: RawExtractedAssertion,
+    allowed_predicates: &[&str],
+) -> Result<AssertionDraft, String> {
     use situation_room_core::vocab::{Confidence, EntityId, Stance};
 
     let claimant_s = raw.claimant.trim();
@@ -267,6 +321,19 @@ fn validate_one(raw: RawExtractedAssertion) -> Result<AssertionDraft, String> {
     let predicate_s = raw.predicate.trim();
     if subject_s.is_empty() || object_s.is_empty() || predicate_s.is_empty() {
         return Err("empty subject/predicate/object".into());
+    }
+
+    // Session 80 — closed-vocab predicate gate. Only enforced when the
+    // caller supplied a non-empty `allowed_predicates`; an empty slice
+    // preserves the Session 77 open-vocab behaviour for plans that
+    // didn't declare relation_kinds.
+    if !allowed_predicates.is_empty()
+        && !allowed_predicates.iter().any(|k| *k == predicate_s)
+    {
+        return Err(format!(
+            "predicate `{predicate_s}` not in plan's declared relation_kinds; \
+             dropping under closed-vocab discipline"
+        ));
     }
 
     let from = EntityId::new(subject_s)
@@ -316,7 +383,24 @@ fn parse_stance(raw: &str) -> Option<situation_room_core::vocab::Stance> {
 /// validated server-side in [`validate_one`]). A schemars-derived
 /// schema would require a `JsonSchema` impl chain through several
 /// types that don't have one today.
-fn extraction_schema_value() -> serde_json::Value {
+fn extraction_schema_value(allowed_predicates: &[&str]) -> serde_json::Value {
+    // Session 80 — when `allowed_predicates` is non-empty bake it into
+    // the schema as a JSON-Schema `enum` on the `predicate` field so a
+    // schema-respecting provider rejects out-of-vocab predicates
+    // upstream (matches the closed-vocab posture of `event_type` and
+    // `metric` on the sibling extractors). Empty list keeps the
+    // open-vocab `{"type":"string"}` form for plans without declared
+    // relation_kinds — preserves Session 77's behaviour.
+    let predicate_schema = if allowed_predicates.is_empty() {
+        serde_json::json!({ "type": "string" })
+    } else {
+        let allowed_json: Vec<serde_json::Value> = allowed_predicates
+            .iter()
+            .map(|s| serde_json::Value::String((*s).to_string()))
+            .collect();
+        serde_json::json!({ "type": "string", "enum": allowed_json })
+    };
+
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -338,7 +422,7 @@ fn extraction_schema_value() -> serde_json::Value {
                             ]
                         },
                         "subject": { "type": "string" },
-                        "predicate": { "type": "string" },
+                        "predicate": predicate_schema,
                         "object": { "type": "string" },
                         "confidence": {
                             "type": "number",
@@ -500,6 +584,9 @@ pub async fn extract_events_from_document(
         temperature: 0.0,
         // Tier mapping picks the per-tier default; no per-call override.
         reasoning_effort: None,
+        // Session 80 — extraction-specific cache shard. See the
+        // assertion-extraction call for the full rationale.
+        prompt_cache_key: Some(EXTRACTION_CACHE_KEY_EVENTS.to_string()),
     };
 
     let resp = provider.complete(cfg.tier, req).await?;
@@ -521,7 +608,10 @@ pub fn build_event_extraction_prompt(
     allowed_event_types: &[&str],
 ) -> String {
     let allowed_joined = allowed_event_types.join(", ");
-    build_extraction_prompt(template, topic, source_url, mime, body)
+    // Session 80 — event-prompt template does not carry
+    // `{{ALLOWED_PREDICATES}}`; passing an empty slice to the shared
+    // builder makes the substitution a no-op there.
+    build_extraction_prompt(template, topic, source_url, mime, body, &[])
         .replace("{{ALLOWED_EVENT_TYPES}}", &allowed_joined)
 }
 
@@ -863,6 +953,9 @@ pub async fn extract_observations_from_document(
         temperature: 0.0,
         // Tier mapping picks the per-tier default; no per-call override.
         reasoning_effort: None,
+        // Session 80 — extraction-specific cache shard. See the
+        // assertion-extraction call for the full rationale.
+        prompt_cache_key: Some(EXTRACTION_CACHE_KEY_OBSERVATIONS.to_string()),
     };
 
     let resp = provider.complete(cfg.tier, req).await?;
@@ -884,7 +977,10 @@ pub fn build_observation_extraction_prompt(
     allowed_metrics: &[&str],
 ) -> String {
     let allowed_joined = allowed_metrics.join(", ");
-    build_extraction_prompt(template, topic, source_url, mime, body)
+    // Session 80 — observation-prompt template does not carry
+    // `{{ALLOWED_PREDICATES}}`; passing an empty slice to the shared
+    // builder makes the substitution a no-op there.
+    build_extraction_prompt(template, topic, source_url, mime, body, &[])
         .replace("{{ALLOWED_METRICS}}", &allowed_joined)
 }
 
@@ -1070,6 +1166,322 @@ fn observation_extraction_schema_value(allowed_metrics: &[&str]) -> serde_json::
 }
 
 // ---------------------------------------------------------------------------
+// Per-Document EntityAttribute extraction (Session 80)
+// ---------------------------------------------------------------------------
+//
+// Fourth sibling alongside the relation-shaped assertion extractor
+// (Session 77), the discrete-event extractor (Session 78), and the
+// numeric-observation extractor (Session 79). Where those three each
+// emit a single record-shape per row, this extractor emits per-entity
+// attribute facts: "company X has employee_count Y", "company X has
+// headquarters_country US", "agency X has authority cybersecurity".
+//
+// **Open-vocabulary `key` in v1.** Today's `EntityKindExpectation`
+// schema does NOT declare a list of allowed attribute names, so the
+// extractor accepts whatever lowercase_snake_case key the LLM emits.
+// A future session can add `attributes: Vec<String>` to
+// `EntityKindExpectation` (schema rev + classifier-prompt edit) and
+// turn this into a closed-vocab gate matching the event +
+// observation extractor posture.
+//
+// **Closed-vocabulary `value_kind`.** The wire shape exposes a typed
+// value discriminator that maps onto `AttributeValue`'s tagged-enum
+// variants. v1 supports `text` / `number` / `boolean` — the three
+// shapes the most common attribute facts ("legal_name = 'Tesla'",
+// "employee_count = 140000", "is_subsidiary = true") fit. `Country`,
+// `Topic`, `Entity`, `EntityList`, `TopicList` are intentionally not
+// surfaced in v1 — they need typed validation (CountryCode, Topic,
+// EntityId) the v1 happy path can do without. A future session can
+// widen.
+
+/// Wire shape for one entity attribute the LLM emits, before
+/// validation. Loose typing — the validator
+/// ([`validate_entity_attribute_one`]) projects to typed
+/// [`EntityAttributeDraft`] and drops malformed rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawExtractedEntityAttribute {
+    /// Entity the attribute belongs to. `prefix:slug` shape consumed
+    /// by [`EntityId::new`]; rows with an invalid entity id are
+    /// dropped (the entity_id is the join key for the dashboard's
+    /// entity panel).
+    pub entity_id: String,
+    /// Attribute key. Lowercase snake_case. Open vocabulary in v1 —
+    /// the validator only checks `!key.is_empty()` after trim.
+    pub key: String,
+    /// Discriminator for which value field carries the payload. Must
+    /// be one of `"text"` / `"number"` / `"boolean"`. Unknown values
+    /// drop the row (same posture as `period` on the observation
+    /// extractor).
+    pub value_kind: String,
+    /// Text payload — required iff `value_kind == "text"`. Other
+    /// `value_kind` values leave this `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_text: Option<String>,
+    /// Numeric payload — required iff `value_kind == "number"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_number: Option<f64>,
+    /// Boolean payload — required iff `value_kind == "boolean"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_boolean: Option<bool>,
+    /// Optional unit string when `value_kind == "number"` (e.g.
+    /// `"persons"` for `employee_count`, `"USD"` for `revenue`).
+    /// Validated via [`Unit::new`]; bad values map to `None` rather
+    /// than dropping the row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// 0.0..=1.0 confidence. Clamped in
+    /// [`validate_entity_attribute_one`].
+    pub confidence: f64,
+}
+
+/// LLM wire envelope for the entity-attribute extractor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawExtractedEntityAttributes {
+    #[serde(default)]
+    pub attributes: Vec<RawExtractedEntityAttribute>,
+}
+
+/// Typed projection of one extracted entity-attribute, ready for the
+/// pipeline orchestrator to wrap in an `Assertion` envelope. The
+/// wrapper variant is `AssertedContent::EntityAttribute` (same
+/// approach Session 77 uses for relations — entity-attribute is a
+/// content-shape on Assertion, not a record-type of its own).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityAttributeDraft {
+    pub entity_id: situation_room_core::vocab::EntityId,
+    pub key: String,
+    pub value: situation_room_core::schema::content::AttributeValue,
+    pub confidence: situation_room_core::vocab::Confidence,
+}
+
+/// Run one entity-attribute extraction pass against a Document body.
+///
+/// Open-vocab on `key` (validator only checks non-empty after trim).
+/// Closed-vocab on `value_kind` (must be one of `text`/`number`/
+/// `boolean`). Returns the validated drafts only; malformed rows
+/// (invalid entity id, empty key, unknown value_kind, mismatched
+/// value field) warn-log and drop.
+pub async fn extract_entity_attributes_from_document(
+    provider: &dyn LlmProvider,
+    cfg: &ExtractionConfig,
+    prompt_template: &str,
+    topic: &str,
+    source_url: &str,
+    mime: &str,
+    body: &str,
+) -> Result<Vec<EntityAttributeDraft>, ExtractionError> {
+    let user = build_entity_attribute_extraction_prompt(
+        prompt_template,
+        topic,
+        source_url,
+        mime,
+        body,
+    );
+    let schema = entity_attribute_extraction_schema_value();
+
+    let req = CompletionRequest {
+        system: Some(
+            "You are the situation_room document-extraction layer. \
+             Read the supplied document body and emit only \
+             entity-attribute facts present in the text. \
+             Output only JSON conforming to the provided schema. \
+             No prose outside the JSON."
+                .to_string(),
+        ),
+        user,
+        schema: Some(StructuredOutputSchema {
+            name: "DocumentEntityAttributes".to_string(),
+            schema,
+        }),
+        // Per-row payload is small (~6 fields, mostly Option-typed);
+        // 2048 covers ~25 attributes comfortably.
+        max_tokens: 2048,
+        // Extraction is mechanical: low temperature, deterministic.
+        temperature: 0.0,
+        reasoning_effort: None,
+        // Session 80 — dedicated extraction cache shard.
+        prompt_cache_key: Some(EXTRACTION_CACHE_KEY_ENTITY_ATTRIBUTES.to_string()),
+    };
+
+    let resp = provider.complete(cfg.tier, req).await?;
+    let drafts = parse_entity_attributes_response(&resp)?;
+    Ok(drafts)
+}
+
+/// Pure helper: render the entity-attribute prompt template. Uses the
+/// shared base `build_extraction_prompt` (empty allowed_predicates
+/// since there's no predicate field on this extractor's wire shape).
+pub fn build_entity_attribute_extraction_prompt(
+    template: &str,
+    topic: &str,
+    source_url: &str,
+    mime: &str,
+    body: &str,
+) -> String {
+    // Reuse the shared substitutor; the entity-attribute template has
+    // no `{{ALLOWED_*}}` placeholder (open-vocab in v1) so this just
+    // wires in topic/url/mime/body.
+    build_extraction_prompt(template, topic, source_url, mime, body, &[])
+}
+
+/// Parse a [`CompletionResponse`] into validated entity-attribute
+/// drafts. Same posture as the other three parsers: warn-log and drop
+/// per-row validation failures.
+pub fn parse_entity_attributes_response(
+    resp: &CompletionResponse,
+) -> Result<Vec<EntityAttributeDraft>, ExtractionError> {
+    let raw_value = resp
+        .structured
+        .as_ref()
+        .ok_or(ExtractionError::NoStructuredOutput)?;
+
+    let parsed: RawExtractedEntityAttributes = serde_json::from_value(raw_value.clone())
+        .map_err(|e| ExtractionError::OutputParse(e.to_string()))?;
+
+    let mut drafts = Vec::with_capacity(parsed.attributes.len());
+    for raw in parsed.attributes {
+        match validate_entity_attribute_one(raw) {
+            Ok(draft) => drafts.push(draft),
+            Err(reason) => {
+                warn!(
+                    reason = %reason,
+                    "document extractor dropped malformed entity attribute"
+                );
+            }
+        }
+    }
+    Ok(drafts)
+}
+
+/// Project one [`RawExtractedEntityAttribute`] to
+/// [`EntityAttributeDraft`]. Drops the row when:
+///   - `entity_id` fails [`EntityId::new`]
+///   - `key` is empty after trim
+///   - `value_kind` is not in `{"text", "number", "boolean"}`
+///   - the value field matching `value_kind` is missing
+///
+/// `unit` parses leniently — a malformed unit string becomes `None`
+/// in the resulting `AttributeValue::Number`.
+fn validate_entity_attribute_one(
+    raw: RawExtractedEntityAttribute,
+) -> Result<EntityAttributeDraft, String> {
+    use situation_room_core::schema::content::AttributeValue;
+    use situation_room_core::vocab::{Confidence, EntityId, Unit};
+
+    let entity_s = raw.entity_id.trim();
+    if entity_s.is_empty() {
+        return Err("empty entity_id".into());
+    }
+    let entity_id = EntityId::new(entity_s)
+        .map_err(|e| format!("invalid entity_id `{entity_s}`: {e}"))?;
+
+    let key = raw.key.trim().to_string();
+    if key.is_empty() {
+        return Err("empty key".into());
+    }
+
+    let kind_s = raw.value_kind.trim().to_ascii_lowercase();
+    let value = match kind_s.as_str() {
+        "text" => {
+            let s = raw
+                .value_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    "value_kind=text but value_text is empty/missing".to_string()
+                })?;
+            AttributeValue::Text(s.to_string())
+        }
+        "number" => {
+            let n = raw.value_number.ok_or_else(|| {
+                "value_kind=number but value_number is missing".to_string()
+            })?;
+            // Unit parses leniently: bad/empty → None, doesn't drop.
+            let unit = raw
+                .unit
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|s| Unit::new(s).ok());
+            AttributeValue::Number { value: n, unit }
+        }
+        "boolean" => {
+            let b = raw.value_boolean.ok_or_else(|| {
+                "value_kind=boolean but value_boolean is missing".to_string()
+            })?;
+            AttributeValue::Boolean(b)
+        }
+        other => {
+            return Err(format!(
+                "unknown value_kind `{other}` (expected text|number|boolean)"
+            ));
+        }
+    };
+
+    let confidence = Confidence::clamp(raw.confidence as f32);
+
+    Ok(EntityAttributeDraft {
+        entity_id,
+        key,
+        value,
+        confidence,
+    })
+}
+
+/// The JSON Schema constraint for entity-attribute extraction. The
+/// `value_kind` field is enum-constrained at the schema level so a
+/// schema-respecting provider rejects unknown kinds upstream; the
+/// validator re-checks as defence against lax providers. All three
+/// `value_*` payload fields are optional at the schema layer; the
+/// validator pulls the right one out based on `value_kind` and
+/// drops the row if it's missing.
+fn entity_attribute_extraction_schema_value() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "attributes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "entity_id": { "type": "string" },
+                        "key": { "type": "string" },
+                        "value_kind": {
+                            "type": "string",
+                            "enum": ["text", "number", "boolean"]
+                        },
+                        "value_text": { "type": "string" },
+                        "value_number": { "type": "number" },
+                        "value_boolean": { "type": "boolean" },
+                        "unit": { "type": "string" },
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0
+                        }
+                    },
+                    "required": [
+                        "entity_id",
+                        "key",
+                        "value_kind",
+                        "confidence"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["attributes"],
+        "additionalProperties": false
+    })
+}
+
+/// Session 80 — extraction cache shard for the entity-attribute
+/// extractor. See the other three `EXTRACTION_CACHE_KEY_*` constants.
+pub const EXTRACTION_CACHE_KEY_ENTITY_ATTRIBUTES: &str =
+    "extraction:document_entity_attributes";
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1080,18 +1492,40 @@ mod tests {
 
     #[test]
     fn build_extraction_prompt_substitutes_placeholders() {
-        let template = "topic=`{{TOPIC}}` url=`{{SOURCE_URL}}` mime=`{{MIME}}` body=`{{BODY}}`";
+        let template = "topic=`{{TOPIC}}` url=`{{SOURCE_URL}}` mime=`{{MIME}}` body=`{{BODY}}` preds=`{{ALLOWED_PREDICATES}}`";
         let out = build_extraction_prompt(
             template,
             "lithium",
             "https://example.test/p",
             "text/html",
             "Hello world",
+            &[],
         );
         assert!(out.contains("topic=`lithium`"));
         assert!(out.contains("url=`https://example.test/p`"));
         assert!(out.contains("mime=`text/html`"));
         assert!(out.contains("body=`Hello world`"));
+        // Empty allowed_predicates renders the open-vocab hint inline,
+        // not a literal empty list. This keeps plans-without-relation-
+        // kinds at Session-77 open-vocab behaviour.
+        assert!(out.contains("no closed vocabulary"));
+    }
+
+    #[test]
+    fn build_extraction_prompt_inlines_closed_vocab_predicates() {
+        // Session 80 — when the caller hands a non-empty predicate
+        // list, the prompt body sees them comma-joined inline (same
+        // posture as event_types and metrics on the sibling extractors).
+        let template = "preds=`{{ALLOWED_PREDICATES}}`";
+        let out = build_extraction_prompt(
+            template,
+            "",
+            "",
+            "",
+            "",
+            &["supplies_to", "subsidiary_of"],
+        );
+        assert!(out.contains("preds=`supplies_to, subsidiary_of`"));
     }
 
     #[test]
@@ -1122,7 +1556,7 @@ mod tests {
             object: "company:tsla".into(),
             confidence: 0.85,
         };
-        let draft = validate_one(raw).expect("should validate");
+        let draft = validate_one(raw, &[]).expect("should validate");
         assert_eq!(draft.claimant.as_str(), "agency:reuters");
         assert!(matches!(draft.stance, Stance::Reported));
         assert_eq!(draft.kind, "supplies_to");
@@ -1140,7 +1574,7 @@ mod tests {
             object: "company:b".into(),
             confidence: 0.8,
         };
-        let result = validate_one(raw);
+        let result = validate_one(raw, &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown stance"));
     }
@@ -1155,7 +1589,61 @@ mod tests {
             object: "company:b".into(),
             confidence: 1.0,
         };
-        assert!(validate_one(raw).is_err());
+        assert!(validate_one(raw, &[]).is_err());
+    }
+
+    #[test]
+    fn validate_one_drops_out_of_vocab_predicate_when_gate_is_active() {
+        // Session 80 — closed-vocab predicate gate. A predicate not in
+        // the plan's declared relation_kinds drops with the same
+        // "dropping under closed-vocab discipline" phrasing the event
+        // and observation extractors emit.
+        let raw = RawExtractedAssertion {
+            claimant: "agency:reuters".into(),
+            stance: "asserted".into(),
+            subject: "company:a".into(),
+            predicate: "competes_with".into(),
+            object: "company:b".into(),
+            confidence: 0.9,
+        };
+        let result = validate_one(raw, &["supplies_to", "subsidiary_of"]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("not in plan's declared relation_kinds"),
+            "expected closed-vocab drop reason, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_one_admits_predicate_when_gate_is_active_and_matches() {
+        let raw = RawExtractedAssertion {
+            claimant: "agency:reuters".into(),
+            stance: "asserted".into(),
+            subject: "company:a".into(),
+            predicate: "subsidiary_of".into(),
+            object: "company:b".into(),
+            confidence: 0.9,
+        };
+        let draft = validate_one(raw, &["supplies_to", "subsidiary_of"])
+            .expect("predicate is in vocab");
+        assert_eq!(draft.kind, "subsidiary_of");
+    }
+
+    #[test]
+    fn validate_one_open_vocab_admits_arbitrary_predicate() {
+        // Empty allowed_predicates preserves Session 77 behaviour: any
+        // non-empty predicate string is accepted regardless of vocab.
+        let raw = RawExtractedAssertion {
+            claimant: "agency:reuters".into(),
+            stance: "asserted".into(),
+            subject: "company:a".into(),
+            predicate: "loosely_associated_with".into(),
+            object: "company:b".into(),
+            confidence: 0.5,
+        };
+        let draft = validate_one(raw, &[]).expect("open vocab admits anything non-empty");
+        assert_eq!(draft.kind, "loosely_associated_with");
     }
 
     #[test]
@@ -1169,7 +1657,7 @@ mod tests {
             object: "company:b".into(),
             confidence: 1.5,
         };
-        let draft = validate_one(raw).expect("should clamp not drop");
+        let draft = validate_one(raw, &[]).expect("should clamp not drop");
         assert!((draft.confidence.value() - 1.0_f32).abs() < 1e-6);
 
         let raw = RawExtractedAssertion {
@@ -1180,7 +1668,7 @@ mod tests {
             object: "company:b".into(),
             confidence: -0.5,
         };
-        let draft = validate_one(raw).expect("should clamp not drop");
+        let draft = validate_one(raw, &[]).expect("should clamp not drop");
         assert!((draft.confidence.value() - 0.0_f32).abs() < 1e-6);
     }
 
@@ -1217,7 +1705,7 @@ mod tests {
             output_tokens: None,
             cached_input_tokens: None,
         };
-        let drafts = parse_response(&resp).expect("parse should succeed");
+        let drafts = parse_response(&resp, &[]).expect("parse should succeed");
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].kind, "supplies_to");
     }
@@ -1233,7 +1721,7 @@ mod tests {
             output_tokens: None,
             cached_input_tokens: None,
         };
-        match parse_response(&resp) {
+        match parse_response(&resp, &[]) {
             Err(ExtractionError::NoStructuredOutput) => {}
             other => panic!("expected NoStructuredOutput, got: {other:?}"),
         }
@@ -1251,13 +1739,53 @@ mod tests {
             output_tokens: None,
             cached_input_tokens: None,
         };
-        let drafts = parse_response(&resp).expect("parse should succeed");
+        let drafts = parse_response(&resp, &[]).expect("parse should succeed");
         assert!(drafts.is_empty());
     }
 
     #[test]
-    fn extraction_schema_value_is_object_with_assertions_array() {
-        let schema = extraction_schema_value();
+    fn parse_response_drops_out_of_vocab_predicate_when_gate_is_active() {
+        // Session 80 — when allowed_predicates is non-empty, the
+        // validator drops items whose predicate is out-of-vocab.
+        // Two items emitted; only the one with `supplies_to` survives.
+        let body = serde_json::json!({
+            "assertions": [
+                {
+                    "claimant": "agency:reuters",
+                    "stance": "reported",
+                    "subject": "company:a",
+                    "predicate": "supplies_to",
+                    "object": "company:b",
+                    "confidence": 0.9
+                },
+                {
+                    "claimant": "agency:reuters",
+                    "stance": "reported",
+                    "subject": "company:c",
+                    "predicate": "competes_with",
+                    "object": "company:d",
+                    "confidence": 0.7
+                }
+            ]
+        });
+        let resp = CompletionResponse {
+            text: "".into(),
+            structured: Some(body),
+            provider: "test".into(),
+            model: "test".into(),
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+        };
+        let drafts = parse_response(&resp, &["supplies_to", "subsidiary_of"])
+            .expect("parse should succeed");
+        assert_eq!(drafts.len(), 1, "only supplies_to survives the gate");
+        assert_eq!(drafts[0].kind, "supplies_to");
+    }
+
+    #[test]
+    fn extraction_schema_value_open_vocab_is_object_with_assertions_array() {
+        let schema = extraction_schema_value(&[]);
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["assertions"]["type"], "array");
         // The closed-vocab stance enum is present so a strict
@@ -1265,6 +1793,30 @@ mod tests {
         // the validator still defends against lax providers.
         assert!(schema["properties"]["assertions"]["items"]["properties"]["stance"]["enum"]
             .is_array());
+        // Predicate stays open-vocab when allowed_predicates is empty.
+        let predicate_schema =
+            &schema["properties"]["assertions"]["items"]["properties"]["predicate"];
+        assert_eq!(predicate_schema["type"], "string");
+        assert!(predicate_schema.get("enum").is_none());
+    }
+
+    #[test]
+    fn extraction_schema_value_closed_vocab_bakes_predicate_enum() {
+        // Session 80 — when allowed_predicates is non-empty the schema
+        // bakes them onto `predicate` as a JSON-Schema enum. A
+        // schema-respecting provider rejects out-of-vocab predicates
+        // upstream; the validator re-checks as defence against lax
+        // providers.
+        let schema = extraction_schema_value(&["supplies_to", "subsidiary_of"]);
+        let predicate_schema =
+            &schema["properties"]["assertions"]["items"]["properties"]["predicate"];
+        assert_eq!(predicate_schema["type"], "string");
+        let enum_arr = predicate_schema["enum"]
+            .as_array()
+            .expect("predicate enum should be present under closed vocab");
+        assert_eq!(enum_arr.len(), 2);
+        assert_eq!(enum_arr[0], "supplies_to");
+        assert_eq!(enum_arr[1], "subsidiary_of");
     }
 
     #[test]
@@ -1877,5 +2429,212 @@ mod tests {
             ))
             .expect("should succeed without calling provider");
         assert!(drafts.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Per-Document EntityAttribute extraction tests (Session 80)
+    // -------------------------------------------------------------------
+
+    fn entity_attr_response(items: serde_json::Value) -> CompletionResponse {
+        CompletionResponse {
+            text: String::new(),
+            structured: Some(serde_json::json!({ "attributes": items })),
+            provider: "test".into(),
+            model: "test".into(),
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+        }
+    }
+
+    #[test]
+    fn entity_attribute_text_value_round_trips() {
+        use situation_room_core::schema::content::AttributeValue;
+        let resp = entity_attr_response(serde_json::json!([
+            {
+                "entity_id": "company:tsla",
+                "key": "legal_name",
+                "value_kind": "text",
+                "value_text": "Tesla, Inc.",
+                "confidence": 0.95
+            }
+        ]));
+        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].entity_id.as_str(), "company:tsla");
+        assert_eq!(drafts[0].key, "legal_name");
+        match &drafts[0].value {
+            AttributeValue::Text(s) => assert_eq!(s, "Tesla, Inc."),
+            other => panic!("expected Text, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entity_attribute_number_value_carries_unit() {
+        use situation_room_core::schema::content::AttributeValue;
+        let resp = entity_attr_response(serde_json::json!([
+            {
+                "entity_id": "company:tsla",
+                "key": "employee_count",
+                "value_kind": "number",
+                "value_number": 140_473.0,
+                "unit": "persons",
+                "confidence": 0.85
+            }
+        ]));
+        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        assert_eq!(drafts.len(), 1);
+        match &drafts[0].value {
+            AttributeValue::Number { value, unit } => {
+                assert!((value - 140_473.0).abs() < 1e-3);
+                assert_eq!(unit.as_ref().map(|u| u.as_str()), Some("persons"));
+            }
+            other => panic!("expected Number, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entity_attribute_number_value_lenient_unit() {
+        // Empty / whitespace unit drops to None rather than dropping
+        // the row. Same posture as the observation extractor's
+        // currency field.
+        use situation_room_core::schema::content::AttributeValue;
+        let resp = entity_attr_response(serde_json::json!([
+            {
+                "entity_id": "company:tsla",
+                "key": "revenue",
+                "value_kind": "number",
+                "value_number": 96_770_000_000.0,
+                "unit": "",
+                "confidence": 0.7
+            }
+        ]));
+        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        assert_eq!(drafts.len(), 1);
+        match &drafts[0].value {
+            AttributeValue::Number { unit, .. } => assert!(unit.is_none()),
+            other => panic!("expected Number, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entity_attribute_boolean_value_round_trips() {
+        use situation_room_core::schema::content::AttributeValue;
+        let resp = entity_attr_response(serde_json::json!([
+            {
+                "entity_id": "company:tsla",
+                "key": "is_publicly_traded",
+                "value_kind": "boolean",
+                "value_boolean": true,
+                "confidence": 1.0
+            }
+        ]));
+        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert!(matches!(&drafts[0].value, AttributeValue::Boolean(true)));
+    }
+
+    #[test]
+    fn entity_attribute_unknown_value_kind_drops_row() {
+        // Closed-vocab gate on value_kind: anything outside
+        // text/number/boolean drops with the unknown-kind reason.
+        let resp = entity_attr_response(serde_json::json!([
+            {
+                "entity_id": "company:tsla",
+                "key": "founded_year",
+                "value_kind": "year",
+                "value_number": 2003.0,
+                "confidence": 0.9
+            }
+        ]));
+        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        assert!(drafts.is_empty(), "unknown value_kind must drop");
+    }
+
+    #[test]
+    fn entity_attribute_missing_payload_field_drops_row() {
+        // value_kind=text but value_text is missing → drop.
+        let resp = entity_attr_response(serde_json::json!([
+            {
+                "entity_id": "company:tsla",
+                "key": "legal_name",
+                "value_kind": "text",
+                "confidence": 0.9
+            }
+        ]));
+        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        assert!(drafts.is_empty());
+    }
+
+    #[test]
+    fn entity_attribute_invalid_entity_id_drops_row() {
+        // `EntityId::new` rejects: empty, length > 128, or any
+        // whitespace/control char. Use a whitespace-containing id
+        // (the LLM emitting "Tesla Motors" instead of "company:tsla"
+        // is the realistic mistake) so the row drops. The constructor
+        // is intentionally permissive on prefix shape (see
+        // `entity_id_allows_real_world_messiness` in vocab tests) —
+        // the closed-vocab discipline lives at the classifier/prompt
+        // layer, not the type layer.
+        let resp = entity_attr_response(serde_json::json!([
+            {
+                "entity_id": "Tesla Motors",
+                "key": "legal_name",
+                "value_kind": "text",
+                "value_text": "Tesla, Inc.",
+                "confidence": 0.9
+            }
+        ]));
+        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        assert!(
+            drafts.is_empty(),
+            "entity_id with whitespace must fail EntityId::new and drop the row"
+        );
+    }
+
+    #[test]
+    fn entity_attribute_empty_key_drops_row() {
+        let resp = entity_attr_response(serde_json::json!([
+            {
+                "entity_id": "company:tsla",
+                "key": "  ",
+                "value_kind": "text",
+                "value_text": "Tesla, Inc.",
+                "confidence": 0.9
+            }
+        ]));
+        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        assert!(drafts.is_empty());
+    }
+
+    #[test]
+    fn entity_attribute_clamps_confidence_to_unit_range() {
+        let resp = entity_attr_response(serde_json::json!([
+            {
+                "entity_id": "company:tsla",
+                "key": "ticker",
+                "value_kind": "text",
+                "value_text": "TSLA",
+                "confidence": 1.5
+            }
+        ]));
+        let drafts = parse_entity_attributes_response(&resp).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert!((drafts[0].confidence.value() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn entity_attribute_schema_constrains_value_kind() {
+        let schema = entity_attribute_extraction_schema_value();
+        let kind_schema =
+            &schema["properties"]["attributes"]["items"]["properties"]["value_kind"];
+        assert_eq!(kind_schema["type"], "string");
+        let enum_arr = kind_schema["enum"]
+            .as_array()
+            .expect("value_kind enum should be present");
+        assert_eq!(enum_arr.len(), 3);
+        assert!(enum_arr.iter().any(|v| v == "text"));
+        assert!(enum_arr.iter().any(|v| v == "number"));
+        assert!(enum_arr.iter().any(|v| v == "boolean"));
     }
 }

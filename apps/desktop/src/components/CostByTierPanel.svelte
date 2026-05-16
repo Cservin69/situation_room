@@ -133,6 +133,33 @@
     // Closed-vocab; ts-rs renders the enum as lowercase literals.
     return t;
   }
+
+  /**
+   * Session 80 — render label for the row's `purpose`. `null` means
+   * "default shard" (classifier / recipe-author / propose-URL all
+   * share); a string carries the extraction shard the call routed to
+   * (`"extraction:document_assertions"` etc.). The label is rendered
+   * compactly so the (provider · tier · purpose) row stays on one
+   * line at the panel's standard width.
+   */
+  function purposeLabel(p: string | null): string {
+    if (p === null) return 'default';
+    // Strip the `extraction:` prefix for compactness when present —
+    // operator already sees the (provider, tier) tuple; the shard
+    // suffix is the distinguishing bit.
+    if (p.startsWith('extraction:')) return p.slice('extraction:'.length);
+    return p;
+  }
+
+  /**
+   * Composite row key — provider · tier · purpose. Stable across
+   * re-renders so `{#each}` doesn't churn the DOM when the snapshot
+   * adds a new bucket. Using `null` as a sentinel keeps the default
+   * shard distinct from any explicit string purpose.
+   */
+  function rowKey(e: LlmCostLedgerEntryDto): string {
+    return e.provider + ':' + e.tier + ':' + (e.purpose ?? '<default>');
+  }
 </script>
 
 <section class="cost-panel" aria-label="llm cost by tier">
@@ -158,12 +185,14 @@
     </p>
   {:else}
     <ul class="rows">
-      {#each entries as e (e.provider + ':' + e.tier)}
+      {#each entries as e (rowKey(e))}
         <li class="row">
           <span class="label">
             <span class="provider">{e.provider}</span>
             <span class="sep">·</span>
             <span class="tier">{tierLabel(e.tier)}</span>
+            <span class="sep">·</span>
+            <span class="purpose" title={e.purpose ?? 'default cache shard (classifier / recipe-author / propose-URL share)'}>{purposeLabel(e.purpose)}</span>
           </span>
           <span class="calls" title="completion calls this session">
             {formatCount(e.calls)} call{Number(e.calls) === 1 ? '' : 's'}
@@ -270,6 +299,19 @@
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: var(--fg-secondary);
+  }
+  /* Session 80 — purpose label. Reads as tertiary metadata next to
+     the (provider, tier) tuple; mono + lower-case to match the
+     cache-key wire forms (`document_assertions` etc.) without
+     fighting the uppercase tier label for visual weight. */
+  .purpose {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--fg-tertiary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 18ch;
   }
   .calls, .tokens {
     font-family: var(--font-mono);

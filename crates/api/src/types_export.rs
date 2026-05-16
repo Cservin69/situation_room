@@ -1562,6 +1562,14 @@ pub struct LlmCostLedgerEntryDto {
     /// (`"xai"`, `"anthropic"`, …).
     pub provider: String,
     pub tier: ModelTierDto,
+    /// Session 80 — call purpose, derived from
+    /// `CompletionRequest.prompt_cache_key`. `None` is the default
+    /// shard shared by classifier / recipe-author / propose-URL calls;
+    /// `Some(key)` carries the extraction-call cache shard the
+    /// extraction path set (`"extraction:document_assertions"` etc.).
+    /// The dashboard renders this alongside `(provider, tier)` so
+    /// extraction calls are a distinct row.
+    pub purpose: Option<String>,
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -1579,6 +1587,7 @@ impl LlmCostLedgerEntryDto {
         Self {
             provider: e.provider,
             tier: e.tier.into(),
+            purpose: e.purpose,
             calls: e.tally.calls,
             input_tokens: e.tally.input_tokens,
             output_tokens: e.tally.output_tokens,
@@ -2683,6 +2692,7 @@ mod tests {
         let typed = situation_room_llm::LedgerEntry {
             provider: "xai".into(),
             tier: situation_room_llm::ModelTier::Workhorse,
+            purpose: None,
             tally: situation_room_llm::Tally {
                 calls: 7,
                 input_tokens: 14_000,
@@ -2694,6 +2704,7 @@ mod tests {
         let dto = LlmCostLedgerEntryDto::from_typed(typed);
         assert_eq!(dto.provider, "xai");
         assert_eq!(dto.tier, ModelTierDto::Workhorse);
+        assert!(dto.purpose.is_none());
         assert_eq!(dto.calls, 7);
         assert_eq!(dto.input_tokens, 14_000);
         assert_eq!(dto.output_tokens, 2_100);
@@ -2709,6 +2720,7 @@ mod tests {
         let typed = situation_room_llm::LedgerEntry {
             provider: "anthropic".into(),
             tier: situation_room_llm::ModelTier::Frontier,
+            purpose: None,
             tally: situation_room_llm::Tally {
                 calls: 3,
                 input_tokens: 4_000,
@@ -2720,5 +2732,28 @@ mod tests {
         let dto = LlmCostLedgerEntryDto::from_typed(typed);
         assert_eq!(dto.calls_with_cache_data, 0);
         assert_eq!(dto.cached_input_tokens, 0);
+    }
+
+    #[test]
+    fn llm_cost_ledger_entry_dto_carries_purpose_to_wire() {
+        // Session 80 — purpose threads through verbatim. The dashboard
+        // uses this to break out extraction calls in their own row.
+        let typed = situation_room_llm::LedgerEntry {
+            provider: "xai".into(),
+            tier: situation_room_llm::ModelTier::Workhorse,
+            purpose: Some("extraction:document_assertions".into()),
+            tally: situation_room_llm::Tally {
+                calls: 5,
+                input_tokens: 6_000,
+                output_tokens: 800,
+                cached_input_tokens: 4_000,
+                calls_with_cache_data: 5,
+            },
+        };
+        let dto = LlmCostLedgerEntryDto::from_typed(typed);
+        assert_eq!(
+            dto.purpose.as_deref(),
+            Some("extraction:document_assertions")
+        );
     }
 }

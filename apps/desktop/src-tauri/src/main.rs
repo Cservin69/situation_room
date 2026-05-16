@@ -83,6 +83,17 @@ const DOCUMENT_EVENTS_PROMPT: &str =
 const DOCUMENT_OBSERVATIONS_PROMPT: &str =
     include_str!("../../../../config/prompts/document_observations.md");
 
+/// Session 80 — per-Document EntityAttribute extractor prompt. Fourth
+/// sibling of the three earlier extractor prompts; same loading
+/// pattern. Consumed by
+/// `pipeline::extract::extract_and_persist_entity_attributes` once per
+/// fetched article-kind Document. v1 is open-vocab on `key` so plans
+/// without a declared attribute list still produce extracted
+/// attributes (the dashboard surfaces them as Assertion rows with
+/// `AssertedContent::EntityAttribute`).
+const DOCUMENT_ENTITY_ATTRIBUTES_PROMPT: &str =
+    include_str!("../../../../config/prompts/document_entity_attributes.md");
+
 fn main() -> Result<()> {
     // .env is a dev convenience; the real environment always wins.
     // Walks up from CWD to find .env at the workspace root and
@@ -234,6 +245,7 @@ fn main() -> Result<()> {
         DOCUMENT_ASSERTIONS_PROMPT,
         DOCUMENT_EVENTS_PROMPT,
         DOCUMENT_OBSERVATIONS_PROMPT,
+        DOCUMENT_ENTITY_ATTRIBUTES_PROMPT,
         sources,
     );
 

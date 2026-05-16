@@ -92,6 +92,23 @@ pub struct CompletionRequest {
     /// See [`ReasoningEffort`] for the principle on why per-source
     /// rules belong nowhere.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Session 80 — optional per-call hint for the provider's prompt
+    /// cache. `Some(key)` routes the request to a cache shard distinct
+    /// from the provider's default routing; `None` keeps the default.
+    ///
+    /// Use case: per-Document extraction calls (assertion / event /
+    /// observation) carry different prompt templates from the
+    /// classifier / recipe-author calls, so routing them to a separate
+    /// cache shard improves hit rate on the extraction-only prefix
+    /// without polluting the authoring shard. The extraction module
+    /// sets this to its prompt id (e.g. `"document_assertions"`).
+    ///
+    /// xAI maps this to the `x-grok-conv-id` header, overriding the
+    /// per-process conv-id from `XAI_CONV_ID`. Anthropic and the stub
+    /// providers currently ignore the hint — they're free to map it
+    /// onto provider-native cache controls in future sessions.
+    #[doc(alias = "x-grok-conv-id")]
+    pub prompt_cache_key: Option<String>,
 }
 
 /// One completion response.

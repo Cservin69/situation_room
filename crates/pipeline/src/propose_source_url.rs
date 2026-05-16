@@ -192,6 +192,10 @@ pub async fn propose_source_url(
         // forbids those, and ReasoningEffort's doc-comment names
         // the failure mode.
         reasoning_effort: effort_override,
+        // Propose-URL shares the provider's default cache shard
+        // (per-process `XAI_CONV_ID`). Session 80 reserves per-call
+        // cache keys for the extraction path.
+        prompt_cache_key: None,
     };
 
     let resp = provider.complete(tier, req).await?;

@@ -28,7 +28,17 @@ export type LlmCostLedgerEntryDto = {
  * Provider id — the same string `LlmProvider::id()` returns
  * (`"xai"`, `"anthropic"`, …).
  */
-provider: string, tier: ModelTierDto, calls: bigint, input_tokens: bigint, output_tokens: bigint, cached_input_tokens: bigint, 
+provider: string, tier: ModelTierDto, 
+/**
+ * Session 80 — call purpose, derived from
+ * `CompletionRequest.prompt_cache_key`. `None` is the default
+ * shard shared by classifier / recipe-author / propose-URL calls;
+ * `Some(key)` carries the extraction-call cache shard the
+ * extraction path set (`"extraction:document_assertions"` etc.).
+ * The dashboard renders this alongside `(provider, tier)` so
+ * extraction calls are a distinct row.
+ */
+purpose: string | null, calls: bigint, input_tokens: bigint, output_tokens: bigint, cached_input_tokens: bigint, 
 /**
  * How many of `calls` reported a `Some(_)` for cached tokens;
  * denominator for the cache-hit ratio. A value of 0 means the

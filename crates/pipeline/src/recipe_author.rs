@@ -442,6 +442,10 @@ pub async fn author_recipe(
         // tier call where the deep think is worth it). Per-call/per-
         // source overrides are forbidden by ReasoningEffort's contract.
         reasoning_effort: None,
+        // Recipe-author calls share the provider's default cache shard
+        // (per-process `XAI_CONV_ID`). Session 80 reserves per-call
+        // cache keys for the extraction path.
+        prompt_cache_key: None,
     };
 
     let fingerprint = provider.id().to_string(); // stable provider id; key fingerprint

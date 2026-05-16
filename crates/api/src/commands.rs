@@ -189,6 +189,14 @@ pub struct AppState {
     /// declared `observation_metrics` short-circuit before the
     /// workhorse-tier call.
     pub document_observations_prompt: &'static str,
+    /// Session 80 — per-Document EntityAttribute extraction prompt.
+    /// Fourth sibling of the three earlier extractor prompts. Consumed
+    /// by `pipeline::extract::extract_and_persist_entity_attributes`,
+    /// called by each run_X_recipe runner immediately after the
+    /// observation extraction call. Same loading pattern (compile-time
+    /// `include_str!`). v1 has no closed-vocab gate on attribute names
+    /// — open-vocab matches the `EntityAttributeContent.key` schema.
+    pub document_entity_attributes_prompt: &'static str,
     /// Doc-narrowed under ADR 0015 (Session 37). The classifier no
     /// longer consults this list; only the executor's `#[ignore]`
     /// live tests do (against `csv_demo` / `json_demo`). Production
@@ -234,6 +242,7 @@ impl AppState {
         document_assertions_prompt: &'static str,
         document_events_prompt: &'static str,
         document_observations_prompt: &'static str,
+        document_entity_attributes_prompt: &'static str,
         sources: Vec<PipelineSourceDescriptor>,
     ) -> Self {
         Self {
@@ -256,6 +265,7 @@ impl AppState {
             document_assertions_prompt,
             document_events_prompt,
             document_observations_prompt,
+            document_entity_attributes_prompt,
             sources,
         }
     }
@@ -1097,6 +1107,9 @@ pub async fn run_fetch_for_plan(
         // production passes `Some(_)`; the eval harness composition
         // root passes `None` to keep cost bounded for repeat trials.
         document_observations_prompt: Some(state.document_observations_prompt),
+        // Session 80 — per-Document EntityAttribute extraction prompt.
+        // Same posture as the three earlier extractor prompts.
+        document_entity_attributes_prompt: Some(state.document_entity_attributes_prompt),
         // The same slice the classifier sees, threaded through to
         // the executor. Doc-narrowed under ADR 0015 (Session 37) and
         // further under Session 39: production authoring no longer

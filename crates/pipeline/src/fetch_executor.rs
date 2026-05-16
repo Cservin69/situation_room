@@ -122,7 +122,8 @@ use crate::propose_source_url::{
 };
 use crate::document_synth::insert_fetch_document;
 use crate::extract::{
-    extract_and_persist_assertions, extract_and_persist_events, extract_and_persist_observations,
+    extract_and_persist_assertions, extract_and_persist_entity_attributes,
+    extract_and_persist_events, extract_and_persist_observations,
 };
 use crate::recipe_apply::{apply, ApplyContext, ApplyError, MAX_RECORDS_PER_RECIPE};
 use crate::recipe_author::{author_recipe, AuthoringContext, AuthoringError};
@@ -387,6 +388,18 @@ pub struct ExecutorContext<'a> {
     /// `observation_metrics` short-circuit before the workhorse-tier
     /// call.
     pub document_observations_prompt: Option<&'a str>,
+    /// Session 80 — per-Document EntityAttribute extraction prompt.
+    /// Fourth sibling of the three earlier extractor prompts. Consumed
+    /// by `crate::extract::extract_and_persist_entity_attributes`,
+    /// called by each runner immediately after the observation
+    /// extraction call. Same gating posture as the other three:
+    /// production passes `Some(prompt)` so the dashboard's Assertions
+    /// panel (under stance `asserted`) populates with EntityAttribute-
+    /// shaped content alongside the existing Relation-shaped content;
+    /// eval harness and test contexts pass `None`. v1 has no
+    /// closed-vocab gate on attribute names — open-vocab matches the
+    /// `EntityAttributeContent.key` schema.
+    pub document_entity_attributes_prompt: Option<&'a str>,
     /// Source descriptors for the executor.
     ///
     /// **Doc-narrowed under ADR 0015 (Session 37) and further under
@@ -4105,6 +4118,26 @@ async fn run_csv_recipe(
         .await;
     }
 
+    // Session 80 — per-Document EntityAttribute extraction. Fourth
+    // sibling. Skipped when `document_entity_attributes_prompt` is
+    // None (eval harness, test contexts). Same gating posture: MIME +
+    // body checks happen inside `extract_and_persist_entity_attributes`;
+    // open-vocab on `key` in v1 so plans without a declared attribute
+    // list still produce extracted attributes.
+    if let Some(prompt) = ctx.document_entity_attributes_prompt {
+        let _ = extract_and_persist_entity_attributes(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
     // Apply.
     let apply_ctx = ApplyContext {
         recipe,
@@ -4285,6 +4318,26 @@ async fn run_json_recipe(
         .await;
     }
 
+    // Session 80 — per-Document EntityAttribute extraction. Fourth
+    // sibling. Skipped when `document_entity_attributes_prompt` is
+    // None (eval harness, test contexts). Same gating posture: MIME +
+    // body checks happen inside `extract_and_persist_entity_attributes`;
+    // open-vocab on `key` in v1 so plans without a declared attribute
+    // list still produce extracted attributes.
+    if let Some(prompt) = ctx.document_entity_attributes_prompt {
+        let _ = extract_and_persist_entity_attributes(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
     // Apply.
     let apply_ctx = ApplyContext {
         recipe,
@@ -4447,6 +4500,26 @@ async fn run_css_recipe(
     // per-metric Observations panel ticking up on the dashboard).
     if let Some(prompt) = ctx.document_observations_prompt {
         let _ = extract_and_persist_observations(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
+    // Session 80 — per-Document EntityAttribute extraction. Fourth
+    // sibling. Skipped when `document_entity_attributes_prompt` is
+    // None (eval harness, test contexts). Same gating posture: MIME +
+    // body checks happen inside `extract_and_persist_entity_attributes`;
+    // open-vocab on `key` in v1 so plans without a declared attribute
+    // list still produce extracted attributes.
+    if let Some(prompt) = ctx.document_entity_attributes_prompt {
+        let _ = extract_and_persist_entity_attributes(
             ctx.store,
             ctx.provider,
             prompt,
@@ -4639,6 +4712,26 @@ async fn run_regex_recipe(
         .await;
     }
 
+    // Session 80 — per-Document EntityAttribute extraction. Fourth
+    // sibling. Skipped when `document_entity_attributes_prompt` is
+    // None (eval harness, test contexts). Same gating posture: MIME +
+    // body checks happen inside `extract_and_persist_entity_attributes`;
+    // open-vocab on `key` in v1 so plans without a declared attribute
+    // list still produce extracted attributes.
+    if let Some(prompt) = ctx.document_entity_attributes_prompt {
+        let _ = extract_and_persist_entity_attributes(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
     // Apply.
     let apply_ctx = ApplyContext {
         recipe,
@@ -4798,6 +4891,26 @@ async fn run_pdf_recipe(
     // per-metric Observations panel ticking up on the dashboard).
     if let Some(prompt) = ctx.document_observations_prompt {
         let _ = extract_and_persist_observations(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
+    // Session 80 — per-Document EntityAttribute extraction. Fourth
+    // sibling. Skipped when `document_entity_attributes_prompt` is
+    // None (eval harness, test contexts). Same gating posture: MIME +
+    // body checks happen inside `extract_and_persist_entity_attributes`;
+    // open-vocab on `key` in v1 so plans without a declared attribute
+    // list still produce extracted attributes.
+    if let Some(prompt) = ctx.document_entity_attributes_prompt {
+        let _ = extract_and_persist_entity_attributes(
             ctx.store,
             ctx.provider,
             prompt,
@@ -5285,6 +5398,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -5368,6 +5482,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -5444,6 +5559,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -5519,6 +5635,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -5586,6 +5703,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -5649,6 +5767,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -5702,6 +5821,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -5736,6 +5856,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -5775,6 +5896,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -5852,6 +5974,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -5907,6 +6030,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -5951,6 +6075,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -6010,6 +6135,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -6052,6 +6178,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -6119,6 +6246,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -6168,6 +6296,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -6255,6 +6384,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -6335,6 +6465,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -6397,6 +6528,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -6441,6 +6573,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -6640,6 +6773,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -6766,6 +6900,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -6929,6 +7064,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &sources,
         };
 
@@ -6999,6 +7135,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &sources,
         };
 
@@ -7069,6 +7206,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &sources,
         };
 
@@ -7137,6 +7275,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &sources,
         };
 
@@ -7314,6 +7453,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -7459,6 +7599,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -8044,6 +8185,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -8089,6 +8231,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &[],
         };
 
@@ -8618,6 +8761,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &sources,
         };
 
@@ -8749,6 +8893,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &sources,
         };
 
@@ -8893,6 +9038,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &sources,
         };
 
@@ -9479,6 +9625,7 @@ mod tests {
             document_assertions_prompt: None,
             document_events_prompt: None,
             document_observations_prompt: None,
+            document_entity_attributes_prompt: None,
             sources: &sources,
         };
 
