@@ -30,6 +30,7 @@ import type { SourcesMemoryEntryDto } from './types/SourcesMemoryEntryDto';
 import type { LlmCostLedgerEntryDto } from './types/LlmCostLedgerEntryDto';
 import type { LlmCostTimelineEntryDto } from './types/LlmCostTimelineEntryDto';
 import type { ClassifierPromptVersionDto } from './types/ClassifierPromptVersionDto';
+import type { PromoteReportDto } from './types/PromoteReportDto';
 
 /**
  * Run Level-1 classification on a topic. Persists the resulting plan
@@ -500,6 +501,38 @@ export async function llmCostLedger(): Promise<LlmCostLedgerEntryDto[]> {
  */
 export async function llmCostTimeline(): Promise<LlmCostTimelineEntryDto[]> {
   return invoke<LlmCostTimelineEntryDto[]>('llm_cost_timeline');
+}
+
+/**
+ * Session 81 (Tauri command surface) + Session 82 (operator-facing
+ * surface). Run the consensus-promotion pass for one plan and return
+ * the summary report.
+ *
+ * Session 82 update: the same command now also runs the
+ * authoritative-source fast-track pass (ADR 0004 pathway 1) when the
+ * registry at `config/vocab/authoritative_sources.toml` is populated.
+ * The function name and IPC contract stay stable; the
+ * `authoritative_promoted` field on the returned report distinguishes
+ * the two pathways.
+ *
+ * `minIndependentClaimants` overrides the default quorum (3) for this
+ * call only. Useful for "preview consensus" sweeps on a fresh plan.
+ *
+ * Idempotent on re-run via content-derived dedup_keys; calling twice
+ * surfaces `skipped_already_promoted > 0` on the second invocation
+ * with zero new emits.
+ *
+ * Throws `{ kind: 'invalid_input' }` if the plan is `pending`. Throws
+ * `{ kind: 'not_found' }` if the id has been removed.
+ */
+export async function promoteConsensusForPlan(
+  id: string,
+  minIndependentClaimants: number | null = null,
+): Promise<PromoteReportDto> {
+  return invoke<PromoteReportDto>('promote_consensus_for_plan', {
+    id,
+    minIndependentClaimants,
+  });
 }
 
 /**

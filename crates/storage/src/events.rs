@@ -48,6 +48,25 @@ impl Store {
         Ok(())
     }
 
+    /// Session 82 (ADR 0021 idempotency surface). Sibling of
+    /// `observation_exists_by_dedup_key` / `relation_exists_by_dedup_key`.
+    /// The promote stage queries this before issuing an insert so a
+    /// re-run lands as `skipped_already_promoted`.
+    pub fn event_exists_by_dedup_key(&self, dedup_key: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Other(format!("connection poisoned: {e}")))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE dedup_key = ?",
+                params![dedup_key],
+                |r| r.get(0),
+            )
+            .map_err(StorageError::DuckDb)?;
+        Ok(count > 0)
+    }
+
     pub fn get_event(&self, id: Uuid) -> Result<Event> {
         let conn = self
             .conn

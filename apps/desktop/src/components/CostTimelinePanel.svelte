@@ -39,10 +39,66 @@
   import { onMount, onDestroy } from 'svelte';
   import { llmCostTimeline } from '$lib/api/client';
   import type { LlmCostTimelineEntryDto } from '$lib/api/types/LlmCostTimelineEntryDto';
+  import MiniSparkline from '$components/charts/MiniSparkline.svelte';
 
   let entries = $state<LlmCostTimelineEntryDto[]>([]);
   let lastUpdated = $state<Date | null>(null);
   let error = $state<string | null>(null);
+
+  /**
+   * Session 82 — trailing-window sparkline.
+   *
+   * The row stack tells the operator *what* the last 50 calls were
+   * (one row each). The sparkline tells them *when* tokens spiked.
+   * A 60s window matches the 10s poll cadence: ~6 polls of history
+   * is enough to see a burst forming without burying it in
+   * background noise.
+   *
+   * Closed-vocabulary on the y-axis: we plot total tokens per call
+   * (input + output + cached). Plotting just `input` or just
+   * `output` would hide the symmetric cost shape — extraction calls
+   * push output tokens, classifier calls push input tokens, both
+   * matter equally for cost.
+   */
+  const SPARKLINE_WINDOW_MS = 60_000;
+
+  /**
+   * Map each timeline entry to a (x: timestamp ms, y: total tokens)
+   * point. Entries with no token data render as y=0 — they're still
+   * data points (the call happened) and dropping them would hide
+   * "wait, the model returned zero tokens?" anomalies.
+   */
+  function sparklinePoints(es: LlmCostTimelineEntryDto[]): { x: number; y: number }[] {
+    const now = Date.now();
+    const out: { x: number; y: number }[] = [];
+    for (const e of es) {
+      const t = Date.parse(e.timestamp);
+      if (Number.isNaN(t)) continue;
+      if (now - t > SPARKLINE_WINDOW_MS) continue;
+      const tot =
+        (e.input_tokens ?? 0) +
+        (e.output_tokens ?? 0) +
+        (e.cached_input_tokens ?? 0);
+      out.push({ x: t, y: tot });
+    }
+    // The Rust ring buffer returns oldest-first; preserve that order
+    // for the polyline so left-to-right is chronological.
+    return out;
+  }
+
+  let sparkPoints = $derived(sparklinePoints(entries));
+
+  /**
+   * Sum of tokens within the sparkline window. Surfaces alongside
+   * the chart so the operator can read a single number even when
+   * the sparkline shape is degenerate (one data point, all-zero).
+   */
+  function windowSum(points: { x: number; y: number }[]): number {
+    let s = 0;
+    for (const p of points) s += p.y;
+    return s;
+  }
+  let sparkTotal = $derived(windowSum(sparkPoints));
 
   /**
    * 10s. Slightly tighter than CostByTierPanel's 15s because the
@@ -124,6 +180,22 @@
   {#if entries.length === 0}
     <p class="empty">no LLM calls yet this session.</p>
   {:else}
+    <!-- Session 82 — trailing-60s sparkline of total tokens per
+         call. Renders only when there's at least one in-window
+         data point; the per-call rows below stay the primary
+         surface. -->
+    {#if sparkPoints.length > 0}
+      <div class="spark-strip" aria-label="trailing 60s token throughput">
+        <span class="spark-label">last 60s</span>
+        <span class="spark-chart">
+          <MiniSparkline points={sparkPoints} width={120} height={20} />
+        </span>
+        <span class="spark-total">
+          Σ {sparkTotal.toLocaleString()} tok · {sparkPoints.length} call{sparkPoints.length === 1 ? '' : 's'}
+        </span>
+      </div>
+    {/if}
+
     <ul class="rows">
       {#each displayEntries as e (e.timestamp + e.provider)}
         <li class="row">
@@ -251,5 +323,32 @@
   }
   .tokens .cached {
     color: var(--fg-tertiary);
+  }
+  /* Session 82 — trailing-60s sparkline strip. Sits between the
+     header and the rows-list, visually grouped with the header by
+     the same top-of-panel area (no border, modest gap). */
+  .spark-strip {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 6px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--fg-tertiary);
+  }
+  .spark-label {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-quaternary);
+  }
+  .spark-chart {
+    display: block;
+    width: 120px;
+    height: 20px;
+  }
+  .spark-total {
+    color: var(--fg-secondary);
+    white-space: nowrap;
   }
 </style>

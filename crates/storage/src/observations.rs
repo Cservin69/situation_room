@@ -58,6 +58,29 @@ impl Store {
         Ok(())
     }
 
+    /// Session 82 (ADR 0021 idempotency surface). Returns `true` if an
+    /// Observation row with the given `dedup_key` already exists.
+    /// Sibling of [`Store::relation_exists_by_dedup_key`] — the
+    /// promote stage queries this before issuing an insert so a
+    /// re-run lands as `skipped_already_promoted` rather than
+    /// double-inserting (the table's `idx_observations_dedup_key`
+    /// index is non-unique by design, so the DB doesn't reject the
+    /// second insert on its own).
+    pub fn observation_exists_by_dedup_key(&self, dedup_key: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Other(format!("connection poisoned: {e}")))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE dedup_key = ?",
+                params![dedup_key],
+                |r| r.get(0),
+            )
+            .map_err(StorageError::DuckDb)?;
+        Ok(count > 0)
+    }
+
     /// Fetch an Observation by id.
     pub fn get_observation(&self, id: Uuid) -> Result<Observation> {
         let conn = self

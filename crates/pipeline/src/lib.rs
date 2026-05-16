@@ -100,3 +100,11 @@ pub mod relation_synth;
 pub mod ua_policies;
 pub mod research_classifier;
 pub mod research_plans_store;
+// Session 82 — ADR 0004 pathway 1. The authoritative-source registry
+// is the configuration-driven half of the assertion-promotion model
+// (the consensus half lives in `promote.rs` since Session 81). When
+// an Assertion's claimant matches an entry in
+// `config/vocab/authoritative_sources.toml` for the right metric +
+// topic, `promote.rs` fast-tracks it at N=1 instead of waiting for
+// quorum.
+pub mod authoritative;

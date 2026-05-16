@@ -263,6 +263,13 @@ pub async fn promote_consensus_for_plan(
         min_independent_claimants: min_independent_claimants.unwrap_or_else(|| {
             situation_room_pipeline::promote::PromoteConfig::default().min_independent_claimants
         }),
+        // Session 82 — ADR 0004 pathway 1. Clone the in-AppState
+        // `AuthorityRegistry` (cheap — Vec<AuthorityEntry> with small N)
+        // into the per-call PromoteConfig. The registry is loaded once
+        // at boot from `config/vocab/authoritative_sources.toml`; an
+        // empty registry preserves Session 81's consensus-only
+        // behaviour.
+        authoritative: (*state.authoritative).clone(),
     };
 
     let report = situation_room_pipeline::promote::promote_consensus_for_plan(

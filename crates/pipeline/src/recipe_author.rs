@@ -1986,12 +1986,23 @@ fn sanitize_for_fence_named(s: &str, fence_id: &str, tag: &str) -> String {
 /// honest and trivially cheap; no caching ceremony.
 pub fn target_record_schemas() -> Result<String, serde_json::Error> {
     use schemars::schema_for;
-    use situation_room_core::{EventContent, ObservationContent, RelationContent};
+    use situation_room_core::{
+        EntityAttributeContent, EventContent, ObservationContent, RelationContent,
+    };
 
     let map = serde_json::json!({
         "observation": schema_for!(ObservationContent),
         "event": schema_for!(EventContent),
         "relation": schema_for!(RelationContent),
+        // Session 82 — ADR 0007 amendment 5. EntityAttributeContent
+        // schema joins the three earlier authorable content types so
+        // the L2 recipe author can produce EntityAttribute-shaped
+        // bindings directly. Pre-Session-82 EntityAttributes were
+        // only available via the per-Document extraction path
+        // (Session 80); now an EDGAR-XBRL or SEC-filings recipe can
+        // emit `legal_name` / `headquarters_country` rows without
+        // routing through the LLM extraction layer.
+        "entity_attribute": schema_for!(EntityAttributeContent),
     });
     serde_json::to_string_pretty(&map)
 }
@@ -2658,26 +2669,30 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Track B: schema-aware authoring helper.
+    // Track B + Session 82: schema-aware authoring helper.
     //
     // `target_record_schemas()` returns the schemars-derived JSON
-    // Schemas for the three authorable record-content types, wrapped
+    // Schemas for the four authorable record-content types, wrapped
     // as a single object the prompt's `{{TARGET_RECORD_SCHEMA}}`
-    // placeholder substitutes. The tests assert the structural shape
-    // (three keys, each is valid JSON, each names recognisable
-    // fields) without pinning schemars' exact output — schemars
-    // versions can change minor structural details and we don't want
-    // a minor bump to break our test suite.
+    // placeholder substitutes. Session 82 (ADR 0007 amendment 5)
+    // added `entity_attribute` to the set so the L2 recipe author
+    // can emit EntityAttribute-shaped bindings directly. The tests
+    // assert the structural shape (four keys, each is valid JSON,
+    // each names recognisable fields) without pinning schemars' exact
+    // output — schemars versions can change minor structural details
+    // and we don't want a minor bump to break our test suite.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn target_record_schemas_emits_all_three_record_types() {
+    fn target_record_schemas_emits_all_four_record_types() {
         let s = target_record_schemas().expect("schemas serialize");
         let v: serde_json::Value = serde_json::from_str(&s).expect("valid json");
         let obj = v.as_object().expect("object");
         assert!(obj.contains_key("observation"));
         assert!(obj.contains_key("event"));
         assert!(obj.contains_key("relation"));
+        // Session 82 — ADR 0007 amendment 5.
+        assert!(obj.contains_key("entity_attribute"));
     }
 
     #[test]
@@ -2705,6 +2720,14 @@ mod tests {
         assert!(s.contains("\"kind\""));
         assert!(s.contains("\"from\""));
         assert!(s.contains("\"to\""));
+    }
+
+    /// Session 82 — ADR 0007 amendment 5.
+    #[test]
+    fn target_record_schemas_entity_attribute_includes_entity_id_and_key() {
+        let s = target_record_schemas().unwrap();
+        assert!(s.contains("\"entity_id\""));
+        assert!(s.contains("\"key\""));
     }
 
     // -----------------------------------------------------------------------

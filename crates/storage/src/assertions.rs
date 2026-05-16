@@ -78,6 +78,26 @@ impl Store {
         Ok(())
     }
 
+    /// Session 82 (ADR 0021 idempotency surface). Sibling of
+    /// `observation_exists_by_dedup_key` etc. The promote stage's
+    /// EntityAttribute pathway emits a consensus-/authoritative-
+    /// stamped `Assertion` (rather than a fresh observation/event/
+    /// relation); this is the equivalent existence check.
+    pub fn assertion_exists_by_dedup_key(&self, dedup_key: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Other(format!("connection poisoned: {e}")))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM assertions WHERE dedup_key = ?",
+                params![dedup_key],
+                |r| r.get(0),
+            )
+            .map_err(StorageError::DuckDb)?;
+        Ok(count > 0)
+    }
+
     pub fn get_assertion(&self, id: Uuid) -> Result<Assertion> {
         let conn = self
             .conn

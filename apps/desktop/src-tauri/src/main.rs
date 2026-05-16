@@ -21,6 +21,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use situation_room_api::commands::AppState;
 use situation_room_apps_common::sources::load_source_descriptors;
+use situation_room_pipeline::authoritative::AuthorityRegistry;
 use situation_room_llm::{
     AnthropicProvider, CostLedger, LlmProvider, MeteredProvider, XaiProvider,
 };
@@ -232,6 +233,40 @@ fn main() -> Result<()> {
         "source descriptors loaded (post-ADR-0015 demo fixtures only)"
     );
 
+    // --- Authoritative-source registry (Session 82) ----------------
+    //
+    // ADR 0004 pathway 1. Reads `config/vocab/authoritative_sources.toml`
+    // — already in-tree since the commodity-vocab work. Missing-file or
+    // parse-error is non-fatal: an empty registry preserves Session 81
+    // consensus-only behaviour. The TOML schema is documented in
+    // `crates/pipeline/src/authoritative.rs`.
+    let authoritative_path = workspace_root
+        .join("config")
+        .join("vocab")
+        .join("authoritative_sources.toml");
+    let authoritative = match AuthorityRegistry::load_from_path(&authoritative_path) {
+        Ok(r) => {
+            info!(
+                count = r.entries().len(),
+                path = %authoritative_path.display(),
+                "authoritative-source registry loaded"
+            );
+            r
+        }
+        Err(e) => {
+            // Non-fatal: log and run with an empty registry. The
+            // promote stage skips its authoritative pre-pass on
+            // empty; consensus still runs.
+            tracing::warn!(
+                path = %authoritative_path.display(),
+                error = %e,
+                "authoritative-source registry load failed — promote runs consensus-only"
+            );
+            AuthorityRegistry::empty()
+        }
+    };
+    let authoritative = Arc::new(authoritative);
+
     // --- AppState ----------------------------------------------------
     let state = AppState::new(
         store,
@@ -247,6 +282,7 @@ fn main() -> Result<()> {
         DOCUMENT_OBSERVATIONS_PROMPT,
         DOCUMENT_ENTITY_ATTRIBUTES_PROMPT,
         sources,
+        authoritative,
     );
 
     // --- Tauri -------------------------------------------------------

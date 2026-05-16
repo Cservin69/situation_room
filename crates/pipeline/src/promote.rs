@@ -43,15 +43,23 @@
 //! sorted topic strings on the Assertion's envelope — sorted because
 //! `Subjects::topics` order is incidental.
 //!
-//! # Authoritative pathway — deferred
+//! # Authoritative pathway — Session 82
 //!
-//! ADR 0004 describes two pathways: consensus (this module) and
-//! authoritative (config-driven fast-track). Authoritative promotion
-//! depends on `config/authoritative.toml` (Phase 3 work) and is not
-//! shipped in Session 81. Consensus is enough to demonstrate the
-//! cross-source-dedup property today; the authoritative branch lands
-//! when the operator decides which sources are dispositive for which
-//! content kinds.
+//! ADR 0004 describes two pathways: consensus (this module's original
+//! surface) and authoritative (config-driven fast-track). Session 82
+//! lands the authoritative half via
+//! [`crate::authoritative::AuthorityRegistry`] +
+//! `promote_authoritative_pass`. When `PromoteConfig::authoritative`
+//! is non-empty `promote_from_assertions` runs an authoritative
+//! pre-pass first: every Assertion whose claimant matches an entry
+//! promotes at N=1 (single-source fast track) with `source_id =
+//! "derived#authoritative"` + `tags = ["authoritative_promotion"]` +
+//! `DerivationRole::Promotion`. Surviving Assertions then go through
+//! the original consensus pass at N≥3.
+//!
+//! When the registry is empty (default), Session 81 behaviour is
+//! preserved exactly — the authoritative pre-pass is a no-op and
+//! consensus runs over every Assertion.
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -69,35 +77,50 @@ use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::authoritative::AuthorityRegistry;
 use crate::research::ResearchPlan;
 
 // ---------------------------------------------------------------------------
 // Public surface
 // ---------------------------------------------------------------------------
 
-/// Configuration for one consensus-promotion run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Configuration for one promotion run.
+///
+/// Carries the consensus quorum (ADR 0004 default 3) and the
+/// authoritative-source registry (Session 82). An empty registry
+/// (default) reproduces Session 81's consensus-only behaviour; a
+/// populated registry adds an authoritative pre-pass that fast-tracks
+/// matching Assertions at N=1.
+#[derive(Debug, Clone)]
 pub struct PromoteConfig {
     /// Minimum number of *distinct* claimants that must agree on a
     /// compatible claim before it promotes. ADR 0004 default is 3.
     pub min_independent_claimants: u32,
+    /// ADR 0004 pathway 1 — Session 82. When non-empty, Assertions
+    /// whose claimant matches an entry are fast-tracked at N=1; the
+    /// remaining Assertions then go through the consensus quorum.
+    /// Empty registry = Session 81 behaviour (consensus only).
+    pub authoritative: AuthorityRegistry,
 }
 
 impl Default for PromoteConfig {
     fn default() -> Self {
         Self {
             min_independent_claimants: 3,
+            authoritative: AuthorityRegistry::empty(),
         }
     }
 }
 
-/// Summary of one consensus-promotion pass.
+/// Summary of one promotion pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromoteReport {
     /// How many Assertion rows the pass considered.
     pub assertions_considered: u32,
     /// How many distinct `(content_hash, subject_hash)` groups met
-    /// quorum and produced a promoted record this run.
+    /// quorum (consensus) AND were not pre-empted by an authoritative
+    /// match for at least one claimant, and produced a promoted record
+    /// this run via the consensus pathway.
     pub groups_promoted: u32,
     /// How many promoted-record inserts skipped because the
     /// `dedup_key` already existed in storage (idempotency hit).
@@ -117,6 +140,13 @@ pub struct PromoteReport {
     pub entity_attributes_emitted: u32,
     /// Per-Assertion insert failures (warn-logged in-band).
     pub insert_failures: u32,
+    /// Session 82 — ADR 0004 pathway 1. How many Assertions promoted
+    /// via the authoritative-source registry (N=1 fast-track). Counted
+    /// against `observations_emitted` / `events_emitted` /
+    /// `relations_emitted` / `entity_attributes_emitted` too — the
+    /// per-shape counters cover both pathways. This field surfaces the
+    /// fraction attributable to the authoritative half.
+    pub authoritative_promoted: u32,
 }
 
 /// Errors that can propagate out of the promote stage.
@@ -131,19 +161,24 @@ pub enum PromoteError {
     Storage(#[from] situation_room_storage::StorageError),
 }
 
-/// Run the consensus-promotion pass for one plan.
+/// Run the promotion pass for one plan.
 ///
 /// Reads every persisted `Assertion` tied to the plan (via the
-/// `records_for_plan` recipe-routing join), groups them by
-/// `(content_hash, subject_hash)`, promotes any group with at least
-/// `cfg.min_independent_claimants` distinct claimants, and inserts
-/// the resulting records. Idempotent on re-run via the
+/// `records_for_plan` recipe-routing join), runs the authoritative
+/// fast-track pass (Session 82) if `cfg.authoritative` is non-empty,
+/// then runs the consensus pass over the remaining Assertions.
+/// Idempotent on re-run via the
 /// `promotion:{content_hash}:{subject_hash}` dedup key.
 ///
 /// Never returns the partial-batch error shape: per-row insert
 /// failures are warn-logged and counted into `insert_failures`. The
 /// outer `Result` covers only "the pass couldn't start" failures
 /// (storage open, the per-plan records-load query itself).
+///
+/// **Naming note.** Function name kept stable for IPC compatibility
+/// (the Tauri command surface refers to it by this name). Despite the
+/// `_consensus_` infix the function runs both ADR 0004 pathways when
+/// the registry is populated.
 pub fn promote_consensus_for_plan(
     store: &Store,
     plan: &ResearchPlan,
@@ -151,14 +186,51 @@ pub fn promote_consensus_for_plan(
 ) -> Result<PromoteReport, PromoteError> {
     let bucket = store.records_for_plan(plan.id)?;
     let assertions = bucket.assertions;
-    Ok(promote_consensus_from_assertions(store, plan, &assertions, cfg))
+    Ok(promote_from_assertions(store, plan, &assertions, cfg))
+}
+
+/// Same as [`promote_consensus_for_plan`] but takes a caller-supplied
+/// slice of Assertions. Used by the auto-trigger hook in
+/// `fetch_executor` (Session 82) so it doesn't double-read the
+/// records_for_plan join the executor doesn't need to issue twice.
+pub fn promote_from_assertions(
+    store: &Store,
+    plan: &ResearchPlan,
+    assertions: &[Assertion],
+    cfg: &PromoteConfig,
+) -> PromoteReport {
+    // Session 82 — authoritative pre-pass. When the registry is empty
+    // (default), `promote_authoritative_pass` returns an empty
+    // report + the full input slice as "remaining" Assertions, so the
+    // consensus pass runs over everything (Session 81 behaviour).
+    let (mut report, remaining) =
+        promote_authoritative_pass(store, plan, assertions, &cfg.authoritative);
+    let consensus_report =
+        promote_consensus_from_assertions_with_report(store, plan, &remaining, cfg);
+    merge_consensus_into(&mut report, consensus_report);
+    report
 }
 
 /// Pure(-ish — still writes to `Store`) helper that promotes a
-/// caller-supplied slice of `Assertion` rows. Split out so tests can
+/// caller-supplied slice of `Assertion` rows via the consensus
+/// pathway only (no authoritative pre-pass). Split out so tests can
 /// hand a synthetic Vec without standing up the records-for-plan
-/// join.
+/// join, and so the public [`promote_from_assertions`] can wire the
+/// authoritative pre-pass in front of it.
 pub fn promote_consensus_from_assertions(
+    store: &Store,
+    plan: &ResearchPlan,
+    assertions: &[Assertion],
+    cfg: &PromoteConfig,
+) -> PromoteReport {
+    promote_consensus_from_assertions_with_report(store, plan, assertions, cfg)
+}
+
+/// Consensus pass that returns a `PromoteReport` carrying only the
+/// consensus-side counters (the auth-pass counters stay zero on the
+/// returned shape). The orchestrator merges this into a possibly
+/// already-populated auth report via [`merge_consensus_into`].
+fn promote_consensus_from_assertions_with_report(
     store: &Store,
     plan: &ResearchPlan,
     assertions: &[Assertion],
@@ -203,73 +275,85 @@ pub fn promote_consensus_from_assertions(
         // a single zealous claimant.
         let avg_confidence = avg_confidence(&group);
 
-        let outcome = match &representative.content {
-            AssertedContent::Observation(c) => {
-                let obs = build_promoted_observation(
-                    plan,
-                    representative,
-                    c,
-                    &supports,
-                    avg_confidence,
-                    &dedup_key,
-                );
-                match store.insert_observation(&obs) {
-                    Ok(()) => {
-                        report.observations_emitted += 1;
-                        InsertResult::Inserted
+        // Session 82 — explicit pre-insert idempotency check. The
+        // per-shape tables' dedup_key indices are non-unique by
+        // migration design (see ADR 0021 amendment notes); the DB
+        // alone won't reject a duplicate. Check first.
+        let outcome = if dedup_already_promoted(store, &representative.content, &dedup_key) {
+            info!(
+                dedup_key = %dedup_key,
+                "consensus promote skipped — record with this dedup_key already exists"
+            );
+            InsertResult::SkippedDuplicate
+        } else {
+            match &representative.content {
+                AssertedContent::Observation(c) => {
+                    let obs = build_promoted_observation(
+                        plan,
+                        representative,
+                        c,
+                        &supports,
+                        avg_confidence,
+                        &dedup_key,
+                    );
+                    match store.insert_observation(&obs) {
+                        Ok(()) => {
+                            report.observations_emitted += 1;
+                            InsertResult::Inserted
+                        }
+                        Err(e) => classify_insert_error(&dedup_key, e),
                     }
-                    Err(e) => classify_insert_error(&dedup_key, e),
                 }
-            }
-            AssertedContent::Event(c) => {
-                let ev = build_promoted_event(
-                    plan,
-                    representative,
-                    c,
-                    &supports,
-                    avg_confidence,
-                    &dedup_key,
-                );
-                match store.insert_event(&ev) {
-                    Ok(()) => {
-                        report.events_emitted += 1;
-                        InsertResult::Inserted
+                AssertedContent::Event(c) => {
+                    let ev = build_promoted_event(
+                        plan,
+                        representative,
+                        c,
+                        &supports,
+                        avg_confidence,
+                        &dedup_key,
+                    );
+                    match store.insert_event(&ev) {
+                        Ok(()) => {
+                            report.events_emitted += 1;
+                            InsertResult::Inserted
+                        }
+                        Err(e) => classify_insert_error(&dedup_key, e),
                     }
-                    Err(e) => classify_insert_error(&dedup_key, e),
                 }
-            }
-            AssertedContent::Relation(c) => {
-                let rel = build_promoted_relation(
-                    plan,
-                    representative,
-                    c,
-                    &supports,
-                    avg_confidence,
-                    &dedup_key,
-                );
-                match store.insert_relation(&rel) {
-                    Ok(()) => {
-                        report.relations_emitted += 1;
-                        InsertResult::Inserted
+                AssertedContent::Relation(c) => {
+                    let rel = build_promoted_relation(
+                        plan,
+                        representative,
+                        c,
+                        &supports,
+                        avg_confidence,
+                        &dedup_key,
+                    );
+                    match store.insert_relation(&rel) {
+                        Ok(()) => {
+                            report.relations_emitted += 1;
+                            InsertResult::Inserted
+                        }
+                        Err(e) => classify_insert_error(&dedup_key, e),
                     }
-                    Err(e) => classify_insert_error(&dedup_key, e),
                 }
-            }
-            AssertedContent::EntityAttribute(c) => {
-                let assertion = build_promoted_entity_attribute(
-                    plan,
-                    representative,
-                    c,
-                    &supports,
-                    avg_confidence,
-                    &dedup_key,
-                );
-                match store.insert_assertion(&assertion) {
-                    Ok(()) => {
-                        report.entity_attributes_emitted += 1;
-                        InsertResult::Inserted
+                AssertedContent::EntityAttribute(c) => {
+                    let assertion = build_promoted_entity_attribute(
+                        plan,
+                        representative,
+                        c,
+                        &supports,
+                        avg_confidence,
+                        &dedup_key,
+                    );
+                    match store.insert_assertion(&assertion) {
+                        Ok(()) => {
+                            report.entity_attributes_emitted += 1;
+                            InsertResult::Inserted
+                        }
+                        Err(e) => classify_insert_error(&dedup_key, e),
                     }
-                    Err(e) => classify_insert_error(&dedup_key, e),
                 }
             }
         };
@@ -298,6 +382,319 @@ pub fn promote_consensus_from_assertions(
     );
 
     report
+}
+
+// ---------------------------------------------------------------------------
+// Session 82 — authoritative pre-pass (ADR 0004 pathway 1)
+// ---------------------------------------------------------------------------
+
+/// Walk `assertions` and promote any whose claimant matches an entry
+/// in `registry` at N=1. Returns the auth-side `PromoteReport` and a
+/// Vec of the assertions that did NOT match (the consensus pass runs
+/// over those).
+///
+/// **Why split.** Authoritative promotion is "this claim is dispositive
+/// by configuration, promote immediately." Consensus is "this claim
+/// needs corroboration from N independent claimants." Mixing them in
+/// one pass would either lose the auth-N=1 semantics (auth would have
+/// to wait for quorum) or surface confusing reports (a single USGS
+/// row producing both an auth-promoted record AND a consensus group
+/// of size 1 below the quorum bar). Splitting keeps the audit shape
+/// clean.
+///
+/// **Idempotency.** Auth promotion shares the consensus pathway's
+/// content-derived dedup_key (`promotion:{content_hash}:{subject_hash}`).
+/// A claim that was already consensus-promoted on a prior run skips
+/// here on the same key; a claim that auth-promoted on a prior run
+/// then later met quorum doesn't double-promote either — the dedup
+/// key collides.
+///
+/// **Empty registry shortcut.** When `registry.is_empty()` the
+/// function returns an empty report + the full input slice cloned-by-
+/// reference into the remaining Vec. No iteration of the registry per
+/// Assertion happens.
+fn promote_authoritative_pass(
+    store: &Store,
+    plan: &ResearchPlan,
+    assertions: &[Assertion],
+    registry: &AuthorityRegistry,
+) -> (PromoteReport, Vec<Assertion>) {
+    let mut report = PromoteReport {
+        assertions_considered: assertions.len() as u32,
+        ..PromoteReport::default()
+    };
+    if registry.is_empty() {
+        // Hot-path: skip iteration when nothing's configured. Clone
+        // the full slice into the remaining Vec; clone cost is small
+        // for the typical Assertion shape (Envelope is a few hundred
+        // bytes; the AssertedContent payload is the dominant cost
+        // and stays bounded by the per-Document extraction caps).
+        return (report, assertions.to_vec());
+    }
+
+    let mut remaining: Vec<Assertion> = Vec::with_capacity(assertions.len());
+    let now = Utc::now();
+
+    for a in assertions {
+        if !registry.matches(a) {
+            remaining.push(a.clone());
+            continue;
+        }
+
+        // Auth-pathway match. Build a promoted record with a single-
+        // claimant `derived_from` chain using DerivationRole::Promotion
+        // (the ADR 0004 role for the authoritative path; the consensus
+        // path uses ConsensusSupport).
+        let dedup_key = format!(
+            "promotion:{}:{}",
+            content_hash_for(&a.content),
+            subject_hash_for(&a.envelope),
+        );
+        let supports = vec![DerivedFrom {
+            record_id: a.id,
+            role: DerivationRole::Promotion,
+        }];
+        let confidence = a.envelope.confidence;
+
+        // Session 82 — explicit pre-insert idempotency check (same
+        // rationale as the consensus path above).
+        let outcome = if dedup_already_promoted(store, &a.content, &dedup_key) {
+            info!(
+                dedup_key = %dedup_key,
+                "authoritative promote skipped — record with this dedup_key already exists"
+            );
+            InsertResult::SkippedDuplicate
+        } else {
+            match &a.content {
+                AssertedContent::Observation(c) => {
+                    let obs = build_authoritative_observation(
+                        plan,
+                        a,
+                        c,
+                        &supports,
+                        confidence,
+                        &dedup_key,
+                    );
+                    match store.insert_observation(&obs) {
+                        Ok(()) => {
+                            report.observations_emitted += 1;
+                            InsertResult::Inserted
+                        }
+                        Err(e) => classify_insert_error(&dedup_key, e),
+                    }
+                }
+                AssertedContent::Event(c) => {
+                    let ev = build_authoritative_event(
+                        plan,
+                        a,
+                        c,
+                        &supports,
+                        confidence,
+                        &dedup_key,
+                    );
+                    match store.insert_event(&ev) {
+                        Ok(()) => {
+                            report.events_emitted += 1;
+                            InsertResult::Inserted
+                        }
+                        Err(e) => classify_insert_error(&dedup_key, e),
+                    }
+                }
+                AssertedContent::Relation(c) => {
+                    let rel = build_authoritative_relation(
+                        plan,
+                        a,
+                        c,
+                        &supports,
+                        confidence,
+                        &dedup_key,
+                    );
+                    match store.insert_relation(&rel) {
+                        Ok(()) => {
+                            report.relations_emitted += 1;
+                            InsertResult::Inserted
+                        }
+                        Err(e) => classify_insert_error(&dedup_key, e),
+                    }
+                }
+                AssertedContent::EntityAttribute(c) => {
+                    let attr = build_authoritative_entity_attribute(
+                        plan,
+                        a,
+                        c,
+                        &supports,
+                        confidence,
+                        &dedup_key,
+                    );
+                    match store.insert_assertion(&attr) {
+                        Ok(()) => {
+                            report.entity_attributes_emitted += 1;
+                            InsertResult::Inserted
+                        }
+                        Err(e) => classify_insert_error(&dedup_key, e),
+                    }
+                }
+            }
+        };
+
+        match outcome {
+            InsertResult::Inserted => {
+                report.authoritative_promoted += 1;
+            }
+            InsertResult::SkippedDuplicate => {
+                report.skipped_already_promoted += 1;
+                // Already promoted on a prior run — exclude from the
+                // consensus pass so we don't get a "skipped" log line
+                // a second time on the same key.
+            }
+            InsertResult::FailedOther => {
+                report.insert_failures += 1;
+                // Insert failure for non-duplicate reasons. Surface it
+                // to the consensus pass so a future retry might still
+                // succeed via quorum. The warn log already named it.
+                remaining.push(a.clone());
+            }
+        }
+    }
+
+    info!(
+        plan_id = %plan.id,
+        considered = report.assertions_considered,
+        authoritative = report.authoritative_promoted,
+        skipped = report.skipped_already_promoted,
+        failed = report.insert_failures,
+        remaining_for_consensus = remaining.len(),
+        ?now,
+        "authoritative promotion pass complete"
+    );
+
+    (report, remaining)
+}
+
+/// Merge a consensus-pass report into an auth-pass report. The auth
+/// pass populated the per-shape emitted counters + `authoritative_promoted`;
+/// the consensus pass adds its own emitted counters + `groups_promoted`
+/// + `skipped_already_promoted` + `insert_failures`.
+/// `assertions_considered` matches the original input — both passes
+/// see the same total; we keep the auth-pass value (which is the input
+/// slice length).
+fn merge_consensus_into(report: &mut PromoteReport, consensus: PromoteReport) {
+    report.groups_promoted = report.groups_promoted.saturating_add(consensus.groups_promoted);
+    report.skipped_already_promoted = report
+        .skipped_already_promoted
+        .saturating_add(consensus.skipped_already_promoted);
+    report.observations_emitted = report
+        .observations_emitted
+        .saturating_add(consensus.observations_emitted);
+    report.events_emitted = report.events_emitted.saturating_add(consensus.events_emitted);
+    report.relations_emitted = report
+        .relations_emitted
+        .saturating_add(consensus.relations_emitted);
+    report.entity_attributes_emitted = report
+        .entity_attributes_emitted
+        .saturating_add(consensus.entity_attributes_emitted);
+    report.insert_failures = report.insert_failures.saturating_add(consensus.insert_failures);
+    // authoritative_promoted stays from the auth pass; consensus has none.
+    // assertions_considered: keep auth-pass value (= input size).
+}
+
+// Authoritative-pathway record builders. Mirror the consensus
+// builders but use `provenance.source_id = "derived#authoritative"`
+// + `tags = ["authoritative_promotion"]` + the auth pathway's
+// `DerivationRole::Promotion` (vs consensus's `ConsensusSupport`).
+
+fn authoritative_provenance(supports: &[DerivedFrom]) -> Provenance {
+    Provenance {
+        source_id: "derived#authoritative".into(),
+        source_url: None,
+        source_published_at: None,
+        license: "derived".into(),
+        derived_from: supports.to_vec(),
+    }
+}
+
+fn authoritative_envelope(
+    plan: &ResearchPlan,
+    representative: &Assertion,
+    supports: &[DerivedFrom],
+    confidence: Confidence,
+) -> Envelope {
+    Envelope {
+        provenance: authoritative_provenance(supports),
+        subjects: representative.envelope.subjects.clone(),
+        tags: vec!["authoritative_promotion".into()],
+        valid_at: representative.envelope.valid_at,
+        observed_at: Utc::now(),
+        confidence,
+    }
+    .with_plan_topics(plan)
+}
+
+fn build_authoritative_observation(
+    plan: &ResearchPlan,
+    representative: &Assertion,
+    content: &ObservationContent,
+    supports: &[DerivedFrom],
+    confidence: Confidence,
+    dedup_key: &str,
+) -> Observation {
+    let envelope = authoritative_envelope(plan, representative, supports, confidence);
+    Observation {
+        id: Uuid::now_v7(),
+        dedup_key: Some(dedup_key.to_string()),
+        envelope,
+        content: content.clone(),
+    }
+}
+
+fn build_authoritative_event(
+    plan: &ResearchPlan,
+    representative: &Assertion,
+    content: &EventContent,
+    supports: &[DerivedFrom],
+    confidence: Confidence,
+    dedup_key: &str,
+) -> Event {
+    let envelope = authoritative_envelope(plan, representative, supports, confidence);
+    let mut ev = Event::new(envelope, content.clone());
+    ev.dedup_key = Some(dedup_key.to_string());
+    ev
+}
+
+fn build_authoritative_relation(
+    plan: &ResearchPlan,
+    representative: &Assertion,
+    content: &RelationContent,
+    supports: &[DerivedFrom],
+    confidence: Confidence,
+    dedup_key: &str,
+) -> Relation {
+    let envelope = authoritative_envelope(plan, representative, supports, confidence);
+    let mut rel = Relation::new(envelope, content.clone());
+    rel.dedup_key = Some(dedup_key.to_string());
+    rel
+}
+
+fn build_authoritative_entity_attribute(
+    plan: &ResearchPlan,
+    representative: &Assertion,
+    content: &EntityAttributeContent,
+    supports: &[DerivedFrom],
+    confidence: Confidence,
+    dedup_key: &str,
+) -> Assertion {
+    use situation_room_core::vocab::{EntityId, Stance};
+    let envelope = authoritative_envelope(plan, representative, supports, confidence);
+    let claimant = EntityId::new("agency:authoritative")
+        .expect("static EntityId `agency:authoritative` must parse");
+    let mut a = Assertion::new(
+        claimant,
+        Stance::Asserted,
+        AssertedContent::EntityAttribute(content.clone()),
+        envelope,
+    );
+    a.dedup_key = Some(dedup_key.to_string());
+    a
 }
 
 // ---------------------------------------------------------------------------
@@ -434,10 +831,50 @@ enum InsertResult {
     FailedOther,
 }
 
+/// Session 82 — pre-insert idempotency check. The dedup_key column
+/// on the per-shape tables (`observations`, `events`, `relations`,
+/// `assertions`) is indexed but NOT marked UNIQUE in the migration
+/// schema, so DuckDB does not reject a duplicate insert on its own.
+/// ADR 0021's "rejected on UNIQUE" framing therefore requires an
+/// explicit existence check at the application layer — this helper
+/// is that check.
+///
+/// Returns `true` iff a record with the given dedup_key already
+/// exists in the per-shape table. On storage-layer error, returns
+/// `false` and warn-logs — falling through to the insert attempt is
+/// the safer fault posture (an extra row is recoverable; refusing to
+/// promote at all on a transient read error is not).
+fn dedup_already_promoted(
+    store: &Store,
+    content: &AssertedContent,
+    dedup_key: &str,
+) -> bool {
+    let result = match content {
+        AssertedContent::Observation(_) => store.observation_exists_by_dedup_key(dedup_key),
+        AssertedContent::Event(_) => store.event_exists_by_dedup_key(dedup_key),
+        AssertedContent::Relation(_) => store.relation_exists_by_dedup_key(dedup_key),
+        AssertedContent::EntityAttribute(_) => store.assertion_exists_by_dedup_key(dedup_key),
+    };
+    match result {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                dedup_key = %dedup_key,
+                error = %e,
+                "exists-by-dedup-key check failed; will attempt insert and let any UNIQUE-violation classifier route the outcome"
+            );
+            false
+        }
+    }
+}
+
 /// DuckDB surfaces a UNIQUE-constraint violation as a string-ish
 /// error. We classify against the substring "dedup_key" / "duplicate"
 /// / "unique" so the per-row-skip case doesn't show up as a runtime
-/// failure on operator dashboards.
+/// failure on operator dashboards. With the Session-82 pre-insert
+/// check above this path is now a fallback for the cases where the
+/// existence query failed silently — but kept in place for defence
+/// in depth.
 ///
 /// This is intentionally lenient: any error mentioning duplication
 /// counts as "already promoted." If a future migration changes the
@@ -900,5 +1337,147 @@ mod tests {
         );
         assert_eq!(report2.observations_emitted, 0);
         assert_eq!(report2.skipped_already_promoted, 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Session 82 — authoritative pass (ADR 0004 pathway 1)
+    // -----------------------------------------------------------------
+
+    use crate::authoritative::{AuthorityEntry, AuthorityRegistry};
+
+    fn auth_cfg(entries: Vec<AuthorityEntry>) -> PromoteConfig {
+        PromoteConfig {
+            min_independent_claimants: 3,
+            authoritative: AuthorityRegistry::from_entries(entries),
+        }
+    }
+
+    #[test]
+    fn auth_pass_promotes_single_claimant_when_registry_matches() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let plan = plan();
+
+        let cfg = auth_cfg(vec![AuthorityEntry {
+            source_id: "usgs_mcs".into(),
+            metric: Some("production".into()),
+            topic: None,
+        }]);
+
+        // Single USGS claimant — would fail consensus quorum (N=3) but
+        // matches the authoritative registry, so it promotes at N=1.
+        let assertions = vec![obs_assertion("agency:usgs_mcs", 142_000.0, 0.85)];
+        let report = promote_from_assertions(&store, &plan, &assertions, &cfg);
+        assert_eq!(report.assertions_considered, 1);
+        assert_eq!(report.authoritative_promoted, 1);
+        assert_eq!(report.observations_emitted, 1);
+        assert_eq!(report.groups_promoted, 0, "consensus path produced nothing");
+        assert_eq!(report.skipped_already_promoted, 0);
+    }
+
+    #[test]
+    fn auth_pass_with_empty_registry_falls_back_to_consensus_only() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let plan = plan();
+
+        let cfg = PromoteConfig::default(); // empty registry
+        let assertions = vec![
+            obs_assertion("agency:reuters", 142_000.0, 0.8),
+            obs_assertion("agency:bloomberg", 142_000.0, 0.85),
+            obs_assertion("agency:argus", 142_000.0, 0.75),
+        ];
+        let report = promote_from_assertions(&store, &plan, &assertions, &cfg);
+        assert_eq!(report.authoritative_promoted, 0);
+        assert_eq!(report.observations_emitted, 1);
+        assert_eq!(report.groups_promoted, 1);
+    }
+
+    #[test]
+    fn auth_pass_idempotent_on_rerun() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let plan = plan();
+
+        let cfg = auth_cfg(vec![AuthorityEntry {
+            source_id: "usgs_mcs".into(),
+            metric: Some("production".into()),
+            topic: None,
+        }]);
+
+        let assertions = vec![obs_assertion("agency:usgs_mcs", 142_000.0, 0.85)];
+        let r1 = promote_from_assertions(&store, &plan, &assertions, &cfg);
+        assert_eq!(r1.authoritative_promoted, 1);
+        assert_eq!(r1.observations_emitted, 1);
+
+        let r2 = promote_from_assertions(&store, &plan, &assertions, &cfg);
+        assert_eq!(r2.authoritative_promoted, 0);
+        assert_eq!(r2.observations_emitted, 0);
+        assert_eq!(r2.skipped_already_promoted, 1);
+    }
+
+    #[test]
+    fn auth_pass_excludes_promoted_assertions_from_consensus_pass() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let plan = plan();
+
+        let cfg = auth_cfg(vec![AuthorityEntry {
+            source_id: "usgs_mcs".into(),
+            metric: Some("production".into()),
+            topic: None,
+        }]);
+
+        // Three assertions: one matches the registry (auth-promoted),
+        // two non-matching (which alone wouldn't meet N=3 quorum).
+        let assertions = vec![
+            obs_assertion("agency:usgs_mcs", 142_000.0, 0.85),
+            obs_assertion("agency:reuters", 142_000.0, 0.8),
+            obs_assertion("agency:bloomberg", 142_000.0, 0.7),
+        ];
+        let report = promote_from_assertions(&store, &plan, &assertions, &cfg);
+        // Auth pass got one; consensus pass saw two remaining (below
+        // N=3 quorum) and emitted none. But the dedup_key the
+        // consensus pass would have used MATCHES the auth-promoted
+        // record's key — so a consensus group with the right
+        // claimants would either be skipped-already-promoted OR
+        // (depending on quorum reaching) succeed. With only 2 non-auth
+        // claimants in this fixture, consensus naturally doesn't reach
+        // quorum; the test pins this case.
+        assert_eq!(report.assertions_considered, 3);
+        assert_eq!(report.authoritative_promoted, 1);
+        assert_eq!(report.groups_promoted, 0);
+        // Observation count = auth path's emission.
+        assert_eq!(report.observations_emitted, 1);
+    }
+
+    #[test]
+    fn auth_promoted_observation_carries_authoritative_provenance() {
+        let plan = plan();
+        let supports = vec![DerivedFrom {
+            record_id: Uuid::now_v7(),
+            role: DerivationRole::Promotion,
+        }];
+        let representative = obs_assertion("agency:usgs_mcs", 142_000.0, 0.9);
+        let content = match &representative.content {
+            AssertedContent::Observation(c) => c.clone(),
+            _ => unreachable!(),
+        };
+        let obs = build_authoritative_observation(
+            &plan,
+            &representative,
+            &content,
+            &supports,
+            Confidence::clamp(0.9),
+            "promotion:abc:def",
+        );
+        assert_eq!(obs.envelope.provenance.source_id, "derived#authoritative");
+        assert_eq!(obs.envelope.provenance.license, "derived");
+        assert_eq!(obs.envelope.provenance.derived_from.len(), 1);
+        assert!(matches!(
+            obs.envelope.provenance.derived_from[0].role,
+            DerivationRole::Promotion
+        ));
+        assert!(obs.envelope.tags.contains(&"authoritative_promotion".into()));
     }
 }

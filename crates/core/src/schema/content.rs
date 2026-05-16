@@ -167,7 +167,17 @@ pub struct RelationContent {
 /// at time T is the aggregation of its attribute records up to T.
 /// This keeps the schema open — adding a new attribute kind doesn't
 /// require a schema change.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// **Session 82 — ADR 0007 amendment 5.** `JsonSchema` derive added
+/// so the recipe-author prompt's `{{TARGET_RECORD_SCHEMA}}` placeholder
+/// can carry the EntityAttribute schema alongside the three other
+/// authorable content types. Pre-Session-82, EntityAttributes were
+/// only producible via the per-Document extraction path (Session 80);
+/// adding the schema unblocks recipe-author emission of
+/// EntityAttribute-shaped output directly (e.g. an EDGAR XBRL recipe
+/// emitting `legal_name` / `headquarters_country` rows bound to the
+/// company's `EntityId`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct EntityAttributeContent {
     /// Which entity this attribute applies to.
     pub entity_id: EntityId,
@@ -184,7 +194,16 @@ pub struct EntityAttributeContent {
 /// Typed attribute value. We use an enum instead of `serde_json::Value`
 /// because we want the schema to express which type kinds are legal —
 /// attributes can't be arbitrary JSON, they must be one of these shapes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// **Session 82 — ADR 0007 amendment 5.** `JsonSchema` derive added
+/// alongside [`EntityAttributeContent`] so the recipe-author prompt's
+/// `{{TARGET_RECORD_SCHEMA}}` placeholder can carry the
+/// EntityAttribute schema. The schemars output models the tagged-
+/// union `{kind, value}` shape correctly because every variant
+/// payload is itself `JsonSchema` (the constituent vocab types —
+/// `Unit`, `CountryCode`, `Topic`, `EntityId` — derive `JsonSchema`
+/// independently).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum AttributeValue {
     Text(String),
@@ -385,5 +404,35 @@ mod tests {
         assert!(s.contains("kind"));
         assert!(s.contains("from"));
         assert!(s.contains("to"));
+    }
+
+    // Session 82 — ADR 0007 amendment 5. `EntityAttributeContent`
+    // and `AttributeValue` derive `JsonSchema` so the recipe-author
+    // prompt's `{{TARGET_RECORD_SCHEMA}}` placeholder carries the
+    // EntityAttribute schema alongside the three pre-Session-82
+    // authorable content types. These tests pin the derive shape.
+    #[test]
+    fn entity_attribute_content_emits_json_schema() {
+        let schema = schemars::schema_for!(EntityAttributeContent);
+        let s = serde_json::to_string(&schema).unwrap();
+        assert!(s.contains("entity_id"));
+        assert!(s.contains("\"key\""));
+        assert!(s.contains("value"));
+    }
+
+    #[test]
+    fn attribute_value_emits_json_schema_with_tagged_union_shape() {
+        let schema = schemars::schema_for!(AttributeValue);
+        let s = serde_json::to_string(&schema).unwrap();
+        // The serde tag/content shape is `{ "kind": "text", "value": "..." }`;
+        // schemars renders this as a oneOf over the named variants.
+        // We assert the snake_case variant tags survive.
+        assert!(s.contains("text"));
+        assert!(s.contains("number"));
+        assert!(s.contains("country"));
+        assert!(s.contains("entity"));
+        assert!(s.contains("boolean"));
+        assert!(s.contains("entity_list"));
+        assert!(s.contains("topic_list"));
     }
 }

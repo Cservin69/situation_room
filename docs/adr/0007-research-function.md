@@ -1292,3 +1292,80 @@ still surfaces real records from the sources whose bytes do fit.
 - `STOCKPILE_HANDOFF_SESSION35.md` — session followup with
   the empirical lineage (sessions 30→34 → 35).
 
+## Amendment 7 (Session 82) — EntityAttributeContent in TARGET_RECORD_SCHEMA
+
+**Status**: Accepted, in effect.
+**Date**: 2026-05-16
+**Scope**: Extends Amendment 4's schema-aware authoring to the
+fourth `AssertedContent` variant.
+
+### What this amendment adds
+
+Amendment 4 (Session 28) wired `schemars::JsonSchema` derive onto
+the three then-authorable content types (`ObservationContent`,
+`EventContent`, `RelationContent`) and threaded the rendered schemas
+into the recipe-author prompt via the `{{TARGET_RECORD_SCHEMA}}`
+placeholder. `EntityAttributeContent` was left out — at the time,
+attribute facts were synthesised in the runtime (Sessions 76–77
+exemplar materialisation) rather than authored by the L2 recipe
+author.
+
+Session 80 added per-Document EntityAttribute extraction (a strict
+LLM call separate from recipe authoring). The per-Document pathway
+solves "an article mentioned a fact about an entity"; it doesn't
+solve "this XBRL endpoint returns the entity's `legal_name` and
+`headquarters_country` as structured fields the recipe could bind
+directly."
+
+Session 82 closes that gap by deriving `JsonSchema` on
+`EntityAttributeContent` (and on the nested `AttributeValue` enum
+that types the value column) and adding the rendered schema to
+`target_record_schemas()` under the key `entity_attribute`. The
+recipe author can now produce `produces` bindings whose target shape
+is `AssertedContent::EntityAttribute` — the runtime synthesises an
+Assertion (not an Entity record update; the schema doesn't have an
+attributes column on `Entity`, per ADR 0021's discussion).
+
+### What changed
+
+- `crates/core/src/schema/content.rs` — `EntityAttributeContent` and
+  `AttributeValue` gain `#[derive(JsonSchema)]`. The constituent
+  vocab types already derived `JsonSchema` (Topic, EntityId,
+  CountryCode, Unit) so no recursive ripples.
+- `crates/pipeline/src/recipe_author.rs::target_record_schemas` —
+  appends `"entity_attribute": schema_for!(EntityAttributeContent)`
+  to the JSON object the prompt's `{{TARGET_RECORD_SCHEMA}}`
+  placeholder substitutes.
+- Tests in `content.rs` pin the EntityAttribute + AttributeValue
+  schema shapes; the existing recipe-author test
+  `target_record_schemas_emits_all_three_record_types` renames to
+  `target_record_schemas_emits_all_four_record_types` with an extra
+  `assert!(obj.contains_key("entity_attribute"))`.
+
+### What this amendment does NOT do
+
+- **No prompt update.** The recipe-author prompt's
+  `{{TARGET_RECORD_SCHEMA}}` placeholder substitution is mechanical
+  — adding the schema is structurally enough. A future session may
+  add prose teaching the LLM *when* to author EntityAttribute
+  bindings (vs. relying on per-Document extraction); Session 82
+  ships the wire structure only.
+- **No runtime apply change.** The pipeline's `recipe_apply` /
+  `build_record` path already handles the four `AssertedContent`
+  variants via the Session 81 promote path; adding the schema lets
+  the LLM author them, the runtime already knows what to do with
+  the output.
+- **No retroactive backfill.** The newly authorable bindings only
+  matter on plans whose recipes get authored after Session 82
+  ships. Old recipes carry their pre-Session-82 binding shape and
+  continue to work via the per-Document extraction route.
+
+### Code references (Amendment 7, Session 82)
+
+- `crates/core/src/schema/content.rs` — `EntityAttributeContent`,
+  `AttributeValue` JsonSchema derives + new tests.
+- `crates/pipeline/src/recipe_author.rs::target_record_schemas` —
+  four-key object + renamed test + new
+  `target_record_schemas_entity_attribute_includes_entity_id_and_key`
+  test.
+

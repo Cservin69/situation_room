@@ -40,6 +40,13 @@ jsonpath-rust = { workspace = true }
 # approach and the closed-enum invariant (we wired the fifth-of-five,
 # we did not add a sixth mode).
 pdf-extract = { workspace = true }
+# Session 82 — `crates/pipeline/src/authoritative.rs` loads the
+# authoritative-source registry from `config/vocab/authoritative_sources.toml`
+# at composition-root time. ADR 0004 names the registry as configuration,
+# not code; `toml` is the lightest dep that gives us a typed parser and
+# is already a workspace dependency (apps_common consumes it for the
+# source-descriptors loader).
+toml = { workspace = true }
 
 [dev-dependencies]
 dotenvy = { workspace = true }

@@ -47,6 +47,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use situation_room_llm::{CostLedger, LlmProvider, ModelTier};
+use situation_room_pipeline::authoritative::AuthorityRegistry;
 use situation_room_pipeline::fetch_backoff::{BackoffFetcher, HostBackoff};
 use situation_room_pipeline::entity_synth::materialize_entity_exemplars;
 use situation_room_pipeline::relation_synth::materialize_relation_exemplars;
@@ -202,6 +203,15 @@ pub struct AppState {
     /// live tests do (against `csv_demo` / `json_demo`). Production
     /// classification uses [`Store::sources_memory`] instead.
     pub sources: Vec<PipelineSourceDescriptor>,
+    /// Session 82 — ADR 0004 pathway 1 registry. Loaded once at the
+    /// composition root from
+    /// `config/vocab/authoritative_sources.toml`. The
+    /// `promote_consensus_for_plan` command clones into the per-call
+    /// `PromoteConfig`; the auto-trigger in `run_fetch_for_plan` does
+    /// the same. Wrapped in `Arc` so the auto-trigger doesn't pay the
+    /// clone cost in the hot path (the per-Tauri-command path still
+    /// clones; the registry is small).
+    pub authoritative: Arc<AuthorityRegistry>,
 }
 
 impl AppState {
@@ -244,6 +254,7 @@ impl AppState {
         document_observations_prompt: &'static str,
         document_entity_attributes_prompt: &'static str,
         sources: Vec<PipelineSourceDescriptor>,
+        authoritative: Arc<AuthorityRegistry>,
     ) -> Self {
         Self {
             store,
@@ -267,6 +278,7 @@ impl AppState {
             document_observations_prompt,
             document_entity_attributes_prompt,
             sources,
+            authoritative,
         }
     }
 }
@@ -1132,7 +1144,97 @@ pub async fn run_fetch_for_plan(
         "fetch run returned"
     );
 
+    // Session 82 — auto-trigger promotion (ADR 0021 deferred half +
+    // ADR 0004 pathway 1). Runs the authoritative pass first (if the
+    // registry is non-empty) then the consensus pass over the
+    // remaining Assertions. Scoped to the plan that just completed —
+    // ADR 0021 flagged cross-plan dedup as the open trade-off; running
+    // only against the just-completed plan limits surprises to that
+    // plan's claim pile.
+    //
+    // Failure-mode discipline: a promote-stage error MUST NOT block
+    // the FetchReport from reaching the operator. The fetch already
+    // ran; whatever it produced should surface. We warn-log the
+    // promote failure and continue.
+    if let Err(e) = auto_promote_after_fetch(&state, parsed).await {
+        warn!(
+            plan_id = %parsed,
+            error = %e,
+            "auto-promote after fetch run failed — operator can still invoke manually"
+        );
+    }
+
     Ok(FetchReportDto::from_typed(report))
+}
+
+/// Session 82 — promote-after-fetch auto-trigger. Separated from
+/// `run_fetch_for_plan` so the failure-isolation is explicit and the
+/// promote-stage's `Result` doesn't pollute the executor's signature.
+async fn auto_promote_after_fetch(
+    state: &tauri::State<'_, AppState>,
+    plan_id: Uuid,
+) -> Result<(), CommandError> {
+    let stored = state
+        .store
+        .get_research_plan(plan_id)
+        .map_err(CommandError::from)?;
+    let stored = match stored {
+        Some(s) => s,
+        // Plan vanished between fetch-run completion and now. Skip;
+        // the warn-log on the caller side will surface the missing
+        // plan id.
+        None => return Ok(()),
+    };
+
+    // Only run against `Accepted` plans. Rejected plans don't get
+    // auto-promoted — if an operator marks a plan rejected they likely
+    // don't want consensus-derived rows landing under it.
+    if !matches!(stored.status, PlanStatus::Accepted) {
+        info!(
+            plan_id = %plan_id,
+            status = ?stored.status,
+            "skipping auto-promote — plan not in Accepted status"
+        );
+        return Ok(());
+    }
+
+    let plan = match situation_room_pipeline::research_plans_store::load_research_plan(
+        state.store.as_ref(),
+        plan_id,
+    )
+    .map_err(|e| CommandError::InvalidInput {
+        field: "id".into(),
+        message: format!("plan deserialization failed: {e}"),
+    })? {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+
+    let cfg = situation_room_pipeline::promote::PromoteConfig {
+        min_independent_claimants: situation_room_pipeline::promote::PromoteConfig::default()
+            .min_independent_claimants,
+        authoritative: (*state.authoritative).clone(),
+    };
+
+    let report = situation_room_pipeline::promote::promote_consensus_for_plan(
+        state.store.as_ref(),
+        &plan,
+        &cfg,
+    )
+    .map_err(|e| match e {
+        situation_room_pipeline::promote::PromoteError::Storage(s) => CommandError::from(s),
+    })?;
+
+    info!(
+        plan_id = %plan_id,
+        considered = report.assertions_considered,
+        authoritative = report.authoritative_promoted,
+        consensus = report.groups_promoted,
+        skipped = report.skipped_already_promoted,
+        "auto-promote after fetch run complete"
+    );
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

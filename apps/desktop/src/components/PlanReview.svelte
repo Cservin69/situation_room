@@ -62,7 +62,10 @@
     classifierPromptVersion,
     isCurrentClassifierVersion,
     parseClassifierId,
+    promoteConsensusForPlan,
+    asCommandError,
   } from '$lib/api/client';
+  import type { PromoteReportDto } from '$lib/api/types/PromoteReportDto';
   import Chip from '$components/common/Chip.svelte';
   import StatusPill from '$components/common/StatusPill.svelte';
   import Bucket from '$components/panels/Bucket.svelte';
@@ -251,6 +254,50 @@
    * only meaningful content in the cold-start state.
    */
   let recordsViewMode = $state<'dashboard' | 'buckets'>('dashboard');
+
+  // Session 82 — operator-driven promote button (ADR 0021 deferred
+  // half + ADR 0004 pathway 1).
+  //
+  // The IPC command (`promoteConsensusForPlan`) shipped in Session 81;
+  // the auto-trigger landed in Session 82 alongside this surface. The
+  // button still exists for two reasons:
+  //   1. Operators may want to re-run the pass after manually editing
+  //      claimant rows (rare, but the path stays open).
+  //   2. The button surfaces the report inline, which the auto-trigger
+  //      doesn't — auto-trigger's report is logged-only because the
+  //      FetchReportDto already carries the operator-visible "what
+  //      just happened" surface.
+  //
+  // Status gating: button hides on Pending plans (the IPC would
+  // refuse). Accepted + Rejected both show it; rejected plans may
+  // still have promoted-record history worth re-consensing.
+  let promoteState = $state<'idle' | 'running' | 'done' | 'error'>('idle');
+  let promoteReport = $state<PromoteReportDto | null>(null);
+  let promoteError = $state<string | null>(null);
+
+  async function onPromote() {
+    if (!plan?.id) return;
+    promoteState = 'running';
+    promoteError = null;
+    try {
+      const report = await promoteConsensusForPlan(plan.id, null);
+      promoteReport = report;
+      promoteState = 'done';
+    } catch (e) {
+      const ce = asCommandError(e);
+      promoteError =
+        'message' in ce && typeof ce.message === 'string'
+          ? ce.message
+          : ce.kind ?? 'unknown error';
+      promoteState = 'error';
+    }
+  }
+
+  function dismissPromoteToast() {
+    promoteState = 'idle';
+    promoteReport = null;
+    promoteError = null;
+  }
 </script>
 
 <article class="plan">
@@ -437,7 +484,53 @@
           buckets
         </button>
       </div>
+      <!-- Session 82 — promote-now button (ADR 0021 / ADR 0004). The
+           auto-trigger fires after each fetch run; this button lets
+           the operator re-run the pass on demand and see the
+           PromoteReport inline. Hidden on Pending plans (the IPC
+           refuses pending plans regardless). -->
+      {#if plan.status !== 'pending'}
+        <button
+          type="button"
+          class="records-promote-btn"
+          onclick={onPromote}
+          disabled={promoteState === 'running'}
+          title="Run authoritative + consensus promotion over this plan's assertions"
+        >
+          {promoteState === 'running' ? 'promoting…' : 'promote'}
+        </button>
+      {/if}
     </header>
+
+    <!-- Session 82 — promote result strip. Renders inline below the
+         toolbar so the operator can read the PromoteReport summary
+         without leaving the panel. Auto-dismissable via the × button;
+         re-running promote replaces the strip's content. -->
+    {#if promoteState === 'done' && promoteReport}
+      <section class="promote-toast promote-toast-ok" aria-live="polite">
+        <span class="promote-toast-label">promote</span>
+        <span class="promote-toast-body">
+          considered <strong>{promoteReport.assertions_considered}</strong>
+          · authoritative <strong>{promoteReport.authoritative_promoted}</strong>
+          · consensus <strong>{promoteReport.groups_promoted}</strong>
+          · skipped <strong>{promoteReport.skipped_already_promoted}</strong>
+          · obs <strong>{promoteReport.observations_emitted}</strong>
+          · ev <strong>{promoteReport.events_emitted}</strong>
+          · rel <strong>{promoteReport.relations_emitted}</strong>
+          · attr <strong>{promoteReport.entity_attributes_emitted}</strong>
+          {#if promoteReport.insert_failures > 0}
+            · failures <strong>{promoteReport.insert_failures}</strong>
+          {/if}
+        </span>
+        <button class="promote-toast-dismiss" type="button" onclick={dismissPromoteToast} aria-label="dismiss">×</button>
+      </section>
+    {:else if promoteState === 'error' && promoteError}
+      <section class="promote-toast promote-toast-err" role="alert">
+        <span class="promote-toast-label">promote failed</span>
+        <span class="promote-toast-body">{promoteError}</span>
+        <button class="promote-toast-dismiss" type="button" onclick={dismissPromoteToast} aria-label="dismiss">×</button>
+      </section>
+    {/if}
   {/if}
 
   <!-- Dashboard view — the situation-room presentation. Renders
@@ -1080,6 +1173,86 @@
   .records-toggle .seg:focus-visible {
     outline: 1px solid var(--border-accent);
     outline-offset: -1px;
+  }
+
+  /* Session 82 — promote button on the records toolbar. Tucked in
+     after the dashboard/buckets toggle; same visual weight (low —
+     power-user affordance), neutral signal color so it doesn't
+     compete with the run-fetch primary button up top. */
+  .records-promote-btn {
+    appearance: none;
+    background: var(--bg-panel);
+    color: var(--fg-secondary);
+    border: 1px solid var(--border-subtle);
+    border-radius: 3px;
+    padding: 4px 10px;
+    font-family: var(--font-sans);
+    font-size: 11px;
+    cursor: pointer;
+    transition: background var(--duration-ui) var(--ease),
+                color var(--duration-ui) var(--ease);
+  }
+  .records-promote-btn:hover:not(:disabled) {
+    background: var(--bg-panel-alt);
+    color: var(--fg-primary);
+  }
+  .records-promote-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+  }
+  .records-promote-btn:focus-visible {
+    outline: 1px solid var(--border-accent);
+    outline-offset: -1px;
+  }
+
+  /* Session 82 — promote result toast. Renders right under the
+     records toolbar so the operator's eye lands on the report
+     summary without scrolling. The "ok" variant uses the neutral
+     panel-surface; the "err" variant uses a more prominent border
+     to draw attention. */
+  .promote-toast {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 3px;
+    background: var(--bg-inset);
+    font-size: 11px;
+    color: var(--fg-secondary);
+  }
+  .promote-toast-ok {
+    border-color: var(--border-subtle);
+  }
+  .promote-toast-err {
+    border-color: var(--signal-warning, var(--border-accent));
+    color: var(--fg-primary);
+  }
+  .promote-toast-label {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 10px;
+    color: var(--fg-tertiary);
+  }
+  .promote-toast-body {
+    flex: 1;
+    font-family: var(--font-mono);
+    color: var(--fg-primary);
+  }
+  .promote-toast-dismiss {
+    appearance: none;
+    background: transparent;
+    border: 0;
+    color: var(--fg-tertiary);
+    font-size: 14px;
+    line-height: 1;
+    padding: 2px 6px;
+    cursor: pointer;
+    border-radius: 3px;
+  }
+  .promote-toast-dismiss:hover {
+    background: var(--bg-panel-alt);
+    color: var(--fg-primary);
   }
 
   /* Six-bucket grid: 3 cols on wide screens, 2 on medium, 1 on narrow. */
