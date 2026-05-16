@@ -295,6 +295,14 @@ fn main() -> Result<()> {
         authoritative,
     );
 
+    // Session 86 — replay persisted promote-history rows into the
+    // in-memory ring. Empty on first boot after migration 0017;
+    // populated on subsequent boots from the previous session's
+    // activity. Non-fatal on any storage failure (see
+    // `AppState::hydrate_promote_history` for the per-row fallback
+    // posture).
+    state.hydrate_promote_history();
+
     // --- Tauri -------------------------------------------------------
     //
     // The capabilities file (`capabilities/default.json`) explicitly

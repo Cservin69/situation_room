@@ -79,6 +79,7 @@
   import MetricCard from '$components/panels/MetricCard.svelte';
   import KindCard from '$components/panels/KindCard.svelte';
   import DocumentDrawer from '$components/DocumentDrawer.svelte';
+  import MetricDetailDrawer from '$components/MetricDetailDrawer.svelte';
   import SamplesModal from '$components/SamplesModal.svelte';
   import type { ChartCatalog, ChartPreview } from '$lib/dashboard/document_chart';
   import { detectChartCatalog, pickPreviewSeries } from '$lib/dashboard/document_chart';
@@ -475,6 +476,27 @@
   function closeSamplesModal(): void {
     selectedSampleGroup = null;
   }
+
+  // Session 86 — MetricDetailDrawer state. When non-null, the drawer
+  // renders over the dashboard listing every observation in the
+  // selected metric group with per-fetch value | when | source | recipe
+  // breakdown. Clicking a MetricCard sets the selection; the drawer's
+  // close handler clears it.
+  //
+  // The selection holds a typed shape (metric + records) rather than
+  // just an index so the drawer renders correctly even if the
+  // underlying records prop updates while the modal is open.
+  let selectedMetricGroup = $state<{
+    metric: string;
+    records: ObservationDto[];
+  } | null>(null);
+
+  function openMetricDrawer(metric: string, recs: ObservationDto[]): void {
+    selectedMetricGroup = { metric, records: recs };
+  }
+  function closeMetricDrawer(): void {
+    selectedMetricGroup = null;
+  }
 </script>
 
 <section class="dashboard" aria-label="records dashboard">
@@ -513,7 +535,11 @@
       </header>
       <div class="cards">
         {#each metricGroups as g (g.metric)}
-          <MetricCard metric={g.metric} records={g.records} />
+          <MetricCard
+            metric={g.metric}
+            records={g.records}
+            onOpen={() => openMetricDrawer(g.metric, g.records)}
+          />
         {/each}
       </div>
     </section>
@@ -712,6 +738,18 @@
     count={selectedSampleGroup.count}
     samples={selectedSampleGroup.samples}
     onClose={closeSamplesModal}
+  />
+{/if}
+
+<!-- Session 86 — MetricDetailDrawer renders over the dashboard when a
+     MetricCard is clicked. Surfaces the per-fetch parse-volatility
+     view (value | when | source | recipe ref per observation). Same
+     {#if}-gate posture as the other modals. -->
+{#if selectedMetricGroup !== null}
+  <MetricDetailDrawer
+    metric={selectedMetricGroup.metric}
+    records={selectedMetricGroup.records}
+    onClose={closeMetricDrawer}
   />
 {/if}
 

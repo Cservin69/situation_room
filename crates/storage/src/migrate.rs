@@ -108,6 +108,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "fetch_run_outcomes table",
         sql: include_str!("../../../migrations/0016_fetch_run_outcomes.sql"),
     },
+    Migration {
+        version: 17,
+        description: "promote_history table",
+        sql: include_str!("../../../migrations/0017_promote_history.sql"),
+    },
 ];
 
 /// Apply every migration whose version is not yet in

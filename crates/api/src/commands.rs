@@ -355,6 +355,81 @@ impl AppState {
             )),
         }
     }
+
+    /// Session 86 — hydrate the promote-history ring buffer from
+    /// persisted storage (migration 0017). Called once at boot from
+    /// the binary's composition root, after `AppState::new` and after
+    /// `Store::migrate`.
+    ///
+    /// Newest-first ordering: storage returns rows ordered by `at
+    /// DESC`, the ring buffer keeps that ordering so `front()` is the
+    /// most recent entry — same shape an empty boot followed by a
+    /// promote pass would produce.
+    ///
+    /// Failure modes are non-fatal: a storage error (missing column,
+    /// poisoned mutex, etc.) warn-logs and leaves the ring empty. The
+    /// product is still functional with an empty strip; the persistence
+    /// is recovery-only.
+    pub fn hydrate_promote_history(&self) {
+        let rows = match self
+            .store
+            .load_recent_promote_history(PROMOTE_HISTORY_CAP)
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(error = %e, "promote_history hydrate: load failed; starting with empty ring");
+                return;
+            }
+        };
+
+        if rows.is_empty() {
+            return;
+        }
+
+        let mut guard = match self.last_promote_summary.lock() {
+            Ok(g) => g,
+            Err(poison) => {
+                warn!(
+                    "promote_history hydrate: in-memory ring mutex poisoned on cold boot — recovering"
+                );
+                poison.into_inner()
+            }
+        };
+
+        // Storage returns newest-first; the ring is newest-first; the
+        // simplest correct path is to push_back in storage order so
+        // the ring's `front()` is the newest row.
+        let mut hydrated = 0usize;
+        for row in rows {
+            let trigger = match row.trigger.as_str() {
+                "auto_after_fetch" => LastPromoteTrigger::AutoAfterFetch,
+                "manual" => LastPromoteTrigger::Manual,
+                other => {
+                    warn!(trigger = other, "promote_history hydrate: skipping row with unknown trigger");
+                    continue;
+                }
+            };
+            let report: situation_room_pipeline::promote::PromoteReport =
+                match serde_json::from_str(&row.report_json) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "promote_history hydrate: skipping row with un-decodable report"
+                        );
+                        continue;
+                    }
+                };
+            guard.push_back(LastPromoteSummary {
+                plan_id: row.plan_id,
+                at: row.at,
+                trigger,
+                report,
+            });
+            hydrated += 1;
+        }
+        info!(count = hydrated, "promote_history hydrated from storage");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1349,6 +1424,14 @@ pub(crate) fn record_last_promote_summary(
         trigger,
         report,
     };
+
+    // Session 86 — persist to migration 0017's promote_history table
+    // before pushing into the in-memory ring. Persistence is best-
+    // effort: a storage failure warn-logs and the in-memory push
+    // still proceeds. The in-memory ring is authoritative for the
+    // current session; persistence is recovery across binary restarts.
+    persist_promote_history_row(state, &summary);
+
     fn push_front(
         deque: &mut std::collections::VecDeque<LastPromoteSummary>,
         summary: LastPromoteSummary,
@@ -1368,6 +1451,34 @@ pub(crate) fn record_last_promote_summary(
             let mut guard = poison.into_inner();
             push_front(&mut guard, summary);
         }
+    }
+}
+
+/// Session 86 — single write-through to the persistent
+/// `promote_history` table. Pulled out of `record_last_promote_summary`
+/// so the in-memory push and the disk write don't share an error
+/// surface; storage failures warn-log and don't interrupt the
+/// dashboard's per-session ring buffer.
+fn persist_promote_history_row(state: &AppState, summary: &LastPromoteSummary) {
+    let report_json = match serde_json::to_string(&summary.report) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "promote_history persist: report serialize failed; skipping disk write");
+            return;
+        }
+    };
+    let row = situation_room_storage::PromoteHistoryRow {
+        id: Uuid::now_v7(),
+        plan_id: summary.plan_id,
+        at: summary.at,
+        trigger: summary.trigger.as_str().to_string(),
+        report_json,
+    };
+    if let Err(e) = state
+        .store
+        .insert_promote_history_entry(&row, PROMOTE_HISTORY_CAP)
+    {
+        warn!(error = %e, "promote_history persist: insert failed; in-memory ring still updated");
     }
 }
 
@@ -3324,5 +3435,187 @@ mod tests {
             TRIGGER_WINDOW >= std::time::Duration::from_secs(30),
             "TRIGGER_WINDOW too short for the dashboard's interactive feedback. Got: {TRIGGER_WINDOW:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Session 86 — promote-history persistence (migration 0017)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn trigger_strings_match_storage_lockstep_set() {
+        // Storage's `promote_history::TRIGGER_STRINGS` enumerates the
+        // two closed strings we accept on the disk. If a future
+        // session adds a new variant to `LastPromoteTrigger`, both
+        // sides must update in the same commit.
+        //
+        // This test catches the api-side oversight: every variant's
+        // `as_str()` output must already be in the storage allowlist.
+        let expected_api_strings = [
+            LastPromoteTrigger::AutoAfterFetch.as_str(),
+            LastPromoteTrigger::Manual.as_str(),
+        ];
+        for s in &expected_api_strings {
+            assert!(
+                situation_room_storage::PROMOTE_HISTORY_TRIGGERS.contains(s),
+                "LastPromoteTrigger::as_str() = {s:?} but storage's TRIGGER_STRINGS doesn't list it. \
+                 Update PROMOTE_HISTORY_TRIGGERS in crates/storage/src/promote_history.rs in the same commit."
+            );
+        }
+        // And the inverse: every storage string must round-trip
+        // through the api enum's parse path (today this is the match
+        // in `hydrate_promote_history`).
+        for s in situation_room_storage::PROMOTE_HISTORY_TRIGGERS {
+            let _trigger = match *s {
+                "auto_after_fetch" => LastPromoteTrigger::AutoAfterFetch,
+                "manual" => LastPromoteTrigger::Manual,
+                other => panic!(
+                    "storage TRIGGER_STRINGS contains {other:?} but the api crate's hydrate match arm doesn't handle it. \
+                     Update the match in `AppState::hydrate_promote_history`."
+                ),
+            };
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_promote_history_seeds_ring_from_storage() {
+        // Composition-root invariant: after `AppState::new` +
+        // `hydrate_promote_history`, the in-memory ring contains
+        // exactly the rows previously persisted to migration 0017's
+        // table, in newest-first order. This test exercises the seam
+        // by writing rows directly to the store, building a fresh
+        // state, calling hydrate, and reading back through
+        // `last_promote_summary` + `promote_history` commands.
+        let store = std::sync::Arc::new(Store::open_in_memory().unwrap());
+        store.migrate().unwrap();
+
+        // Pre-seed the table with three rows.
+        let plan_id = Uuid::now_v7();
+        let now = chrono::Utc::now();
+        for (i, trigger) in [
+            ("manual", now - chrono::Duration::seconds(120)),
+            ("auto_after_fetch", now - chrono::Duration::seconds(60)),
+            ("auto_after_fetch", now),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let row = situation_room_storage::PromoteHistoryRow {
+                id: Uuid::now_v7(),
+                plan_id,
+                at: trigger.1,
+                trigger: trigger.0.into(),
+                report_json: serde_json::to_string(
+                    &situation_room_pipeline::promote::PromoteReport {
+                        assertions_considered: i as u32,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            };
+            store
+                .insert_promote_history_entry(&row, PROMOTE_HISTORY_CAP)
+                .unwrap();
+        }
+
+        // Build an AppState wired to that store. Use trivial / no-op
+        // collaborators for everything not relevant to this test.
+        let state = make_test_app_state(store.clone());
+        state.hydrate_promote_history();
+
+        let guard = state.last_promote_summary.lock().unwrap();
+        assert_eq!(guard.len(), 3, "all three pre-seeded rows hydrate");
+        // Newest-first: the front should be the `now` row.
+        assert_eq!(
+            guard.front().unwrap().trigger,
+            LastPromoteTrigger::AutoAfterFetch
+        );
+        // And the oldest (manual @ -120s) lands at the back.
+        assert_eq!(
+            guard.back().unwrap().trigger,
+            LastPromoteTrigger::Manual
+        );
+    }
+
+    #[tokio::test]
+    async fn record_last_promote_summary_writes_through_to_storage() {
+        // The in-memory push and the disk write must both happen on
+        // every promote pass. A fresh state + one record + a fresh
+        // load should yield exactly one persisted row.
+        let store = std::sync::Arc::new(Store::open_in_memory().unwrap());
+        store.migrate().unwrap();
+        let state = make_test_app_state(store.clone());
+        let plan_id = Uuid::now_v7();
+        let report = situation_room_pipeline::promote::PromoteReport {
+            assertions_considered: 42,
+            groups_promoted: 7,
+            ..Default::default()
+        };
+        record_last_promote_summary(
+            &state,
+            plan_id,
+            LastPromoteTrigger::Manual,
+            report.clone(),
+        );
+
+        let rows = store.load_recent_promote_history(20).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].plan_id, plan_id);
+        assert_eq!(rows[0].trigger, "manual");
+        let decoded: situation_room_pipeline::promote::PromoteReport =
+            serde_json::from_str(&rows[0].report_json).unwrap();
+        assert_eq!(decoded, report);
+    }
+
+    /// Test helper. Builds an `AppState` over an in-memory store with
+    /// minimal collaborators. Anything the persistence tests don't
+    /// touch is stubbed to keep the wiring compact.
+    fn make_test_app_state(store: std::sync::Arc<Store>) -> AppState {
+        use situation_room_llm::{CompletionRequest, CompletionResponse, CostLedger, LlmError};
+        use situation_room_pipeline::authoritative::AuthorityRegistry;
+        use situation_room_pipeline::authoritative_live::LiveAuthorityRegistry;
+        use situation_room_secure::http::SecureHttpClient;
+
+        struct StubProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for StubProvider {
+            fn id(&self) -> &'static str {
+                "stub"
+            }
+            fn supported_tiers(&self) -> &[ModelTier] {
+                &[ModelTier::Cheap, ModelTier::Workhorse, ModelTier::Frontier]
+            }
+            async fn complete(
+                &self,
+                _tier: ModelTier,
+                _request: CompletionRequest,
+            ) -> std::result::Result<CompletionResponse, LlmError> {
+                Err(LlmError::Api("test stub".into()))
+            }
+        }
+
+        let http = Arc::new(
+            SecureHttpClient::new(situation_room_secure::http::SecureHttpConfig::default())
+                .unwrap(),
+        );
+        let prefetch_http = http.clone();
+        AppState::new(
+            store,
+            Arc::new(StubProvider) as Arc<dyn LlmProvider + Send + Sync>,
+            http,
+            prefetch_http,
+            Arc::new(CostLedger::new()),
+            "stub-classifier",
+            "stub-recipe-author",
+            "stub-propose-url",
+            "stub-doc-assertions",
+            "stub-doc-events",
+            "stub-doc-observations",
+            "stub-doc-entity-attrs",
+            vec![],
+            LiveAuthorityRegistry::new(
+                AuthorityRegistry::empty(),
+                std::path::PathBuf::from("/dev/null"),
+            ),
+        )
     }
 }

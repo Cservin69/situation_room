@@ -52,12 +52,25 @@
   import type { AuthorityRegistrySummaryDto } from '$lib/api/types/AuthorityRegistrySummaryDto';
   import type { LastPromoteSummaryDto } from '$lib/api/types/LastPromoteSummaryDto';
   import type { PromoteHistoryDto } from '$lib/api/types/PromoteHistoryDto';
+  import PromoteDetailDrawer from '$components/PromoteDetailDrawer.svelte';
 
   let registry = $state<AuthorityRegistrySummaryDto | null>(null);
   let last = $state<LastPromoteSummaryDto | null>(null);
   let history = $state<PromoteHistoryDto | null>(null);
   let lastUpdated = $state<Date | null>(null);
   let error = $state<string | null>(null);
+  // Session 86 — selected history cell for click-through detail drawer.
+  // `null` when no cell is open; the {#if} guard below keeps the modal
+  // off the DOM in the common case so its keydown handler doesn't
+  // accumulate listeners across open/close cycles.
+  let selectedHistoryEntry = $state<LastPromoteSummaryDto | null>(null);
+
+  function openHistoryDetail(e: LastPromoteSummaryDto) {
+    selectedHistoryEntry = e;
+  }
+  function closeHistoryDetail() {
+    selectedHistoryEntry = null;
+  }
 
   /**
    * Polling cadence. 10s is the trade-off between "operator sees the
@@ -331,11 +344,21 @@
         </div>
         <ul class="history-cells">
           {#each history.entries as e, i (i)}
-            <li
-              class="history-cell"
-              data-sign={entrySign(e)}
-              title={entryTitle(e)}
-            ></li>
+            <!-- Session 86 — click-through to per-pass detail drawer.
+                 Each cell becomes an actual <button> so it's
+                 keyboard-focusable; the hover tooltip stays in place
+                 as the at-a-glance affordance, and the click opens
+                 the full per-counter breakdown in a modal. -->
+            <li class="history-cell-wrap">
+              <button
+                type="button"
+                class="history-cell"
+                data-sign={entrySign(e)}
+                title={entryTitle(e)}
+                aria-label="open promote pass detail"
+                onclick={() => openHistoryDetail(e)}
+              ></button>
+            </li>
           {/each}
         </ul>
       </div>
@@ -349,6 +372,14 @@
     {/if}
   {/if}
 </section>
+
+<!-- Session 86 — per-pass detail drawer over the dashboard when a
+     history-strip cell is clicked. The {#if} gate keeps the modal off
+     the DOM entirely when no cell is open (same posture as
+     DocumentDrawer in RecordsDashboard). -->
+{#if selectedHistoryEntry !== null}
+  <PromoteDetailDrawer entry={selectedHistoryEntry} onClose={closeHistoryDetail} />
+{/if}
 
 <style>
   .promote-panel {
@@ -586,13 +617,31 @@
     gap: 3px;
     align-items: stretch;
   }
+  /* Session 86 — wrap exists so the flex item is the <li>; the
+     focusable <button> inside takes the colour/border styles. The
+     wrap stays bare so the strip still distributes width evenly. */
+  .history-cell-wrap {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+  }
   .history-cell {
     flex: 1 1 0;
     min-width: 0;
     height: 14px;
+    padding: 0;
     border-radius: 2px;
     border: 1px solid var(--border-subtle);
     background: var(--bg-panel-alt);
+    cursor: pointer;
+    transition:
+      transform var(--duration-ui, 120ms) var(--ease, ease),
+      border-color var(--duration-ui, 120ms) var(--ease, ease);
+  }
+  .history-cell:hover,
+  .history-cell:focus-visible {
+    border-color: var(--border-strong);
+    transform: translateY(-1px);
   }
   .history-cell[data-sign='positive'] {
     background: rgba(91, 198, 133, 0.55);

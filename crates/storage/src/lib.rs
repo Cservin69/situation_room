@@ -22,6 +22,7 @@ pub mod fetch_run_outcomes;
 pub mod fetch_runs;
 pub mod migrate;
 pub mod observations;
+pub mod promote_history;
 pub mod queries;
 pub mod recipe_feedback;
 pub mod recipe_fetch_attempts;
@@ -37,6 +38,7 @@ pub use fetch_run_outcomes::{
     RecipeOutcomeHistoryEntry, RecipeOutcomeHistoryRunRow, StoredFetchRunOutcome,
 };
 pub use fetch_runs::{FetchRunRow, StoredFetchRun};
+pub use promote_history::{PromoteHistoryRow, TRIGGER_STRINGS as PROMOTE_HISTORY_TRIGGERS};
 pub use queries::{RecordsByPlan, TopicUsage};
 pub use recipe_feedback::{RecipeFeedbackRow, StoredRecipeFeedback};
 pub use recipe_fetch_attempts::{

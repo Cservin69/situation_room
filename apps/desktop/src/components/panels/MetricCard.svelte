@@ -71,8 +71,16 @@
      * length 1 or longer.
      */
     records: ObservationDto[];
+    /**
+     * Session 86 — optional click-through to a per-Observation detail
+     * drawer (parse-volatility visibility). When provided, the card
+     * becomes a `<button>` and surfaces a subtle hover cue; when
+     * omitted, the card stays a plain `<article>` (no regression for
+     * any caller that doesn't yet wire the drawer).
+     */
+    onOpen?: () => void;
   }
-  let { metric, records }: Props = $props();
+  let { metric, records, onOpen }: Props = $props();
 
   // -- safe shape reads (see header docstring) ----------------------
 
@@ -252,9 +260,37 @@
   let whenLabel = $derived(latest ? dateLabel(latest) : '');
   let sourceHost = $derived(latest ? hostOf(latest.envelope.provenance.source_url) : '');
   let sourceUrl = $derived(latest ? latest.envelope.provenance.source_url ?? '' : '');
+
+  // Session 86 — click-through to MetricDetailDrawer. Mirrors the
+  // KindCard pattern: click anywhere on the card body to open, but
+  // skip clicks that target an inner button or anchor (so the
+  // source-row's CopyButton doesn't also fire the drawer).
+  function onCardClick(e: MouseEvent) {
+    if (!onOpen) return;
+    const t = e.target as HTMLElement;
+    if (t.closest('button, a')) return;
+    onOpen();
+  }
+  function onCardKeydown(e: KeyboardEvent) {
+    if (!onOpen) return;
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      onOpen();
+    }
+  }
 </script>
 
-<article class="metric-card">
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+<article
+  class="metric-card"
+  class:clickable={onOpen !== undefined}
+  role={onOpen ? 'button' : undefined}
+  tabindex={onOpen ? 0 : undefined}
+  onclick={onCardClick}
+  onkeydown={onCardKeydown}
+  aria-label={onOpen ? `open ${metric} detail` : undefined}
+>
   <header class="head">
     <span class="metric-name" title={metric}>{metric}</span>
     {#if records.length > 1}
@@ -323,6 +359,21 @@
     border: 1px solid var(--border-subtle);
     border-radius: 3px;
     min-width: 160px;
+  }
+  /* Session 86 — subtle hover affordance when the parent wires
+     `onOpen`. Keeps the resting state identical to a non-clickable
+     card so the dashboard's at-a-glance reading doesn't shift. */
+  .metric-card.clickable {
+    cursor: pointer;
+    transition:
+      border-color var(--duration-ui, 120ms) var(--ease, ease),
+      transform var(--duration-ui, 120ms) var(--ease, ease);
+  }
+  .metric-card.clickable:hover,
+  .metric-card.clickable:focus-visible {
+    border-color: var(--border-strong);
+    transform: translateY(-1px);
+    outline: none;
   }
 
   .head {

@@ -315,11 +315,20 @@ fn check_schema_warnings(toml_text: &str) {
     // Top-level: warn on any key that isn't in the allowlist.
     for (key, _) in table.iter() {
         if !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()) {
-            warn!(
-                key = %key,
-                "authoritative-sources TOML: unknown top-level key (ignored). Allowed: {:?}",
-                KNOWN_TOP_LEVEL_KEYS
-            );
+            match distance_1_suggestion(key, KNOWN_TOP_LEVEL_KEYS) {
+                Some(suggestion) => warn!(
+                    key = %key,
+                    suggestion = %suggestion,
+                    "authoritative-sources TOML: unknown top-level key (ignored). Did you mean `{}`? Allowed: {:?}",
+                    suggestion,
+                    KNOWN_TOP_LEVEL_KEYS
+                ),
+                None => warn!(
+                    key = %key,
+                    "authoritative-sources TOML: unknown top-level key (ignored). Allowed: {:?}",
+                    KNOWN_TOP_LEVEL_KEYS
+                ),
+            }
         }
     }
 
@@ -333,14 +342,137 @@ fn check_schema_warnings(toml_text: &str) {
         };
         for (key, _) in row.iter() {
             if !KNOWN_ENTRY_FIELDS.contains(&key.as_str()) {
-                warn!(
-                    entry_index = idx,
-                    unknown_field = %key,
-                    "authoritative-sources TOML: unknown field on [[authority]] entry (ignored). Allowed: {:?}",
-                    KNOWN_ENTRY_FIELDS
-                );
+                match distance_1_suggestion(key, KNOWN_ENTRY_FIELDS) {
+                    Some(suggestion) => warn!(
+                        entry_index = idx,
+                        unknown_field = %key,
+                        suggestion = %suggestion,
+                        "authoritative-sources TOML: unknown field on [[authority]] entry (ignored). Did you mean `{}`? Allowed: {:?}",
+                        suggestion,
+                        KNOWN_ENTRY_FIELDS
+                    ),
+                    None => warn!(
+                        entry_index = idx,
+                        unknown_field = %key,
+                        "authoritative-sources TOML: unknown field on [[authority]] entry (ignored). Allowed: {:?}",
+                        KNOWN_ENTRY_FIELDS
+                    ),
+                }
             }
         }
+    }
+}
+
+/// Session 86 — closest distance-1 typo suggestion against a closed
+/// allowlist. Returns `Some(candidate)` when there's exactly one
+/// allowlist entry within edit distance 1 of `unknown`, otherwise
+/// `None`.
+///
+/// Edit distance 1 is defined as: a single character insertion,
+/// deletion, or substitution (Levenshtein 1). Transpositions of two
+/// adjacent characters count as 2 edits under classic Levenshtein but
+/// we promote them to distance 1 here because TOML field-name typos
+/// like `metirc` ↔ `metric` are the canonical case.
+///
+/// **Why "exactly one":** when two allowlist entries are equidistant
+/// the suggestion would be ambiguous, so we surface nothing rather
+/// than guess. The warn still names the full allowlist, which is the
+/// fallback behaviour from Session 85.
+///
+/// **Why a tiny custom implementation:** the allowlist is a handful of
+/// ASCII identifiers; pulling in `strsim` or `levenshtein` would be
+/// dependency weight for a leaf decoration. The bound below operates
+/// over up to len*allowlist character comparisons — measured in
+/// nanoseconds for any plausible config file.
+fn distance_1_suggestion<'a>(unknown: &str, allowlist: &'a [&'a str]) -> Option<&'a str> {
+    let mut matches = Vec::new();
+    for candidate in allowlist {
+        if is_within_edit_distance_1(unknown, candidate) {
+            matches.push(*candidate);
+            if matches.len() > 1 {
+                // Two equidistant candidates: refuse to guess.
+                return None;
+            }
+        }
+    }
+    matches.into_iter().next()
+}
+
+/// Returns true iff `a` and `b` differ by exactly one
+/// insertion / deletion / substitution / adjacent transposition.
+/// Equal strings return false (the caller wants a *suggestion*, not
+/// self-identity).
+fn is_within_edit_distance_1(a: &str, b: &str) -> bool {
+    if a == b {
+        return false;
+    }
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let (alen, blen) = (a_bytes.len(), b_bytes.len());
+    let len_diff = alen.abs_diff(blen);
+    if len_diff > 1 {
+        return false;
+    }
+
+    if alen == blen {
+        // Substitution: exactly one byte differs.
+        let mut diffs = 0;
+        let mut first_diff: Option<usize> = None;
+        for i in 0..alen {
+            if a_bytes[i] != b_bytes[i] {
+                if diffs == 0 {
+                    first_diff = Some(i);
+                }
+                diffs += 1;
+                if diffs > 2 {
+                    return false;
+                }
+            }
+        }
+        if diffs == 1 {
+            return true;
+        }
+        // Exactly-2-diff case: accept only if they form an adjacent
+        // transposition (a[i] = b[i+1] && a[i+1] = b[i]). The typoed
+        // `metirc` vs `metric` lands here.
+        if diffs == 2 {
+            if let Some(i) = first_diff {
+                if i + 1 < alen
+                    && a_bytes[i] == b_bytes[i + 1]
+                    && a_bytes[i + 1] == b_bytes[i]
+                    && a_bytes[i + 2..] == b_bytes[i + 2..]
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    } else {
+        // Insertion / deletion: align the shorter against the longer
+        // and require at most one byte unaccounted for.
+        let (short, long) = if alen < blen {
+            (a_bytes, b_bytes)
+        } else {
+            (b_bytes, a_bytes)
+        };
+        let mut i = 0;
+        let mut j = 0;
+        let mut skipped = false;
+        while i < short.len() && j < long.len() {
+            if short[i] == long[j] {
+                i += 1;
+                j += 1;
+            } else if !skipped {
+                skipped = true;
+                j += 1;
+            } else {
+                return false;
+            }
+        }
+        // Either we consumed the short side and the long side has at
+        // most one byte left, or the long side is exhausted (and the
+        // tail skip happens implicitly).
+        true
     }
 }
 
@@ -805,6 +937,108 @@ consensus_quorum = 2
         assert_eq!(e.metric.as_deref(), Some("production"));
         assert_eq!(e.topic.as_deref(), Some("Cu"));
         assert_eq!(e.consensus_quorum, Some(2));
+    }
+
+    // Session 86 — distance-1 typo suggestions -------------------------
+
+    #[test]
+    fn substitution_typo_resolves_to_canonical_field() {
+        // `consensus_quorom` ↔ `consensus_quorum` — single substitution
+        // (`o` → `u` at position 14). Most common shape of TOML typos.
+        let allow = &["source_id", "metric", "topic", "consensus_quorum"];
+        assert_eq!(distance_1_suggestion("consensus_quorom", allow), Some("consensus_quorum"));
+    }
+
+    #[test]
+    fn transposition_typo_resolves_to_canonical_field() {
+        // `metirc` ↔ `metric` — adjacent transposition at positions 2/3.
+        // Classic Levenshtein is distance 2, but we promote
+        // single-adjacent-swap to distance 1 — typing-realistic, and
+        // these are exactly the typos operators make.
+        let allow = &["source_id", "metric", "topic", "consensus_quorum"];
+        assert_eq!(distance_1_suggestion("metirc", allow), Some("metric"));
+    }
+
+    #[test]
+    fn deletion_typo_resolves_to_canonical_field() {
+        // `topi` ↔ `topic` — missing trailing `c`. Single deletion.
+        let allow = &["source_id", "metric", "topic", "consensus_quorum"];
+        assert_eq!(distance_1_suggestion("topi", allow), Some("topic"));
+    }
+
+    #[test]
+    fn insertion_typo_resolves_to_canonical_field() {
+        // `metrics` ↔ `metric` — extra trailing `s`. Single insertion.
+        let allow = &["source_id", "metric", "topic", "consensus_quorum"];
+        assert_eq!(distance_1_suggestion("metrics", allow), Some("metric"));
+    }
+
+    #[test]
+    fn far_typo_yields_no_suggestion() {
+        // `quor` is distance 1 from no allowlist entry: shorter than
+        // every multi-char candidate by more than one, and not a
+        // prefix of `consensus_quorum`.
+        let allow = &["source_id", "metric", "topic", "consensus_quorum"];
+        assert_eq!(distance_1_suggestion("quor", allow), None);
+    }
+
+    #[test]
+    fn equidistant_candidates_yield_no_suggestion() {
+        // `xs` is distance 1 from both `xa` and `xb`: refuse to guess
+        // when two allowlist entries are tied. The full allowlist still
+        // gets named in the warn (caller's responsibility).
+        let allow = &["xa", "xb", "completely_different"];
+        assert_eq!(distance_1_suggestion("xs", allow), None);
+    }
+
+    #[test]
+    fn exact_match_yields_no_suggestion() {
+        // Defensive: `distance_1_suggestion` is only called when the
+        // key is NOT in the allowlist, but if a caller ever invokes it
+        // with a known field name it returns None — a suggestion of
+        // self-identity would be a nonsense warn.
+        let allow = &["source_id", "metric", "topic", "consensus_quorum"];
+        assert_eq!(distance_1_suggestion("metric", allow), None);
+    }
+
+    #[test]
+    fn edit_distance_helper_is_symmetric() {
+        // Defence-in-depth: the helper's contract is symmetric, so
+        // swapping the two arguments should not change the boolean.
+        assert!(is_within_edit_distance_1("metirc", "metric"));
+        assert!(is_within_edit_distance_1("metric", "metirc"));
+        assert!(is_within_edit_distance_1("topi", "topic"));
+        assert!(is_within_edit_distance_1("topic", "topi"));
+    }
+
+    #[test]
+    fn edit_distance_rejects_distance_two_and_above() {
+        // `souce_di` from `source_id`: deletion + transposition,
+        // distance 2; neither alignment fits within 1.
+        let allow = &["source_id", "metric", "topic", "consensus_quorum"];
+        assert_eq!(distance_1_suggestion("souce_di", allow), None);
+        // Sanity: kitten/sitten is distance 1 (single substitution).
+        assert!(is_within_edit_distance_1("kitten", "sitten"));
+        // sittin vs kitten is distance 2 (k→s + e→i).
+        assert!(!is_within_edit_distance_1("kitten", "sittin"));
+    }
+
+    #[test]
+    fn parse_unknown_field_with_typo_suggestion_still_parses() {
+        // Operator typoed `consensus_quorom`. The pre-parse sweep emits
+        // a suggestion-bearing warn; the typed parse below proceeds with
+        // the field at its serde default. Behaviour identical to
+        // Session 85 from the registry's point of view — the
+        // suggestion is purely a log decoration.
+        let s = r#"
+[[authority]]
+source_id = "agency:reuters"
+metric = "production"
+consensus_quorom = 2
+"#;
+        let r = AuthorityRegistry::parse(s).expect("typo still parses");
+        assert_eq!(r.entries().len(), 1);
+        assert_eq!(r.entries()[0].consensus_quorum, None);
     }
 
     #[test]
