@@ -33,6 +33,7 @@ import type { ClassifierPromptVersionDto } from './types/ClassifierPromptVersion
 import type { PromoteReportDto } from './types/PromoteReportDto';
 import type { AuthorityRegistrySummaryDto } from './types/AuthorityRegistrySummaryDto';
 import type { LastPromoteSummaryDto } from './types/LastPromoteSummaryDto';
+import type { PromoteHistoryDto } from './types/PromoteHistoryDto';
 
 /**
  * Run Level-1 classification on a topic. Persists the resulting plan
@@ -556,9 +557,32 @@ export async function authoritativeRegistrySummary(): Promise<AuthorityRegistryS
  * this binary session. Used by the dashboard tile to surface
  * "the last pass found X auth + Y consensus" without grepping INFO
  * logs.
+ *
+ * Session 85: derived from the promote-history ring buffer's front.
+ * Behaviour is the same as Session-84 for any caller that just
+ * needs the newest entry; for the full ring + cross-plan trigger
+ * counter, reach for `promoteHistory`.
  */
 export async function lastPromoteSummary(): Promise<LastPromoteSummaryDto | null> {
   return invoke<LastPromoteSummaryDto | null>('last_promote_summary');
+}
+
+/**
+ * Session 85 — return the in-memory ring buffer of recent promote
+ * passes (newest first) plus the rolling auto-trigger counter.
+ *
+ * The dashboard tile renders the `entries` array as a strip of
+ * micro-summaries and uses `auto_triggers_last_minute` to surface a
+ * "N runs in the last minute" caption when the operator fires
+ * multiple plans in rapid succession (closes the visibility gap
+ * Session 84 left open: the singleton "last promote" tile would
+ * otherwise only show the most recent run).
+ *
+ * Pure read; no LLM call, no DB. Capped server-side at
+ * `PROMOTE_HISTORY_CAP` (currently 20).
+ */
+export async function promoteHistory(): Promise<PromoteHistoryDto> {
+  return invoke<PromoteHistoryDto>('promote_history');
 }
 
 /**

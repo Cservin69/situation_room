@@ -1782,6 +1782,50 @@ impl PromoteReportFlatDto {
 }
 
 // ---------------------------------------------------------------------------
+// Session 85 — promote-pass history + cross-plan trigger counter
+// ---------------------------------------------------------------------------
+
+/// Wire shape for the `promote_history` command (Session 85).
+///
+/// Carries the in-memory ring buffer of recent promote-pass summaries
+/// (capped server-side) plus a rolling auto-trigger counter so the
+/// dashboard tile can surface two operator-facing questions Session
+/// 84 left open:
+///
+///   1. "How have the last N promote runs gone?" — `entries` is the
+///      newest-first list, rendered as a strip on the dashboard.
+///
+///   2. "Did the dashboard miss anything from my last burst of
+///      activity?" — `auto_triggers_last_minute` counts auto-trigger
+///      entries within the rolling window. When > 1, the dashboard
+///      shows "N runs in the last minute" so the operator can tell
+///      "last shown is stale" apart from "this is the only run".
+///
+/// The `capacity` and `trigger_window_seconds` fields surface the
+/// server-side knobs so the frontend can render copy without hard-
+/// coding the numbers (and so the test suite can pin both via the
+/// wire shape without reaching back into the Rust constants).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct PromoteHistoryDto {
+    /// Recent promote-pass summaries, newest first. Capped at
+    /// `capacity`; older entries fall off the back as new ones land.
+    pub entries: Vec<LastPromoteSummaryDto>,
+    /// Maximum number of entries the ring buffer holds. Matches
+    /// `PROMOTE_HISTORY_CAP` on the Rust side.
+    pub capacity: u32,
+    /// Count of auto-trigger entries (i.e. `trigger ==
+    /// "auto_after_fetch"`) whose timestamp falls within the last
+    /// `trigger_window_seconds`. Manual promote-button clicks are
+    /// excluded — the operator already knows about those.
+    pub auto_triggers_last_minute: u32,
+    /// The rolling-window size in seconds. Surfaces
+    /// `TRIGGER_WINDOW` so the frontend renders copy in lockstep with
+    /// the server-side knob.
+    pub trigger_window_seconds: u32,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

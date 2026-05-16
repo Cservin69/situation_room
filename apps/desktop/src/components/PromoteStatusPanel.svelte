@@ -4,7 +4,7 @@
 
   ## What this answers
 
-  Two operator-facing questions Session 82 left for the dashboard:
+  Three operator-facing questions:
 
     1. "Which sources is the binary treating as authoritative right
        now?" — pulls from `authoritative_registry_summary` and renders
@@ -18,12 +18,20 @@
        (`auto_after_fetch` vs `manual`). Replaces the "grep INFO logs"
        muscle memory that Session 82 left in place.
 
+    3. "Did the dashboard miss anything from my last burst of
+       activity?" — Session 85: pulls from `promote_history` and
+       renders a strip of the last ~20 passes plus a
+       "N runs in the last minute" caption when more than one
+       auto-trigger fired inside the rolling window.
+
   ## Layout
 
-  Single panel with two horizontally-stacked sections:
+  Single panel with three horizontally-stacked sections:
 
-    - left  — registry summary: entry count + sample rows
-    - right — last-promote summary: counters + trigger chip + age
+    - left   — registry summary: entry count + sample rows
+    - middle — last-promote summary: counters + trigger chip + age
+    - bottom — history strip (Session 85): one micro-cell per recent
+      pass, hover-titled with the per-pass counters
 
   Stacks vertically on narrow widths to keep the same readability the
   CostByTierPanel sets above.
@@ -33,21 +41,21 @@
   - **No edit UI.** The TOML is the source of truth; the panel is
     read-only. Editing happens in the operator's editor, then propagates
     via the hot-reload watcher.
-  - **No history.** The "last" promote summary is process-session
-    scoped; we don't surface the timeline of previous runs (that
-    belongs in a future "promote history" surface).
 -->
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import {
     authoritativeRegistrySummary,
     lastPromoteSummary,
+    promoteHistory,
   } from '$lib/api/client';
   import type { AuthorityRegistrySummaryDto } from '$lib/api/types/AuthorityRegistrySummaryDto';
   import type { LastPromoteSummaryDto } from '$lib/api/types/LastPromoteSummaryDto';
+  import type { PromoteHistoryDto } from '$lib/api/types/PromoteHistoryDto';
 
   let registry = $state<AuthorityRegistrySummaryDto | null>(null);
   let last = $state<LastPromoteSummaryDto | null>(null);
+  let history = $state<PromoteHistoryDto | null>(null);
   let lastUpdated = $state<Date | null>(null);
   let error = $state<string | null>(null);
 
@@ -63,12 +71,14 @@
 
   async function refresh() {
     try {
-      const [reg, ls] = await Promise.all([
+      const [reg, ls, hist] = await Promise.all([
         authoritativeRegistrySummary(),
         lastPromoteSummary(),
+        promoteHistory(),
       ]);
       registry = reg;
       last = ls;
+      history = hist;
       lastUpdated = new Date();
       error = null;
     } catch (e) {
@@ -150,6 +160,47 @@
     if (topic) bits.push(`topic:${topic}`);
     if (metric) bits.push(`metric:${metric}`);
     return bits.length === 0 ? '*' : bits.join(' · ');
+  }
+
+  /**
+   * Session 85 — per-cell signal for the history strip. Each cell
+   * encodes one PromoteReport's "did this run actually do anything"
+   * verdict via a four-state closed-vocab data-sign:
+   *   - positive   → at least one record promoted (auth or consensus)
+   *   - info       → considered > 0 but nothing new (skipped-already)
+   *   - muted      → no Assertions considered at all
+   *   - negative   → insert_failures > 0 (load-bearing failure)
+   * The verdicts are mutually exclusive in practice; we evaluate
+   * negative first so the failure case dominates the others.
+   */
+  function entrySign(e: LastPromoteSummaryDto): string {
+    if (e.report.insert_failures > 0) return 'negative';
+    const promoted =
+      e.report.authoritative_promoted + e.report.groups_promoted;
+    if (promoted > 0) return 'positive';
+    if (e.report.assertions_considered > 0) return 'info';
+    return 'muted';
+  }
+
+  /**
+   * Tooltip text shown on hover. Captures the per-cell verdict in
+   * one line so the operator doesn't need to click through to a
+   * detail surface.
+   */
+  function entryTitle(e: LastPromoteSummaryDto): string {
+    const promoted =
+      e.report.authoritative_promoted + e.report.groups_promoted;
+    return [
+      `trigger: ${formatTrigger(e.trigger)}`,
+      `${ageOf(e.at)}`,
+      `considered: ${e.report.assertions_considered}`,
+      `promoted: ${promoted} (auth ${e.report.authoritative_promoted} + consensus ${e.report.groups_promoted})`,
+      e.report.insert_failures > 0
+        ? `insert failures: ${e.report.insert_failures}`
+        : null,
+    ]
+      .filter((s) => s !== null)
+      .join('\n');
   }
 </script>
 
@@ -262,6 +313,34 @@
         {/if}
       </div>
     </div>
+
+    <!-- Session 85 — history strip + cross-plan trigger counter -->
+    {#if history !== null && history.entries.length > 0}
+      <div class="history-strip" aria-label="recent promote passes">
+        <div class="history-header">
+          <span class="history-title">recent passes</span>
+          <span class="history-coord">
+            {history.entries.length} · cap {history.capacity}
+            {#if history.auto_triggers_last_minute > 1}
+              <span class="trigger-counter"
+                title="auto-trigger fired {history.auto_triggers_last_minute} times in the last {history.trigger_window_seconds}s; the last-promote tile above only shows the most recent — use this strip to see the rest">
+                · {history.auto_triggers_last_minute} runs in the last {history.trigger_window_seconds}s
+              </span>
+            {/if}
+          </span>
+        </div>
+        <ul class="history-cells">
+          {#each history.entries as e, i (i)}
+            <li
+              class="history-cell"
+              data-sign={entrySign(e)}
+              title={entryTitle(e)}
+            ></li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
+
     {#if lastUpdated !== null}
       <p class="footnote">
         updated {lastUpdated.toLocaleTimeString()} · auto-refresh every
@@ -469,5 +548,65 @@
     font-size: 10px;
     color: var(--fg-quaternary);
     font-family: var(--font-mono);
+  }
+
+  /* Session 85 — history strip */
+  .history-strip {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px 0 0 0;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .history-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    font-size: 10px;
+    color: var(--fg-tertiary);
+    font-family: var(--font-mono);
+  }
+  .history-title {
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+  }
+  .history-coord {
+    color: var(--fg-quaternary);
+  }
+  .trigger-counter {
+    color: var(--signal-info);
+    margin-left: 4px;
+  }
+  .history-cells {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: row;
+    gap: 3px;
+    align-items: stretch;
+  }
+  .history-cell {
+    flex: 1 1 0;
+    min-width: 0;
+    height: 14px;
+    border-radius: 2px;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-panel-alt);
+  }
+  .history-cell[data-sign='positive'] {
+    background: rgba(91, 198, 133, 0.55);
+    border-color: rgba(91, 198, 133, 0.7);
+  }
+  .history-cell[data-sign='info'] {
+    background: rgba(120, 144, 200, 0.35);
+    border-color: rgba(120, 144, 200, 0.5);
+  }
+  .history-cell[data-sign='muted'] {
+    background: var(--bg-panel-alt);
+  }
+  .history-cell[data-sign='negative'] {
+    background: rgba(220, 90, 90, 0.55);
+    border-color: rgba(220, 90, 90, 0.7);
   }
 </style>

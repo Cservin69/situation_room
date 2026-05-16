@@ -60,6 +60,12 @@
     const i = catalog.series.findIndex((s) => s.key === key);
     return i >= 0 ? i : 0;
   }
+  // `initialKey` is intentionally captured at component creation —
+  // the prop name signals "seed me with this once". After mount,
+  // `activeIndex` is operator-driven via the popover; later changes
+  // to the parent's prop should NOT clobber that. The directive on
+  // the following line marks the capture-once read as deliberate.
+  // svelte-ignore state_referenced_locally
   let activeIndex = $state(indexOfKey(initialKey));
   let active = $derived<ChartSeries>(
     catalog.series[activeIndex] ?? catalog.series[0],

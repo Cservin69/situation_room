@@ -225,8 +225,33 @@ pub struct AppState {
     /// authoritative + Y consensus" without grepping logs. Per-run
     /// updates from `run_fetch_for_plan`'s auto-trigger and from
     /// `promote_consensus_for_plan` write into the Mutex.
-    pub last_promote_summary: Arc<std::sync::Mutex<Option<LastPromoteSummary>>>,
+    ///
+    /// Session 85 — repurposed as a ring buffer (capacity
+    /// [`PROMOTE_HISTORY_CAP`]). The most recent entry stays at index 0
+    /// (newest-first ordering); older entries shift right and fall off
+    /// once the cap is hit. `last_promote_summary` still returns the
+    /// newest entry; the new `promote_history` command exposes the
+    /// full ring so the dashboard can render a "last N passes" strip.
+    pub last_promote_summary: Arc<std::sync::Mutex<std::collections::VecDeque<LastPromoteSummary>>>,
 }
+
+/// Session 85 — cap on the promote-pass history ring buffer.
+///
+/// 20 is the smallest size that keeps a typical interactive operator
+/// session (a few plans accepted, fetched, re-fetched) inside the
+/// window. The dashboard renders ~8 strip columns by default; the
+/// ring buffer surfaces a generous parent set so the strip can grow
+/// without a server-side refactor.
+pub const PROMOTE_HISTORY_CAP: usize = 20;
+
+/// Session 85 — rolling window for the cross-plan trigger counter.
+///
+/// Counts auto-triggers (i.e. `run_fetch_for_plan` completions) whose
+/// timestamp falls inside this window. Sized to match an operator's
+/// "did I just kick off three things in rapid succession?" mental
+/// model: anything in the last minute is "right now", anything older
+/// is "previous activity".
+pub const TRIGGER_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Session 84 — packaged shape of "the most recent promote run."
 /// Public so the `last_promote_summary` Tauri command can map this
@@ -325,7 +350,9 @@ impl AppState {
             document_entity_attributes_prompt,
             sources,
             authoritative,
-            last_promote_summary: Arc::new(std::sync::Mutex::new(None)),
+            last_promote_summary: Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::with_capacity(PROMOTE_HISTORY_CAP),
+            )),
         }
     }
 }
@@ -1304,6 +1331,12 @@ async fn auto_promote_after_fetch(
 /// write path. Failure (lock poisoning) is logged-only — the promote
 /// result itself is the load-bearing return value; the summary is a
 /// dashboard convenience.
+///
+/// Session 85 — pushes the new summary onto the front of a ring
+/// buffer capped at [`PROMOTE_HISTORY_CAP`]. The newest entry stays
+/// at index 0; older entries fall off the back once the cap is hit.
+/// `last_promote_summary` returns `front()`; `promote_history`
+/// returns the full deque + the rolling auto-trigger counter.
 pub(crate) fn record_last_promote_summary(
     state: &AppState,
     plan_id: Uuid,
@@ -1316,19 +1349,47 @@ pub(crate) fn record_last_promote_summary(
         trigger,
         report,
     };
-    match state.last_promote_summary.lock() {
-        Ok(mut guard) => {
-            *guard = Some(summary);
+    fn push_front(
+        deque: &mut std::collections::VecDeque<LastPromoteSummary>,
+        summary: LastPromoteSummary,
+    ) {
+        deque.push_front(summary);
+        while deque.len() > PROMOTE_HISTORY_CAP {
+            deque.pop_back();
         }
+    }
+    match state.last_promote_summary.lock() {
+        Ok(mut guard) => push_front(&mut guard, summary),
         Err(poison) => {
             warn!(
                 trigger = %trigger.as_str(),
                 "last_promote_summary mutex poisoned — recovering and recording anyway"
             );
             let mut guard = poison.into_inner();
-            *guard = Some(summary);
+            push_front(&mut guard, summary);
         }
     }
+}
+
+/// Session 85 — count auto-trigger entries whose `at` falls within
+/// the last [`TRIGGER_WINDOW`] seconds. Used by the
+/// `promote_history` command to surface the "X runs this minute"
+/// signal Session 84 left open — addresses the visibility gap when an
+/// operator runs several plans in rapid succession and the dashboard
+/// tile only shows the most recent.
+///
+/// Counts only `AutoAfterFetch` triggers; manual button-click runs
+/// are tallied separately because the operator already knows they
+/// fired (they clicked the button).
+pub(crate) fn count_recent_auto_triggers(
+    history: &std::collections::VecDeque<LastPromoteSummary>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> u32 {
+    let cutoff = now - chrono::Duration::from_std(TRIGGER_WINDOW).unwrap_or_default();
+    history
+        .iter()
+        .filter(|s| s.trigger == LastPromoteTrigger::AutoAfterFetch && s.at >= cutoff)
+        .count() as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -2488,7 +2549,7 @@ pub async fn authoritative_registry_summary(
 }
 
 // ---------------------------------------------------------------------------
-// Command 20 — last_promote_summary (Session 84)
+// Command 20 — last_promote_summary (Session 84) / promote_history (Session 85)
 // ---------------------------------------------------------------------------
 
 /// Return the most recent `PromoteReport` (auto-trigger or manual).
@@ -2497,6 +2558,10 @@ pub async fn authoritative_registry_summary(
 /// after boot, or no `run_fetch_for_plan` has completed against an
 /// accepted plan). The dashboard tile renders an explicit empty
 /// state in that case.
+///
+/// Session 85: derived from the ring-buffer front. Behaviour is the
+/// same as Session-84 for any caller that just needs the newest
+/// entry; callers that need history reach for `promote_history`.
 #[tauri::command]
 pub async fn last_promote_summary(
     state: tauri::State<'_, AppState>,
@@ -2512,7 +2577,7 @@ pub async fn last_promote_summary(
             poison.into_inner()
         }
     };
-    let Some(summary) = guard.as_ref() else {
+    let Some(summary) = guard.front() else {
         return Ok(None);
     };
     Ok(Some(crate::types_export::LastPromoteSummaryDto {
@@ -2521,6 +2586,54 @@ pub async fn last_promote_summary(
         trigger: summary.trigger.as_str().to_string(),
         report: crate::types_export::PromoteReportFlatDto::from_typed(&summary.report),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Command 21 — promote_history (Session 85)
+// ---------------------------------------------------------------------------
+
+/// Return the ring buffer of recent promote-pass summaries (newest
+/// first) plus the rolling auto-trigger counter.
+///
+/// Capped at [`PROMOTE_HISTORY_CAP`] entries server-side. The
+/// dashboard's `PromoteStatusPanel` reads this to render a sparkline-
+/// style strip showing the last N passes and to surface the "Y
+/// runs in the last minute" cross-plan-trigger signal.
+///
+/// Pure read; no LLM call, no DB.
+#[tauri::command]
+pub async fn promote_history(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::types_export::PromoteHistoryDto, CommandError> {
+    let guard = match state.last_promote_summary.lock() {
+        Ok(g) => g,
+        Err(poison) => {
+            tracing::warn!(
+                "last_promote_summary mutex poisoned — returning recovered history"
+            );
+            poison.into_inner()
+        }
+    };
+
+    let now = chrono::Utc::now();
+    let auto_triggers_last_minute = count_recent_auto_triggers(&guard, now);
+
+    let entries: Vec<crate::types_export::LastPromoteSummaryDto> = guard
+        .iter()
+        .map(|summary| crate::types_export::LastPromoteSummaryDto {
+            plan_id: summary.plan_id.to_string(),
+            at: summary.at.to_rfc3339(),
+            trigger: summary.trigger.as_str().to_string(),
+            report: crate::types_export::PromoteReportFlatDto::from_typed(&summary.report),
+        })
+        .collect();
+
+    Ok(crate::types_export::PromoteHistoryDto {
+        entries,
+        capacity: PROMOTE_HISTORY_CAP as u32,
+        auto_triggers_last_minute,
+        trigger_window_seconds: TRIGGER_WINDOW.as_secs() as u32,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3125,6 +3238,91 @@ mod tests {
         assert!(
             dtos.is_empty(),
             "failed-only sources must not surface to the operator panel"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Session 85 — promote-history ring buffer + cross-plan trigger counter
+    // -----------------------------------------------------------------
+
+    /// Helper: build a `LastPromoteSummary` at a specific time with a
+    /// chosen trigger. The PromoteReport is `Default` — these tests
+    /// don't exercise the report's numeric fields, just the ring's
+    /// ordering and the counter's filter.
+    fn summary_at(
+        at: chrono::DateTime<chrono::Utc>,
+        trigger: LastPromoteTrigger,
+    ) -> LastPromoteSummary {
+        LastPromoteSummary {
+            plan_id: Uuid::now_v7(),
+            at,
+            trigger,
+            report: situation_room_pipeline::promote::PromoteReport::default(),
+        }
+    }
+
+    #[test]
+    fn count_recent_auto_triggers_filters_by_window_and_trigger() {
+        let now = chrono::Utc::now();
+        let inside = now - chrono::Duration::seconds(30);
+        let outside = now - chrono::Duration::seconds(120);
+
+        let mut deque = std::collections::VecDeque::new();
+        // Inside window, auto trigger → counts.
+        deque.push_back(summary_at(inside, LastPromoteTrigger::AutoAfterFetch));
+        // Inside window, manual trigger → ignored.
+        deque.push_back(summary_at(inside, LastPromoteTrigger::Manual));
+        // Outside window, auto trigger → ignored.
+        deque.push_back(summary_at(outside, LastPromoteTrigger::AutoAfterFetch));
+
+        assert_eq!(count_recent_auto_triggers(&deque, now), 1);
+    }
+
+    #[test]
+    fn count_recent_auto_triggers_empty_history_returns_zero() {
+        let deque: std::collections::VecDeque<LastPromoteSummary> =
+            std::collections::VecDeque::new();
+        assert_eq!(count_recent_auto_triggers(&deque, chrono::Utc::now()), 0);
+    }
+
+    #[test]
+    fn count_recent_auto_triggers_three_in_window_returns_three() {
+        // Three auto-triggers fired in rapid succession inside the
+        // window → counter == 3. Exact case the dashboard surfaces
+        // as "3 runs in the last 60s".
+        let now = chrono::Utc::now();
+        let mut deque = std::collections::VecDeque::new();
+        for i in 0i64..3 {
+            deque.push_back(summary_at(
+                now - chrono::Duration::seconds(i),
+                LastPromoteTrigger::AutoAfterFetch,
+            ));
+        }
+        assert_eq!(count_recent_auto_triggers(&deque, now), 3);
+    }
+
+    #[test]
+    fn promote_history_cap_constant_is_at_least_dashboard_strip_render_count() {
+        // Dashboard renders a strip; today the cap is generous (20).
+        // This test pins that we keep enough room for at least 8 cells
+        // (the panel's render budget at default width) without forcing
+        // the strip to scroll.
+        assert!(
+            PROMOTE_HISTORY_CAP >= 8,
+            "PROMOTE_HISTORY_CAP must be at least 8 to keep the dashboard strip rendering without horizontal scrolling. \
+             Got: {PROMOTE_HISTORY_CAP}"
+        );
+    }
+
+    #[test]
+    fn trigger_window_at_least_thirty_seconds() {
+        // The dashboard copy reads "runs in the last Ns" — a window
+        // shorter than 30s would surface a counter that's blank between
+        // pulses even when the operator just fired a fetch. Pin a
+        // sane floor.
+        assert!(
+            TRIGGER_WINDOW >= std::time::Duration::from_secs(30),
+            "TRIGGER_WINDOW too short for the dashboard's interactive feedback. Got: {TRIGGER_WINDOW:?}"
         );
     }
 }

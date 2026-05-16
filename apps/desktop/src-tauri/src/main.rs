@@ -415,6 +415,13 @@ fn main() -> Result<()> {
             // promote command.
             situation_room_api::commands::authoritative_registry_summary,
             situation_room_api::commands::last_promote_summary,
+            // Session 85 — promote-pass history ring buffer + rolling
+            // auto-trigger counter. Sibling to `last_promote_summary`;
+            // surfaces the last N (~20) PromoteReports plus the
+            // cross-plan trigger counter so the dashboard tile can show
+            // "X runs in the last minute" when an operator fires several
+            // fetches in rapid succession.
+            situation_room_api::commands::promote_history,
         ])
         .build(tauri::generate_context!())
         .context("building tauri")?;
