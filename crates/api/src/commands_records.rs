@@ -263,13 +263,11 @@ pub async fn promote_consensus_for_plan(
         min_independent_claimants: min_independent_claimants.unwrap_or_else(|| {
             situation_room_pipeline::promote::PromoteConfig::default().min_independent_claimants
         }),
-        // Session 82 — ADR 0004 pathway 1. Clone the in-AppState
-        // `AuthorityRegistry` (cheap — Vec<AuthorityEntry> with small N)
-        // into the per-call PromoteConfig. The registry is loaded once
-        // at boot from `config/vocab/authoritative_sources.toml`; an
-        // empty registry preserves Session 81's consensus-only
-        // behaviour.
-        authoritative: (*state.authoritative).clone(),
+        // Session 82 — ADR 0004 pathway 1. Snapshot the live registry
+        // (Session 84 hot-reload) and deref-clone the contents into
+        // the per-call PromoteConfig. The registry stays small; the
+        // clone cost is negligible.
+        authoritative: (*state.authoritative.snapshot()).clone(),
     };
 
     let report = situation_room_pipeline::promote::promote_consensus_for_plan(
@@ -291,6 +289,15 @@ pub async fn promote_consensus_for_plan(
         relations = report.relations_emitted,
         entity_attributes = report.entity_attributes_emitted,
         "promote_consensus_for_plan returning"
+    );
+
+    // Session 84 — record this run into AppState's
+    // `last_promote_summary` so the dashboard tile picks it up.
+    crate::commands::record_last_promote_summary(
+        state.inner(),
+        parsed,
+        crate::commands::LastPromoteTrigger::Manual,
+        report.clone(),
     );
 
     Ok(report)

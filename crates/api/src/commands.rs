@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use situation_room_llm::{CostLedger, LlmProvider, ModelTier};
-use situation_room_pipeline::authoritative::AuthorityRegistry;
+use situation_room_pipeline::authoritative_live::LiveAuthorityRegistry;
 use situation_room_pipeline::fetch_backoff::{BackoffFetcher, HostBackoff};
 use situation_room_pipeline::entity_synth::materialize_entity_exemplars;
 use situation_room_pipeline::relation_synth::materialize_relation_exemplars;
@@ -208,10 +208,56 @@ pub struct AppState {
     /// `config/vocab/authoritative_sources.toml`. The
     /// `promote_consensus_for_plan` command clones into the per-call
     /// `PromoteConfig`; the auto-trigger in `run_fetch_for_plan` does
-    /// the same. Wrapped in `Arc` so the auto-trigger doesn't pay the
-    /// clone cost in the hot path (the per-Tauri-command path still
-    /// clones; the registry is small).
-    pub authoritative: Arc<AuthorityRegistry>,
+    /// the same.
+    ///
+    /// Session 84 — wrapped as a [`LiveAuthorityRegistry`] hot-reload
+    /// handle. The composition root spawns a polling watcher on the
+    /// TOML file; this handle's `snapshot()` returns the freshest
+    /// installed registry on each call. Per-command clone path stays
+    /// the same (`(*snapshot).clone()`); the registry stays small
+    /// enough that the clone cost is negligible.
+    pub authoritative: LiveAuthorityRegistry,
+
+    /// Session 84 — last completed `PromoteReport` (auto-trigger or
+    /// operator-driven). The dashboard's `PromoteStatusPanel`
+    /// reads from this via the `last_promote_summary` Tauri command
+    /// so operators can see "the latest promote run found X
+    /// authoritative + Y consensus" without grepping logs. Per-run
+    /// updates from `run_fetch_for_plan`'s auto-trigger and from
+    /// `promote_consensus_for_plan` write into the Mutex.
+    pub last_promote_summary: Arc<std::sync::Mutex<Option<LastPromoteSummary>>>,
+}
+
+/// Session 84 — packaged shape of "the most recent promote run."
+/// Public so the `last_promote_summary` Tauri command can map this
+/// onto its DTO without reaching into private fields.
+#[derive(Debug, Clone)]
+pub struct LastPromoteSummary {
+    pub plan_id: Uuid,
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub trigger: LastPromoteTrigger,
+    pub report: situation_room_pipeline::promote::PromoteReport,
+}
+
+/// Why this promote run fired. Closed-vocab so the dashboard can
+/// render a stable tag without parsing free text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LastPromoteTrigger {
+    /// Fired automatically after a `run_fetch_for_plan` completion
+    /// (Session 82 auto-trigger).
+    AutoAfterFetch,
+    /// Fired explicitly via the `promote_consensus_for_plan` Tauri
+    /// command (Session 82 operator button).
+    Manual,
+}
+
+impl LastPromoteTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LastPromoteTrigger::AutoAfterFetch => "auto_after_fetch",
+            LastPromoteTrigger::Manual => "manual",
+        }
+    }
 }
 
 impl AppState {
@@ -254,7 +300,7 @@ impl AppState {
         document_observations_prompt: &'static str,
         document_entity_attributes_prompt: &'static str,
         sources: Vec<PipelineSourceDescriptor>,
-        authoritative: Arc<AuthorityRegistry>,
+        authoritative: LiveAuthorityRegistry,
     ) -> Self {
         Self {
             store,
@@ -279,6 +325,7 @@ impl AppState {
             document_entity_attributes_prompt,
             sources,
             authoritative,
+            last_promote_summary: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -1213,7 +1260,11 @@ async fn auto_promote_after_fetch(
     let cfg = situation_room_pipeline::promote::PromoteConfig {
         min_independent_claimants: situation_room_pipeline::promote::PromoteConfig::default()
             .min_independent_claimants,
-        authoritative: (*state.authoritative).clone(),
+        // Session 84 — snapshot the live registry. `.snapshot()`
+        // returns an `Arc<AuthorityRegistry>` detached from the hot-
+        // reload lock; we deref-clone the contents into the per-call
+        // PromoteConfig as before.
+        authoritative: (*state.authoritative.snapshot()).clone(),
     };
 
     let report = situation_room_pipeline::promote::promote_consensus_for_plan(
@@ -1234,7 +1285,50 @@ async fn auto_promote_after_fetch(
         "auto-promote after fetch run complete"
     );
 
+    // Session 84 — record into `last_promote_summary` so the
+    // dashboard's PromoteStatusPanel can surface the most recent run
+    // without grepping logs.
+    record_last_promote_summary(
+        state.inner(),
+        plan_id,
+        LastPromoteTrigger::AutoAfterFetch,
+        report,
+    );
+
     Ok(())
+}
+
+/// Session 84 — write into the `AppState::last_promote_summary`
+/// Mutex. Pulled out so both the auto-trigger and the
+/// operator-driven `promote_consensus_for_plan` command share one
+/// write path. Failure (lock poisoning) is logged-only — the promote
+/// result itself is the load-bearing return value; the summary is a
+/// dashboard convenience.
+pub(crate) fn record_last_promote_summary(
+    state: &AppState,
+    plan_id: Uuid,
+    trigger: LastPromoteTrigger,
+    report: situation_room_pipeline::promote::PromoteReport,
+) {
+    let summary = LastPromoteSummary {
+        plan_id,
+        at: chrono::Utc::now(),
+        trigger,
+        report,
+    };
+    match state.last_promote_summary.lock() {
+        Ok(mut guard) => {
+            *guard = Some(summary);
+        }
+        Err(poison) => {
+            warn!(
+                trigger = %trigger.as_str(),
+                "last_promote_summary mutex poisoned — recovering and recording anyway"
+            );
+            let mut guard = poison.into_inner();
+            *guard = Some(summary);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2350,6 +2444,83 @@ pub async fn classifier_prompt_version(
     Ok(crate::types_export::ClassifierPromptVersionDto {
         current: CLASSIFIER_PROMPT_VERSION.to_string(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Command 19 — authoritative_registry_summary (Session 84)
+// ---------------------------------------------------------------------------
+
+/// Snapshot the live authoritative-source registry.
+///
+/// Reads from the hot-reload handle in [`AppState::authoritative`]
+/// so a TOML edit propagates to the next IPC call within ~2 seconds
+/// (the watcher's polling cadence). Pure read; no DB, no LLM.
+///
+/// Entries are capped at
+/// [`crate::types_export::AUTHORITY_SUMMARY_CAP`] to bound the IPC
+/// payload regardless of TOML size.
+#[tauri::command]
+pub async fn authoritative_registry_summary(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::types_export::AuthorityRegistrySummaryDto, CommandError> {
+    let snapshot = state.authoritative.snapshot();
+    let all = snapshot.entries();
+    let cap = crate::types_export::AUTHORITY_SUMMARY_CAP;
+    let capped = all.len() > cap;
+    let entries: Vec<crate::types_export::AuthorityEntryDto> = all
+        .iter()
+        .take(cap)
+        .map(crate::types_export::AuthorityEntryDto::from_typed)
+        .collect();
+
+    info!(
+        entry_count = all.len(),
+        path = %state.authoritative.source_path().display(),
+        "authoritative_registry_summary returning"
+    );
+
+    Ok(crate::types_export::AuthorityRegistrySummaryDto {
+        entry_count: all.len() as u32,
+        source_path: state.authoritative.source_path().display().to_string(),
+        entries,
+        entries_capped: capped,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Command 20 — last_promote_summary (Session 84)
+// ---------------------------------------------------------------------------
+
+/// Return the most recent `PromoteReport` (auto-trigger or manual).
+///
+/// `None` when the binary hasn't run a promote pass yet (cold-start
+/// after boot, or no `run_fetch_for_plan` has completed against an
+/// accepted plan). The dashboard tile renders an explicit empty
+/// state in that case.
+#[tauri::command]
+pub async fn last_promote_summary(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<crate::types_export::LastPromoteSummaryDto>, CommandError> {
+    let guard = match state.last_promote_summary.lock() {
+        Ok(g) => g,
+        Err(poison) => {
+            // Lock poisoning is a bug-class event we'd rather report
+            // to the operator than panic on; recover and return.
+            tracing::warn!(
+                "last_promote_summary mutex poisoned — returning recovered snapshot"
+            );
+            poison.into_inner()
+        }
+    };
+    let Some(summary) = guard.as_ref() else {
+        return Ok(None);
+    };
+    Ok(Some(crate::types_export::LastPromoteSummaryDto {
+        plan_id: summary.plan_id.to_string(),
+        at: summary.at.to_rfc3339(),
+        trigger: summary.trigger.as_str().to_string(),
+        report: crate::types_export::PromoteReportFlatDto::from_typed(&summary.report),
+    }))
 }
 
 // ---------------------------------------------------------------------------

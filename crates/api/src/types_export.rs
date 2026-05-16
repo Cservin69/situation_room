@@ -1663,6 +1663,125 @@ impl LlmCostTimelineEntryDto {
 }
 
 // ---------------------------------------------------------------------------
+// Session 84 — authoritative-registry dashboard tile wire shapes
+// ---------------------------------------------------------------------------
+
+/// One entry surface for the dashboard tile. Mirrors the on-disk
+/// `[[authority]]` row shape with all optional gates exposed.
+///
+/// `consensus_quorum` reflects the Session-84 override: `None` /
+/// `Some(1)` means the entry fast-tracks at N=1 via the authoritative
+/// pass; `Some(n >= 2)` opts out of fast-track and lowers the
+/// consensus quorum bar for groups containing the matching claimant.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct AuthorityEntryDto {
+    pub source_id: String,
+    pub metric: Option<String>,
+    pub topic: Option<String>,
+    pub consensus_quorum: Option<u32>,
+}
+
+impl AuthorityEntryDto {
+    /// Lift a typed `AuthorityEntry` into wire shape.
+    pub fn from_typed(e: &situation_room_pipeline::authoritative::AuthorityEntry) -> Self {
+        Self {
+            source_id: e.source_id.clone(),
+            metric: e.metric.clone(),
+            topic: e.topic.clone(),
+            consensus_quorum: e.consensus_quorum,
+        }
+    }
+}
+
+/// Wire shape for the `authoritative_registry_summary` command
+/// (Session 84). Surfaces what the operator needs to see in the
+/// dashboard tile without having to grep the TOML:
+///   - how many entries are loaded
+///   - where they were loaded from
+///   - the entries themselves (capped — we don't expect this to
+///     grow beyond a few dozen rows; full transparency keeps the
+///     "is this entry actually being applied?" question one
+///     glance away).
+///
+/// The summary is read live from the
+/// [`situation_room_pipeline::authoritative_live::LiveAuthorityRegistry`]
+/// in AppState so a hot-reload edit propagates to the next call.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct AuthorityRegistrySummaryDto {
+    /// Total entry count.
+    pub entry_count: u32,
+    /// File path the registry was loaded from. Surfaced verbatim so
+    /// an operator can pin down which TOML the binary is reading.
+    pub source_path: String,
+    /// The full set of loaded entries (capped to
+    /// [`AUTHORITY_SUMMARY_CAP`] for safety; realistic deployments
+    /// stay well under that).
+    pub entries: Vec<AuthorityEntryDto>,
+    /// True iff `entries` was clipped at the cap.
+    pub entries_capped: bool,
+}
+
+/// Cap on `entries` returned in `AuthorityRegistrySummaryDto`. 200
+/// is well above the typical fixture size (~3 rows today, ~dozen at
+/// projected fill); the cap exists so a misconfigured TOML can't
+/// blow up the IPC payload.
+pub const AUTHORITY_SUMMARY_CAP: usize = 200;
+
+/// Wire shape for the `last_promote_summary` command (Session 84).
+/// Surfaces the most recent completed promote run so the dashboard
+/// tile can render "the last pass found X authoritative + Y
+/// consensus groups" without grepping INFO logs.
+///
+/// `trigger` carries the closed-vocab tag for why the pass fired
+/// (`"auto_after_fetch"` or `"manual"`).
+/// `at` is RFC-3339 (UTC) for IPC simplicity; the frontend parses
+/// with `new Date(...)` when it needs a Date object.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct LastPromoteSummaryDto {
+    pub plan_id: String,
+    pub at: String,
+    pub trigger: String,
+    pub report: PromoteReportFlatDto,
+}
+
+/// Flattened mirror of `situation_room_pipeline::promote::PromoteReport`
+/// — the wire shape exposed by `last_promote_summary`. Hand-mapped
+/// (the Rust type derives `Serialize` but not `TS`; mirroring it
+/// here keeps the desktop binary's ts-rs export self-contained).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct PromoteReportFlatDto {
+    pub assertions_considered: u32,
+    pub groups_promoted: u32,
+    pub skipped_already_promoted: u32,
+    pub observations_emitted: u32,
+    pub events_emitted: u32,
+    pub relations_emitted: u32,
+    pub entity_attributes_emitted: u32,
+    pub insert_failures: u32,
+    pub authoritative_promoted: u32,
+}
+
+impl PromoteReportFlatDto {
+    pub fn from_typed(r: &situation_room_pipeline::promote::PromoteReport) -> Self {
+        Self {
+            assertions_considered: r.assertions_considered,
+            groups_promoted: r.groups_promoted,
+            skipped_already_promoted: r.skipped_already_promoted,
+            observations_emitted: r.observations_emitted,
+            events_emitted: r.events_emitted,
+            relations_emitted: r.relations_emitted,
+            entity_attributes_emitted: r.entity_attributes_emitted,
+            insert_failures: r.insert_failures,
+            authoritative_promoted: r.authoritative_promoted,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

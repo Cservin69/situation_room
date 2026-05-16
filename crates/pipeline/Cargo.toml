@@ -47,6 +47,11 @@ pdf-extract = { workspace = true }
 # is already a workspace dependency (apps_common consumes it for the
 # source-descriptors loader).
 toml = { workspace = true }
+# Session 84 — content-derived dedup_key hashing in `promote.rs`. ADR
+# 0021 amendment: swap the DoubleSipHash pair for SHA-256 truncated to
+# 128 bits. Same on-disk shape (32 lowercase hex chars), stronger
+# collision floor. The swap is a named ADR path, not a rewrite.
+sha2 = { workspace = true }
 
 [dev-dependencies]
 dotenvy = { workspace = true }

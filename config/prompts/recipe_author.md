@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.22
+# Recipe Author Prompt — v1.23
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -1552,6 +1552,99 @@ and will fail deserialization.
 - `valid_until` (ISO-8601 timestamp, optional) — end of the
   relation's validity window if it has one.
 
+### `entity_attribute` — fields of `EntityAttributeContent`
+
+A v1.23 addition. Use `entity_attribute` recipes when a source
+publishes structured *attributes of a known entity* — typically a
+filings page, a company profile, a reference register — rather than
+a time-series measurement (which is `observation`) or a flow between
+entities (which is `relation`). The closed-vocabulary heuristic: if
+the question "what *is* this entity?" matches the data, the binding
+is an attribute; if the question "what *happened* to this entity?"
+matches, it's an event; if "how much of X does this entity have over
+time?" matches, it's an observation.
+
+The three fields are:
+
+- `entity_id` (entity id) — required. Which entity carries this
+  attribute. Usually `from_plan` pointing at the target entity
+  expectation's name, **never** a `literal` carrying a guess pulled
+  from the source bytes — entity identity is identity-bearing and
+  must come from the plan's controlled vocabulary, not from the
+  page's free-text rendering. If the source publishes attributes for
+  many entities (a register, a filings index), use an iterator-bearing
+  recipe and bind `entity_id` via `extracted` against the per-row
+  identifier — the runtime then enforces that the extracted string
+  parses as an EntityId.
+- `key` (string, snake_case) — required. The attribute name.
+  Examples: `"legal_name"`, `"headquarters_country"`, `"ticker"`,
+  `"employee_count"`, `"primary_commodity"`, `"founded_year"`.
+  Usually a `literal` (one recipe ⇄ one attribute key) when the
+  recipe extracts one attribute per row; iterator-bearing recipes
+  that surface many attribute keys per fetch should bind `key` via
+  `extracted` against the row's first column.
+- `value` (typed value) — required. **Closed-vocabulary tagged
+  union.** The wire shape is `{kind, value}` (or `{kind, value, unit}`
+  for the numeric variant). Use the variant whose shape matches the
+  attribute's natural type:
+
+  - `Text { kind: "text", value: string }` — names, descriptions,
+    identifiers. Default when the source publishes free text and
+    there's no narrower type that fits.
+  - `Number { kind: "number", value: f64, unit: Option<Unit> }` —
+    counts, sizes, percentages. The `unit` field follows the same
+    UCUM-style discipline as `observation.unit` (`"USD"`, `"persons"`,
+    `"t"`, `"%"`, `"1"`).
+  - `Country { kind: "country", value: CountryCode }` — ISO-3166
+    alpha-2 only. Use for "headquarters_country", "incorporated_in",
+    or any attribute whose natural domain is the country namespace.
+  - `Topic { kind: "topic", value: Topic }` — categorical values from
+    the open Topic namespace. Sectors, primary commodities, technology
+    areas. Use over `Text` when the attribute fits the per-plan topic
+    vocabulary; the runtime carries Topic-typed attributes more
+    usefully through downstream surfaces than free strings.
+  - `Entity { kind: "entity", value: EntityId }` — when the attribute
+    points at another entity by reference. Use for "operator", "parent
+    company", "primary supplier" when the source publishes the
+    related entity by id; if the source only publishes a name string,
+    prefer `Text` and let the entity-synth stage resolve later.
+  - `Boolean { kind: "boolean", value: bool }` — yes/no attributes.
+    Rare; useful for "publicly_listed", "is_state_owned".
+  - `EntityList { kind: "entity_list", value: Vec<EntityId> }` — for
+    multi-valued reference attributes like "subsidiaries",
+    "joint_venture_partners".
+  - `TopicList { kind: "topic_list", value: Vec<Topic> }` — for
+    multi-valued tag attributes like "sectors", "commodities_produced".
+
+  **The `unit` sub-field is part of the `Number` variant — not a
+  top-level recipe field.** A `value` binding that produces the
+  numeric variant must populate both `value` (the number) and `unit`
+  (the UCUM string or null); a binding that produces the text variant
+  must populate only the inner `value` string. The runtime rejects
+  half-populated tagged-union payloads at apply time.
+
+  **`Text` is the safe default when the source's type is ambiguous.**
+  An attribute string that parses as a country code under the
+  `Country` variant must actually be a country code; binding "USA" to
+  a `Country` value works (ISO-3166 alpha-3 → alpha-2 falls back to a
+  parser error), but binding "United States" does not — the parser
+  is strict on the alpha-2 form. When in doubt, ship the attribute as
+  `Text` and let the entity-synth stage upgrade it later.
+
+  **Closed-enum fields inside the value variants follow the same
+  rule as `observation.period`:** they must be `literal`, never
+  `extracted`. The `kind` discriminator above is the obvious example
+  — it picks the variant the binding produces and is always
+  authored as a literal. The per-variant `value` payload (the actual
+  attribute content) is the part that's typically `extracted`.
+
+Most `entity_attribute` recipes target a single attribute key per
+fetch and are single-instance — one company-profile page → one
+attribute. When a register or table publishes many entities, lift
+the recipe to iterator mode (see "Iterating over listings" below) so
+one fetch produces N attribute bindings, with `dedup_key_field`
+pointing at the per-row entity_id selector.
+
 ### The envelope and subjects are automatic
 
 You do **not** map anything onto the envelope (`provenance`,
@@ -1865,6 +1958,30 @@ you pick.
 ---
 
 ### Changelog
+
+- **v1.23** (2026-05-16) — Session 84, EntityAttribute binding
+  guidance. Adds the `### entity_attribute — fields of EntityAttributeContent`
+  block to the **Content type reference** section. The new prose
+  documents the three fields (`entity_id`, `key`, `value`), the
+  closed-vocabulary tagged-union variants of `AttributeValue`
+  (`Text`/`Number`/`Country`/`Topic`/`Entity`/`Boolean`/`EntityList`/
+  `TopicList`), and the apply-time rules around the `Number` variant's
+  inner `unit` field. No output-contract change — recipes were free
+  to author `entity_attribute` bindings under v1.22, but the
+  reference section didn't describe what shapes the runtime accepts,
+  which left the LLM guessing and the validator catching mistakes at
+  apply time. The new block closes that gap so attribute extraction
+  is a first-class peer of observation / event / relation.
+
+  Cosmetic-only edit to the `## Content type reference` section
+  intro: no change to the existing observation/event/relation
+  subsections.
+
+  Also adds the operator-readable "what's the closed-vocabulary
+  heuristic to pick attribute vs event vs observation?" framing that
+  the Session-77/78/79/80 extractors derive their kind selection
+  from, so single-recipe authors land on the same closed-vocab
+  intuition the per-Document extractors carry.
 
 - **v1.22** (2026-05-15) — Session 74, prompt-cache-friendly
   restructure. No output contract change; no schema change; no

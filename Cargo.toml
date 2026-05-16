@@ -121,6 +121,15 @@ scraper = "0.20"
 # that breaks compilation on current rustc).
 jsonpath-rust = "1.0"
 
+# Session 84 — content-derived dedup_key hashing in
+# `pipeline::promote`. ADR 0021 named the original DoubleSipHash pair
+# as a "tentative pick, swap if collisions ever surface" approach; the
+# swap path is now ride. SHA-256 truncated to 128 bits gives a
+# cryptographically sound floor for the same 32-char hex shape on
+# disk, at the cost of ~one extra workspace dep. See ADR 0021
+# amendment.
+sha2 = "0.10"
+
 # Internal workspace crates
 situation_room-core = { path = "crates/core" }
 situation_room-storage = { path = "crates/storage" }

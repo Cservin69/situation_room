@@ -38,10 +38,25 @@
 //! promotion stage is safe to run many times against a growing
 //! assertion store.
 //!
-//! `content_hash` is SHA-256 over the canonical JSON serialization
-//! of the `AssertedContent` value. `subject_hash` is SHA-256 over the
-//! sorted topic strings on the Assertion's envelope — sorted because
+//! `content_hash` is SHA-256 (truncated to 128 bits) over the
+//! canonical JSON serialization of the `AssertedContent` value.
+//! `subject_hash` is SHA-256 (truncated to 128 bits) over the sorted
+//! topic strings on the Assertion's envelope — sorted because
 //! `Subjects::topics` order is incidental.
+//!
+//! Session 84 — ADR 0021 amendment 1. The original Session 81 code
+//! used a `(DefaultHasher, DefaultHasher-with-salt)` 128-bit pair
+//! because the workspace did not yet take a hashing-crate dependency.
+//! Session 84 lands the named-swap path: `sha2` is now a workspace
+//! dep, `hex128` truncates SHA-256 to the same 32-char lowercase hex
+//! shape on disk, and the collision floor goes from "2^64 SipHash
+//! pairs" to "cryptographically sound 2^64 birthday bound on the
+//! truncated digest." Dedup keys produced before Session 84 will not
+//! match dedup keys produced after; the migration story is "re-runs
+//! produce fresh promoted records and the per-shape tables grow by
+//! one row per group on the first post-swap pass." Acceptable
+//! because consensus_promotion records are derived data, not
+//! upstream truth.
 //!
 //! # Authoritative pathway — Session 82
 //!
@@ -63,6 +78,7 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use situation_room_core::schema::content::{
     AssertedContent, EntityAttributeContent, EventContent, ObservationContent, RelationContent,
 };
@@ -70,9 +86,7 @@ use situation_room_core::schema::envelope::{DerivationRole, DerivedFrom, Envelop
 use situation_room_core::schema::records::{Assertion, Event, Observation, Relation};
 use situation_room_core::vocab::Confidence;
 use situation_room_storage::Store;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{Hash, Hasher};
 use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -247,7 +261,27 @@ fn promote_consensus_from_assertions_with_report(
     for (key, group) in groups {
         let distinct_claimants: BTreeSet<&str> =
             group.iter().map(|a| a.claimant.as_str()).collect();
-        if (distinct_claimants.len() as u32) < cfg.min_independent_claimants {
+
+        // Session 84 — per-claimant consensus quorum override (ADR
+        // 0004 amendment). When any group member's claimant matches
+        // an `[[authority]]` entry with a `consensus_quorum` set, the
+        // group's effective quorum bar drops to that override (or the
+        // minimum across multiple matching members). Falls back to
+        // `cfg.min_independent_claimants` when no override applies.
+        //
+        // Entries with `consensus_quorum = 1` (or unset, i.e. the
+        // Session-82 fast-track default) never reach this branch in
+        // practice — the auth pre-pass already promoted them. We
+        // honour Some(1) here too as defence in depth in case a
+        // future caller invokes the consensus path directly.
+        let effective_quorum = group
+            .iter()
+            .filter_map(|a| cfg.authoritative.quorum_override_for(a))
+            .min()
+            .map(|q| q.min(cfg.min_independent_claimants))
+            .unwrap_or(cfg.min_independent_claimants);
+
+        if (distinct_claimants.len() as u32) < effective_quorum {
             continue;
         }
 
@@ -726,16 +760,15 @@ fn group_assertions_for_consensus<'a>(
     out
 }
 
-/// Content-derived hash. Canonical-JSON serialization → 128-bit
-/// `(SipHash13, SipHash13-with-salt)` pair, rendered as a 32-char
-/// lowercase hex string. ADR 0021 explains why we use two SipHash
-/// runs rather than reaching for SHA-256: the workspace doesn't
-/// currently take a hashing-crate dependency, and adding one for a
-/// content-identity key whose adversarial-collision surface is "an
-/// LLM emits 2^64 attempts to forge a dedup_key" is overkill. The
-/// 128-bit pair has a collision floor on the order of 2^64 — fine
-/// for a within-session dedup table that won't grow past low
-/// millions of rows.
+/// Content-derived hash. Canonical-JSON serialization → SHA-256 →
+/// truncate to 128 bits → render as a 32-char lowercase hex string.
+/// Session 84 — ADR 0021 amendment 1. Replaced the original
+/// `(DefaultHasher, DefaultHasher-with-salt)` 128-bit pair with
+/// SHA-256-truncated-to-128 once the `sha2` workspace dep landed.
+/// The 32-char hex shape is byte-for-byte compatible with the
+/// pre-swap output shape so downstream `dedup_key` columns and the
+/// `promotion:{content_hash}:{subject_hash}` format keep working;
+/// only the hash values themselves change.
 ///
 /// `serde_json::to_value` produces a deterministic shape but
 /// `serde_json::to_string` does NOT sort object keys, so we
@@ -773,20 +806,32 @@ pub fn subject_hash_for(env: &Envelope) -> String {
 }
 
 /// 128-bit fingerprint of `bytes`, rendered as 32 lowercase hex
-/// chars. Combines two `DefaultHasher` runs — the second seeded with
-/// a salt — so the output space is `2^128` rather than the bare
-/// `u64.to_string()` output of one `DefaultHasher` would give.
+/// chars. SHA-256 over the input, truncated to the first 16 bytes.
+/// The 128-bit truncation matches the pre-Session-84 output width
+/// exactly (same column shape on disk); SHA-256 over the same input
+/// is collision-resistant up to a ~2^64 birthday bound on the
+/// truncated digest, with no published shortcut better than that.
+///
+/// Why truncate. The dedup column doesn't need full 256-bit
+/// pre-image resistance — it's a "did we already promote this exact
+/// claim?" key, not a cryptographic identifier. 128 bits keeps the
+/// per-row storage cost identical to the pre-swap shape (operators
+/// can run the pre- and post-swap binaries against the same DB
+/// without column-width fights) and is well clear of any plausible
+/// collision rate the consensus pipeline could produce.
 fn hex128(bytes: &[u8]) -> String {
-    let a = hash_u64(bytes, 0);
-    let b = hash_u64(bytes, 0x9e37_79b9_7f4a_7c15);
-    format!("{a:016x}{b:016x}")
-}
-
-fn hash_u64(bytes: &[u8], salt: u64) -> u64 {
-    let mut h = DefaultHasher::new();
-    salt.hash(&mut h);
-    bytes.hash(&mut h);
-    h.finish()
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    // First 16 bytes → 32 hex chars. The slice is fixed-size from the
+    // GenericArray output of finalize() so the formatter cost is
+    // bounded; we render manually for the 32-char-exact contract
+    // rather than going through `hex::encode` (no new dep).
+    let mut out = String::with_capacity(32);
+    for byte in &digest[..16] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// Canonicalise a `serde_json::Value`: sort object keys recursively
@@ -1082,6 +1127,33 @@ mod tests {
     }
 
     #[test]
+    fn hex128_is_exactly_32_lowercase_hex_chars() {
+        // Session 84 — ADR 0021 amendment 1. Pin the output shape so a
+        // future swap that changes the digest function still has to
+        // honour the 32-char hex contract (the dedup_key column shape
+        // and the `promotion:{a}:{b}` format both depend on it).
+        let h = hex128(b"hello");
+        assert_eq!(h.len(), 32, "hex128 must render exactly 32 chars");
+        assert!(
+            h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "hex128 must render lowercase hex digits only, got `{h}`"
+        );
+        // Specific value pin: SHA-256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+        // First 16 bytes → 2cf24dba5fb0a30e26e83b2ac5b9e29e.
+        assert_eq!(h, "2cf24dba5fb0a30e26e83b2ac5b9e29e");
+    }
+
+    #[test]
+    fn hex128_different_inputs_produce_different_outputs() {
+        assert_ne!(hex128(b"hello"), hex128(b"hello world"));
+        assert_ne!(hex128(b"hello"), hex128(b"Hello"));
+        // Empty input is well-defined too (SHA-256("") =
+        // e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        // → first 16 = e3b0c44298fc1c149afbf4c8996fb924).
+        assert_eq!(hex128(b""), "e3b0c44298fc1c149afbf4c8996fb924");
+    }
+
+    #[test]
     fn content_hash_is_stable_for_equal_content() {
         let a = AssertedContent::Observation(ObservationContent {
             metric: "production".into(),
@@ -1362,6 +1434,7 @@ mod tests {
             source_id: "usgs_mcs".into(),
             metric: Some("production".into()),
             topic: None,
+            consensus_quorum: None,
         }]);
 
         // Single USGS claimant — would fail consensus quorum (N=3) but
@@ -1403,6 +1476,7 @@ mod tests {
             source_id: "usgs_mcs".into(),
             metric: Some("production".into()),
             topic: None,
+            consensus_quorum: None,
         }]);
 
         let assertions = vec![obs_assertion("agency:usgs_mcs", 142_000.0, 0.85)];
@@ -1426,6 +1500,7 @@ mod tests {
             source_id: "usgs_mcs".into(),
             metric: Some("production".into()),
             topic: None,
+            consensus_quorum: None,
         }]);
 
         // Three assertions: one matches the registry (auth-promoted),
@@ -1479,5 +1554,104 @@ mod tests {
             DerivationRole::Promotion
         ));
         assert!(obs.envelope.tags.contains(&"authoritative_promotion".into()));
+    }
+
+    // -----------------------------------------------------------------
+    // Session 84 — per-claimant consensus quorum override
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn consensus_quorum_override_lowers_bar_for_matching_groups() {
+        // Registry entry sets consensus_quorum=2 for Reuters
+        // production claims. Two distinct claimants (Reuters +
+        // Bloomberg) form a group; with default global N=3 they'd
+        // miss quorum, but the Reuters entry's override lowers the
+        // bar to N=2 for groups containing a Reuters Assertion.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let plan = plan();
+
+        let cfg = auth_cfg(vec![AuthorityEntry {
+            source_id: "reuters".into(),
+            metric: Some("production".into()),
+            topic: None,
+            consensus_quorum: Some(2),
+        }]);
+
+        let assertions = vec![
+            obs_assertion("agency:reuters", 142_000.0, 0.85),
+            obs_assertion("agency:bloomberg", 142_000.0, 0.8),
+        ];
+        let report = promote_from_assertions(&store, &plan, &assertions, &cfg);
+
+        // Auth pass: Reuters entry opts out of fast-track via
+        // consensus_quorum=2, so authoritative_promoted stays 0.
+        assert_eq!(report.authoritative_promoted, 0);
+        // Consensus pass: 2 distinct claimants meet the lowered N=2
+        // quorum → one observation promoted.
+        assert_eq!(
+            report.observations_emitted, 1,
+            "consensus_quorum=2 should let the 2-claimant group promote"
+        );
+        assert_eq!(report.groups_promoted, 1);
+    }
+
+    #[test]
+    fn consensus_quorum_override_does_not_promote_below_override() {
+        // Registry entry sets consensus_quorum=2; only one matching
+        // claimant present. The auth pass opts out (consensus_quorum
+        // >= 2), and the consensus pass sees a single-claimant group
+        // — below even the lowered N=2 bar. Nothing promotes.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let plan = plan();
+
+        let cfg = auth_cfg(vec![AuthorityEntry {
+            source_id: "reuters".into(),
+            metric: Some("production".into()),
+            topic: None,
+            consensus_quorum: Some(2),
+        }]);
+
+        let assertions = vec![obs_assertion("agency:reuters", 142_000.0, 0.85)];
+        let report = promote_from_assertions(&store, &plan, &assertions, &cfg);
+
+        assert_eq!(report.authoritative_promoted, 0);
+        assert_eq!(report.observations_emitted, 0);
+        assert_eq!(report.groups_promoted, 0);
+    }
+
+    #[test]
+    fn consensus_quorum_override_min_wins_when_multiple_entries_match() {
+        // Two overrides apply: Reuters consensus_quorum=3, Bloomberg
+        // consensus_quorum=2 (under a metric-less entry). The group
+        // {Reuters, Bloomberg} resolves to min(3, 2, cfg_default=3) =
+        // 2. Two claimants meet it → promotion.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let plan = plan();
+
+        let cfg = auth_cfg(vec![
+            AuthorityEntry {
+                source_id: "reuters".into(),
+                metric: None,
+                topic: None,
+                consensus_quorum: Some(3),
+            },
+            AuthorityEntry {
+                source_id: "bloomberg".into(),
+                metric: None,
+                topic: None,
+                consensus_quorum: Some(2),
+            },
+        ]);
+        let assertions = vec![
+            obs_assertion("agency:reuters", 142_000.0, 0.85),
+            obs_assertion("agency:bloomberg", 142_000.0, 0.8),
+        ];
+        let report = promote_from_assertions(&store, &plan, &assertions, &cfg);
+        assert_eq!(report.authoritative_promoted, 0);
+        assert_eq!(report.observations_emitted, 1);
+        assert_eq!(report.groups_promoted, 1);
     }
 }

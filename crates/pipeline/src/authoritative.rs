@@ -27,15 +27,33 @@
 //!
 //! ```toml
 //! [[authority]]
-//! source_id = "usgs_mcs"
-//! metric    = "production"   # optional
-//! topic     = "Cu"           # optional
+//! source_id        = "usgs_mcs"
+//! metric           = "production"   # optional
+//! topic            = "Cu"           # optional
+//! consensus_quorum = 2              # optional, Session 84
 //! ```
 //!
 //! `source_id` is the *trailing* portion of a claimant `EntityId`:
 //! `agency:usgs_mcs` claimants match a `source_id = "usgs_mcs"`
 //! entry. The matcher also accepts the bare form (`"usgs_mcs"` →
 //! `"usgs_mcs"`) so a config author can write either shape.
+//!
+//! `consensus_quorum` (Session 84) is the per-entry override on the
+//! quorum bar this claim must clear before promotion.
+//!  - **Unset or `1`** preserves the Session-82 fast-track: a single
+//!    matching Assertion promotes immediately via the authoritative
+//!    pass at N=1.
+//!  - **`>= 2`** opts out of the authoritative fast-track. The
+//!    Assertion goes through the consensus pass instead; its group's
+//!    effective quorum drops to `min(cfg.min_independent_claimants,
+//!    min over matching entries' consensus_quorum)`. Operator
+//!    interpretation: "we trust Reuters enough to lower the global
+//!    N=3 bar to N=2 for any claim they participate in, but we
+//!    still want corroboration before promoting."
+//!
+//! The override is per-(claimant × metric × topic), so an operator
+//! can mark `consensus_quorum = 2` for one metric a source covers
+//! well while leaving another metric at the global default.
 //!
 //! `metric` matches:
 //! - `ObservationContent.metric` (e.g. `"production"`),
@@ -77,6 +95,13 @@ pub struct AuthorityEntry {
     pub metric: Option<String>,
     #[serde(default)]
     pub topic: Option<String>,
+    /// Session 84 — per-claimant consensus quorum override.
+    /// `None` or `Some(1)` preserves the Session-82 N=1 fast-track via
+    /// the authoritative pass. `Some(n)` with `n >= 2` opts this entry
+    /// OUT of the fast-track and instead lowers the consensus quorum
+    /// for groups its claimant participates in.
+    #[serde(default)]
+    pub consensus_quorum: Option<u32>,
 }
 
 /// Wrapper for the TOML file: `[[authority]]` table arrays.
@@ -175,21 +200,69 @@ impl AuthorityRegistry {
     /// True iff this Assertion's claimant matches any entry's
     /// `source_id`, AND any declared `metric` matches the content's
     /// natural metric/key, AND any declared `topic` is in the
-    /// envelope's `subjects.topics`. An entry with no metric or topic
-    /// gate accepts any content/subject for the matching claimant.
+    /// envelope's `subjects.topics`, AND the matching entry's
+    /// `consensus_quorum` is `None` or `Some(1)` (i.e. the entry opts
+    /// into the authoritative fast-track). Entries with
+    /// `consensus_quorum >= 2` deliberately fall out of this predicate
+    /// so the auth pass does NOT fast-track them — they're handled by
+    /// the consensus pass at the lowered quorum returned by
+    /// [`Self::quorum_override_for`].
+    ///
+    /// An entry with no metric or topic gate accepts any
+    /// content/subject for the matching claimant.
     pub fn matches(&self, a: &Assertion) -> bool {
         let claimant = a.claimant.as_str();
         self.entries.iter().any(|entry| {
-            claimant_matches(claimant, &entry.source_id)
-                && entry
-                    .metric
-                    .as_deref()
-                    .map_or(true, |m| content_metric_matches(&a.content, m))
-                && entry.topic.as_deref().map_or(true, |t| {
-                    a.envelope.subjects.topics.iter().any(|topic| topic.as_str() == t)
-                })
+            entry_matches_assertion(entry, claimant, a)
+                && entry.consensus_quorum.unwrap_or(1) <= 1
         })
     }
+
+    /// Session 84 — per-claimant consensus quorum override.
+    ///
+    /// Returns the minimum `consensus_quorum` across every entry that
+    /// matches this Assertion (claimant + metric + topic gates the
+    /// same as [`Self::matches`], without the `<= 1` short-circuit).
+    /// Returns `None` when no entry matches, OR when every matching
+    /// entry's `consensus_quorum` is unset (treated as the
+    /// auth-fast-track default).
+    ///
+    /// Operator semantics:
+    ///  - **None** → use the global `PromoteConfig::min_independent_claimants`.
+    ///  - **Some(n)** → lower the consensus bar to `n` for groups
+    ///    containing this Assertion. Pre-existing N=3 logic still wins
+    ///    if `cfg.min_independent_claimants < n` (consensus uses the
+    ///    min of the two).
+    pub fn quorum_override_for(&self, a: &Assertion) -> Option<u32> {
+        let claimant = a.claimant.as_str();
+        let mut min_q: Option<u32> = None;
+        for entry in &self.entries {
+            if !entry_matches_assertion(entry, claimant, a) {
+                continue;
+            }
+            if let Some(q) = entry.consensus_quorum {
+                if q < 1 {
+                    continue;
+                }
+                min_q = Some(min_q.map_or(q, |cur| cur.min(q)));
+            }
+        }
+        min_q
+    }
+}
+
+/// Shared (claimant, metric, topic) predicate used by both `matches`
+/// and `quorum_override_for`. Pulled out so the two surfaces can't
+/// drift on the closed-vocabulary matching rules.
+fn entry_matches_assertion(entry: &AuthorityEntry, claimant: &str, a: &Assertion) -> bool {
+    claimant_matches(claimant, &entry.source_id)
+        && entry
+            .metric
+            .as_deref()
+            .map_or(true, |m| content_metric_matches(&a.content, m))
+        && entry.topic.as_deref().map_or(true, |t| {
+            a.envelope.subjects.topics.iter().any(|topic| topic.as_str() == t)
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +403,7 @@ topic = "Cu"
             source_id: "usgs_mcs".into(),
             metric: Some("production".into()),
             topic: None,
+            consensus_quorum: None,
         }]);
         let a = obs_assertion("agency:usgs_mcs", "production", "lithium");
         assert!(r.matches(&a));
@@ -341,6 +415,7 @@ topic = "Cu"
             source_id: "usgs_mcs".into(),
             metric: None,
             topic: None,
+            consensus_quorum: None,
         }]);
         let a = obs_assertion("usgs_mcs", "production", "");
         assert!(r.matches(&a));
@@ -352,6 +427,7 @@ topic = "Cu"
             source_id: "usgs_mcs".into(),
             metric: Some("production".into()),
             topic: None,
+            consensus_quorum: None,
         }]);
         let a = obs_assertion("agency:usgs_mcs", "reserves", "lithium");
         assert!(!r.matches(&a));
@@ -363,6 +439,7 @@ topic = "Cu"
             source_id: "lme_warehouse".into(),
             metric: Some("warehouse_stock".into()),
             topic: Some("Cu".into()),
+            consensus_quorum: None,
         }]);
         // Copper assertion matches.
         let cu = obs_assertion("agency:lme_warehouse", "warehouse_stock", "Cu");
@@ -381,6 +458,7 @@ topic = "Cu"
             source_id: "agency:sec".into(),
             metric: Some("export_restriction".into()),
             topic: None,
+            consensus_quorum: None,
         }]);
         let event = Assertion::new(
             EntityId::new("agency:sec").unwrap(),
@@ -404,6 +482,7 @@ topic = "Cu"
             source_id: "agency:edgar".into(),
             metric: Some("ownership".into()),
             topic: None,
+            consensus_quorum: None,
         }]);
         let rel = Assertion::new(
             EntityId::new("agency:edgar").unwrap(),
@@ -426,6 +505,7 @@ topic = "Cu"
             source_id: "agency:edgar".into(),
             metric: Some("legal_name".into()),
             topic: None,
+            consensus_quorum: None,
         }]);
         let attr = Assertion::new(
             EntityId::new("agency:edgar").unwrap(),
@@ -438,6 +518,104 @@ topic = "Cu"
             env("agency:edgar", ""),
         );
         assert!(r.matches(&attr));
+    }
+
+    // Session 84 — per-claimant consensus quorum override -----------
+
+    #[test]
+    fn entry_with_consensus_quorum_2_opts_out_of_fast_track_match() {
+        // An entry with consensus_quorum >= 2 should not satisfy
+        // `matches` (the auth pass would otherwise fast-track at N=1
+        // and skip the consensus pass entirely).
+        let r = AuthorityRegistry::from_entries(vec![AuthorityEntry {
+            source_id: "agency:reuters".into(),
+            metric: Some("production".into()),
+            topic: None,
+            consensus_quorum: Some(2),
+        }]);
+        let a = obs_assertion("agency:reuters", "production", "lithium");
+        assert!(!r.matches(&a), "consensus_quorum=2 must NOT fast-track");
+        assert_eq!(r.quorum_override_for(&a), Some(2));
+    }
+
+    #[test]
+    fn entry_with_consensus_quorum_1_still_fast_tracks() {
+        // Explicit `consensus_quorum = 1` behaves the same as the
+        // default (None) — preserves Session-82 N=1 fast-track.
+        let r = AuthorityRegistry::from_entries(vec![AuthorityEntry {
+            source_id: "agency:usgs_mcs".into(),
+            metric: Some("production".into()),
+            topic: None,
+            consensus_quorum: Some(1),
+        }]);
+        let a = obs_assertion("agency:usgs_mcs", "production", "lithium");
+        assert!(r.matches(&a));
+        // quorum_override_for still returns Some(1) for traceability;
+        // the consensus pass treats Some(n) and the cfg default the
+        // same when min() resolves.
+        assert_eq!(r.quorum_override_for(&a), Some(1));
+    }
+
+    #[test]
+    fn quorum_override_picks_minimum_across_matching_entries() {
+        // Two entries match the same Assertion. The lower
+        // consensus_quorum wins.
+        let r = AuthorityRegistry::from_entries(vec![
+            AuthorityEntry {
+                source_id: "agency:reuters".into(),
+                metric: None,
+                topic: None,
+                consensus_quorum: Some(3),
+            },
+            AuthorityEntry {
+                source_id: "agency:reuters".into(),
+                metric: Some("production".into()),
+                topic: None,
+                consensus_quorum: Some(2),
+            },
+        ]);
+        let a = obs_assertion("agency:reuters", "production", "lithium");
+        assert_eq!(r.quorum_override_for(&a), Some(2));
+    }
+
+    #[test]
+    fn quorum_override_returns_none_when_no_entry_matches() {
+        let r = AuthorityRegistry::from_entries(vec![AuthorityEntry {
+            source_id: "agency:usgs_mcs".into(),
+            metric: Some("production".into()),
+            topic: None,
+            consensus_quorum: Some(2),
+        }]);
+        let a = obs_assertion("agency:other", "production", "lithium");
+        assert_eq!(r.quorum_override_for(&a), None);
+    }
+
+    #[test]
+    fn parse_handles_consensus_quorum_field() {
+        let s = r#"
+[[authority]]
+source_id = "agency:reuters"
+metric = "production"
+consensus_quorum = 2
+"#;
+        let r = AuthorityRegistry::parse(s).expect("toml parses");
+        assert_eq!(r.entries().len(), 1);
+        assert_eq!(r.entries()[0].consensus_quorum, Some(2));
+    }
+
+    #[test]
+    fn parse_treats_missing_consensus_quorum_as_none() {
+        // Backwards-compat: pre-Session-84 TOML rows have no
+        // `consensus_quorum` field. They must parse as None and
+        // continue to fast-track via the auth pass at N=1.
+        let s = r#"
+[[authority]]
+source_id = "usgs_mcs"
+metric = "production"
+"#;
+        let r = AuthorityRegistry::parse(s).expect("toml parses");
+        assert_eq!(r.entries().len(), 1);
+        assert_eq!(r.entries()[0].consensus_quorum, None);
     }
 
     #[test]

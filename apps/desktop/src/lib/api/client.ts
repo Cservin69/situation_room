@@ -31,6 +31,8 @@ import type { LlmCostLedgerEntryDto } from './types/LlmCostLedgerEntryDto';
 import type { LlmCostTimelineEntryDto } from './types/LlmCostTimelineEntryDto';
 import type { ClassifierPromptVersionDto } from './types/ClassifierPromptVersionDto';
 import type { PromoteReportDto } from './types/PromoteReportDto';
+import type { AuthorityRegistrySummaryDto } from './types/AuthorityRegistrySummaryDto';
+import type { LastPromoteSummaryDto } from './types/LastPromoteSummaryDto';
 
 /**
  * Run Level-1 classification on a topic. Persists the resulting plan
@@ -533,6 +535,30 @@ export async function promoteConsensusForPlan(
     id,
     minIndependentClaimants,
   });
+}
+
+/**
+ * Session 84 — snapshot the live authoritative-source registry.
+ *
+ * Reads through the `LiveAuthorityRegistry` hot-reload handle on the
+ * Rust side, so an operator edit to
+ * `config/vocab/authoritative_sources.toml` propagates to the next
+ * call within ~2 seconds (the watcher's polling cadence). Pure read;
+ * no DB, no LLM.
+ */
+export async function authoritativeRegistrySummary(): Promise<AuthorityRegistrySummaryDto> {
+  return invoke<AuthorityRegistrySummaryDto>('authoritative_registry_summary');
+}
+
+/**
+ * Session 84 — return the most recent `PromoteReport` (auto-trigger
+ * or manual). Returns `null` when no promote pass has run yet in
+ * this binary session. Used by the dashboard tile to surface
+ * "the last pass found X auth + Y consensus" without grepping INFO
+ * logs.
+ */
+export async function lastPromoteSummary(): Promise<LastPromoteSummaryDto | null> {
+  return invoke<LastPromoteSummaryDto | null>('last_promote_summary');
 }
 
 /**

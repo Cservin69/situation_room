@@ -4588,6 +4588,7 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
+ "sha2",
  "situation_room-core",
  "situation_room-llm",
  "situation_room-secure",

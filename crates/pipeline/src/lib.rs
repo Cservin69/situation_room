@@ -108,3 +108,9 @@ pub mod research_plans_store;
 // topic, `promote.rs` fast-tracks it at N=1 instead of waiting for
 // quorum.
 pub mod authoritative;
+// Session 84 — hot-reload wrapper around `AuthorityRegistry`. Watches
+// `config/vocab/authoritative_sources.toml` for mtime changes and
+// swaps the in-memory `Arc<AuthorityRegistry>` atomically. ADR 0021
+// amendment: operator can tune `consensus_quorum` without restarting
+// the desktop binary.
+pub mod authoritative_live;

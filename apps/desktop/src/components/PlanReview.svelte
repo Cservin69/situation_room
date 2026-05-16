@@ -76,6 +76,7 @@
   import RecordsDashboard from '$components/RecordsDashboard.svelte';
   import CostByTierPanel from '$components/CostByTierPanel.svelte';
   import CostTimelinePanel from '$components/CostTimelinePanel.svelte';
+  import PromoteStatusPanel from '$components/PromoteStatusPanel.svelte';
   import RunFetchButton from '$components/RunFetchButton.svelte';
   import FetchReport from '$components/FetchReport.svelte';
   import RecipesPanel from '$components/RecipesPanel.svelte';
@@ -546,6 +547,13 @@
          coherent. -->
     <CostByTierPanel />
     <CostTimelinePanel />
+    <!-- Session 84 — authoritative-registry + last-promote tile.
+         Slots next to the cost panels so the operator sees promote
+         status alongside spend status. The component polls on its own
+         interval; reads through the hot-reload handle so a TOML edit
+         to `config/vocab/authoritative_sources.toml` propagates here
+         within ~12s (2s watcher + 10s tile poll). -->
+    <PromoteStatusPanel />
   {/if}
 
   <!-- Six bucket panels (legacy default, now toggle-gated).

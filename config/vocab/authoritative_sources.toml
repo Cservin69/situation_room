@@ -2,11 +2,22 @@
 # When an Assertion's claimant matches an authoritative source, the
 # promotion pipeline elevates it directly to an Observation/Event without
 # requiring multi-source consensus.
+#
+# Session 84 — `consensus_quorum` per-entry override.
+#
+#   - Field absent or `consensus_quorum = 1`: Session-82 fast-track at
+#     N=1 (the matching Assertion promotes immediately via the
+#     authoritative pass).
+#   - `consensus_quorum = n` with n >= 2: opts out of fast-track and
+#     instead lowers the consensus quorum to `n` for groups containing
+#     this claimant. Use for sources that are trusted enough to relax
+#     the global N=3 bar but not enough to skip corroboration entirely.
 
 [[authority]]
 source_id = "usgs_mcs"
 metric = "production"
 # No topic = applies to any topic this source reports on
+# No consensus_quorum = N=1 fast-track via the authoritative pass
 
 [[authority]]
 source_id = "usgs_mcs"

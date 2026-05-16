@@ -22,6 +22,9 @@ use anyhow::{Context, Result};
 use situation_room_api::commands::AppState;
 use situation_room_apps_common::sources::load_source_descriptors;
 use situation_room_pipeline::authoritative::AuthorityRegistry;
+use situation_room_pipeline::authoritative_live::{
+    LiveAuthorityRegistry, DEFAULT_POLL_INTERVAL,
+};
 use situation_room_llm::{
     AnthropicProvider, CostLedger, LlmProvider, MeteredProvider, XaiProvider,
 };
@@ -244,7 +247,7 @@ fn main() -> Result<()> {
         .join("config")
         .join("vocab")
         .join("authoritative_sources.toml");
-    let authoritative = match AuthorityRegistry::load_from_path(&authoritative_path) {
+    let initial_registry = match AuthorityRegistry::load_from_path(&authoritative_path) {
         Ok(r) => {
             info!(
                 count = r.entries().len(),
@@ -265,7 +268,14 @@ fn main() -> Result<()> {
             AuthorityRegistry::empty()
         }
     };
-    let authoritative = Arc::new(authoritative);
+    // Session 84 — wrap the boot-time registry in a hot-reload handle
+    // and spawn a polling watcher. Edits to
+    // `config/vocab/authoritative_sources.toml` propagate to the next
+    // promote run within ~2 seconds without restarting the desktop
+    // binary. ADR 0021 amendment: operators can tune
+    // `consensus_quorum` interactively.
+    let authoritative = LiveAuthorityRegistry::new(initial_registry, authoritative_path.clone());
+    authoritative.spawn_watcher(DEFAULT_POLL_INTERVAL);
 
     // --- AppState ----------------------------------------------------
     let state = AppState::new(
@@ -395,6 +405,16 @@ fn main() -> Result<()> {
             // a future session may schedule this off the fetch-run
             // completion hook.
             situation_room_api::commands_records::promote_consensus_for_plan,
+            // Session 84 — dashboard tile surfaces over the live
+            // authoritative registry + the most recent PromoteReport.
+            // Both are pure reads off AppState; no DB, no LLM. The
+            // first reads the hot-reload snapshot so an operator's
+            // edit to the TOML appears in the dashboard within ~2s.
+            // The second reads the in-memory `last_promote_summary`
+            // Mutex written by the auto-trigger and the manual
+            // promote command.
+            situation_room_api::commands::authoritative_registry_summary,
+            situation_room_api::commands::last_promote_summary,
         ])
         .build(tauri::generate_context!())
         .context("building tauri")?;
