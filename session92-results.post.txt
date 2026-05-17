@@ -1,0 +1,59 @@
+== A1. assertion counts by content_kind ==
+content_kind      n  
+----------------  ---
+entity_attribute  127
+relation          17 
+== A2. relation assertion total + distinct claimant universe ==
+n_relation_assertions  n_distinct_claimants_total  earliest_observed_at           latest_observed_at           
+---------------------  --------------------------  -----------------------------  -----------------------------
+17                     3                           2026-05-15 18:29:34.431238+02  2026-05-15 19:59:39.701649+02
+== B1. distinct-claimants-per-triple HISTOGRAM (all plans) ==
+distinct_claimants  n_triples
+------------------  ---------
+1                   7        
+2                   2        
+== B2. distinct-claimants-per-triple HISTOGRAM (per plan) ==
+topic                          triples  singleton_triples  pair_triples  quorum_triples
+-----------------------------  -------  -----------------  ------------  --------------
+global aluminium supply chain  7        7                  0             0             
+minecraft                      2        0                  2             0             
+== B3. multi-claimant SAMPLE (the ADR 0023 success shape) ==
+rel_kind      rel_from                    rel_to                  distinct_claimants  n_assertions  claimants_list                      
+------------  --------------------------  ----------------------  ------------------  ------------  ------------------------------------
+available_on  game:minecraft_dungeons_ii  service:xbox_game_pass  2                   4             ['agency:xbox', 'company:microsoft']
+coming_to     game:minecraft_dungeons_ii  service:xbox_game_pass  2                   3             ['company:microsoft', 'agency:xbox']
+== C1. relation Assertions written in last 1 hour (re-extract freshness) ==
+n_recent  n_distinct_claimants_recent  n_distinct_triples_recent  earliest_recent  latest_recent
+--------  ---------------------------  -------------------------  ---------------  -------------
+0         0                            0                          NULL             NULL         
+== C2. last-hour relations grouped by (kind, from, to) ==
+rel_kind  rel_from  rel_to  distinct_claimants_recent  n_assertions_recent  claimants_list
+--------  --------  ------  -------------------------  -------------------  --------------
+== D1. relation rows promoted in last 1 hour (post-promote signal) ==
+n_promoted_relations_recent  earliest_recent                latest_recent                
+---------------------------  -----------------------------  -----------------------------
+1                            2026-05-17 10:33:41.912476+02  2026-05-17 10:33:41.912476+02
+== D2. relations promoted in last 1 hour — claimant fingerprint ==
+pathway  n
+-------  -
+other    1
+== E1. article-kind document count per plan (re-extract cost preview) ==
+topic                                  article_docs  avg_body_chars  max_body_chars  plan_id                             
+-------------------------------------  ------------  --------------  --------------  ------------------------------------
+meta stock price                       26            32768           32768           019e30cb-35e4-7951-9743-e19d5392fc65
+minecraft                              17            3403            3745            019e2c63-51db-78f0-9878-b651edea22b1
+tesla stock price                      15            32768           32768           019e311e-a016-78b2-9e61-83c718fa2ce3
+NVIDIA stock price                     15            32768           32768           019e2c20-c4a9-7323-ac16-59697741b5c1
+tesla stock price                      15            32768           32768           019e2ff6-71c5-7f62-af11-71440977e395
+TESLA Stock price                      12            32768           32768           019e27ba-ceb2-7341-95c2-592e7a2c6640
+federal reserve rate policy            12            17590           32768           019e20b3-7c87-7191-ad0a-8b53cb42e632
+minecraft                              9             3115            3115            019e2c75-4052-7560-832c-1ba7b770ba07
+meta stock price                       8             25583           32768           019e30c4-617f-7fc0-8a71-d2824a6b10e5
+professional bull riding - PBR         6             8305            9793            019e3208-97ca-71d1-bcd1-ee8d6c06f729
+professional bull riding - PBR         5             5824            9673            019e3511-bd28-7322-8f52-27aca1763253
+TESLA Stock price                      5             32768           32768           019e2bea-3bb1-7223-aea7-318c3d233ee6
+federal reserve rate policy            2             11112           14334           019e313e-55b4-7e91-a147-6cc93b8dcfe9
+global aluminium supply chain          2             6907            6908            019e2c87-8ab0-7443-b679-d865ae91623f
+2025 atlantic hurricane season         1             8344            8344            019e2023-6b1a-76a3-8efe-b7d75089de29
+ebola outbreaks in the last ten years  1             9059            9059            019e1675-5c84-7582-8a43-fd0d2a92ffde
+== END of session92-measure.sql ==
