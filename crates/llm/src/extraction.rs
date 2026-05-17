@@ -1913,6 +1913,78 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_keeps_multi_claimant_rows_for_same_triple() {
+        // Session 91 — ADR 0023, prompt v1.2. A document that
+        // attributes the same triple to multiple distinct claimants
+        // produces multiple rows on the wire; parse_response validates
+        // them independently and returns one draft per row. The
+        // pipeline orchestrator persists each as an independent
+        // Assertion; the consensus pass groups on content hash so the
+        // distinct-claimants count rises naturally.
+        //
+        // Three rows: agency:reuters reports, agency:ustr asserts,
+        // agency:wood_mackenzie asserts. Same triple. N=3 distinct
+        // claimants — the consensus pass at the default quorum
+        // promotes this triple on first ingest.
+        let body = serde_json::json!({
+            "assertions": [
+                {
+                    "claimant": "agency:reuters",
+                    "stance": "reported",
+                    "subject": "company:panasonic",
+                    "predicate": "supplies_to",
+                    "object": "company:tsla",
+                    "confidence": 0.9
+                },
+                {
+                    "claimant": "agency:ustr",
+                    "stance": "asserted",
+                    "subject": "company:panasonic",
+                    "predicate": "supplies_to",
+                    "object": "company:tsla",
+                    "confidence": 0.85
+                },
+                {
+                    "claimant": "agency:wood_mackenzie",
+                    "stance": "asserted",
+                    "subject": "company:panasonic",
+                    "predicate": "supplies_to",
+                    "object": "company:tsla",
+                    "confidence": 0.8
+                }
+            ]
+        });
+        let resp = CompletionResponse {
+            text: "".into(),
+            structured: Some(body),
+            provider: "test".into(),
+            model: "test".into(),
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+        };
+        let drafts = parse_response(&resp, &[]).expect("parse should succeed");
+        assert_eq!(
+            drafts.len(),
+            3,
+            "all three multi-claimant rows must survive"
+        );
+        // Same triple on every row.
+        for d in &drafts {
+            assert_eq!(d.kind, "supplies_to");
+            assert_eq!(d.from.as_str(), "company:panasonic");
+            assert_eq!(d.to.as_str(), "company:tsla");
+        }
+        // Distinct claimants — what unlocks the consensus pass.
+        let claimants: std::collections::BTreeSet<&str> =
+            drafts.iter().map(|d| d.claimant.as_str()).collect();
+        assert_eq!(claimants.len(), 3);
+        assert!(claimants.contains("agency:reuters"));
+        assert!(claimants.contains("agency:ustr"));
+        assert!(claimants.contains("agency:wood_mackenzie"));
+    }
+
+    #[test]
     fn extraction_schema_value_open_vocab_is_object_with_assertions_array() {
         let schema = extraction_schema_value(&[]);
         assert_eq!(schema["type"], "object");

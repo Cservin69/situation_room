@@ -1,13 +1,22 @@
-# Document Assertions Extraction Prompt — v1.1
+# Document Assertions Extraction Prompt — v1.2
 
 <!--
     Session 77 — Phase-3 minimal landing.
+    Session 80 — closed-vocab predicate gate (v1.1).
+    Session 91 — multi-claimant attribution (v1.2). See ADR 0023.
 
     This prompt runs once per persisted Document (Session 69 synth).
     The LLM reads the Document body and emits zero or more
     relation-shaped assertions present in the text. Each emitted
     item becomes one `Assertion` row in storage, with content
     shape `AssertedContent::Relation` (kind/from/to triple).
+
+    Multi-claimant emission (v1.2): a single document can produce
+    multiple Assertions for the same (subject, predicate, object)
+    triple when the text attributes the claim to multiple distinct
+    claimants by name. Each row carries the same triple, a distinct
+    claimant, and a stance that matches that claimant's relationship
+    to the claim. Cap: 4 rows per (triple, document).
 
     ## Why relation-only in v1
 
@@ -77,6 +86,24 @@ Schema details:
   the claimant from the document, use a sensible default like
   `agency:unknown`.
 
+  **Session 91 — multi-claimant attribution.** Documents commonly
+  attribute the same relation triple to multiple distinct claimants:
+  the publisher reports on it; a cited third party (industry analyst,
+  government agency, prior report) made the original claim; a
+  quoted authority (the company's CEO, a regulator) confirms or
+  denies it. When you can identify two or more *distinct,
+  document-attributed* claimants for the same triple, emit one
+  Assertion *per claimant* — same `subject`, same `predicate`, same
+  `object`, different `claimant` and matching `stance`. The
+  "Multi-claimant worked example" section below shows the shape.
+
+  **Cap.** Emit at most **four Assertions per (triple, document)**.
+  When more than four claimants attribute the same triple, pick the
+  four most *prominently attributed* in the document — the
+  publisher and the most explicitly named/cited authorities. Past
+  four, additional rows don't unlock new promotions and inflate
+  cost.
+
 - **`stance`** — the claimant's stance toward the content.
   Closed vocabulary:
   - `asserted` — the claimant states this as fact.
@@ -88,6 +115,19 @@ Schema details:
   - `predicted` — the claimant makes a forward-looking projection
     ("Tesla will...").
   - `speculated` — the claimant frames the claim as conjecture.
+
+  **Session 91 — per-claimant stance discipline.** When the same
+  triple is emitted with multiple claimants (see "Multi-claimant
+  attribution" under `claimant`), each row's stance reflects *that
+  specific claimant's* relationship to the claim, not the
+  publisher's. A publisher reporting on a regulator's finding emits
+  two rows: one with `claimant: agency:<publisher>` + `stance:
+  reported`, one with `claimant: agency:<regulator>` + `stance:
+  asserted`. The publisher's stance is `reported` because they are
+  relaying; the regulator's stance is `asserted` because the
+  regulator is the originator. A quoted denial uses
+  `stance: denied` on the denier's row even if the publisher's row
+  uses `stance: reported`.
 
 - **`subject`** — the source end of the relation, as an
   `EntityId` (`prefix:slug` shape). Use the same entity-id
@@ -181,6 +221,88 @@ The second item: Tesla is the claimant, the stance is `denied`
 confidence is lower because the document only says "declined to
 comment on rumors" — the denial is implicit, not explicit.
 
+## Multi-claimant worked example (Session 91)
+
+**Document body** (paraphrased): "Reuters reports that the U.S.
+Trade Representative cited an industry analyst at Wood Mackenzie in
+its annual review of critical-minerals supply chains, naming
+Panasonic as the primary cell supplier to Tesla's North American
+production. A Panasonic spokesperson confirmed the relationship
+when asked. Tesla declined to comment."
+
+**Output**:
+
+```json
+{
+  "assertions": [
+    {
+      "claimant": "agency:reuters",
+      "stance": "reported",
+      "subject": "company:panasonic",
+      "predicate": "supplies_to",
+      "object": "company:tsla",
+      "confidence": 0.9
+    },
+    {
+      "claimant": "agency:ustr",
+      "stance": "asserted",
+      "subject": "company:panasonic",
+      "predicate": "supplies_to",
+      "object": "company:tsla",
+      "confidence": 0.85
+    },
+    {
+      "claimant": "agency:wood_mackenzie",
+      "stance": "asserted",
+      "subject": "company:panasonic",
+      "predicate": "supplies_to",
+      "object": "company:tsla",
+      "confidence": 0.8
+    },
+    {
+      "claimant": "company:panasonic",
+      "stance": "asserted",
+      "subject": "company:panasonic",
+      "predicate": "supplies_to",
+      "object": "company:tsla",
+      "confidence": 0.95
+    }
+  ]
+}
+```
+
+Walk-through:
+
+- **Same triple, four claimants.** Subject/predicate/object are
+  identical on every row. Each claimant is a *distinct
+  document-attributed* source of the same factual claim.
+- **Per-claimant stance.** Reuters is `reported` (publisher
+  relaying). USTR is `asserted` (originator citing in an annual
+  review). Wood Mackenzie is `asserted` (the underlying analyst
+  attribution USTR cited). Panasonic is `asserted` (first-party
+  confirmation when asked).
+- **Tesla declined → no row.** A decline-to-comment is not a
+  stance toward the triple. If Tesla had affirmatively denied the
+  supply relationship, that would be a fifth row with `stance:
+  denied` — but the cap is four, so the LLM would drop the row
+  with the weakest attribution (likely the publisher) to keep the
+  denier visible.
+- **Four-row cap reached.** No additional Assertions for this
+  triple in this Document, even if a passing mention of another
+  cited authority appears later in the body.
+
+Why this matters: at N=3 consensus, this Document alone clears the
+quorum bar for the `(panasonic, supplies_to, tsla)` triple — four
+distinct claimants exceed three. Before this prompt change (v1.0 /
+v1.1), the same Document would have emitted *one* row claimed by
+the publisher, and the triple would have waited for two more
+independent publications to corroborate.
+
+Single-claimant documents still emit a single row. The multi-row
+emission fires *only* when the document text supports distinct
+attribution to multiple named claimants. Do not invent claimants;
+do not duplicate the publisher under a different prefix.
+
 ## Empty output is legal
 
 If the document contains no relation-shaped claims, emit:
@@ -240,3 +362,18 @@ outside the JSON.
   bakes the list as a JSON-Schema enum and the validator drops
   out-of-vocab predicates with the same phrasing the event and
   observation extractors emit.
+
+- **v1.2** (2026-05-17) — Session 91. Multi-claimant attribution.
+  When a document attributes the same triple to multiple distinct
+  claimants, emit one Assertion per claimant with the triple
+  repeated and the claimant + stance updated per row. Cap at four
+  rows per (triple, document). Per-claimant stance discipline
+  sharpened — publisher = `reported`, originator/citation =
+  `asserted`, first-party denial = `denied`. New "Multi-claimant
+  worked example" section walks the four-row shape. No wire schema
+  change; the existing flat `assertions[]` list carries multiple
+  rows for the same triple naturally. Drives ADR 0023: closes the
+  relation-promotion quorum gap by surfacing the plural attribution
+  the corpus already supports, instead of lowering N (rejected as
+  Path A2) or curating per-source registry entries (rejected as
+  Path B).

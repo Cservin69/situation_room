@@ -1,0 +1,172 @@
+== K1. promote_history schema ==
+column_name  column_type               null  key   default  extra
+-----------  ------------------------  ----  ----  -------  -----
+id           UUID                      NO    PRI   NULL     NULL 
+plan_id      UUID                      NO    NULL  NULL     NULL 
+recorded_at  TIMESTAMP WITH TIME ZONE  NO    NULL  NULL     NULL 
+trigger      VARCHAR                   NO    NULL  NULL     NULL 
+report       VARCHAR                   NO    NULL  NULL     NULL 
+== K2. one promote_history row (most recent by rowid) ==
+id                                    plan_id                               recorded_at                    trigger           report                                                                                                                                                                                                                                               
+------------------------------------  ------------------------------------  -----------------------------  ----------------  -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+019e311c-b329-7821-b313-0bbc047b70a4  019e30cb-35e4-7951-9743-e19d5392fc65  2026-05-16 16:07:05.001896+02  auto_after_fetch  {"assertions_considered":36,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]}
+019e3121-ba11-7a11-b444-0689e805d0d2  019e311e-a016-78b2-9e61-83c718fa2ce3  2026-05-16 16:12:34.449802+02  auto_after_fetch  {"assertions_considered":6,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]} 
+019e3123-aed8-7ca2-a4c5-412b3a057aeb  019e311e-a016-78b2-9e61-83c718fa2ce3  2026-05-16 16:14:42.648253+02  manual            {"assertions_considered":6,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]} 
+== K3. expectations JSON shape — actual top-level keys ==
+id                                    topic                        top_level_keys                                                                                        
+------------------------------------  ---------------------------  ------------------------------------------------------------------------------------------------------
+019e20b3-7c87-7191-ad0a-8b53cb42e632  federal reserve rate policy  [observation_metrics, event_types, entity_kinds, relation_kinds, document_sources, assertion_guidance]
+019e313d-eccb-7202-b7b5-f5d86ac8ad6f  federal reserve rate policy  [observation_metrics, event_types, entity_kinds, document_sources, assertion_guidance]                
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  federal reserve rate policy  [observation_metrics, event_types, entity_kinds, document_sources, assertion_guidance]                
+== K4. expectations JSON full (newest fed plan) ==
+expectations_text                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+{"observation_metrics":[{"name":"federal_funds_target_rate","unit_hint":"pct","rationale":"Primary policy instrument set by the FOMC."},{"name":"effective_federal_funds_rate","unit_hint":"pct","rationale":"Market-implied overnight rate between banks."},{"name":"inflation_expectation_5y","unit_hint":"pct","rationale":"Market-based measure of long-run inflation outlook."}],"event_types":[{"event_type":"fomc_decision","rationale":"Scheduled rate announcements and forward guidance changes."},{"event_type":"dot_plot_published","rationale":"Quarterly SEP release showing individual projections."},{"event_type":"minutes_released","rationale":"Detailed discussion and voting record three weeks after meeting."}],"entity_kinds":[{"kind":"government_agency","exemplars":["agency:federal_reserve"],"attributes":["chair","board_members","policy_rate","last_decision_date"],"rationale":"Primary decision-making body for U.S. monetary policy."},{"kind":"company","exemplars":["company:gs","company:jpm"],"attributes":["ticker","headquarters_country","sector"],"rationale":"Primary dealers and market participants reacting to rate decisions."}],"document_sources":[{"nomination_id":"019e313e-55b4-7e91-a147-6c61205d99eb","description":"Federal Reserve FOMC statements, minutes, and Summary of Economic Projections (SEP) — official releases after each meeting with dot plot and median projections","priority_tier":"authoritative_primary"},{"nomination_id":"019e313e-55b4-7e91-a147-6c79ddb84006","description":"Federal Reserve Board H.15 Selected Interest Rates statistical release — daily and weekly federal funds rate, discount rate, and Treasury yields","priority_tier":"authoritative_primary"},{"nomination_id":"019e313e-55b4-7e91-a147-6c8f43c50872","description":"FRED (St. Louis Fed) series for federal funds effective rate, target rate, and inflation expectations (PCE, CPI) — downloadable time-series","priority_tier":"authoritative_secondary"},{"nomination_id":"019e313e-55b4-7e91-a147-6c925a0f2529","description":"Federal Reserve Beige Book — regional economic conditions summary released before each FOMC meeting","priority_tier":"authoritative_primary"},{"nomination_id":"019e313e-55b4-7e91-a147-6cae1ef0362f","description":"Treasury Department and OMB fiscal and debt-ceiling updates that interact with Fed policy","priority_tier":"authoritative_secondary"},{"nomination_id":"019e313e-55b4-7e91-a147-6cb98d15a5ab","description":"Bloomberg or Reuters central-bank policy coverage — FOMC preview, decision, and reaction reporting","priority_tier":"general_news"}],"assertion_guidance":"Prioritize claims by named FOMC members or the Chair about rate paths, inflation outlook, and labor-market conditions; claims by the Federal Reserve about forward guidance, balance-sheet policy, and SEP revisions."}
+== L1. outcomes per fed plan id ==
+id                                    topic                        created_at                     succeeded  declined  failed  rate_limited  skipped  total
+------------------------------------  ---------------------------  -----------------------------  ---------  --------  ------  ------------  -------  -----
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  federal reserve rate policy  2026-05-16 16:43:49.30062+02   2          14        0       0             0        16   
+019e313d-eccb-7202-b7b5-f5d86ac8ad6f  federal reserve rate policy  2026-05-16 16:43:22.443801+02  0          0         0       0             0        0    
+019e20b3-7c87-7191-ad0a-8b53cb42e632  federal reserve rate policy  2026-05-13 11:38:14.279548+02  20         20        10      0             0        50   
+== L2. recipes per fed plan id ==
+id                                    topic                        recipe_n
+------------------------------------  ---------------------------  --------
+019e20b3-7c87-7191-ad0a-8b53cb42e632  federal reserve rate policy  6       
+019e313d-eccb-7202-b7b5-f5d86ac8ad6f  federal reserve rate policy  0       
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  federal reserve rate policy  2       
+== L3. fed plan landed-records-per-table — per fed plan id ==
+plan_id                               created     tbl           landed
+------------------------------------  ----------  ------------  ------
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  2026-05-16  events        69    
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  2026-05-16  observations  6     
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  2026-05-16  entities      3     
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  2026-05-16  documents     2     
+019e20b3-7c87-7191-ad0a-8b53cb42e632  2026-05-13  events        473   
+019e20b3-7c87-7191-ad0a-8b53cb42e632  2026-05-13  documents     12    
+019e20b3-7c87-7191-ad0a-8b53cb42e632  2026-05-13  observations  10    
+019e20b3-7c87-7191-ad0a-8b53cb42e632  2026-05-13  assertions    8     
+== M1. entity_attribute assertions — who is the single claimant? ==
+claimant         n    distinct_dedup_keys  first_seen  last_seen 
+---------------  ---  -------------------  ----------  ----------
+agency:document  117  0                    2026-05-16  2026-05-16
+== M2. entity_attribute content shape — what attributes are claimed? ==
+entity_id                       attribute  n 
+------------------------------  ---------  --
+company:tsla                    NULL       61
+company:meta                    NULL       36
+series:fedfunds                 NULL       6 
+company:nvda                    NULL       2 
+person:brady_fielder            NULL       1 
+person:callum_miller            NULL       1 
+person:luciano_de_castro        NULL       1 
+person:paulo_eduardos_rossetto  NULL       1 
+committee:fomc                  NULL       1 
+agency:fomc                     NULL       1 
+person:daylon_swearingen        NULL       1 
+person:hudson_bolton            NULL       1 
+person:lucas_divino             NULL       1 
+person:claudio_montanha_jr      NULL       1 
+person:maverick_smith           NULL       1 
+person:dener_barbosa            NULL       1 
+== M3. relation assertions — claimant diversity per relation kind ==
+rel_kind                n_assertions  distinct_claimants  distinct_dedup_keys
+----------------------  ------------  ------------------  -------------------
+reaches_agreement_with  4             1                   0                  
+available_on            4             2                   0                  
+partners_with           4             1                   0                  
+coming_to               3             2                   0                  
+operates                1             1                   0                  
+owns                    1             1                   0                  
+== M4. relation assertions — subject-object-predicate spread ==
+subj  predicate               obj   n_claims  distinct_claimants
+----  ----------------------  ----  --------  ------------------
+NULL  available_on            NULL  4         2                 
+NULL  coming_to               NULL  3         2                 
+NULL  partners_with           NULL  4         1                 
+NULL  reaches_agreement_with  NULL  4         1                 
+NULL  operates                NULL  1         1                 
+NULL  owns                    NULL  1         1                 
+== N1. all three fed plans — declines by decline_shape ==
+id                                    created     decline_shape     bucket              n
+------------------------------------  ----------  ----------------  ------------------  -
+019e20b3-7c87-7191-ad0a-8b53cb42e632  2026-05-13  per_expectation   observation_metric  7
+019e20b3-7c87-7191-ad0a-8b53cb42e632  2026-05-13  per_expectation   entity_kind         4
+019e20b3-7c87-7191-ad0a-8b53cb42e632  2026-05-13  per_expectation   relation_kind       4
+019e20b3-7c87-7191-ad0a-8b53cb42e632  2026-05-13  per_expectation   event_type          3
+019e20b3-7c87-7191-ad0a-8b53cb42e632  2026-05-13  nomination_level  NULL                2
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  2026-05-16  per_expectation   entity_kind         4
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  2026-05-16  nomination_level  NULL                4
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  2026-05-16  per_expectation   observation_metric  3
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  2026-05-16  per_expectation   event_type          3
+== N2. all three fed plans — decline message heads ==
+id                                    message_head                                                                                                    n
+------------------------------------  --------------------------------------------------------------------------------------------------------------  -
+019e20b3-7c87-7191-ad0a-8b53cb42e632  Source provides FOMC meeting calendars and statements but contains no extractable structured data to populate   1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  url proposer declined after 2 attempt(s): Prior attempts exhausted the WEO database landing page and October 2  1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  The source is a general news index without structured relation data matching sets_policy_for.                   1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  authoring-time validation against the prefetched bytes failed: extraction [css_select]: FieldMap "headline": i  1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  Source provides federal funds rate time series data for observations, not FOMC meeting events.                  1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  The CNBC federal-reserve page is a news index containing only article headlines and summaries with no structur  1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  The source page is a press releases index without extractable numeric time-series data for the inflation_pce m  1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  The press releases listing page does not contain structured relation data matching sets_policy_for between ent  1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://www.bls.gov/news.rele  1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  CNBC federal-reserve page publishes news articles rather than the numeric federal funds rate time series requi  1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  Source is a news index without structured listings for government_agency entities.                              1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  This FRED series page supplies numeric federal funds rate observations, not relation data for sets_policy_for.  1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  The prefetched page is a press releases index without numeric federal funds rate data extractable via the clos  1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  Target expectation is entity_kind index 0 (government_agency) but source provides numeric rate observations, n  1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  The source page lists FOMC meeting calendars and statements but contains no extractable entity relations of ki  1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  Source provides time-series rate data values, not discrete FOMC rate decision events or announcements.          1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  The fetched page contains only FOMC meeting calendars and links to statements/minutes but no numerical time-se  1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  The source is a press releases listing page and does not contain structured data to populate the government_ag  1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  Source is the federal funds rate series (FEDFUNDS) and does not contain PCE inflation data.                     1
+019e20b3-7c87-7191-ad0a-8b53cb42e632  This page lists FOMC meeting calendars and links to statements but contains no numeric federal_funds_rate valu  1
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://www.reuters.com/marke  1
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  The source publishes time-series rate observations, not FOMC decision events.                                   1
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  Target expectation is entity_kind government_agency but recipes produce only observation/event/relation record  1
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  The FOMC calendars page lists meeting dates and links to statements/minutes but contains no extractable numeri  1
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  This FRED series page publishes effective federal funds rate time-series observations and does not contain dot  1
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://www.federalreserve.go  1
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  The FRED series page for FEDFUNDS provides numeric rate data suitable for observations but contains no structu  1
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://home.treasury.gov/pol  1
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  The provided FRED series FEDFUNDS is the effective federal funds rate, not the federal_funds_target_rate named  1
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  authoring-time validation against the prefetched bytes failed: extraction [css_select]: FieldMap "headline": i  1
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  Source publishes only FOMC meeting calendars with no company entity attributes; entity_kind target cannot be b  1
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  The FOMC calendars page lists meeting dates and links to statements but does not publish numeric values for th  1
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  Source publishes macroeconomic time series data and does not contain company attributes such as ticker or head  1
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  url proposer declined after 2 attempt(s): Both common paths on the authoritative host (beigebook.htm and beige  1
+== N3. all three fed plans — failed-stage shape ==
+id                                    failure_stage  message_head                                                                      n 
+------------------------------------  -------------  --------------------------------------------------------------------------------  --
+019e20b3-7c87-7191-ad0a-8b53cb42e632  apply          extraction [css_select]: inner selector matched no elements within iterator matc  10
+== O1. promote_history full rows (capped) ==
+id                                    plan_id                               recorded_at                    trigger           report                                                                                                                                                                                                                                               
+------------------------------------  ------------------------------------  -----------------------------  ----------------  -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+019e311c-b329-7821-b313-0bbc047b70a4  019e30cb-35e4-7951-9743-e19d5392fc65  2026-05-16 16:07:05.001896+02  auto_after_fetch  {"assertions_considered":36,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]}
+019e3121-ba11-7a11-b444-0689e805d0d2  019e311e-a016-78b2-9e61-83c718fa2ce3  2026-05-16 16:12:34.449802+02  auto_after_fetch  {"assertions_considered":6,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]} 
+019e3123-aed8-7ca2-a4c5-412b3a057aeb  019e311e-a016-78b2-9e61-83c718fa2ce3  2026-05-16 16:14:42.648253+02  manual            {"assertions_considered":6,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]} 
+019e3123-c3c8-7362-8c10-777a7c8ef8ec  019e311e-a016-78b2-9e61-83c718fa2ce3  2026-05-16 16:14:48.008661+02  manual            {"assertions_considered":6,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]} 
+019e3124-e75d-72f1-9894-a37190817f76  019e311e-a016-78b2-9e61-83c718fa2ce3  2026-05-16 16:16:02.653287+02  auto_after_fetch  {"assertions_considered":12,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]}
+019e3126-c61d-7d33-aed4-a90505196183  019e311e-a016-78b2-9e61-83c718fa2ce3  2026-05-16 16:18:05.213023+02  auto_after_fetch  {"assertions_considered":18,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]}
+019e3129-e8c6-7082-b0cb-6a8497b64656  019e311e-a016-78b2-9e61-83c718fa2ce3  2026-05-16 16:21:30.694098+02  auto_after_fetch  {"assertions_considered":24,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]}
+019e313d-46e2-7cf3-9f7b-bdbb4c42ba70  019e311e-a016-78b2-9e61-83c718fa2ce3  2026-05-16 16:42:39.970454+02  auto_after_fetch  {"assertions_considered":30,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]}
+019e3140-8e9f-7b10-81f1-c43691f62669  019e20b3-7c87-7191-ad0a-8b53cb42e632  2026-05-16 16:46:14.94337+02   auto_after_fetch  {"assertions_considered":8,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]} 
+019e3145-f71c-7030-a14e-7aada1bb2563  019e313e-55b4-7e91-a147-6cc93b8dcfe9  2026-05-16 16:52:09.371995+02  auto_after_fetch  {"assertions_considered":0,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]} 
+019e3205-1355-7440-9415-e4655e4967eb  019e3202-6ade-7270-9ca0-154c5e839e80  2026-05-16 20:20:53.973825+02  auto_after_fetch  {"assertions_considered":0,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]} 
+019e3207-88e9-72e0-8c2c-6d7739159de2  019e3202-6ade-7270-9ca0-154c5e839e80  2026-05-16 20:23:35.145525+02  auto_after_fetch  {"assertions_considered":0,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]} 
+019e3207-a6a5-7353-b15a-726630b224fa  019e3202-6ade-7270-9ca0-154c5e839e80  2026-05-16 20:23:42.757348+02  auto_after_fetch  {"assertions_considered":0,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]} 
+019e3207-b4ad-7811-a430-68543a0f8c02  019e3202-6ade-7270-9ca0-154c5e839e80  2026-05-16 20:23:46.349497+02  auto_after_fetch  {"assertions_considered":0,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]} 
+019e320d-c381-79b0-8b09-9000e8ba7d25  019e3208-97ca-71d1-bcd1-ee8d6c06f729  2026-05-16 20:30:23.361918+02  auto_after_fetch  {"assertions_considered":10,"groups_promoted":0,"skipped_already_promoted":0,"observations_emitted":0,"events_emitted":0,"relations_emitted":0,"entity_attributes_emitted":0,"insert_failures":0,"authoritative_promoted":0,"promoted_record_ids":[]}
+== P1. system-wide decline source_id prefixes ==
+shape                        n  
+---------------------------  ---
+nom:_:_:_ (per-expectation)  195
+nom:_ (nomination-level)     96 
+== P2. per-expectation decline by bucket — system-wide ==
+bucket              n 
+------------------  --
+event_type          70
+observation_metric  57
+entity_kind         51
+relation_kind       17
+== END of session89-analyze-v2.sql ==

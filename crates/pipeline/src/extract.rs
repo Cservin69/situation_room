@@ -1226,4 +1226,146 @@ mod tests {
         assert_eq!(assertion.envelope.subjects.topics.len(), 1);
         assert_eq!(assertion.envelope.observed_at, fetched_at);
     }
+
+    // -------------------------------------------------------------------
+    // Session 91 — ADR 0023 multi-claimant relation extraction
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn build_assertion_groups_multi_claimant_rows_on_same_content_hash() {
+        // ADR 0023 / prompt v1.2: a single Document can emit multiple
+        // AssertionDrafts for the same (subject, predicate, object)
+        // triple with distinct claimants. The orchestrator builds one
+        // Assertion per draft; the consensus pass groups by content
+        // hash, so the per-triple distinct-claimants count rises
+        // naturally past N=3 on the first ingest.
+        //
+        // This test pins the load-bearing invariant: same content
+        // hash across rows that differ only in claimant + stance +
+        // confidence. If the hash ever picks up envelope-level fields,
+        // multi-claimant emission stops grouping and consensus
+        // regresses to per-row promotion. Catch that here, not in
+        // live verification.
+        use crate::promote::content_hash_for;
+        use situation_room_core::vocab::{Confidence, EntityId, Stance};
+
+        let plan = sample_plan();
+        let recipe = sample_recipe(
+            &plan,
+            "https://example.test/multi",
+            "example_news",
+        );
+        let fetched_at = Utc.with_ymd_and_hms(2026, 5, 17, 12, 0, 0).unwrap();
+
+        // Three drafts: same triple, distinct claimants, per-claimant
+        // stance — exactly the v1.2 worked example shape.
+        let drafts = vec![
+            AssertionDraft {
+                claimant: EntityId::new("agency:reuters").unwrap(),
+                stance: Stance::Reported,
+                kind: "supplies_to".into(),
+                from: EntityId::new("company:panasonic").unwrap(),
+                to: EntityId::new("company:tsla").unwrap(),
+                confidence: Confidence::new(0.9).unwrap(),
+            },
+            AssertionDraft {
+                claimant: EntityId::new("agency:ustr").unwrap(),
+                stance: Stance::Asserted,
+                kind: "supplies_to".into(),
+                from: EntityId::new("company:panasonic").unwrap(),
+                to: EntityId::new("company:tsla").unwrap(),
+                confidence: Confidence::new(0.85).unwrap(),
+            },
+            AssertionDraft {
+                claimant: EntityId::new("agency:wood_mackenzie").unwrap(),
+                stance: Stance::Asserted,
+                kind: "supplies_to".into(),
+                from: EntityId::new("company:panasonic").unwrap(),
+                to: EntityId::new("company:tsla").unwrap(),
+                confidence: Confidence::new(0.8).unwrap(),
+            },
+        ];
+
+        let assertions: Vec<_> = drafts
+            .iter()
+            .map(|d| build_assertion(&plan, &recipe, d, fetched_at))
+            .collect();
+
+        // Distinct Assertion ids — each row is independently
+        // persistable.
+        let ids: std::collections::BTreeSet<_> =
+            assertions.iter().map(|a| a.id).collect();
+        assert_eq!(ids.len(), 3, "each Assertion has a distinct id");
+
+        // Distinct claimants — what makes the consensus pass count
+        // this triple at N=3 instead of N=1.
+        let claimants: std::collections::BTreeSet<_> =
+            assertions.iter().map(|a| a.claimant.as_str()).collect();
+        assert_eq!(claimants.len(), 3);
+
+        // Same content hash on every Assertion — the consensus pass's
+        // group key. If this regresses, multi-claimant emission stops
+        // unlocking promotion and the ADR 0023 fix is dead.
+        let h0 = content_hash_for(&assertions[0].content);
+        for a in &assertions[1..] {
+            assert_eq!(
+                content_hash_for(&a.content),
+                h0,
+                "content hashes must match across multi-claimant rows \
+                 — otherwise the consensus pass won't group them"
+            );
+        }
+    }
+
+    #[test]
+    fn build_assertion_distinct_triples_produce_distinct_hashes() {
+        // Defensive twin to the multi-claimant test above: rows that
+        // differ in subject/predicate/object MUST produce distinct
+        // content hashes so the consensus pass groups them into
+        // separate triples. Catches a hash regression that would
+        // collapse unrelated triples into one group.
+        use crate::promote::content_hash_for;
+        use situation_room_core::vocab::{Confidence, EntityId, Stance};
+
+        let plan = sample_plan();
+        let recipe = sample_recipe(&plan, "https://example.test/p", "ex");
+        let fetched_at = Utc.with_ymd_and_hms(2026, 5, 17, 12, 0, 0).unwrap();
+
+        let mk = |from: &str, predicate: &str, to: &str| AssertionDraft {
+            claimant: EntityId::new("agency:reuters").unwrap(),
+            stance: Stance::Reported,
+            kind: predicate.into(),
+            from: EntityId::new(from).unwrap(),
+            to: EntityId::new(to).unwrap(),
+            confidence: Confidence::new(0.9).unwrap(),
+        };
+
+        let a = build_assertion(
+            &plan,
+            &recipe,
+            &mk("company:panasonic", "supplies_to", "company:tsla"),
+            fetched_at,
+        );
+        // Different predicate.
+        let b = build_assertion(
+            &plan,
+            &recipe,
+            &mk("company:panasonic", "competes_with", "company:tsla"),
+            fetched_at,
+        );
+        // Different endpoints.
+        let c = build_assertion(
+            &plan,
+            &recipe,
+            &mk("company:catl", "supplies_to", "company:tsla"),
+            fetched_at,
+        );
+
+        let ha = content_hash_for(&a.content);
+        let hb = content_hash_for(&b.content);
+        let hc = content_hash_for(&c.content);
+        assert_ne!(ha, hb, "different predicate → distinct hash");
+        assert_ne!(ha, hc, "different subject → distinct hash");
+        assert_ne!(hb, hc, "different predicate + subject → distinct hash");
+    }
 }

@@ -1,0 +1,182 @@
+== A1. schema_migrations (expect 19) ==
+schema_version
+--------------
+18            
+Run Time (s): real 0.000 user 0.000285 sys 0.000130
+== A2. plans on disk ==
+id                                    topic                          classified_by  created_at                     historical_window_days
+------------------------------------  -----------------------------  -------------  -----------------------------  ----------------------
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  federal reserve rate policy    xai@2.3        2026-05-16 16:43:49.30062+02   730                   
+019e313d-eccb-7202-b7b5-f5d86ac8ad6f  federal reserve rate policy    xai@2.3        2026-05-16 16:43:22.443801+02  730                   
+019e311e-a016-78b2-9e61-83c718fa2ce3  tesla stock price              xai@2.3        2026-05-16 16:09:11.190795+02  730                   
+019e311d-4003-72f3-b223-5f373575f1d6  tesla stock price              xai@2.3        2026-05-16 16:07:41.05909+02   730                   
+019e30cb-35e4-7951-9743-e19d5392fc65  meta stock price               xai@2.3        2026-05-16 14:38:04.516671+02  365                   
+019e30ca-7600-78d3-8769-b003a2a7c56f  meta stock price               xai@2.3        2026-05-16 14:37:15.392083+02  365                   
+019e30c4-617f-7fc0-8a71-d2824a6b10e5  meta stock price               xai@2.3        2026-05-16 14:30:36.92724+02   730                   
+019e30c0-f455-7a30-aecf-963e846ce6da  hungary maize supply           xai@2.3        2026-05-16 14:26:52.373727+02  730                   
+019e2ff6-71c5-7f62-af11-71440977e395  tesla stock price              xai@2.3        2026-05-16 10:45:40.677062+02  730                   
+019e2ff1-e298-7282-95b8-60d561d1971a  global coal supply chain       xai@2.3        2026-05-16 10:40:41.880627+02  730                   
+019e2ff0-8298-7442-8153-1ebd858ad758  GE stock price                 xai@2.3        2026-05-16 10:39:11.768246+02  365                   
+019e2ccd-aa12-79f1-9ce1-61bd92f0629b  global aluminium supply chain  xai@2.2        2026-05-15 20:02:16.466879+02  730                   
+019e2c87-8ab0-7443-b679-d865ae91623f  global aluminium supply chain  xai@2.2        2026-05-15 18:45:40.912646+02  730                   
+019e2c75-4052-7560-832c-1ba7b770ba07  minecraft                      xai@2.2        2026-05-15 18:25:42.22665+02   365                   
+019e2c63-51db-78f0-9878-b651edea22b1  minecraft                      xai@2.2        2026-05-15 18:06:07.067892+02  730                   
+019e2c20-c4a9-7323-ac16-59697741b5c1  NVIDIA stock price             xai@2.2        2026-05-15 16:53:25.545461+02  365                   
+019e2bea-3bb1-7223-aea7-318c3d233ee6  TESLA Stock price              xai            2026-05-15 15:53:51.537614+02  365                   
+019e2bdb-f1de-7663-847a-dba25691b0e3  porsche stock price            xai            2026-05-15 15:38:15.134097+02  365                   
+019e2ad0-f4a9-7741-a589-30ea49ec1dd8  hungarian corn yield           xai            2026-05-15 10:46:37.737663+02  3650                  
+019e2abf-6b78-7d53-876b-4865dbafbb93  hungarian corn yield           xai            2026-05-15 10:27:28.504218+02  3650                  
+019e27cc-e27a-7390-b2cc-68dbb96bd70a  global lithium supply chain    xai            2026-05-14 20:43:19.290943+02  730                   
+019e27bd-f57b-7c02-b44b-8bb1545d7b8a  FEMA                           xai            2026-05-14 20:27:01.11576+02   730                   
+019e27bc-61f2-7611-83a8-68867389727e  FEMA                           xai            2026-05-14 20:25:17.81075+02   730                   
+019e27ba-ceb2-7341-95c2-592e7a2c6640  TESLA Stock price              xai            2026-05-14 20:23:34.578853+02  365                   
+019e27ba-2f52-74d3-9893-93433e8e1275  FEMA                           xai            2026-05-14 20:22:53.778646+02  365                   
+019e2646-f4ea-7f63-8348-1521c2cdf02d  TESLA Stock price              xai            2026-05-14 13:37:24.970547+02  730                   
+Run Time (s): real 0.002 user 0.002002 sys 0.001001
+== A3. row-counts by record table (the "we land with three cards" question, system-wide) ==
+kind          n   
+------------  ----
+events        3373
+observations  1469
+relations     290 
+documents     260 
+assertions    124 
+entities      31  
+Run Time (s): real 0.001 user 0.001161 sys 0.000603
+== A4. row-counts by infra/audit table ==
+tbl                    n  
+---------------------  ---
+fetch_run_outcomes     533
+fetch_runs             88 
+recipes                78 
+recipe_fetch_attempts  18 
+recipe_feedback        0  
+Run Time (s): real 0.001 user 0.000845 sys 0.000457
+== B1. fed plan(s) by topic LIKE — confirm the id Session 89 should target ==
+id                                    topic                        created_at                   
+------------------------------------  ---------------------------  -----------------------------
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  federal reserve rate policy  2026-05-16 16:43:49.30062+02 
+019e313d-eccb-7202-b7b5-f5d86ac8ad6f  federal reserve rate policy  2026-05-16 16:43:22.443801+02
+019e20b3-7c87-7191-ad0a-8b53cb42e632  federal reserve rate policy  2026-05-13 11:38:14.279548+02
+Run Time (s): real 0.000 user 0.000533 sys 0.000193
+== B2. fed plan expectations (the classifier nominations per bucket) ==
+id                                    topic                        obs_kind  obs_metric_count  event_kind_count  entity_kind_count  relation_kind_count  document_kind_count  nomination_count
+------------------------------------  ---------------------------  --------  ----------------  ----------------  -----------------  -------------------  -------------------  ----------------
+019e313e-55b4-7e91-a147-6cc93b8dcfe9  federal reserve rate policy  NULL      NULL              NULL              NULL               NULL                 NULL                 NULL            
+019e313d-eccb-7202-b7b5-f5d86ac8ad6f  federal reserve rate policy  NULL      NULL              NULL              NULL               NULL                 NULL                 NULL            
+019e20b3-7c87-7191-ad0a-8b53cb42e632  federal reserve rate policy  NULL      NULL              NULL              NULL               NULL                 NULL                 NULL            
+Run Time (s): real 0.001 user 0.000661 sys 0.000090
+== C1. outcome_kind distribution — system-wide ==
+outcome_kind  n  
+------------  ---
+succeeded     258
+declined      251
+failed        24 
+Run Time (s): real 0.001 user 0.001339 sys 0.001394
+== C2. fed-plan outcome_kind distribution (replace plan-id at the head if you want a specific one) ==
+outcome_kind  n
+------------  -
+Run Time (s): real 0.001 user 0.001559 sys 0.000649
+== C3. fed-plan DECLINE shape by bucket — nomination vs per-expectation ==
+decline_shape  bucket  n
+-------------  ------  -
+Run Time (s): real 0.002 user 0.001305 sys 0.000269
+== C4. system-wide DECLINE reasons (top 30 by frequency, head only) ==
+message_head                                                                                          n
+----------------------------------------------------------------------------------------------------  -
+exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://www.reuters  9
+authoring-time validation against the prefetched bytes failed: extraction [css_select]: selector did  5
+authoring-time validation against the prefetched bytes failed: content assembly failed: observation   5
+authoring-time validation against the prefetched bytes failed: extraction [css_select]: selector "sp  3
+Target expectation is entity_kind which is materialized from plan exemplars at accept time and canno  3
+exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://www.iea.org  3
+exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://www.ksh.hu/  3
+exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://www.sec.gov  3
+exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://www.worldba  2
+exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://apnews.com/  2
+exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://www.nasdaq.  2
+authoring-time validation against the prefetched bytes failed: extraction [json_path]: path "$.chart  2
+exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://www.fastmar  2
+authoring-time validation against the prefetched bytes failed: extraction [json_path]: path query fa  2
+exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://finance.yah  2
+url proposer declined after 1 attempt(s): Prior attempt on sec.gov returned host_blocked_by_waf (403  2
+url proposer declined after 2 attempt(s): LME host returned 403 (WAF block) on the canonical prices-  1
+The Yahoo Finance chart endpoint returns only price/volume time-series data and contains no analyst   1
+This Eurostat numeric data API returns production values suitable for observations, not event headli  1
+Source provides NASDAQ Composite index values, not Meta Platforms market capitalization data.         1
+exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://www.porsche  1
+exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://www.met.hu/  1
+The Yahoo Finance TSLA quote page provides an estimated earnings date but lacks structured listings,  1
+exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://www.boerse-  1
+Source lists all SEC filings; no structural selector isolates only earnings_release events.           1
+Target expectation is entity_kind which cannot be populated via recipe bindings (only observation/ev  1
+Source provides stock price time-series data, not entity metadata suitable for populating the compan  1
+authoring-time validation against the prefetched bytes failed: binding[0]: field mapping: from_plan   1
+url proposer declined after 1 attempt(s): Prior attempt on the main index URL timed out (host_unreac  1
+exhausted 3 attempts without authoring against any target; attempts: [attempt 1] https://www.deutsch  1
+Run Time (s): real 0.001 user 0.002137 sys 0.001417
+== C5. fed-plan DECLINE reasons — verbatim message head per row ==
+source_id  message_head  attempted_at
+---------  ------------  ------------
+Run Time (s): real 0.000 user 0.000946 sys 0.000155
+== D1. fed-plan failure shape by stage ==
+failure_stage  message_head  n
+-------------  ------------  -
+Run Time (s): real 0.001 user 0.001041 sys 0.000211
+== D2. system-wide apply-failure messages (Session-67 + ADR-0012 Class B territory) ==
+message_head                                                                                          n 
+----------------------------------------------------------------------------------------------------  --
+extraction [css_select]: inner selector matched no elements within iterator match (the iterator's se  15
+extraction [css_select]: iterator produced 589 matches; cap is 500 (ADR 0016 §Consequences). Likely   3 
+Run Time (s): real 0.001 user 0.001394 sys 0.000330
+== D3. recipe_fetch_attempts (bytes captured for apply failures only — Session 13) ==
+recipe_id  succeeded  failure_head  excerpt_bytes  attempted_at
+---------  ---------  ------------  -------------  ------------
+Run Time (s): real 0.001 user 0.001637 sys 0.000708
+== E1. fed-plan succeeded-but-empty recipes ==
+recipe_id  source_id  records_produced  attempted_at
+---------  ---------  ----------------  ------------
+Run Time (s): real 0.001 user 0.000947 sys 0.000152
+== F1. assertions by content_kind — system-wide ==
+content_kind      n  
+----------------  ---
+entity_attribute  107
+relation          17 
+Run Time (s): real 0.001 user 0.001052 sys 0.000262
+== F2. fed-plan assertions by content_kind (via source_id LIKE recipe-id join) ==
+content_kind  n
+------------  -
+Run Time (s): real 0.001 user 0.003264 sys 0.000712
+== F3. assertion claimant diversity per content_kind — quorum visibility ==
+content_kind      n_assertions  distinct_claimants
+----------------  ------------  ------------------
+relation          17            3                 
+entity_attribute  107           1                 
+Run Time (s): real 0.001 user 0.002233 sys 0.000372
+== F4. unpromoted-assertion pile — assertions with no outgoing derived_from edge ==
+content_kind      unpromoted_n
+----------------  ------------
+entity_attribute  107         
+relation          17          
+Run Time (s): real 0.001 user 0.001126 sys 0.000152
+== G1. fed-plan Documents by doc_kind + mime + body-length bucket ==
+doc_kind  mime  body_size_bucket  n
+--------  ----  ----------------  -
+Run Time (s): real 0.005 user 0.007153 sys 0.003010
+== H1. promote_history (most recent 10 rows) ==
+Binder Error: Referenced column "ran_at" not found in FROM clause!
+Candidate bindings: "plan_id", "report"
+
+LINE 3: ORDER BY ran_at DESC
+                 ^
+Run Time (s): real 0.000 user 0.000188 sys 0.000034
+== I1. fed-plan recipes with their reauthor_reason head ==
+id  source_id  version  is_reauthor  reason_head  authored_at
+--  ---------  -------  -----------  -----------  -----------
+Run Time (s): real 0.001 user 0.001243 sys 0.000171
+== J1. fed-plan landed-records-per-table (the dashboard numbers) ==
+tbl       landed_n
+--------  --------
+entities  3       
+Run Time (s): real 0.002 user 0.005298 sys 0.001373
+== END of session89-analyze.sql ==

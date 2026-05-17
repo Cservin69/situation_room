@@ -23,10 +23,13 @@ use situation_room_api::commands::AppState;
 use situation_room_apps_common::sources::{
     load_source_descriptors, LiveSources, DEFAULT_SOURCES_POLL_INTERVAL,
 };
-use situation_room_pipeline::authoritative::AuthorityRegistry;
+use situation_room_pipeline::authoritative::{
+    default_seed_entries, AuthorityEntry, AuthorityRegistry,
+};
 use situation_room_pipeline::authoritative_live::{
     LiveAuthorityRegistry, DEFAULT_POLL_INTERVAL,
 };
+use situation_room_storage::authority_registry::AuthorityProvenance;
 use situation_room_llm::{
     AnthropicProvider, CostLedger, LlmProvider, MeteredProvider, XaiProvider,
 };
@@ -261,12 +264,12 @@ fn main() -> Result<()> {
         .join("config")
         .join("vocab")
         .join("authoritative_sources.toml");
-    let initial_registry = match AuthorityRegistry::load_from_path(&authoritative_path) {
+    let toml_registry = match AuthorityRegistry::load_from_path(&authoritative_path) {
         Ok(r) => {
             info!(
                 count = r.entries().len(),
                 path = %authoritative_path.display(),
-                "authoritative-source registry loaded"
+                "authoritative-source registry loaded from TOML"
             );
             r
         }
@@ -277,18 +280,86 @@ fn main() -> Result<()> {
             tracing::warn!(
                 path = %authoritative_path.display(),
                 error = %e,
-                "authoritative-source registry load failed — promote runs consensus-only"
+                "authoritative-source registry TOML load failed — falling back to DB-only seed"
             );
             AuthorityRegistry::empty()
         }
     };
+
+    // Session 90 — ADR 0022 Stage 2 seed-on-empty boot path.
+    //
+    // Phase-3 extraction (Sessions 77/78/80) stamps every per-Document
+    // Assertion with a single synthetic claimant kind (`agency:document`),
+    // which made the N=3 consensus quorum mathematically unreachable on
+    // every historical run. Seeding `agency:document` with
+    // `consensus_quorum = Some(1)` opts that kind into the authoritative
+    // fast-track: a single matching Assertion promotes immediately.
+    //
+    // Seeding is idempotent — `Store::seed_if_empty` short-circuits the
+    // moment the table has any rows, so re-boots and operator-curated
+    // additions are preserved. The TOML at `authoritative_path` stays
+    // as a *bootstrap* artefact: useful for the empty-DB first boot,
+    // ignored once the DB has authority over the registry.
+    let seed_rows: Vec<_> = default_seed_entries()
+        .iter()
+        .map(|e| e.to_seed_row(AuthorityProvenance::TomlSeed))
+        .collect();
+    match store.seed_if_empty(&seed_rows) {
+        Ok(0) => info!(
+            "authority_registry already populated — default seed skipped"
+        ),
+        Ok(n) => info!(
+            seeded = n,
+            "authority_registry seeded from default closed-vocab entries"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "authority_registry seed_if_empty failed — promote auth pass may stay empty"
+        ),
+    }
+
+    // Resolve the active registry. DB beats TOML when populated; this
+    // matches `LiveAuthorityRegistry::reload`'s source-of-truth order
+    // so the boot-time snapshot is consistent with subsequent reloads.
+    let initial_registry = match store.authority_registry_entries() {
+        Ok(rows) if !rows.is_empty() => {
+            let count = rows.len();
+            let entries: Vec<AuthorityEntry> =
+                rows.into_iter().map(AuthorityEntry::from).collect();
+            info!(
+                count,
+                "authoritative-source registry sourced from DB"
+            );
+            AuthorityRegistry::from_entries(entries)
+        }
+        Ok(_) => {
+            // DB unexpectedly empty after seed_if_empty (would only
+            // happen if seed_if_empty above failed). Use the TOML
+            // registry we already loaded so the auth pass at least
+            // sees whatever the operator has in `config/vocab/…`.
+            toml_registry
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "authority_registry DB read failed — falling back to TOML-loaded registry"
+            );
+            toml_registry
+        }
+    };
+
     // Session 84 — wrap the boot-time registry in a hot-reload handle
     // and spawn a polling watcher. Edits to
     // `config/vocab/authoritative_sources.toml` propagate to the next
     // promote run within ~2 seconds without restarting the desktop
     // binary. ADR 0021 amendment: operators can tune
     // `consensus_quorum` interactively.
-    let authoritative = LiveAuthorityRegistry::new(initial_registry, authoritative_path.clone());
+    //
+    // Session 90 binds the `Store` handle so `reload()` (whether
+    // triggered by the watcher or by a future operator command)
+    // resolves DB-over-TOML the same way the boot path just did.
+    let authoritative = LiveAuthorityRegistry::new(initial_registry, authoritative_path.clone())
+        .with_store(Arc::clone(&store));
     authoritative.spawn_watcher(DEFAULT_POLL_INTERVAL);
 
     // --- AppState ----------------------------------------------------

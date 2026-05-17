@@ -33,7 +33,8 @@
 //! warning in the desktop log without the binary dropping its
 //! existing auth pass.
 
-use crate::authoritative::{AuthorityRegistry, AuthorityLoadError};
+use crate::authoritative::{AuthorityEntry, AuthorityLoadError, AuthorityRegistry};
+use situation_room_storage::Store;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
@@ -58,6 +59,13 @@ pub struct LiveAuthorityRegistry {
     /// diagnostic IPC surfaces (`authoritative_registry_summary`) can
     /// quote the resolved location to the operator.
     source_path: Arc<PathBuf>,
+    /// Session 90 (ADR 0022 Stage 2) — optional DB-backed registry
+    /// source. When set, [`Self::reload`] prefers DB rows whenever
+    /// `authority_registry` is non-empty; the TOML stays as a
+    /// bootstrap artefact for fresh DBs. When None (the default),
+    /// reload reads the TOML — preserving Session-82/84 behaviour for
+    /// every test site that doesn't plumb a Store.
+    store: Option<Arc<Store>>,
 }
 
 impl LiveAuthorityRegistry {
@@ -69,7 +77,18 @@ impl LiveAuthorityRegistry {
         Self {
             inner: Arc::new(RwLock::new(Arc::new(initial))),
             source_path: Arc::new(source_path),
+            store: None,
         }
+    }
+
+    /// Session 90 — bind a [`Store`] handle. Once bound,
+    /// [`Self::reload`] checks the `authority_registry` table first
+    /// and only falls back to the TOML when the table is empty.
+    /// Idempotent builder; the composition root calls it after
+    /// [`Self::new`].
+    pub fn with_store(mut self, store: Arc<Store>) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// Build an empty-registry handle. Test sites + the fallback
@@ -100,10 +119,47 @@ impl LiveAuthorityRegistry {
         self.source_path.as_path()
     }
 
-    /// Re-read the TOML and swap the inner Arc atomically.
+    /// Re-read the source-of-truth and swap the inner Arc atomically.
     /// Public so test sites and the boot path can trigger a reload
     /// without going through the watcher thread.
+    ///
+    /// **Source-of-truth resolution (Session 90, ADR 0022 Stage 2)**:
+    ///
+    ///   1. If a [`Store`] is bound (via [`Self::with_store`]) AND the
+    ///      `authority_registry` table is non-empty, the DB rows win.
+    ///      `LiveAuthorityRegistry` installs an `AuthorityRegistry`
+    ///      built from those rows; the TOML on disk is ignored.
+    ///   2. If the Store is bound but the table is empty, OR no Store
+    ///      is bound, fall back to the legacy TOML load path.
+    ///
+    /// A DB read failure (poisoned lock, schema mismatch, etc.) is
+    /// warn-logged and triggers the TOML fallback rather than failing
+    /// the whole reload — operator interactivity over fail-closed.
     pub fn reload(&self) -> Result<(), AuthorityLoadError> {
+        if let Some(store) = &self.store {
+            match store.authority_registry_entries() {
+                Ok(rows) if !rows.is_empty() => {
+                    let count = rows.len();
+                    let entries: Vec<AuthorityEntry> =
+                        rows.into_iter().map(AuthorityEntry::from).collect();
+                    self.install(AuthorityRegistry::from_entries(entries));
+                    info!(
+                        entries = count,
+                        "authoritative-source registry reloaded from DB"
+                    );
+                    return Ok(());
+                }
+                Ok(_) => {
+                    // Table empty → TOML fallback below.
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "authority_registry DB read failed; falling back to TOML"
+                    );
+                }
+            }
+        }
         let path = self.source_path.as_path();
         let fresh = AuthorityRegistry::load_from_path(path)?;
         self.install(fresh);
@@ -272,6 +328,132 @@ mod tests {
         let new_snapshot = live.snapshot();
         assert_eq!(reader_snapshot.entries()[0].source_id, "v1");
         assert_eq!(new_snapshot.entries()[0].source_id, "v2");
+    }
+
+    // Session 90 — DB-backed reload ----------------------------------
+
+    use situation_room_storage::authority_registry::{
+        AuthorityProvenance, AuthorityRegistryRow,
+    };
+    use uuid::Uuid;
+
+    fn store_with_migrations() -> Arc<Store> {
+        let s = Store::open_in_memory().expect("open in-memory store");
+        s.migrate().expect("apply migrations through v19");
+        Arc::new(s)
+    }
+
+    fn db_row(source_id: &str, quorum: Option<u32>) -> AuthorityRegistryRow {
+        AuthorityRegistryRow {
+            id: Uuid::new_v4(),
+            source_id: source_id.into(),
+            metric: None,
+            topic: None,
+            consensus_quorum: quorum,
+            provenance: AuthorityProvenance::TomlSeed,
+        }
+    }
+
+    #[test]
+    fn reload_prefers_db_when_table_is_populated() {
+        // Bind a Store with one seeded row. The TOML at `source_path`
+        // points at a non-existent file. reload() must succeed by
+        // reading from the DB (the TOML fallback is never reached).
+        let store = store_with_migrations();
+        store
+            .seed_if_empty(&[db_row("agency:document", Some(1))])
+            .unwrap();
+
+        let live = LiveAuthorityRegistry::new(
+            AuthorityRegistry::empty(),
+            PathBuf::from("/does/not/exist.toml"),
+        )
+        .with_store(Arc::clone(&store));
+
+        live.reload().expect("DB read should bypass missing TOML");
+        let snap = live.snapshot();
+        assert_eq!(snap.entries().len(), 1);
+        assert_eq!(snap.entries()[0].source_id, "agency:document");
+        assert_eq!(snap.entries()[0].consensus_quorum, Some(1));
+    }
+
+    #[test]
+    fn reload_falls_back_to_toml_when_db_table_is_empty() {
+        // Bind a Store with no seeded rows. reload() must fall through
+        // to the TOML path. A non-existent TOML surfaces the IO error
+        // — verifying the fallback path is actually being taken.
+        let store = store_with_migrations();
+        let live = LiveAuthorityRegistry::new(
+            AuthorityRegistry::empty(),
+            PathBuf::from("/does/not/exist.toml"),
+        )
+        .with_store(store);
+
+        let err = live.reload().expect_err("empty DB → TOML fallback → IO error");
+        assert!(matches!(err, AuthorityLoadError::Io(_)));
+    }
+
+    #[test]
+    fn reload_falls_back_to_toml_when_no_store_bound() {
+        // No Store bound at all (Session 82/84 behaviour). reload()
+        // reads TOML directly. Mirrors the legacy test below.
+        let tmp_dir = std::env::temp_dir();
+        let path = tmp_dir.join("sr_session90_no_store_fallback.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[authority]]
+source_id = "legacy_toml_entry"
+metric = "production"
+"#,
+        )
+        .expect("write toml");
+
+        let live = LiveAuthorityRegistry::new(AuthorityRegistry::empty(), path.clone());
+        live.reload().expect("toml reload");
+        let snap = live.snapshot();
+        assert_eq!(snap.entries().len(), 1);
+        assert_eq!(snap.entries()[0].source_id, "legacy_toml_entry");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reload_picks_up_new_db_rows_after_first_call() {
+        // Initial state: empty DB → TOML fallback. After a row is
+        // seeded into the DB mid-life, a second reload() picks it up.
+        // Mirrors the operator workflow of curating the table at
+        // runtime and triggering a reload via the (future) dashboard.
+        let tmp_dir = std::env::temp_dir();
+        let path = tmp_dir.join("sr_session90_promote_db_takeover.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[authority]]
+source_id = "from_toml_before_db_seed"
+"#,
+        )
+        .expect("write toml");
+
+        let store = store_with_migrations();
+        let live = LiveAuthorityRegistry::new(AuthorityRegistry::empty(), path.clone())
+            .with_store(Arc::clone(&store));
+
+        live.reload().expect("first reload reads TOML");
+        let snap_a = live.snapshot();
+        assert_eq!(snap_a.entries()[0].source_id, "from_toml_before_db_seed");
+
+        // Operator-equivalent: seed the DB.
+        store
+            .seed_if_empty(&[db_row("agency:document", Some(1))])
+            .unwrap();
+
+        live.reload().expect("second reload reads DB");
+        let snap_b = live.snapshot();
+        assert_eq!(snap_b.entries().len(), 1);
+        assert_eq!(snap_b.entries()[0].source_id, "agency:document");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

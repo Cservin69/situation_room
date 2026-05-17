@@ -49,3 +49,13 @@ CREATE INDEX IF NOT EXISTS idx_authority_registry_source_metric
     ON authority_registry (source_id, metric);
 CREATE INDEX IF NOT EXISTS idx_authority_registry_source_topic
     ON authority_registry (source_id, topic);
+
+-- Session 90 — record this migration. The Sn-88 commit was missing
+-- this insert; without it the bookkeeping table never records v19 as
+-- applied (CREATE TABLE / CREATE INDEX IF NOT EXISTS made re-runs
+-- silent no-ops, but `schema_migrations` probes returned zero rows).
+-- Using `INSERT OR IGNORE` so DBs that already have the v19 table from
+-- a prior boot don't error on the re-apply.
+INSERT INTO schema_migrations (version, description)
+    VALUES (19, 'authority_registry table')
+    ON CONFLICT (version) DO NOTHING;

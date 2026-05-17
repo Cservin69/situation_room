@@ -204,6 +204,74 @@ impl Store {
             .map_err(StorageError::DuckDb)?;
         Ok(())
     }
+
+    /// Session 90 — ADR 0022 Stage 2 seed-on-empty boot path.
+    ///
+    /// Inside a single transaction:
+    ///
+    ///  - If `authority_registry` already has any rows, **no-op** and
+    ///    return `Ok(0)`. This is what makes the seed safe to call on
+    ///    every boot: once the operator has curated the table, repeated
+    ///    boots don't clobber their work.
+    ///  - Otherwise insert each [`AuthorityRegistryRow`] in `entries`
+    ///    verbatim (the caller chose the row id + provenance stamp),
+    ///    commit, and return the count inserted.
+    ///
+    /// `entries` may be empty — the bookkeeping still runs the count
+    /// check (so a future re-call with a non-empty slice still seeds).
+    ///
+    /// **Closed-vocab note**: this method makes no decisions about
+    /// *what* to seed; the seed list comes from
+    /// [`situation_room_pipeline::authoritative::default_seed_entries`]
+    /// at the composition root. Per the closed-vocabulary discipline
+    /// (`project_sr_no_source_routing`), seeding source-specific
+    /// claimants belongs in operator-curated rows added through
+    /// [`Self::upsert_authority_entry`], not in the default seed.
+    pub fn seed_if_empty(&self, entries: &[AuthorityRegistryRow]) -> Result<usize> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Other(format!("connection poisoned: {e}")))?;
+
+        let tx = conn.transaction().map_err(StorageError::DuckDb)?;
+
+        // Atomic count + insert under the same transaction. If a
+        // concurrent boot raced us between our COUNT and our INSERTs
+        // the transaction would still serialize correctly (DuckDB's
+        // single-writer model + transactional table reads), and the
+        // second-to-commit would see the rows from the first and skip.
+        let existing: i64 = tx
+            .query_row("SELECT COUNT(*) FROM authority_registry", [], |r| r.get(0))
+            .map_err(StorageError::DuckDb)?;
+        if existing > 0 {
+            // No-op. Drop the transaction (commit is a no-op here but
+            // explicit commit avoids leaving an empty tx hanging).
+            tx.commit().map_err(StorageError::DuckDb)?;
+            return Ok(0);
+        }
+
+        let mut inserted = 0usize;
+        for entry in entries {
+            let quorum_i: Option<i64> = entry.consensus_quorum.map(|q| q as i64);
+            tx.execute(
+                "INSERT INTO authority_registry
+                   (id, source_id, metric, topic, consensus_quorum, provenance)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                params![
+                    entry.id,
+                    entry.source_id,
+                    entry.metric,
+                    entry.topic,
+                    quorum_i,
+                    entry.provenance.as_str(),
+                ],
+            )
+            .map_err(StorageError::DuckDb)?;
+            inserted += 1;
+        }
+        tx.commit().map_err(StorageError::DuckDb)?;
+        Ok(inserted)
+    }
 }
 
 #[cfg(test)]
@@ -314,5 +382,122 @@ mod tests {
             .unwrap();
         let entries = store.authority_registry_entries().unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    // Session 90 — seed_if_empty -------------------------------------
+
+    fn seed_row(source_id: &str, consensus_quorum: Option<u32>) -> AuthorityRegistryRow {
+        AuthorityRegistryRow {
+            id: Uuid::new_v4(),
+            source_id: source_id.into(),
+            metric: None,
+            topic: None,
+            consensus_quorum,
+            provenance: AuthorityProvenance::TomlSeed,
+        }
+    }
+
+    #[test]
+    fn seed_if_empty_inserts_into_empty_table() {
+        let store = fresh_store();
+        let rows = vec![
+            seed_row("agency:document", Some(1)),
+            seed_row("agency:other", Some(2)),
+        ];
+        let inserted = store.seed_if_empty(&rows).unwrap();
+        assert_eq!(inserted, 2);
+        let entries = store.authority_registry_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        // Verify the row identity round-trips (id, source_id, quorum,
+        // provenance all stamped from the input).
+        let agency_doc = entries
+            .iter()
+            .find(|e| e.source_id == "agency:document")
+            .expect("agency:document inserted");
+        assert_eq!(agency_doc.consensus_quorum, Some(1));
+        assert_eq!(agency_doc.provenance, AuthorityProvenance::TomlSeed);
+    }
+
+    #[test]
+    fn seed_if_empty_is_noop_when_table_is_populated() {
+        let store = fresh_store();
+        // Pre-populate with an operator-curated row. seed_if_empty
+        // must NOT clobber it.
+        store
+            .upsert_authority_entry(
+                "operator:hand_curated",
+                Some("legal_name"),
+                None,
+                Some(3),
+                AuthorityProvenance::Operator,
+            )
+            .unwrap();
+        let rows = vec![seed_row("agency:document", Some(1))];
+        let inserted = store.seed_if_empty(&rows).unwrap();
+        assert_eq!(inserted, 0, "non-empty table must short-circuit");
+        let entries = store.authority_registry_entries().unwrap();
+        assert_eq!(entries.len(), 1, "operator row preserved, seed skipped");
+        assert_eq!(entries[0].source_id, "operator:hand_curated");
+        assert_eq!(entries[0].provenance, AuthorityProvenance::Operator);
+    }
+
+    #[test]
+    fn seed_if_empty_called_twice_yields_count_then_zero() {
+        // First call seeds; second call sees a non-empty table and
+        // becomes a no-op even with the same input slice. This is the
+        // idempotency property the boot path relies on — every boot
+        // calls seed_if_empty regardless of whether seeding happened
+        // before.
+        let store = fresh_store();
+        let rows = vec![
+            seed_row("agency:document", Some(1)),
+            seed_row("agency:fred", None),
+        ];
+        let first = store.seed_if_empty(&rows).unwrap();
+        let second = store.seed_if_empty(&rows).unwrap();
+        assert_eq!(first, 2);
+        assert_eq!(second, 0);
+        assert_eq!(store.authority_registry_entries().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn seed_if_empty_empty_slice_into_empty_table_is_zero() {
+        // Edge case: empty seed list against an empty table. Returns
+        // Ok(0) and leaves the table empty. A subsequent call with a
+        // non-empty slice still seeds (the table is still empty).
+        let store = fresh_store();
+        let inserted = store.seed_if_empty(&[]).unwrap();
+        assert_eq!(inserted, 0);
+        assert!(store.authority_registry_entries().unwrap().is_empty());
+        // The "table is still empty" property is the load-bearing one
+        // here: a future re-call must still seed.
+        let rows = vec![seed_row("agency:document", Some(1))];
+        let after = store.seed_if_empty(&rows).unwrap();
+        assert_eq!(after, 1);
+    }
+
+    #[test]
+    fn seed_if_empty_preserves_row_uuids_and_provenance() {
+        // Each row in the slice carries its own UUID and provenance
+        // stamp. The boot path uses fresh `Uuid::new_v4()` + TomlSeed,
+        // but other callers (operator-driven hot reseed, in some future
+        // session) may want Operator-provenance rows. The method must
+        // honour both fields verbatim.
+        let store = fresh_store();
+        let row = AuthorityRegistryRow {
+            id: Uuid::nil(), // pinned UUID for round-trip check
+            source_id: "agency:document".into(),
+            metric: Some("legal_name".into()),
+            topic: Some("treasury".into()),
+            consensus_quorum: Some(1),
+            provenance: AuthorityProvenance::Operator,
+        };
+        store.seed_if_empty(&[row.clone()]).unwrap();
+        let entries = store.authority_registry_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, Uuid::nil());
+        assert_eq!(entries[0].metric.as_deref(), Some("legal_name"));
+        assert_eq!(entries[0].topic.as_deref(), Some("treasury"));
+        assert_eq!(entries[0].provenance, AuthorityProvenance::Operator);
     }
 }

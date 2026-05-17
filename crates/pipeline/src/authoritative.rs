@@ -79,9 +79,13 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use situation_room_core::schema::content::AssertedContent;
 use situation_room_core::schema::records::Assertion;
+use situation_room_storage::authority_registry::{
+    AuthorityProvenance, AuthorityRegistryRow,
+};
 
 // ---------------------------------------------------------------------------
 // On-disk shape
@@ -261,6 +265,97 @@ impl AuthorityRegistry {
         }
         min_q
     }
+}
+
+// ---------------------------------------------------------------------------
+// Session 90 — ADR 0022 Stage 2 boot path: TOML ↔ DB ↔ runtime conversions
+// ---------------------------------------------------------------------------
+
+/// Convert a stored row into the runtime [`AuthorityEntry`] shape.
+///
+/// The runtime layer doesn't care about row identity, provenance, or
+/// timestamps — those are storage metadata that only the operator-
+/// facing curation UI needs. The promote stage only sees the closed
+/// `(source_id, metric, topic, consensus_quorum)` tuple.
+impl From<AuthorityRegistryRow> for AuthorityEntry {
+    fn from(row: AuthorityRegistryRow) -> Self {
+        Self {
+            source_id: row.source_id,
+            metric: row.metric,
+            topic: row.topic,
+            consensus_quorum: row.consensus_quorum,
+        }
+    }
+}
+
+impl AuthorityEntry {
+    /// Build an [`AuthorityRegistryRow`] from this entry with a fresh
+    /// UUID and the provided provenance stamp. Used by the boot path
+    /// to convert default seed entries into storage rows before
+    /// calling `Store::seed_if_empty`.
+    pub fn to_seed_row(&self, provenance: AuthorityProvenance) -> AuthorityRegistryRow {
+        AuthorityRegistryRow {
+            id: Uuid::new_v4(),
+            source_id: self.source_id.clone(),
+            metric: self.metric.clone(),
+            topic: self.topic.clone(),
+            consensus_quorum: self.consensus_quorum,
+            provenance,
+        }
+    }
+}
+
+/// Session 90 — closed-vocab default seed for the `authority_registry`
+/// table. Returned to the boot path which stamps each entry with
+/// `AuthorityProvenance::TomlSeed` and writes it via
+/// `Store::seed_if_empty` on first boot of a fresh DB.
+///
+/// # Why this list is what it is
+///
+/// Session 89's database analysis showed the promote pipeline emitting
+/// zero records across 16 historical runs. Two prongs blocked it:
+///
+///   1. The authoritative registry was empty — `Store::seed_if_empty`
+///      had nothing to insert and `LiveAuthorityRegistry` ran with
+///      `is_empty() == true`, so `promote.rs::promote_authoritative_pass`
+///      short-circuited.
+///   2. Consensus quorum (N=3 by default) was mathematically
+///      unreachable because the per-Document Phase-3 extractors
+///      (Sessions 78/80) stamp every Assertion with a *single*
+///      synthetic claimant kind: `agency:document`. Per-kind claimant
+///      diversity in storage was ≤ 2 across every relation kind that
+///      existed, so no group could form a quorum.
+///
+/// Seeding `agency:document` with `consensus_quorum = Some(1)` opts it
+/// into the authoritative fast-track at N=1: a single matching
+/// Assertion promotes immediately. The fast-track matcher
+/// ([`AuthorityRegistry::matches`]) requires `consensus_quorum <= 1`,
+/// so Some(1) is the right value — None would also work (None →
+/// default of 1) but Some(1) is the more explicit operator-readable
+/// stamp on a DB row.
+///
+/// # Closed-vocabulary discipline (`project_sr_no_source_routing`)
+///
+/// The seed names a *claimant kind* the Phase-3 extractors already
+/// stamp — not a host, not a URL, not a recipe-specific routing
+/// decision. Source-specific claimants (`agency:fred`, `agency:bls`,
+/// `agency:federal_reserve`, …) get added by operators via the DB
+/// curation pathway as recipe-author/Phase-3 evolve to stamp those
+/// distinct claimants. They are deliberately NOT in this default
+/// seed.
+///
+/// Adding a future closed-vocab claimant kind to this list is an
+/// ADR-territory decision (which extraction path stamps it, what its
+/// quorum should be), not a one-line edit. The unit test
+/// `default_seed_is_closed_vocab` documents the current shape and
+/// will fail if a future change adds a host-shaped string.
+pub fn default_seed_entries() -> Vec<AuthorityEntry> {
+    vec![AuthorityEntry {
+        source_id: "agency:document".into(),
+        metric: None,
+        topic: None,
+        consensus_quorum: Some(1),
+    }]
 }
 
 /// Session 85 — schema-validation sweep over the raw TOML.
@@ -1079,5 +1174,91 @@ consensus_quorom = 2
                  Add it to `KNOWN_ENTRY_FIELDS` in `check_schema_warnings` in the same commit."
             );
         }
+    }
+
+    // Session 90 — default seed list + TOML ↔ DB ↔ runtime conversions
+
+    #[test]
+    fn default_seed_is_closed_vocab() {
+        // The default seed names a single claimant *kind* the Phase-3
+        // extractors already stamp — `agency:document`. No host
+        // strings, no URLs, no recipe-specific routing. If a future
+        // session widens the seed, the new entry must remain in the
+        // closed claimant-kind vocabulary; this test pins that shape.
+        let seed = default_seed_entries();
+        assert_eq!(seed.len(), 1, "Session 90: one closed-vocab entry");
+        let e = &seed[0];
+        assert_eq!(e.source_id, "agency:document");
+        assert_eq!(
+            e.consensus_quorum,
+            Some(1),
+            "auth fast-track at N=1 — the whole point of the seed"
+        );
+        assert_eq!(e.metric, None, "no metric gate by default");
+        assert_eq!(e.topic, None, "no topic gate by default");
+
+        // Closed-vocab guardrail: source_id must start with one of the
+        // well-known claimant-namespace prefixes the matcher knows.
+        // A host string (e.g. "fred.stlouisfed.org") would slip past
+        // typed checks; this assertion makes the regression load-bearing.
+        assert!(
+            e.source_id.starts_with("agency:")
+                || e.source_id.starts_with("publisher:")
+                || e.source_id.starts_with("source:"),
+            "seed source_id {:?} must be in the claimant-kind vocab \
+             (agency: / publisher: / source:)",
+            e.source_id
+        );
+    }
+
+    #[test]
+    fn default_seed_matches_synthetic_phase3_claimant() {
+        // The seed must actually unlock the promote pass for the
+        // claimant kind Phase-3 stamps. Construct an Assertion with
+        // `agency:document` as the claimant and verify
+        // `AuthorityRegistry::matches` says yes.
+        let registry =
+            AuthorityRegistry::from_entries(default_seed_entries());
+        let a = obs_assertion("agency:document", "production", "lithium");
+        assert!(
+            registry.matches(&a),
+            "default seed must fast-track agency:document claimants — \
+             this is the whole point of Session 90's unblocker"
+        );
+    }
+
+    #[test]
+    fn row_to_entry_drops_storage_metadata() {
+        // From<AuthorityRegistryRow> for AuthorityEntry — runtime
+        // shape doesn't carry id, provenance, or timestamps.
+        let row = AuthorityRegistryRow {
+            id: Uuid::new_v4(),
+            source_id: "agency:document".into(),
+            metric: Some("legal_name".into()),
+            topic: None,
+            consensus_quorum: Some(1),
+            provenance: AuthorityProvenance::Operator,
+        };
+        let entry: AuthorityEntry = row.clone().into();
+        assert_eq!(entry.source_id, row.source_id);
+        assert_eq!(entry.metric, row.metric);
+        assert_eq!(entry.topic, row.topic);
+        assert_eq!(entry.consensus_quorum, row.consensus_quorum);
+    }
+
+    #[test]
+    fn to_seed_row_stamps_provenance_and_fresh_uuid() {
+        let entry = AuthorityEntry {
+            source_id: "agency:document".into(),
+            metric: None,
+            topic: None,
+            consensus_quorum: Some(1),
+        };
+        let row_a = entry.to_seed_row(AuthorityProvenance::TomlSeed);
+        let row_b = entry.to_seed_row(AuthorityProvenance::TomlSeed);
+        assert_eq!(row_a.source_id, "agency:document");
+        assert_eq!(row_a.consensus_quorum, Some(1));
+        assert_eq!(row_a.provenance, AuthorityProvenance::TomlSeed);
+        assert_ne!(row_a.id, row_b.id, "fresh UUID per call");
     }
 }

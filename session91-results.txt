@@ -1,0 +1,70 @@
+== A1. assertion counts by content_kind ==
+content_kind      n  
+----------------  ---
+entity_attribute  127
+relation          17 
+== A2. one relation row — wire-shape spot-check ==
+content_json                                                                                                          claimant         
+--------------------------------------------------------------------------------------------------------------------  -----------------
+{"asserted_kind":"relation","kind":"coming_to","from":"game:minecraft_dungeons_ii","to":"service:xbox_game_pass"}     agency:xbox      
+{"asserted_kind":"relation","kind":"available_on","from":"game:minecraft_dungeons_ii","to":"service:xbox_game_pass"}  company:microsoft
+{"asserted_kind":"relation","kind":"available_on","from":"game:minecraft_dungeons_ii","to":"service:xbox_game_pass"}  agency:xbox      
+== B1. distinct-claimants-per-triple HISTOGRAM (all plans) ==
+distinct_claimants  n_triples
+------------------  ---------
+1                   7        
+2                   2        
+== B2. triples at N=1 (singletons) — the Path A target ==
+rel_kind                rel_from           rel_to             distinct_claimants  n_assertions
+----------------------  -----------------  -----------------  ------------------  ------------
+reaches_agreement_with  country:guinea     company:gac        1                   2           
+reaches_agreement_with  country:guinea     company:ega        1                   2           
+partners_with           company:trafigura  company:mih        1                   2           
+partners_with           company:trafigura  company:egypalum   1                   1           
+partners_with           company:trafigura  company:egyptalum  1                   1           
+owns                    company:south32    smelter:hillside   1                   1           
+operates                company:south32    smelter:hillside   1                   1           
+== B3. triples at N=2 (one more claimant = consensus) ==
+rel_kind      rel_from                    rel_to                  distinct_claimants  n_assertions
+------------  --------------------------  ----------------------  ------------------  ------------
+available_on  game:minecraft_dungeons_ii  service:xbox_game_pass  2                   4           
+coming_to     game:minecraft_dungeons_ii  service:xbox_game_pass  2                   3           
+== B4. triples already at N>=3 (would already promote) ==
+rel_kind  rel_from  rel_to  distinct_claimants  n_assertions
+--------  --------  ------  ------------------  ------------
+== C1. relation kind summary: assertions, triples, distinct claimants ==
+rel_kind                n_assertions  n_distinct_triples  n_distinct_claimants_system_wide  max_claimants_any_triple
+----------------------  ------------  ------------------  --------------------------------  ------------------------
+reaches_agreement_with  4             2                   1                                 1                       
+available_on            4             1                   2                                 2                       
+partners_with           4             3                   1                                 1                       
+coming_to               3             1                   2                                 2                       
+operates                1             1                   1                                 1                       
+owns                    1             1                   1                                 1                       
+== D1. relations per plan + per-triple claimant ceiling ==
+plan_id                               topic                          created     triples  singleton_triples  pair_triples  quorum_triples  total_assertions
+------------------------------------  -----------------------------  ----------  -------  -----------------  ------------  --------------  ----------------
+019e2c87-8ab0-7443-b679-d865ae91623f  global aluminium supply chain  2026-05-15  7        7                  0             0               10              
+019e2c75-4052-7560-832c-1ba7b770ba07  minecraft                      2026-05-15  2        0                  2             0               7               
+== E1. singleton-triple → document body preview spot-check (10 rows) ==
+rel_kind       rel_from           rel_to             sample_assertion_id                   source_url                                    body_head                                                                                                                                                                                                                                       
+-------------  -----------------  -----------------  ------------------------------------  --------------------------------------------  ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+operates       company:south32    smelter:hillside   019e2c8a-f04c-7900-ba31-51afda8a060c  https://www.miningweekly.com/topic/aluminium  Topic - Aluminium https://www.miningweekly.com Search Enter your search term *Limited to most recent 250 articles Use advanced search to set an earlier date range Where? anywhere in the article search headings only in the first paragraph Wi
+operates       company:south32    smelter:hillside   019e2c8a-f04c-7900-ba31-51afda8a060c  https://www.miningweekly.com/topic/aluminium  Topic - Aluminium https://www.miningweekly.com Search Enter your search term *Limited to most recent 250 articles Use advanced search to set an earlier date range Where? anywhere in the article search headings only in the first paragraph Wi
+owns           company:south32    smelter:hillside   019e2ccb-ccb8-7793-ac81-7ea8c45c1c46  https://www.miningweekly.com/topic/aluminium  Topic - Aluminium https://www.miningweekly.com Search Enter your search term *Limited to most recent 250 articles Use advanced search to set an earlier date range Where? anywhere in the article search headings only in the first paragraph Wi
+owns           company:south32    smelter:hillside   019e2ccb-ccb8-7793-ac81-7ea8c45c1c46  https://www.miningweekly.com/topic/aluminium  Topic - Aluminium https://www.miningweekly.com Search Enter your search term *Limited to most recent 250 articles Use advanced search to set an earlier date range Where? anywhere in the article search headings only in the first paragraph Wi
+partners_with  company:trafigura  company:egypalum   019e2c8a-f00b-73a2-a82b-5fd57f89aa5e  https://www.miningweekly.com/topic/aluminium  Topic - Aluminium https://www.miningweekly.com Search Enter your search term *Limited to most recent 250 articles Use advanced search to set an earlier date range Where? anywhere in the article search headings only in the first paragraph Wi
+partners_with  company:trafigura  company:egypalum   019e2c8a-f00b-73a2-a82b-5fd57f89aa5e  https://www.miningweekly.com/topic/aluminium  Topic - Aluminium https://www.miningweekly.com Search Enter your search term *Limited to most recent 250 articles Use advanced search to set an earlier date range Where? anywhere in the article search headings only in the first paragraph Wi
+partners_with  company:trafigura  company:egyptalum  019e2ccb-cc7c-7960-81c4-a2f0bb695539  https://www.miningweekly.com/topic/aluminium  Topic - Aluminium https://www.miningweekly.com Search Enter your search term *Limited to most recent 250 articles Use advanced search to set an earlier date range Where? anywhere in the article search headings only in the first paragraph Wi
+partners_with  company:trafigura  company:egyptalum  019e2ccb-cc7c-7960-81c4-a2f0bb695539  https://www.miningweekly.com/topic/aluminium  Topic - Aluminium https://www.miningweekly.com Search Enter your search term *Limited to most recent 250 articles Use advanced search to set an earlier date range Where? anywhere in the article search headings only in the first paragraph Wi
+partners_with  company:trafigura  company:mih        019e2c8a-f024-7e23-ace0-6eb8f557b1ad  https://www.miningweekly.com/topic/aluminium  Topic - Aluminium https://www.miningweekly.com Search Enter your search term *Limited to most recent 250 articles Use advanced search to set an earlier date range Where? anywhere in the article search headings only in the first paragraph Wi
+partners_with  company:trafigura  company:mih        019e2c8a-f024-7e23-ace0-6eb8f557b1ad  https://www.miningweekly.com/topic/aluminium  Topic - Aluminium https://www.miningweekly.com Search Enter your search term *Limited to most recent 250 articles Use advanced search to set an earlier date range Where? anywhere in the article search headings only in the first paragraph Wi
+== E2. cited-claimant prefix counts in document bodies (rough proxy) ==
+docs_with_relation_assertions  avg_body_chars      avg_agency_mentions  avg_company_mentions
+-----------------------------  ------------------  -------------------  --------------------
+11                             3804.4545454545455  0.0                  0.0                 
+== F1. distinct singleton-claimants (Path B curation cost) ==
+sole_claimant        triples_held_back
+-------------------  -----------------
+agency:miningweekly  7                
+== END of session91-measure.sql ==
