@@ -1,6 +1,6 @@
 # ADR 0023 — Relation-promotion claimant diversity at extraction time (Session 91)
 
-**Status**: Proposed (Session 91 — code-and-prompt landed; live verification deferred)
+**Status**: Proposed (Session 91 — code-and-prompt landed; Session 92 added the operator-triggered re-extract path so live verification no longer needs to wait on net-new fetches; live verification gated on Sn-92 runbook output)
 **Date**: 2026-05-17
 **Related**: ADR 0004 (assertion promotion model), ADR 0021 (consensus
 promotion stage), ADR 0022 (authority registry DB-backed),
@@ -362,7 +362,8 @@ it should land an amendment rather than rewrite this ADR.
   net-new fetches under the next executor pass.
 - **Accepted (next session)**: required evidence —
   (1) `session91-measure.sql` output's B1 histogram shows the N=1
-  bucket dominates over N≥2 (confirms Path A1 over A2);
+  bucket dominates over N≥2 (confirms Path A1 over A2); Sn-91
+  verify confirmed this (7 singletons, 2 pairs, 0 at N≥3).
   (2) a fresh-fetch live extraction pass produces ≥1 Document with
   ≥2 distinct claimants on the same triple, surfaced in the
   Assertions panel.
@@ -370,3 +371,29 @@ it should land an amendment rather than rewrite this ADR.
   identical content hash (the new `build_assertion_groups_…` test
   pins this offline; live evidence is the same triple promoted at
   N≥3 from a single Document).
+
+- **Session 92 (this commit's status note)**: Sn-91 verify's signal
+  was richer than expected — the unpromoted aluminium singletons
+  trace to topic-index page bytes with no attribution to extract.
+  Prompt v1.2 can't help that input shape (no claimants in the
+  bytes to recognise); the right verify target is article-shape
+  bytes elsewhere. Session 92 unblocked two of the three Accepted-
+  status preconditions:
+
+  (a) Operator path to re-extract existing Documents under v1.2
+      shipped — `crates/pipeline/src/reextract.rs` +
+      `reextract_relations_for_plan` Tauri command + per-plan
+      button on PlanReview. The path-to-Accepted no longer
+      requires net-new fetches; the operator can backfill any
+      article-shape plan's Document corpus on demand. Cost-bounded
+      by article-kind Document count per plan.
+
+  (b) Verification runbook `session92-verify.sh` + measurement SQL
+      `session92-measure.sql` shipped. The runbook's Stage 4
+      walks the operator through a Minecraft-shape plan
+      re-extract → promote → before/after SQL snapshot →
+      ADR-coherence check ([a]+[b]+[c]+[d] in the runbook = the
+      three Accepted preconditions above, made operational).
+
+  ADR 0023 stays Proposed until Stage 4's [a]+[b] both hold. The
+  prompt does NOT change in Sn-92; only the operator path lights up.

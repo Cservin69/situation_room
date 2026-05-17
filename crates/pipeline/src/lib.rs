@@ -114,3 +114,10 @@ pub mod authoritative;
 // amendment: operator can tune `consensus_quorum` without restarting
 // the desktop binary.
 pub mod authoritative_live;
+// Session 92 — operator-triggered re-extraction of relation Assertions
+// from Documents already on disk. Lights up ADR 0023's multi-claimant
+// prompt (v1.2) for the pre-Sn-91 article-Document pile that the
+// executor's per-Document hook only touched once under v1.1 or earlier.
+// Cost-bounded by article-kind Document count per plan; per-plan UI
+// trigger (Session 92 Option 2 chose per-plan over per-Document).
+pub mod reextract;

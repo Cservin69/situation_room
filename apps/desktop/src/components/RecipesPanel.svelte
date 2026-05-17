@@ -262,8 +262,65 @@
     outcomeForRecipe,
   } from '$lib/outcomes';
   import { latestAttemptForRecipe, asCommandError } from '$lib/api/client';
+  import { matchesQuery } from '$lib/dashboard/text_filter';
   import RecipeFlagDialog from '$components/dialogs/RecipeFlagDialog.svelte';
   import ReauthorDialog from '$components/dialogs/ReauthorDialog.svelte';
+
+  // ---------------------------------------------------------------
+  // Session 92 — recipes filter affordance
+  // ---------------------------------------------------------------
+  //
+  // Plans regularly accumulate 10-30 recipes across re-authoring
+  // passes. Operators scanning for one source's recipe (by name,
+  // URL fragment, or dedup-key fragment) were doing it visually
+  // until now. This adds the same icon-first → input pattern the
+  // DocumentTable and SamplesModal already use, sharing the
+  // `matchesQuery` predicate so the three surfaces don't drift on
+  // case folding or whitespace handling.
+  //
+  // Haystack composition: `source_id`, `source_url`, and (when
+  // present) `dedup_key`. These are the three operator-visible
+  // identifiers on the recipe card header — the same strings the
+  // operator's eye scans, joined with spaces so a query that spans
+  // two fields matches the visual reading order. Structural
+  // metadata (extraction JSON, produces JSON) is deliberately
+  // excluded: it's pretty-printed and high-volume, and a
+  // substring match into "css_select" / "json_path" would surface
+  // every recipe of that mode rather than the specific recipe the
+  // operator is looking for.
+  //
+  // Empty-query passthrough: `matchesQuery` returns true for an
+  // empty / whitespace query, so the `.filter` call in the
+  // derivation is structurally identical when no filter is set.
+
+  let filterQuery = $state('');
+  let filterExpanded = $state(false);
+  let filterInput = $state<HTMLInputElement | undefined>(undefined);
+
+  function onFilterIconClick() {
+    filterExpanded = true;
+    queueMicrotask(() => filterInput?.focus());
+  }
+  function onFilterBlur() {
+    if (filterQuery.trim().length === 0) {
+      filterExpanded = false;
+    }
+  }
+  function onFilterClear() {
+    filterQuery = '';
+    filterExpanded = false;
+  }
+
+  function recipeHaystack(r: RecipeDto): string {
+    const parts: string[] = [r.source_id, r.source_url];
+    if (r.dedup_key) parts.push(r.dedup_key);
+    return parts.join(' ');
+  }
+
+  let filteredRecipes = $derived(
+    plans.recipes.filter((r) => matchesQuery(recipeHaystack(r), filterQuery)),
+  );
+  let filterIsActive = $derived(filterQuery.trim().length > 0);
 
   // ADR 0013: which recipe (if any) currently has its flag dialog
   // open. We key by `source_id` rather than `recipe.id` because the
@@ -617,10 +674,58 @@
     <header class="head">
       <span class="label">recipes</span>
       <span class="count">{plans.recipes.length}</span>
+      {#if filterIsActive}
+        <span class="filter-caption">
+          showing {filteredRecipes.length} of {plans.recipes.length}
+        </span>
+      {/if}
+      <!-- Session 92 filter: icon-first when collapsed, input when
+           focused or non-empty. `.filter` pushes itself to the right
+           edge via `margin-left: auto`. Shared `matchesQuery`
+           predicate with DocumentTable + SamplesModal — three sibling
+           inspection surfaces, one consistent filter shape. -->
+      <div class="filter" class:expanded={filterExpanded}>
+        {#if filterExpanded || filterIsActive}
+          <input
+            bind:this={filterInput}
+            bind:value={filterQuery}
+            class="filter-input"
+            type="text"
+            placeholder="filter recipes…"
+            aria-label="filter recipes"
+            onblur={onFilterBlur}
+          />
+          {#if filterIsActive}
+            <button
+              class="filter-clear"
+              type="button"
+              aria-label="clear filter"
+              onclick={onFilterClear}
+              title="clear filter"
+            >
+              ×
+            </button>
+          {/if}
+        {:else}
+          <button
+            type="button"
+            class="filter-icon"
+            onclick={onFilterIconClick}
+            aria-label="filter recipes"
+            title="filter recipes by source_id, url, or dedup_key"
+          >
+            ⌕
+          </button>
+        {/if}
+      </div>
     </header>
 
+    {#if filterIsActive && filteredRecipes.length === 0}
+      <p class="empty">— no recipes match the filter</p>
+    {/if}
+
     <div class="list">
-      {#each plans.recipes as recipe (recipe.id)}
+      {#each filteredRecipes as recipe (recipe.id)}
         {@render recipeCard(recipe)}
       {/each}
     </div>
@@ -1040,9 +1145,15 @@
   }
 
   .head {
+    /* Session 92 — switched from `justify-content: space-between` to
+       a gap-only layout so additional header items (filter caption,
+       filter affordance) can sit between label/count and the
+       right-aligned filter without spreading them. The filter pushes
+       itself to the right edge via `margin-left: auto`; label + count
+       stay together on the left. */
     display: flex;
-    align-items: baseline;
-    justify-content: space-between;
+    align-items: center;
+    gap: 6px;
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.06em;
@@ -1055,6 +1166,83 @@
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
     color: var(--fg-tertiary);
+  }
+
+  /* Session 92 — recipes filter affordance. Identical shape to the
+     DocumentTable + SamplesModal filter (header-affordance pattern,
+     icon-first → input). Three-surface visual parity is deliberate:
+     once an operator learns the affordance on one surface, the
+     others read the same. */
+  .filter {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    text-transform: none;
+    letter-spacing: normal;
+  }
+  .filter-icon {
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    border-radius: 3px;
+    color: var(--fg-secondary);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1;
+    padding: 2px 6px;
+    cursor: pointer;
+  }
+  .filter-icon:hover,
+  .filter-icon:focus-visible {
+    border-color: var(--border-strong);
+    color: var(--fg-primary);
+  }
+  .filter-input {
+    background: var(--bg-panel-alt);
+    border: 1px solid var(--border-subtle);
+    border-radius: 3px;
+    color: var(--fg-primary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 2px 6px;
+    width: 160px;
+    outline: none;
+  }
+  .filter-input:focus {
+    border-color: var(--border-strong);
+  }
+  .filter-clear {
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    border-radius: 3px;
+    color: var(--fg-secondary);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1;
+    padding: 1px 5px;
+    cursor: pointer;
+  }
+  .filter-clear:hover,
+  .filter-clear:focus-visible {
+    border-color: var(--border-strong);
+    color: var(--fg-primary);
+  }
+  .filter-caption {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--fg-tertiary);
+    text-transform: none;
+    letter-spacing: normal;
+  }
+
+  .empty {
+    margin: 0;
+    padding: 6px 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-style: italic;
+    color: var(--fg-tertiary);
+    text-align: center;
   }
 
   .list {

@@ -523,6 +523,15 @@ fn main() -> Result<()> {
             // get_record_by_id fetches the full envelope).
             situation_room_api::commands_records::record_types_for_ids,
             situation_room_api::commands_records::get_record_by_id,
+            // Session 92 — operator-triggered re-extraction of relation
+            // Assertions under prompt v1.2 (ADR 0023). Iterates the
+            // plan's article-kind Documents already on disk; one
+            // workhorse-tier LLM call per Document. Cost-bounded by
+            // article-kind Document count per plan. The auto-trigger
+            // pattern was deliberately avoided — operator clicks
+            // per-plan, sees per-plan summary, decides whether to
+            // re-extract another plan.
+            situation_room_api::commands_records::reextract_relations_for_plan,
         ])
         .build(tauri::generate_context!())
         .context("building tauri")?;

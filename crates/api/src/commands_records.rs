@@ -307,6 +307,107 @@ pub async fn promote_consensus_for_plan(
 }
 
 // ---------------------------------------------------------------------------
+// reextract_relations_for_plan — Session 92, ADR 0023 Option 2
+// ---------------------------------------------------------------------------
+
+/// Re-run the relation Assertion extractor over every article-kind
+/// Document already on disk for one plan, using the v1.2 prompt
+/// currently loaded in `AppState::document_assertions_prompt`.
+///
+/// The executor's per-Document hook (Session 77) fires the v1.2
+/// prompt on net-new fetches only; this command exists so the
+/// operator can backfill the pre-Sn-91 Document corpus without
+/// re-fetching. Cost is bounded by article-kind Document count per
+/// plan (one workhorse-tier LLM call per Document) — the report
+/// surfaces the count so the operator can see the spend.
+///
+/// **Per-plan granularity.** Session 92 Option 2 chose per-plan
+/// over per-Document selection; the operator picks one plan and
+/// kicks the full re-extraction, rather than scrolling Document
+/// drawers and clicking individually.
+///
+/// **Idempotency caveat.** Re-running this command produces fresh
+/// Assertion rows (v1 has no per-Document dedup); the downstream
+/// `promote_consensus_for_plan` pass dedups at the cross-source
+/// consensus layer. Operators who plan to re-extract repeatedly
+/// should run promote between passes.
+///
+/// ## Status gating
+///
+/// Plan must be `Accepted` or `Rejected`. Pending plans haven't
+/// been fetched yet, so they have no Documents on disk to
+/// re-extract from — surfacing `InvalidInput` here matches
+/// `promote_consensus_for_plan`'s posture.
+///
+/// ## Errors
+///
+/// - `InvalidInput { field: "id" }` — id isn't a valid UUID, or
+///   the plan is pending.
+/// - `NotFound` — id not in store.
+/// - `Storage` — DB-level failure during the plan / recipe loads.
+#[tauri::command]
+pub async fn reextract_relations_for_plan(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<situation_room_pipeline::reextract::ReextractReport, CommandError> {
+    let parsed: Uuid = id.parse().map_err(|e: uuid::Error| CommandError::InvalidInput {
+        field: "id".into(),
+        message: format!("not a valid UUID: {e}"),
+    })?;
+
+    info!(plan_id = %parsed, "reextract_relations_for_plan command invoked");
+
+    let stored = state
+        .store
+        .get_research_plan(parsed)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::NotFound { id: id.clone() })?;
+
+    match stored.status {
+        PlanStatus::Pending => {
+            return Err(CommandError::InvalidInput {
+                field: "id".into(),
+                message:
+                    "plan must be accepted before re-extraction (current: pending; nothing fetched yet)"
+                        .into(),
+            });
+        }
+        PlanStatus::Accepted | PlanStatus::Rejected => {}
+    }
+
+    let plan = situation_room_pipeline::research_plans_store::load_research_plan(
+        &state.store,
+        parsed,
+    )
+    .map_err(|e| CommandError::InvalidInput {
+        field: "id".into(),
+        message: format!("plan deserialization failed: {e}"),
+    })?
+    .ok_or_else(|| CommandError::NotFound { id: id.clone() })?;
+
+    let report = situation_room_pipeline::reextract::reextract_relations_for_plan(
+        &state.store,
+        state.provider.as_ref(),
+        state.document_assertions_prompt,
+        &plan,
+    )
+    .await;
+
+    info!(
+        plan_id = %parsed,
+        documents_considered = report.documents_considered,
+        documents_unrouted = report.documents_unrouted,
+        assertions_extracted = report.assertions_extracted,
+        assertions_persisted = report.assertions_persisted,
+        assertion_insert_failures = report.assertion_insert_failures,
+        llm_call_errors = report.llm_call_errors,
+        "reextract_relations_for_plan returning"
+    );
+
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------------
 // record_types_for_ids — Session 88 (Sn-87 candidate 4)
 // ---------------------------------------------------------------------------
 

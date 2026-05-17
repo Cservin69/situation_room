@@ -63,9 +63,11 @@
     isCurrentClassifierVersion,
     parseClassifierId,
     promoteConsensusForPlan,
+    reextractRelationsForPlan,
     asCommandError,
   } from '$lib/api/client';
   import type { PromoteReportDto } from '$lib/api/types/PromoteReportDto';
+  import type { ReextractReportDto } from '$lib/api/types/ReextractReportDto';
   import Chip from '$components/common/Chip.svelte';
   import StatusPill from '$components/common/StatusPill.svelte';
   import Bucket from '$components/panels/Bucket.svelte';
@@ -299,6 +301,52 @@
     promoteReport = null;
     promoteError = null;
   }
+
+  // Session 92 — operator-triggered re-extraction of relation
+  // Assertions under prompt v1.2 (ADR 0023 Option 2).
+  //
+  // The executor's per-Document extraction hook (Session 77) only
+  // fires the v1.2 prompt on net-new fetches. This button backfills:
+  // it iterates the plan's article-kind Documents already on disk
+  // and re-runs the relation extractor against each, so the
+  // pre-Sn-91 Document corpus inherits the multi-claimant attribution
+  // shape v1.2 unlocks.
+  //
+  // Cost: one workhorse-tier LLM call per article-kind Document on
+  // this plan. The returned report's `documents_considered` tells
+  // the operator how many calls the next plan's pass will burn.
+  // No auto-trigger — per-plan operator click only (Session 92
+  // Option 2 chose per-plan over per-Document granularity).
+  //
+  // Idempotency: each invocation produces fresh Assertion rows.
+  // Run `promote` between re-extracts if running this repeatedly.
+  let reextractState = $state<'idle' | 'running' | 'done' | 'error'>('idle');
+  let reextractReport = $state<ReextractReportDto | null>(null);
+  let reextractError = $state<string | null>(null);
+
+  async function onReextractRelations() {
+    if (!plan?.id) return;
+    reextractState = 'running';
+    reextractError = null;
+    try {
+      const report = await reextractRelationsForPlan(plan.id);
+      reextractReport = report;
+      reextractState = 'done';
+    } catch (e) {
+      const ce = asCommandError(e);
+      reextractError =
+        'message' in ce && typeof ce.message === 'string'
+          ? ce.message
+          : ce.kind ?? 'unknown error';
+      reextractState = 'error';
+    }
+  }
+
+  function dismissReextractToast() {
+    reextractState = 'idle';
+    reextractReport = null;
+    reextractError = null;
+  }
 </script>
 
 <article class="plan">
@@ -500,6 +548,23 @@
         >
           {promoteState === 'running' ? 'promoting…' : 'promote'}
         </button>
+        <!-- Session 92 — re-extract under prompt v1.2 (ADR 0023
+             Option 2). Iterates this plan's article-kind Documents
+             already on disk and re-runs the relation extractor under
+             v1.2 (multi-claimant attribution). Cost is per-Document;
+             the resulting toast surfaces `documents_considered` so
+             the operator can see what was burned before reaching for
+             another plan. Hidden on Pending plans (same IPC
+             precondition as promote). -->
+        <button
+          type="button"
+          class="records-reextract-btn"
+          onclick={onReextractRelations}
+          disabled={reextractState === 'running'}
+          title="Re-extract relation Assertions under prompt v1.2 (ADR 0023). One workhorse-tier LLM call per article-kind Document on this plan."
+        >
+          {reextractState === 'running' ? 're-extracting…' : 're-extract relations'}
+        </button>
       {/if}
     </header>
 
@@ -530,6 +595,36 @@
         <span class="promote-toast-label">promote failed</span>
         <span class="promote-toast-body">{promoteError}</span>
         <button class="promote-toast-dismiss" type="button" onclick={dismissPromoteToast} aria-label="dismiss">×</button>
+      </section>
+    {/if}
+
+    <!-- Session 92 — re-extract result strip. Same shape as the
+         Session-82 promote toast (visual parity is deliberate; both
+         are post-action one-liners with a dismiss affordance). -->
+    {#if reextractState === 'done' && reextractReport}
+      <section class="promote-toast promote-toast-ok" aria-live="polite">
+        <span class="promote-toast-label">re-extract</span>
+        <span class="promote-toast-body">
+          documents <strong>{reextractReport.documents_considered}</strong>
+          {#if reextractReport.documents_unrouted > 0}
+            · unrouted <strong>{reextractReport.documents_unrouted}</strong>
+          {/if}
+          · extracted <strong>{reextractReport.assertions_extracted}</strong>
+          · persisted <strong>{reextractReport.assertions_persisted}</strong>
+          {#if reextractReport.assertion_insert_failures > 0}
+            · insert-failures <strong>{reextractReport.assertion_insert_failures}</strong>
+          {/if}
+          {#if reextractReport.llm_call_errors > 0}
+            · llm-errors <strong>{reextractReport.llm_call_errors}</strong>
+          {/if}
+        </span>
+        <button class="promote-toast-dismiss" type="button" onclick={dismissReextractToast} aria-label="dismiss">×</button>
+      </section>
+    {:else if reextractState === 'error' && reextractError}
+      <section class="promote-toast promote-toast-err" role="alert">
+        <span class="promote-toast-label">re-extract failed</span>
+        <span class="promote-toast-body">{reextractError}</span>
+        <button class="promote-toast-dismiss" type="button" onclick={dismissReextractToast} aria-label="dismiss">×</button>
       </section>
     {/if}
   {/if}
@@ -1209,6 +1304,36 @@
     opacity: 0.6;
   }
   .records-promote-btn:focus-visible {
+    outline: 1px solid var(--border-accent);
+    outline-offset: -1px;
+  }
+
+  /* Session 92 — re-extract button. Visually identical to the
+     Session-82 promote button (deliberate parity: two sibling
+     post-action affordances on the same toolbar should not compete
+     for attention by styling). Only the label distinguishes them. */
+  .records-reextract-btn {
+    appearance: none;
+    background: var(--bg-panel);
+    color: var(--fg-secondary);
+    border: 1px solid var(--border-subtle);
+    border-radius: 3px;
+    padding: 4px 10px;
+    font-family: var(--font-sans);
+    font-size: 11px;
+    cursor: pointer;
+    transition: background var(--duration-ui) var(--ease),
+                color var(--duration-ui) var(--ease);
+  }
+  .records-reextract-btn:hover:not(:disabled) {
+    background: var(--bg-panel-alt);
+    color: var(--fg-primary);
+  }
+  .records-reextract-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+  }
+  .records-reextract-btn:focus-visible {
     outline: 1px solid var(--border-accent);
     outline-offset: -1px;
   }

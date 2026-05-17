@@ -34,6 +34,7 @@ import type { PromoteReportDto } from './types/PromoteReportDto';
 import type { AuthorityRegistrySummaryDto } from './types/AuthorityRegistrySummaryDto';
 import type { LastPromoteSummaryDto } from './types/LastPromoteSummaryDto';
 import type { PromoteHistoryDto } from './types/PromoteHistoryDto';
+import type { ReextractReportDto } from './types/ReextractReportDto';
 
 /**
  * Run Level-1 classification on a topic. Persists the resulting plan
@@ -583,6 +584,34 @@ export async function lastPromoteSummary(): Promise<LastPromoteSummaryDto | null
  */
 export async function promoteHistory(): Promise<PromoteHistoryDto> {
   return invoke<PromoteHistoryDto>('promote_history');
+}
+
+/**
+ * Session 92 — operator-triggered re-extraction of relation
+ * Assertions from Documents already on disk. Runs the v1.2
+ * `document_assertions.md` prompt (ADR 0023) against every
+ * article-kind Document the plan has fetched, so the pre-Sn-91
+ * Document corpus inherits the multi-claimant attribution shape
+ * the prompt v1.2 lights up on net-new fetches.
+ *
+ * **Cost.** One workhorse-tier LLM call per article-kind Document.
+ * The returned report's `documents_considered` count tells the
+ * operator how many calls the next plan's re-extraction will burn.
+ * No auto-trigger; per-plan operator click.
+ *
+ * **Idempotency.** Re-running this command produces fresh Assertion
+ * rows (v1 has no per-Document dedup). `promote_consensus_for_plan`
+ * dedups at the cross-source consensus layer; operators running
+ * repeated re-extracts should run promote between passes.
+ *
+ * Throws `{ kind: 'invalid_input' }` if the plan is pending (nothing
+ * fetched yet → nothing to re-extract from). Throws
+ * `{ kind: 'not_found' }` if the id has been removed.
+ */
+export async function reextractRelationsForPlan(
+  id: string,
+): Promise<ReextractReportDto> {
+  return invoke<ReextractReportDto>('reextract_relations_for_plan', { id });
 }
 
 /**
