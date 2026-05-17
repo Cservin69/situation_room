@@ -14,4 +14,4 @@ rsync -av --delete \
   --exclude='*.duckdb' \
   --exclude='*.duckdb.wal' \
   ~/Documents/Claude/Projects/SituationRoom/ \
-  /Users/aben/RustRoverProjects/situation_room/
+  /Users/aben/RustroverProjects/situation_room/

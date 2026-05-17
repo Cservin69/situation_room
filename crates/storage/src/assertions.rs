@@ -172,6 +172,33 @@ impl Store {
             envelope,
         })
     }
+
+    /// Session 93 — operator-triggered cull. Deletes a single
+    /// Assertion row by id, along with its subjects/derived-from
+    /// joins via `envelope_io::delete_subjects_and_derivation`.
+    /// Idempotent — `DELETE … WHERE id = ?` returns 0 if the row is
+    /// already gone (no error).
+    ///
+    /// The caller (the cull pipeline module) is responsible for
+    /// deciding *which* Assertions to delete. This method only
+    /// performs the storage-level removal; it does not consult any
+    /// classifier and does not touch the source Document.
+    pub fn delete_assertion(&self, id: Uuid) -> Result<()> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Other(format!("connection poisoned: {e}")))?;
+        let tx = conn.transaction().map_err(StorageError::DuckDb)?;
+        // Subjects + derivation rows hang off the Assertion's id with
+        // the polymorphic `record_kind = 'assertion'` discriminator;
+        // remove them first so foreign-key-style invariants stay
+        // intact even though DuckDB doesn't enforce them.
+        crate::envelope_io::delete_subjects_and_derivation(&tx, id, "assertion")?;
+        tx.execute("DELETE FROM assertions WHERE id = ?", params![id])
+            .map_err(StorageError::DuckDb)?;
+        tx.commit().map_err(StorageError::DuckDb)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

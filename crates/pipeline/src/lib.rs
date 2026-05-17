@@ -121,3 +121,24 @@ pub mod authoritative_live;
 // Cost-bounded by article-kind Document count per plan; per-plan UI
 // trigger (Session 92 Option 2 chose per-plan over per-Document).
 pub mod reextract;
+// Session 93 — apply-time index-page detector. Pre-apply check on
+// HTML payloads: when bytes look like a topic/category listing
+// rather than article prose, short-circuit selector evaluation and
+// stamp the outcome with `FetchOutcomeClass::IndexPageDetected` so
+// the proposer's next attempt routes through the v1.24 "follow-the-
+// link" path. Closed-vocabulary throughout — no host strings;
+// structural signals only.
+pub mod index_page_detector;
+// Session 93 — operator-triggered cull pass for boilerplate-shaped
+// Assertions. Read-only sample listing + bounded DELETE pass, gated
+// on a per-plan caller. Pairs with `index_page_detector`: an
+// Assertion whose source Document scored Index is exactly the
+// boilerplate the cull is designed to remove.
+pub mod cull;
+// Session 93 — relation-predicate vocabulary enforcement at extract
+// time. Closes the cross-plan spillover gap (Tesla/Meta predicates
+// in fed plan). The plan's classifier-declared `relation_kinds` set
+// is the closed vocabulary for that plan's relations; anything
+// outside the set is dropped at LLM-output validation with a
+// warn-log so the operator sees the bound rather than silent loss.
+pub mod relation_vocab;

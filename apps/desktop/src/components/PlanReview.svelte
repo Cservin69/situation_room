@@ -64,10 +64,16 @@
     parseClassifierId,
     promoteConsensusForPlan,
     reextractRelationsForPlan,
+    sampleIndexAssertionsForPlan,
+    cullIndexAssertionsForPlan,
     asCommandError,
   } from '$lib/api/client';
   import type { PromoteReportDto } from '$lib/api/types/PromoteReportDto';
   import type { ReextractReportDto } from '$lib/api/types/ReextractReportDto';
+  import type {
+    CullReportDto,
+    CullPreviewItemDto,
+  } from '$lib/api/types/CullReportDto';
   import Chip from '$components/common/Chip.svelte';
   import StatusPill from '$components/common/StatusPill.svelte';
   import Bucket from '$components/panels/Bucket.svelte';
@@ -347,6 +353,70 @@
     reextractReport = null;
     reextractError = null;
   }
+
+  // Session 93 — cull-index-assertions for this plan. Two-step shape:
+  // preview first (read-only, surfaces what would go), then a second
+  // click confirms the destructive call. The verify-runbook COST
+  // WARNING discipline says "never delete without showing what would
+  // go"; the same posture binds at the UI layer.
+  //
+  // Cost: zero LLM calls — the detector is structural. Deletion only
+  // touches Assertions whose source Document scored Index under the
+  // apply-time detector (which runs at fetch time for new fetches;
+  // older Assertions get re-classified by the cull pass against
+  // current Document bytes).
+  let cullState = $state<
+    'idle' | 'preview-loading' | 'previewed' | 'culling' | 'done' | 'error'
+  >('idle');
+  let cullPreview = $state<CullPreviewItemDto[]>([]);
+  let cullReport = $state<CullReportDto | null>(null);
+  let cullError = $state<string | null>(null);
+
+  async function onCullPreview() {
+    if (!plan?.id) return;
+    cullState = 'preview-loading';
+    cullError = null;
+    cullReport = null;
+    try {
+      const items = await sampleIndexAssertionsForPlan(plan.id);
+      cullPreview = items;
+      cullState = 'previewed';
+    } catch (e) {
+      const ce = asCommandError(e);
+      cullError =
+        'message' in ce && typeof ce.message === 'string'
+          ? ce.message
+          : ce.kind ?? 'unknown error';
+      cullState = 'error';
+    }
+  }
+
+  async function onCullConfirm() {
+    if (!plan?.id) return;
+    if (cullState !== 'previewed') return;
+    cullState = 'culling';
+    cullError = null;
+    try {
+      const report = await cullIndexAssertionsForPlan(plan.id);
+      cullReport = report;
+      cullPreview = [];
+      cullState = 'done';
+    } catch (e) {
+      const ce = asCommandError(e);
+      cullError =
+        'message' in ce && typeof ce.message === 'string'
+          ? ce.message
+          : ce.kind ?? 'unknown error';
+      cullState = 'error';
+    }
+  }
+
+  function dismissCull() {
+    cullState = 'idle';
+    cullPreview = [];
+    cullReport = null;
+    cullError = null;
+  }
 </script>
 
 <article class="plan">
@@ -565,8 +635,84 @@
         >
           {reextractState === 'running' ? 're-extracting…' : 're-extract relations'}
         </button>
+        <!-- Session 93 — cull boilerplate-shaped Assertions whose
+             source Document scores Index under the apply-time
+             detector. Two-step shape: preview first (read-only),
+             then explicit confirm. Zero LLM cost; the verdict comes
+             from the structural detector. -->
+        <button
+          type="button"
+          class="records-cull-btn"
+          onclick={onCullPreview}
+          disabled={cullState === 'preview-loading' || cullState === 'culling'}
+          title="Preview which Assertions trace back to index/topic/archive listing pages (no article prose). Two-step: preview, then confirm cull."
+        >
+          {cullState === 'preview-loading' ? 'scanning…' : cullState === 'culling' ? 'culling…' : 'cull boilerplate'}
+        </button>
       {/if}
     </header>
+
+    <!-- Session 93 — cull preview / confirm strip. Renders inline
+         below the toolbar when a preview exists. The two-button
+         shape (preview → confirm) keeps the destructive call behind
+         a deliberate confirmation gate; the COST WARNING discipline
+         from the verify runbook says "never delete without showing
+         what would go". -->
+    {#if cullState === 'previewed' && cullPreview.length > 0}
+      <section class="cull-preview" aria-live="polite">
+        <header class="cull-preview-head">
+          <span class="cull-preview-label">
+            cull preview · {cullPreview.length} candidate{cullPreview.length === 1 ? '' : 's'}
+          </span>
+          <div class="cull-preview-actions">
+            <button class="cull-confirm" type="button" onclick={onCullConfirm}>
+              confirm cull
+            </button>
+            <button class="cull-dismiss" type="button" onclick={dismissCull} aria-label="dismiss">×</button>
+          </div>
+        </header>
+        <ul class="cull-preview-list">
+          {#each cullPreview as item (item.assertion_id)}
+            <li class="cull-preview-item">
+              <span class="cull-kind">{item.content_kind}</span>
+              <span class="cull-path" title={item.source_path}>{item.source_path}</span>
+              <span class="cull-aid" title={item.assertion_id}>{item.assertion_id.slice(0, 8)}</span>
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {:else if cullState === 'previewed' && cullPreview.length === 0}
+      <section class="promote-toast promote-toast-ok" aria-live="polite">
+        <span class="promote-toast-label">cull</span>
+        <span class="promote-toast-body">
+          no boilerplate-shaped Assertions detected on this plan — every Assertion's source Document scored Article or Unknown.
+        </span>
+        <button class="promote-toast-dismiss" type="button" onclick={dismissCull} aria-label="dismiss">×</button>
+      </section>
+    {:else if cullState === 'done' && cullReport}
+      <section class="promote-toast promote-toast-ok" aria-live="polite">
+        <span class="promote-toast-label">cull done</span>
+        <span class="promote-toast-body">
+          considered <strong>{cullReport.assertions_considered}</strong>
+          · culled <strong>{cullReport.assertions_culled}</strong>
+          · kept-article <strong>{cullReport.assertions_kept_article}</strong>
+          · kept-unknown <strong>{cullReport.assertions_kept_unknown}</strong>
+          {#if cullReport.assertions_unrouted > 0}
+            · unrouted <strong>{cullReport.assertions_unrouted}</strong>
+          {/if}
+          {#if cullReport.delete_failures > 0}
+            · delete-fails <strong>{cullReport.delete_failures}</strong>
+          {/if}
+        </span>
+        <button class="promote-toast-dismiss" type="button" onclick={dismissCull} aria-label="dismiss">×</button>
+      </section>
+    {:else if cullState === 'error' && cullError}
+      <section class="promote-toast promote-toast-err" role="alert">
+        <span class="promote-toast-label">cull failed</span>
+        <span class="promote-toast-body">{cullError}</span>
+        <button class="promote-toast-dismiss" type="button" onclick={dismissCull} aria-label="dismiss">×</button>
+      </section>
+    {/if}
 
     <!-- Session 82 — promote result strip. Renders inline below the
          toolbar so the operator can read the PromoteReport summary
@@ -635,7 +781,7 @@
        dashboard answers "what did we get?", not "what did we ask
        for?". For the latter, flip to `buckets`. -->
   {#if recordsLoaded && totalRecords > 0 && recordsViewMode === 'dashboard' && plans.records}
-    <RecordsDashboard records={plans.records} />
+    <RecordsDashboard records={plans.records} planId={plan.id} />
     <!-- Session 75 — cost-by-tier ledger underneath the dashboard. Same
          polling component used on the home view; it auto-refreshes on
          its own interval so this drill-in surface and the home view stay
@@ -1336,6 +1482,126 @@
   .records-reextract-btn:focus-visible {
     outline: 1px solid var(--border-accent);
     outline-offset: -1px;
+  }
+
+  /* Session 93 — cull button. Visually same family as promote /
+     re-extract (operator-triggered destructive-or-bulk action), but
+     coloured slightly differently so the eye can distinguish them
+     when all three are in the toolbar. Border-accent on hover signals
+     "this opens a destructive flow." */
+  .records-cull-btn {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+    padding: 4px 10px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 3px;
+    background: transparent;
+    color: var(--fg-secondary);
+    cursor: pointer;
+    transition: background var(--duration-ui) var(--ease),
+                color var(--duration-ui) var(--ease),
+                border-color var(--duration-ui) var(--ease);
+  }
+  .records-cull-btn:hover:not(:disabled) {
+    background: var(--bg-panel-alt);
+    color: var(--fg-primary);
+    border-color: var(--signal-warning, var(--border-accent));
+  }
+  .records-cull-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+  }
+  .records-cull-btn:focus-visible {
+    outline: 1px solid var(--border-accent);
+    outline-offset: -1px;
+  }
+
+  /* Cull preview strip. Renders the list of candidate Assertion ids
+     + their hostless paths + content_kind so the operator can scan
+     what would go before confirming. */
+  .cull-preview {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 12px;
+    background: var(--bg-inset);
+    border: 1px solid var(--signal-warning, var(--border-subtle));
+    border-radius: 3px;
+  }
+  .cull-preview-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .cull-preview-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--signal-warning, var(--fg-secondary));
+  }
+  .cull-preview-actions {
+    display: flex;
+    gap: 6px;
+  }
+  .cull-confirm {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: lowercase;
+    padding: 4px 10px;
+    border: 1px solid var(--signal-warning, var(--border-accent));
+    background: var(--signal-warning, transparent);
+    color: var(--fg-inverse, var(--fg-primary));
+    border-radius: 3px;
+    cursor: pointer;
+  }
+  .cull-confirm:hover {
+    filter: brightness(1.1);
+  }
+  .cull-dismiss {
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    color: var(--fg-secondary);
+    width: 22px;
+    height: 22px;
+    font-size: 14px;
+    line-height: 1;
+    border-radius: 2px;
+    cursor: pointer;
+  }
+  .cull-preview-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-height: 240px;
+    overflow-y: auto;
+  }
+  .cull-preview-item {
+    display: grid;
+    grid-template-columns: 110px 1fr 80px;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--fg-secondary);
+    padding: 2px 0;
+  }
+  .cull-kind {
+    color: var(--fg-tertiary);
+  }
+  .cull-path {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .cull-aid {
+    color: var(--fg-quaternary, var(--fg-tertiary));
+    text-align: right;
   }
 
   /* Session 82 — promote result toast. Renders right under the

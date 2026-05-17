@@ -212,6 +212,28 @@
         "for 429s — the runtime already handles that; you don't need " +
         "to re-author).",
     },
+    {
+      // Session 93 — apply-time index-page detector. The fetched HTML
+      // scored Index (topic/category/archive listing); the prompt's
+      // v1.24 follow-the-link section is the remediation path. The
+      // prefill steers the operator to pick a headline-shaped anchor
+      // out of the bytes excerpt and re-author against that deeper
+      // URL rather than the index URL that triggered the diagnosis.
+      pattern: /index_page_detected/i,
+      label: 'index page detected — follow a link to an article',
+      note:
+        "The runtime's index-page detector classified the fetched bytes " +
+        "as a topic / category / archive listing rather than article " +
+        "prose. The recipe targeting this URL will find navigation " +
+        "chrome, not data — even if the selectors are well-formed. " +
+        "Re-author against a deeper URL: pick a headline-shaped anchor " +
+        "from the bytes excerpt below (≥5 words, sentence-shaped, " +
+        "deeper path on the same host than the current URL), and use " +
+        "that anchor's href as the new source_url. Keep the same " +
+        "target_record_schemas the prior recipe declared. One " +
+        "re-author = one followed link; the operator runs this " +
+        "affordance again for the next article.",
+    },
   ];
 
   const matchedHints = $derived(

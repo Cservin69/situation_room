@@ -532,6 +532,17 @@ fn main() -> Result<()> {
             // per-plan, sees per-plan summary, decides whether to
             // re-extract another plan.
             situation_room_api::commands_records::reextract_relations_for_plan,
+            // Session 93 — narrower of the above, scoped to one
+            // Document by id. Wired so the DocumentDrawer header's
+            // re-extract button can target the open Document
+            // without paying for the full plan pass.
+            situation_room_api::commands_records::reextract_relations_for_document,
+            // Session 93 — operator-triggered cull of boilerplate-
+            // shaped Assertions whose source Document scores Index
+            // under the apply-time detector. Read-only preview +
+            // destructive cull pair.
+            situation_room_api::commands_records::sample_index_assertions_for_plan,
+            situation_room_api::commands_records::cull_index_assertions_for_plan,
         ])
         .build(tauri::generate_context!())
         .context("building tauri")?;

@@ -1,6 +1,6 @@
 # ADR 0023 — Relation-promotion claimant diversity at extraction time (Session 91)
 
-**Status**: Proposed (Session 91 — code-and-prompt landed; Session 92 added the operator-triggered re-extract path so live verification no longer needs to wait on net-new fetches; live verification gated on Sn-92 runbook output)
+**Status**: Proposed (Session 91 — code-and-prompt landed; Session 92 added the operator-triggered re-extract path so live verification no longer needs to wait on net-new fetches; Session 93 added the upstream index-page detector + cull path so the Sn-91 "topic-index input had no attribution to extract" failure shape is now structurally surfaced rather than silently re-extracted; live verification gated on Sn-93 verify-runbook Stage 4 output)
 **Date**: 2026-05-17
 **Related**: ADR 0004 (assertion promotion model), ADR 0021 (consensus
 promotion stage), ADR 0022 (authority registry DB-backed),
@@ -397,3 +397,43 @@ it should land an amendment rather than rewrite this ADR.
 
   ADR 0023 stays Proposed until Stage 4's [a]+[b] both hold. The
   prompt does NOT change in Sn-92; only the operator path lights up.
+
+- **Session 93 (this commit's status note)**: Sn-92's pre/post
+  measurement was byte-identical (the operator didn't reach Stage 4
+  before kicking off Sn-93). Two complementary unblockers landed:
+
+  (c) Upstream guard against the failure shape that produced the
+      Sn-91 7/7 singleton aluminium triples. The new
+      `crates/pipeline/src/index_page_detector.rs` module classifies
+      fetched HTML as Article / Index / Unknown via structural
+      signals (link density, generic URL-path tokens — `/topic/`,
+      `/category/`, `/tag/`, `/section/`, `/archive/` — and a
+      body-prose floor). `FetchOutcomeClass::IndexPageDetected` +
+      `FailureStage::IndexPageDetected` are new variants;
+      `run_css_recipe` calls the detector before invoking apply and
+      short-circuits with the new stage when the bytes score Index.
+      The proposer's prior-attempts history stamps these with the
+      new class so the next attempt routes through the recipe-author
+      prompt's v1.24 follow-the-link section (the section is the
+      one place the prompt names `index_page_detected`; elsewhere
+      it continues to teach structural patterns).
+
+  (d) Cleanup path for the existing boilerplate pile. The new
+      `crates/pipeline/src/cull.rs` module re-runs the same detector
+      against each Assertion's source Document and deletes those
+      whose Document scores Index. Two-step UI on PlanReview:
+      preview first (`sample_index_assertions_for_plan` Tauri
+      command, capped at 50 candidates) → explicit confirm
+      (`cull_index_assertions_for_plan`). Zero LLM cost; the
+      verdict comes from the structural detector.
+
+  Also: per-Document re-extract (Sn-93 cand 3) backs a button in
+  the DocumentDrawer header so an operator inspecting one Document
+  can refresh its Assertions without paying for the full plan pass
+  — narrower caller of Sn-92's per-plan path.
+
+  Status remains Proposed. The Sn-93 verify runbook's Stage 4 is
+  what flips the status to Accepted if [a]+[b] hold; if Stage 4
+  on a Minecraft-shape plan now produces multi-claimant relation
+  Assertions under v1.2 *and* the cull pass removed the Sn-91
+  aluminium singletons, the prompt change is verified live.

@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.23
+# Recipe Author Prompt — v1.24
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -870,6 +870,109 @@ recipe works across all observed shapes, **`decline_reason`** is
 the honest answer. The runtime's re-author path will see the
 operator's diagnosis next time and you can author against a
 narrower, more honest target.
+
+## Diagnosis-driven re-authoring — follow-the-link from an index page
+
+The runtime's apply-time index-page detector classifies fetched
+HTML as **article** or **index** before invoking your recipe's
+selectors. When it scores **index**, the proposer marks the
+URL with the `index_page_detected` class in the prior-attempts
+history below the **Concrete inputs** section. A URL marked with
+that class is a strong signal that the recipe you author next
+must point at a *deeper* URL — a specific article reachable from
+the index — not the index URL that triggered the diagnosis.
+
+The pattern is generic across the web. A topic / category / tag
+/ section / archive page collects link cards to individual
+articles; the index page itself carries navigation chrome and
+link text rather than article prose, so a relation / event /
+observation recipe targeting the index will find boilerplate,
+not data. The fix is to *follow* one of those links.
+
+How to follow the link from this prompt's affordances:
+
+1. **Read the document excerpt** in the **Concrete inputs**
+   section. The excerpt contains the rendered text of the index
+   page — including the `<a href>` elements whose anchor text
+   identifies the available articles.
+2. **Pick one anchor whose text reads like a headline.** Use
+   structural cues, not host knowledge:
+   - Headline-shaped anchors are ≥5 words and read as a
+     sentence (subject + verb + object), not as a label
+     (`"Search"`, `"Subscribe"`, `"More topics"`, `"Latest"`,
+     `"Privacy policy"`).
+   - The href points to a *deeper* path on the same host than
+     the index URL itself (more path segments, often
+     containing a date or a slug).
+   - Avoid pagination links (`?page=2`, `/page/3`),
+     section-archive links (anchor text "More from X"), or
+     promotional / share / RSS links — those re-land on
+     another index page or on auxiliary content.
+3. **Author a single recipe** whose `source_url` is that
+   deeper URL and whose `target_record_schemas` are exactly
+   the schemas the prior (declined) recipe declared. Do not
+   try to enumerate every article from the index in one shot;
+   one re-author = one followed link. The operator will run
+   the follow-the-link affordance again for the next article
+   if the first one validates.
+4. **Keep the extraction mode appropriate to the followed
+   page.** Article pages are usually CSS-selectable (`<article>`,
+   `<h1>`, `<time>`, `<p class="byline">`); reach for
+   `css_select` first. Only fall back to `regex_capture`
+   when the underlying response is XML-shaped (RSS / Atom).
+
+The two worked examples below show the pattern across different
+generic URL shapes. Different web patterns, same shape.
+
+**Worked example — `/topic/` listing.** The supplied
+`Sample URL` is `https://www.example-news.com/topic/aluminium`.
+The document excerpt contains anchor cards like:
+
+```
+<a href="/2026/05/12/chile-lithium-production-rises-15-percent">
+  Chile lithium production rises 15 percent on new Atacama brine
+</a>
+<a href="/topic/aluminium?page=2">More aluminium stories</a>
+<a href="/about">About us</a>
+```
+
+The right re-author picks the first anchor — its href is a
+deeper path with a date and a slug, its text reads as a
+sentence ≥5 words. The new `source_url` becomes
+`https://www.example-news.com/2026/05/12/chile-lithium-production-rises-15-percent`.
+
+**Worked example — `/tag/` archive.** The supplied
+`Sample URL` is `https://blog.example.org/tag/policy-rate`.
+The excerpt contains:
+
+```
+<a href="/posts/fed-holds-rate-may-2026">
+  Federal Reserve holds policy rate at 5.25 percent in May
+</a>
+<a href="/tag/policy-rate?page=2">Older posts</a>
+<a href="/feed.xml">RSS</a>
+```
+
+The right re-author picks the first anchor — headline-shaped,
+deeper path. The new `source_url` becomes
+`https://blog.example.org/posts/fed-holds-rate-may-2026`. The
+`/tag/` URL itself stays out — re-using it would re-trigger the
+index detector at apply time.
+
+**Anti-example.** When the only headline-shaped anchor in the
+excerpt points *back* to the same index URL family (every link
+is `/topic/<topic>?page=N` style), follow-the-link is not
+possible. Decline with a `decline_reason` naming the failure
+shape: "the index page contains no article-shaped links to
+deeper URLs; the source structures its archive as paginated
+listing pages without per-article instance pages reachable
+from this entry point."
+
+This section is the only place this prompt names the
+`index_page_detected` class. The class name appears in the
+prior-attempts history when the runtime's detector triggered;
+elsewhere this prompt continues to teach structural patterns,
+not class-by-class behaviour.
 
 ## The source context
 
@@ -1958,6 +2061,40 @@ you pick.
 ---
 
 ### Changelog
+
+- **v1.24** (2026-05-17) — Session 93, follow-the-link diagnosis-
+  driven re-authoring. Adds the **Diagnosis-driven re-authoring —
+  follow-the-link from an index page** section between *Defensive
+  variants* and *The source context*. The new prose names the
+  apply-time `index_page_detected` class once (in that one section
+  only — the rest of the prompt continues to teach structural
+  patterns rather than class-by-class behaviour), explains the
+  follow-the-link affordance, and ships two worked examples
+  (`/topic/` listing and `/tag/` archive) plus an anti-example for
+  archives that don't expose per-article instance pages. Closed-
+  vocabulary discipline preserved: every example URL is generic
+  (`example-news.com`, `blog.example.org`) and every cue is
+  structural (headline-shape ≥5 words, deeper path on the same
+  host, avoid pagination / share / RSS), not host-specific.
+  Output contract is unchanged — same `RecipeAuthoringOutput`
+  shape, same field-source kinds, same closed enums, same
+  validator behaviour. Existing recipes are unaffected; the
+  follow-the-link path activates on the next re-author triggered
+  by an `index_page_detected` apply-failure.
+
+  Motivation: Sn-91's measurement showed that 7/7 singleton
+  relation triples in the global-aluminium plan traced to a
+  topic-index URL (`miningweekly.com/topic/aluminium`) whose body
+  was navigation chrome, not article prose. ADR 0023's multi-
+  claimant prompt v1.2 is structurally sound but has no
+  attribution to extract when the bytes are a listing. The
+  runtime gets the new
+  `crates/pipeline/src/index_page_detector.rs` module + the new
+  `FetchOutcomeClass::IndexPageDetected` + `FailureStage::IndexPageDetected`
+  variants in the same session, so an index-detected apply now
+  stamps the outcome with the new class and the proposer's
+  prior_attempts history feeds the v1.24 prompt the diagnostic
+  signal it needs.
 
 - **v1.23** (2026-05-16) — Session 84, EntityAttribute binding
   guidance. Adds the `### entity_attribute — fields of EntityAttributeContent`

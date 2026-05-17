@@ -791,6 +791,10 @@ pub enum FailureStageDto {
     Fetch,
     Apply,
     Insert,
+    /// Session 93 — apply-time index-page detector tripped before
+    /// selectors ran. The fetch itself succeeded; the bytes scored
+    /// Index under `crate::index_page_detector`.
+    IndexPageDetected,
 }
 
 /// Summary row for the fetch-runs list.
@@ -897,6 +901,7 @@ impl From<situation_room_pipeline::fetch_executor::FailureStage> for FailureStag
             S::Fetch => FailureStageDto::Fetch,
             S::Apply => FailureStageDto::Apply,
             S::Insert => FailureStageDto::Insert,
+            S::IndexPageDetected => FailureStageDto::IndexPageDetected,
         }
     }
 }

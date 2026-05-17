@@ -35,6 +35,10 @@ import type { AuthorityRegistrySummaryDto } from './types/AuthorityRegistrySumma
 import type { LastPromoteSummaryDto } from './types/LastPromoteSummaryDto';
 import type { PromoteHistoryDto } from './types/PromoteHistoryDto';
 import type { ReextractReportDto } from './types/ReextractReportDto';
+import type {
+  CullReportDto,
+  CullPreviewItemDto,
+} from './types/CullReportDto';
 
 /**
  * Run Level-1 classification on a topic. Persists the resulting plan
@@ -612,6 +616,58 @@ export async function reextractRelationsForPlan(
   id: string,
 ): Promise<ReextractReportDto> {
   return invoke<ReextractReportDto>('reextract_relations_for_plan', { id });
+}
+
+/**
+ * Session 93 — narrower of `reextractRelationsForPlan`, scoped to one
+ * Document by id. Backs the re-extract button in the DocumentDrawer
+ * header so an operator inspecting one Document can refresh just that
+ * row's Assertions without paying for the full plan pass.
+ *
+ * Returns a `ReextractReportDto` with `documents_considered ∈ {0, 1}`
+ * so the report renderer is shared with the per-plan call.
+ *
+ * Throws `{ kind: 'invalid_input' }` if the plan is pending, if either
+ * id is malformed, or if the Document isn't in the plan's record set.
+ */
+export async function reextractRelationsForDocument(
+  planId: string,
+  documentId: string,
+): Promise<ReextractReportDto> {
+  return invoke<ReextractReportDto>('reextract_relations_for_document', {
+    planId,
+    documentId,
+  });
+}
+
+/**
+ * Session 93 — read-only preview of the cull pass. Returns up to
+ * `DEFAULT_PREVIEW_CAP` (50) Assertion-id + path + content_kind rows
+ * the destructive cull would remove. The UI surfaces this list before
+ * the operator confirms the cull, matching the verify-runbook COST
+ * WARNING discipline (never delete without showing what would go).
+ */
+export async function sampleIndexAssertionsForPlan(
+  id: string,
+): Promise<CullPreviewItemDto[]> {
+  return invoke<CullPreviewItemDto[]>('sample_index_assertions_for_plan', {
+    id,
+  });
+}
+
+/**
+ * Session 93 — destructive cull pass. Deletes every Assertion in the
+ * plan whose source Document scores `Index` under the apply-time
+ * detector. Idempotent: re-running after a successful sweep is a no-op.
+ *
+ * The UI MUST call `sampleIndexAssertionsForPlan` first and surface
+ * its result before invoking this call — the preview is the user-
+ * visible "what would go" gate.
+ */
+export async function cullIndexAssertionsForPlan(
+  id: string,
+): Promise<CullReportDto> {
+  return invoke<CullReportDto>('cull_index_assertions_for_plan', { id });
 }
 
 /**

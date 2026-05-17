@@ -287,6 +287,14 @@ pub enum FailureStage {
     Apply,
     /// Storage rejected one of the produced records on insert.
     Insert,
+    /// Session 93 — pre-apply check: the fetched HTML bytes look
+    /// like a topic / category / archive listing rather than article
+    /// prose. Treated as a distinct failure stage from `Apply` so the
+    /// proposer-mapping at `author_for_nomination` can stamp it with
+    /// `FetchOutcomeClass::IndexPageDetected` instead of the
+    /// `UrlShapeMismatch` default, routing the next attempt into the
+    /// v1.24 "follow-the-link" path rather than another shape retry.
+    IndexPageDetected,
 }
 
 /// Errors that prevent the executor from doing any per-recipe work.
@@ -1382,9 +1390,23 @@ async fn author_for_nomination(
                 // semantics. The free-text reason still carries
                 // the apply-stage detail for any disambiguation
                 // the LLM wants to do beyond the class.
+                //
+                // Session 93 — apply-time index-page detector
+                // (FailureStage::IndexPageDetected). Same shape but
+                // stamped with a distinct class so the proposer's
+                // next attempt routes through the v1.24 follow-the-
+                // link path rather than another shape retry against
+                // the same URL. Closed-vocab: the failure_stage
+                // string is the contract here (it's what storage
+                // returns); the proposer maps it to the class.
+                let class = if f.failure_stage == "index_page_detected" {
+                    FetchOutcomeClass::IndexPageDetected
+                } else {
+                    FetchOutcomeClass::UrlShapeMismatch
+                };
                 prior_attempts.push(PriorAttempt {
                     url: f.source_url,
-                    class: FetchOutcomeClass::UrlShapeMismatch,
+                    class,
                     reason: format!(
                         "recipe authored but apply failed: {} · {}{}",
                         f.failure_stage, head, suffix
@@ -4000,6 +4022,7 @@ fn failure_stage_as_str(stage: FailureStage) -> &'static str {
         FailureStage::Fetch => "fetch",
         FailureStage::Apply => "apply",
         FailureStage::Insert => "insert",
+        FailureStage::IndexPageDetected => "index_page_detected",
     }
 }
 
@@ -4532,6 +4555,37 @@ async fn run_css_recipe(
         .await;
     }
 
+    // Session 93 — apply-time index-page detector. Before invoking
+    // apply against the fetched HTML, check whether the bytes look
+    // like a topic / category / archive listing rather than article
+    // prose. When the signal is `Index`, short-circuit apply and
+    // stamp the outcome as `FailureStage::IndexPageDetected` so the
+    // proposer-mapping at `author_for_nomination` routes the next
+    // attempt into the v1.24 "follow-the-link" path rather than a
+    // shape retry on the same URL. We pass the recipe's `source_url`
+    // (the URL the runtime fetches on each refresh) — that's the
+    // path the detector reasons about for the `/topic/` etc. tokens.
+    if let Some(message) = check_index_page(
+        &bytes,
+        response_content_type.as_deref(),
+        recipe.source_url.as_str(),
+    ) {
+        record_apply_failure_attempt(
+            ctx.store,
+            run_id,
+            recipe.id,
+            &bytes,
+            response_content_type.as_deref(),
+            &message,
+        );
+        return RecipeOutcome::Failed {
+            recipe_id: recipe.id,
+            source_id: recipe.source_id.clone(),
+            stage: FailureStage::IndexPageDetected,
+            message,
+        };
+    }
+
     // Apply.
     let apply_ctx = ApplyContext {
         recipe,
@@ -4580,6 +4634,35 @@ async fn run_css_recipe(
         recipe_id: recipe.id,
         source_id: recipe.source_id.clone(),
         records_produced: records.len() as u32,
+    }
+}
+
+/// Session 93 — apply-time index-page detector hook.
+///
+/// Returns `Some(message)` when the bytes score `Index` and the
+/// caller should short-circuit apply with
+/// `FailureStage::IndexPageDetected`; returns `None` when the
+/// detector returns `Article` or `Unknown` and the caller should
+/// proceed with apply as before.
+///
+/// The message is the short structured prose the proposer's
+/// `prior_attempts` history surfaces to the LLM in the follow-the-
+/// link re-author path; keep it stable so v1.24's prompt section
+/// can reason about the signal verbatim.
+fn check_index_page(
+    bytes: &[u8],
+    response_content_type: Option<&str>,
+    source_url: &str,
+) -> Option<String> {
+    use crate::index_page_detector::{classify_fetched_bytes, IndexPageSignal};
+    let mime = response_content_type.unwrap_or("");
+    match classify_fetched_bytes(bytes, mime, source_url) {
+        IndexPageSignal::Index => Some(format!(
+            "index_page_detected: fetched HTML looks like a topic / category / archive \
+             listing rather than article prose. Recipe should follow one of the page's \
+             article-headline links and re-author against that deeper URL."
+        )),
+        IndexPageSignal::Article | IndexPageSignal::Unknown => None,
     }
 }
 

@@ -408,6 +408,193 @@ pub async fn reextract_relations_for_plan(
 }
 
 // ---------------------------------------------------------------------------
+// reextract_relations_for_document — Session 93
+// ---------------------------------------------------------------------------
+
+/// Per-Document narrower of [`reextract_relations_for_plan`]: re-runs
+/// the relation extractor against one specific Document by id. The
+/// operator-visible affordance is a button in the DocumentDrawer
+/// header so an operator inspecting one Document can refresh just
+/// that row's Assertions without paying for the full plan pass.
+///
+/// Returns the same [`ReextractReport`] shape as the per-plan call
+/// (with `documents_considered` ∈ {0, 1}) so the frontend's report
+/// renderer is shared.
+///
+/// ## Status gating
+///
+/// Same posture as the per-plan call: Pending plans rejected with
+/// `InvalidInput`; Accepted + Rejected both allowed.
+#[tauri::command]
+pub async fn reextract_relations_for_document(
+    plan_id: String,
+    document_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<situation_room_pipeline::reextract::ReextractReport, CommandError> {
+    let plan_uuid: Uuid = plan_id.parse().map_err(|e: uuid::Error| CommandError::InvalidInput {
+        field: "plan_id".into(),
+        message: format!("not a valid UUID: {e}"),
+    })?;
+    let doc_uuid: Uuid = document_id.parse().map_err(|e: uuid::Error| CommandError::InvalidInput {
+        field: "document_id".into(),
+        message: format!("not a valid UUID: {e}"),
+    })?;
+
+    info!(
+        plan_id = %plan_uuid,
+        document_id = %doc_uuid,
+        "reextract_relations_for_document command invoked"
+    );
+
+    let stored = state
+        .store
+        .get_research_plan(plan_uuid)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::NotFound { id: plan_id.clone() })?;
+
+    match stored.status {
+        PlanStatus::Pending => {
+            return Err(CommandError::InvalidInput {
+                field: "plan_id".into(),
+                message: "plan must be accepted before re-extraction (current: pending)".into(),
+            });
+        }
+        PlanStatus::Accepted | PlanStatus::Rejected => {}
+    }
+
+    let plan = situation_room_pipeline::research_plans_store::load_research_plan(
+        &state.store,
+        plan_uuid,
+    )
+    .map_err(|e| CommandError::InvalidInput {
+        field: "plan_id".into(),
+        message: format!("plan deserialization failed: {e}"),
+    })?
+    .ok_or_else(|| CommandError::NotFound { id: plan_id.clone() })?;
+
+    let report = situation_room_pipeline::reextract::reextract_relations_for_document(
+        &state.store,
+        state.provider.as_ref(),
+        state.document_assertions_prompt,
+        &plan,
+        doc_uuid,
+    )
+    .await
+    .map_err(|e| CommandError::InvalidInput {
+        field: "document_id".into(),
+        message: format!("re-extract failed: {e}"),
+    })?;
+
+    info!(
+        plan_id = %plan_uuid,
+        document_id = %doc_uuid,
+        documents_considered = report.documents_considered,
+        assertions_extracted = report.assertions_extracted,
+        assertions_persisted = report.assertions_persisted,
+        "reextract_relations_for_document returning"
+    );
+
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// cull_index_assertions_for_plan + sample — Session 93 (cand 4)
+// ---------------------------------------------------------------------------
+
+/// Read-only preview of which Assertions the cull pass *would* delete.
+/// Surfaced to the UI before the operator clicks "cull".
+#[tauri::command]
+pub async fn sample_index_assertions_for_plan(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<situation_room_pipeline::cull::CullPreviewItem>, CommandError> {
+    let parsed: Uuid = id.parse().map_err(|e: uuid::Error| CommandError::InvalidInput {
+        field: "id".into(),
+        message: format!("not a valid UUID: {e}"),
+    })?;
+
+    let stored = state
+        .store
+        .get_research_plan(parsed)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::NotFound { id: id.clone() })?;
+
+    match stored.status {
+        PlanStatus::Pending => {
+            return Err(CommandError::InvalidInput {
+                field: "id".into(),
+                message: "plan must be accepted before cull preview (current: pending)".into(),
+            });
+        }
+        PlanStatus::Accepted | PlanStatus::Rejected => {}
+    }
+
+    let preview = situation_room_pipeline::cull::sample_index_assertions_for_plan(
+        &state.store,
+        parsed,
+        situation_room_pipeline::cull::DEFAULT_PREVIEW_CAP,
+    );
+
+    info!(
+        plan_id = %parsed,
+        n_candidates = preview.len(),
+        "sample_index_assertions_for_plan returning"
+    );
+
+    Ok(preview)
+}
+
+/// Destructive cull pass. Deletes every Assertion in the plan whose
+/// source Document scores `Index` under the apply-time detector.
+/// Idempotent: re-running after a successful sweep is a no-op.
+#[tauri::command]
+pub async fn cull_index_assertions_for_plan(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<situation_room_pipeline::cull::CullReport, CommandError> {
+    let parsed: Uuid = id.parse().map_err(|e: uuid::Error| CommandError::InvalidInput {
+        field: "id".into(),
+        message: format!("not a valid UUID: {e}"),
+    })?;
+
+    info!(plan_id = %parsed, "cull_index_assertions_for_plan command invoked");
+
+    let stored = state
+        .store
+        .get_research_plan(parsed)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::NotFound { id: id.clone() })?;
+
+    match stored.status {
+        PlanStatus::Pending => {
+            return Err(CommandError::InvalidInput {
+                field: "id".into(),
+                message: "plan must be accepted before cull (current: pending)".into(),
+            });
+        }
+        PlanStatus::Accepted | PlanStatus::Rejected => {}
+    }
+
+    let report = situation_room_pipeline::cull::cull_index_assertions_for_plan(
+        &state.store,
+        parsed,
+    );
+
+    info!(
+        plan_id = %parsed,
+        considered = report.assertions_considered,
+        culled = report.assertions_culled,
+        kept_article = report.assertions_kept_article,
+        kept_unknown = report.assertions_kept_unknown,
+        unrouted = report.assertions_unrouted,
+        delete_failures = report.delete_failures,
+        "cull_index_assertions_for_plan returning"
+    );
+
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------------
 // record_types_for_ids — Session 88 (Sn-87 candidate 4)
 // ---------------------------------------------------------------------------
 

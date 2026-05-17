@@ -127,6 +127,42 @@ pub(crate) fn insert_subjects_and_derivation(
     Ok(())
 }
 
+/// Session 93 — counterpart to [`insert_subjects_and_derivation`]:
+/// remove the subject + derivation join rows tied to a given record
+/// id. Call inside the same transaction as the record-row delete so
+/// the join tables don't carry orphans.
+///
+/// Idempotent: a record id that has no rows in the join tables
+/// (because none were inserted, or a prior delete already removed
+/// them) returns Ok(()) with zero rows affected.
+pub(crate) fn delete_subjects_and_derivation(
+    tx: &Transaction,
+    record_id: Uuid,
+    record_type: &str,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM record_subjects_entities WHERE record_id = ? AND record_type = ?",
+        params![record_id, record_type],
+    )
+    .map_err(StorageError::DuckDb)?;
+    tx.execute(
+        "DELETE FROM record_subjects_places WHERE record_id = ? AND record_type = ?",
+        params![record_id, record_type],
+    )
+    .map_err(StorageError::DuckDb)?;
+    tx.execute(
+        "DELETE FROM record_subjects_topics WHERE record_id = ? AND record_type = ?",
+        params![record_id, record_type],
+    )
+    .map_err(StorageError::DuckDb)?;
+    tx.execute(
+        "DELETE FROM record_derived_from WHERE child_id = ? AND child_type = ?",
+        params![record_id, record_type],
+    )
+    .map_err(StorageError::DuckDb)?;
+    Ok(())
+}
+
 /// Raw envelope columns as they come back from a record-table SELECT.
 /// Order matches the common prefix: caller's SELECT should list them
 /// in this order.

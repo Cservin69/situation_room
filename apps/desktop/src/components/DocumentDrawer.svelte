@@ -65,8 +65,30 @@
     /** Close-the-drawer callback. Wired to backdrop click, Escape
      * key, and the explicit close button. */
     onClose: () => void;
+    /**
+     * Session 93 — optional re-extract callback. When provided, the
+     * header gains a "re-extract relations" button that invokes the
+     * parent's handler with this Document's id. The parent knows the
+     * owning plan; the drawer does not, so the parent is responsible
+     * for wiring `reextractRelationsForDocument(planId, doc.id)`.
+     * Omit on contexts where re-extraction doesn't apply (the button
+     * hides cleanly when this is undefined).
+     */
+    onReextract?: (documentId: string) => void;
+    /**
+     * Session 93 — true while the parent's re-extract handler is in
+     * flight, so the button can render a spinner state and disable
+     * itself against double-clicks. Defaults to false when omitted.
+     */
+    reextracting?: boolean;
   }
-  let { document: doc, chartCatalog, onClose }: Props = $props();
+  let {
+    document: doc,
+    chartCatalog,
+    onClose,
+    onReextract,
+    reextracting = false,
+  }: Props = $props();
 
   // ---- Body rendering ---------------------------------------------
 
@@ -190,14 +212,32 @@
           <span class="when" title="observed_at">{observedAt}</span>
         {/if}
       </div>
-      <button
-        class="close"
-        type="button"
-        aria-label="close document detail"
-        onclick={onClose}
-      >
-        ×
-      </button>
+      <div class="head-actions">
+        {#if onReextract}
+          <!-- Session 93 — per-Document re-extract affordance. Same
+               wire path as the per-plan button on PlanReview but
+               scoped to this Document only. Cost: one workhorse-tier
+               LLM call. Disabled while in flight to prevent double-
+               clicks. -->
+          <button
+            class="reextract"
+            type="button"
+            disabled={reextracting}
+            title="Re-run the relation extractor against this Document's stored body. One LLM call."
+            onclick={() => onReextract?.(doc.id)}
+          >
+            {reextracting ? 're-extracting…' : 're-extract relations'}
+          </button>
+        {/if}
+        <button
+          class="close"
+          type="button"
+          aria-label="close document detail"
+          onclick={onClose}
+        >
+          ×
+        </button>
+      </div>
     </header>
 
     {#if sourceUrl}
@@ -318,6 +358,41 @@
     font-family: var(--font-mono);
     font-size: 11px;
     color: var(--fg-tertiary);
+  }
+  .head-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+  }
+  /* Session 93 — re-extract button sits next to the close button so
+     the head's right edge collects the modal's controls. Visual
+     parity with PlanReview's per-plan button is intentional: the
+     two are siblings of the same affordance, scoped differently. */
+  .reextract {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+    padding: 4px 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    color: var(--fg-secondary);
+    background: var(--bg-panel-alt);
+    border: 1px solid var(--border-subtle);
+    transition: background var(--duration-ui) var(--ease),
+                border-color var(--duration-ui) var(--ease),
+                color var(--duration-ui) var(--ease);
+  }
+  .reextract:hover:not(:disabled),
+  .reextract:focus-visible:not(:disabled) {
+    background: var(--bg-elevated, var(--bg-panel));
+    border-color: var(--border-strong);
+    color: var(--fg-primary);
+  }
+  .reextract:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
   .close {
     flex: 0 0 auto;

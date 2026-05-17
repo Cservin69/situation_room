@@ -219,6 +219,134 @@ pub async fn reextract_relations_for_plan(
     report
 }
 
+/// Session 93 — per-Document re-extraction.
+///
+/// Narrower caller of the same orchestrator the per-plan path uses.
+/// The operator-visible affordance is a button in the DocumentDrawer
+/// header; the cost is one workhorse-tier LLM call for the named
+/// Document only. Same idempotency caveat as the per-plan path
+/// applies: re-running produces a fresh Assertion row; promote
+/// dedups at the cross-source consensus layer.
+///
+/// Returns `Ok(ReextractReport)` with `documents_considered = 1`
+/// when the Document is in the plan's record set and passes the
+/// gate, or `documents_considered = 0` when the Document was found
+/// but didn't pass the gate (non-article MIME, empty body) or
+/// couldn't be routed back to a recipe.
+///
+/// Returns `Err(ReextractDocumentError)` only when the Document
+/// itself is missing from this plan's record set — every other
+/// failure (LLM call error, insert error, missing recipe) is
+/// absorbed into the `ReextractReport` so the dashboard's renderer
+/// gets uniform shape regardless of internal failure.
+pub async fn reextract_relations_for_document(
+    store: &Store,
+    provider: &dyn LlmProvider,
+    document_assertions_prompt: &str,
+    plan: &ResearchPlan,
+    document_id: Uuid,
+) -> Result<ReextractReport, ReextractDocumentError> {
+    let mut report = ReextractReport::default();
+
+    let recipes = match load_recipes_for_plan(store, plan.id) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                plan_id = %plan.id,
+                error = %e,
+                "reextract_for_document: failed to load recipes for plan"
+            );
+            return Ok(report);
+        }
+    };
+    let recipe_by_id: std::collections::HashMap<Uuid, FetchRecipe> =
+        recipes.into_iter().map(|r| (r.id, r)).collect();
+
+    let records = match store.records_for_plan(plan.id) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                plan_id = %plan.id,
+                document_id = %document_id,
+                error = %e,
+                "reextract_for_document: records_for_plan failed"
+            );
+            return Ok(report);
+        }
+    };
+
+    let doc = records
+        .documents
+        .iter()
+        .find(|d| d.id == document_id)
+        .ok_or(ReextractDocumentError::DocumentNotInPlan)?;
+
+    if !extract::should_extract_from(&doc.mime, doc.body.len()) {
+        // Document found but doesn't pass the gate. documents_considered
+        // stays 0; the caller surfaces "nothing to re-extract" to the UI.
+        return Ok(report);
+    }
+    report.documents_considered = 1;
+
+    let source_id = &doc.envelope.provenance.source_id;
+    let recipe_id = match parse_recipe_id_from_source_id(source_id) {
+        Some(id) => id,
+        None => {
+            report.documents_unrouted = 1;
+            return Ok(report);
+        }
+    };
+    let recipe = match recipe_by_id.get(&recipe_id) {
+        Some(r) => r,
+        None => {
+            report.documents_unrouted = 1;
+            return Ok(report);
+        }
+    };
+
+    let fetched_at = doc.envelope.observed_at;
+    let mime_str = doc.mime.as_str();
+    let inner = extract::extract_and_persist_assertions(
+        store,
+        provider,
+        document_assertions_prompt,
+        plan,
+        recipe,
+        doc.body.as_bytes(),
+        Some(mime_str),
+        fetched_at,
+    )
+    .await;
+
+    report.assertions_extracted = inner.extracted;
+    report.assertions_persisted = inner.persisted;
+    report.assertion_insert_failures = inner.insert_failures;
+    if inner.call_error.is_some() {
+        report.llm_call_errors = 1;
+    }
+
+    info!(
+        plan_id = %plan.id,
+        document_id = %document_id,
+        assertions_extracted = report.assertions_extracted,
+        assertions_persisted = report.assertions_persisted,
+        "reextract_for_document: pass complete"
+    );
+
+    Ok(report)
+}
+
+/// Session 93 — error shape for the per-Document re-extract entry point.
+/// Only one failure mode rises to a typed error (the Document isn't in
+/// the plan's record set, which the UI should never trigger because the
+/// button hides on plans whose dashboard doesn't surface this
+/// Document). Everything else absorbs into the `ReextractReport`.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ReextractDocumentError {
+    #[error("document not found in plan's record set")]
+    DocumentNotInPlan,
+}
+
 /// Parse the `recipe:` UUID out of a canonical
 /// `{source}#recipe:{uuid}@v{version}` source_id. Returns `None` on
 /// any deviation from the shape — pre-Sn-22 rows, plan-keyed

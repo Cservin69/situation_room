@@ -94,8 +94,17 @@
      * state by not rendering us in that case.
      */
     records: RecordsByPlanDto;
+    /**
+     * Session 93 — when the dashboard is rendered in a per-plan
+     * context (e.g. PlanReview), the parent passes the plan's UUID
+     * so per-Document affordances (the DocumentDrawer re-extract
+     * button) can route the IPC. Omitted on cross-plan contexts
+     * (the global recent-records view), where the re-extract
+     * affordance hides cleanly.
+     */
+    planId?: string;
   }
-  let { records }: Props = $props();
+  let { records, planId }: Props = $props();
 
   // -- safe shape reads --------------------------------------------
 
@@ -456,6 +465,49 @@
   function closeDocumentDrawer(): void {
     selectedDocument = null;
     selectedDocumentCatalog = null;
+    reextractInFlight = false;
+    reextractError = null;
+    reextractReport = null;
+  }
+
+  // Session 93 — per-Document re-extract state. Lives on the
+  // dashboard because the drawer is open while the IPC is in flight
+  // and we want the spinner state to survive the document tree
+  // updates triggered by completion.
+  let reextractInFlight = $state(false);
+  let reextractError = $state<string | null>(null);
+  let reextractReport = $state<{
+    documents_considered: number;
+    assertions_extracted: number;
+    assertions_persisted: number;
+    assertion_insert_failures: number;
+    llm_call_errors: number;
+  } | null>(null);
+
+  async function handleDocumentReextract(docId: string): Promise<void> {
+    if (!planId) return; // Button hides without planId; defensive.
+    if (reextractInFlight) return;
+    reextractInFlight = true;
+    reextractError = null;
+    reextractReport = null;
+    try {
+      const { reextractRelationsForDocument } = await import('$lib/api/client');
+      const r = await reextractRelationsForDocument(planId, docId);
+      reextractReport = {
+        documents_considered: r.documents_considered,
+        assertions_extracted: r.assertions_extracted,
+        assertions_persisted: r.assertions_persisted,
+        assertion_insert_failures: r.assertion_insert_failures,
+        llm_call_errors: r.llm_call_errors,
+      };
+    } catch (e) {
+      reextractError =
+        e && typeof e === 'object' && 'message' in e
+          ? String((e as { message: unknown }).message)
+          : String(e);
+    } finally {
+      reextractInFlight = false;
+    }
   }
 
   // Session 80 — SamplesModal state. When non-null, the modal renders
@@ -726,7 +778,41 @@
     document={selectedDocument}
     chartCatalog={selectedDocumentCatalog}
     onClose={closeDocumentDrawer}
+    onReextract={planId ? handleDocumentReextract : undefined}
+    reextracting={reextractInFlight}
   />
+  {#if reextractError !== null || reextractReport !== null}
+    <!-- Session 93 — per-Document re-extract result toast. Lives
+         outside the drawer so it survives close+reopen cycles; the
+         drawer's own close handler clears it. -->
+    <div class="reextract-toast" role="status" aria-live="polite">
+      {#if reextractError !== null}
+        <span class="toast-label toast-error">re-extract failed</span>
+        <span class="toast-body">{reextractError}</span>
+      {:else if reextractReport !== null}
+        <span class="toast-label">re-extract done</span>
+        <span class="toast-body">
+          documents {reextractReport.documents_considered}
+          · extracted {reextractReport.assertions_extracted}
+          · persisted {reextractReport.assertions_persisted}
+          {#if reextractReport.assertion_insert_failures > 0}
+            · insert-fails {reextractReport.assertion_insert_failures}
+          {/if}
+          {#if reextractReport.llm_call_errors > 0}
+            · llm-errors {reextractReport.llm_call_errors}
+          {/if}
+        </span>
+      {/if}
+      <button
+        type="button"
+        class="toast-close"
+        aria-label="dismiss"
+        onclick={() => {
+          reextractReport = null;
+          reextractError = null;
+        }}>×</button>
+    </div>
+  {/if}
 {/if}
 
 <!-- Session 80 — SamplesModal renders over the dashboard when a
@@ -949,5 +1035,58 @@
     font-size: 11px;
     color: var(--fg-tertiary);
     text-align: center;
+  }
+
+  /* Session 93 — per-Document re-extract result toast. Floats below
+     the drawer (z-index above the dashboard, below other modals so a
+     subsequent SamplesModal still covers it). */
+  .reextract-toast {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    z-index: 110;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 14px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+    font-size: 12px;
+    max-width: min(680px, calc(100vw - 40px));
+  }
+  .reextract-toast .toast-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--fg-secondary);
+  }
+  .reextract-toast .toast-label.toast-error {
+    color: var(--signal-warning, var(--fg-secondary));
+  }
+  .reextract-toast .toast-body {
+    font-family: var(--font-mono);
+    color: var(--fg-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .reextract-toast .toast-close {
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    color: var(--fg-secondary);
+    font-size: 14px;
+    line-height: 1;
+    width: 20px;
+    height: 20px;
+    border-radius: 2px;
+    cursor: pointer;
+  }
+  .reextract-toast .toast-close:hover {
+    background: var(--bg-canvas);
+    color: var(--fg-primary);
   }
 </style>

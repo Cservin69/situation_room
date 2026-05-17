@@ -111,6 +111,17 @@ pub enum FetchOutcomeClass {
     HostRequiresUaPolicy,
     UrlShapeMismatch,
     RateLimited,
+    /// Session 93 — apply-time signal (not a fetch-error class) that
+    /// the fetched bytes are a topic / category / archive listing
+    /// rather than article prose. The fetch itself succeeded; the
+    /// signal says "this URL won't carry the record shape the recipe
+    /// targets, regardless of selector quality." The proposer should
+    /// pivot to an article URL on the same host class (follow a link
+    /// out of the listing), not retry the index URL with a different
+    /// shape. The [`crate::index_page_detector`] module is the only
+    /// emitter; see ADR 0017's follow-on Sn-91/Sn-93 history for the
+    /// rationale.
+    IndexPageDetected,
 }
 
 impl FetchOutcomeClass {
@@ -128,6 +139,7 @@ impl FetchOutcomeClass {
             Self::HostRequiresUaPolicy => "host_requires_ua_policy",
             Self::UrlShapeMismatch => "url_shape_mismatch",
             Self::RateLimited => "rate_limited",
+            Self::IndexPageDetected => "index_page_detected",
         }
     }
 }
@@ -508,6 +520,11 @@ mod tests {
             "url_shape_mismatch"
         );
         assert_eq!(FetchOutcomeClass::RateLimited.label(), "rate_limited");
+        // Session 93 — apply-time signal added; same label-shape rules.
+        assert_eq!(
+            FetchOutcomeClass::IndexPageDetected.label(),
+            "index_page_detected"
+        );
     }
 
     #[test]
@@ -537,6 +554,10 @@ mod tests {
                 "\"url_shape_mismatch\"",
             ),
             (FetchOutcomeClass::RateLimited, "\"rate_limited\""),
+            (
+                FetchOutcomeClass::IndexPageDetected,
+                "\"index_page_detected\"",
+            ),
         ];
         for (class, expected_json) in cases {
             let json = serde_json::to_string(&class).unwrap();

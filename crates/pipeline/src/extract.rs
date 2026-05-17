@@ -173,6 +173,29 @@ pub async fn extract_and_persist_assertions(
         }
     };
 
+    // Session 93 — defense-in-depth predicate vocab gate. The LLM
+    // schema (Sn-80) bakes the allowed predicates as a JSON-Schema
+    // enum and the validator at `validate_one` re-checks membership;
+    // this third layer at the pipeline boundary catches the rare
+    // case where a provider ignores the enum and the validator was
+    // bypassed by a fallback parser, AND surfaces the drop count
+    // structurally so the operator-visible signal is "drift caught"
+    // rather than "silent shrink". On clean traffic this is a no-op
+    // (the upstream gates left zero drafts to drop); the cost is a
+    // hash-set construction per call.
+    let (drafts, vocab_report) =
+        crate::relation_vocab::filter_drafts_against_plan(&drafts, plan);
+    if vocab_report.dropped_unknown_kind > 0 {
+        warn!(
+            recipe_id = %recipe.id,
+            kept = vocab_report.kept,
+            dropped = vocab_report.dropped_unknown_kind,
+            dropped_predicates = ?vocab_report.dropped_predicates_sample,
+            "relation_vocab caught LLM emissions outside the plan's declared relation_kinds; \
+             upstream schema/validator was lax for these"
+        );
+    }
+
     report.extracted = drafts.len() as u32;
     if drafts.is_empty() {
         info!(
