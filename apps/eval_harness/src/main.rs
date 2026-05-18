@@ -681,6 +681,10 @@ async fn run_one_trial(
             // Session 80 — entity-attribute extraction skipped for the
             // same reason: cost discipline.
             document_entity_attributes_prompt: None,
+            // Session 97 Lever A — Entity extraction skipped under
+            // the same cost discipline; the harness's records-produced
+            // signal doesn't change with extracted entities.
+            document_entities_prompt: None,
             sources,
         };
 

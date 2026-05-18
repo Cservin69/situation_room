@@ -1,4 +1,4 @@
-# Recipe Author Prompt — v1.24
+# Recipe Author Prompt — v1.25
 
 <!--
     This file is the Level-2 recipe authoring prompt for situation_room.
@@ -520,6 +520,72 @@ inner selectors** covers the common shape where the listing has
 table-level identification but no cell-level semantics. Do not
 require semantic per-cell classes before authoring multi-leaf —
 positional selectors are how real HTML tables are extracted.
+
+### Worked example — entity production from a listing page (v1.25)
+
+When the source publishes a roster of actors — one row per actor,
+with a stable id and a display name — and the plan's
+`entity_kinds[]` includes the matching kind, author an iterator-
+bearing `entity` recipe. This is the "324 bulls from one fetch"
+pattern: one fetch contributes hundreds of Entity rows that the
+classifier's exemplar list could not enumerate.
+
+A driver roster where each `<tr>` carries the driver id (slug) in
+column 1, the driver's display name in column 2, and the row has
+no class attributes. The plan's `entity_kinds[]` declares
+`{ kind: "driver", exemplars: [...], attributes: [...] }`.
+
+```json
+{
+  "extraction": { "mode": "css_select", "selector": "table.roster tbody tr td:nth-child(1)" },
+  "iterator":   { "mode": "css_select", "selector": "table.roster tbody tr" },
+  "produces": [{
+    "expectation": { "list": "entity_kind", "index": 0 },
+    "record_type": "entity",
+    "dedup_key_field": "entity_id",
+    "field_mappings": [
+      { "path": "entity_id",
+        "source": { "kind": "extracted_inner",
+                    "spec": { "mode": "css_select",
+                              "selector": "td:nth-child(1)" } } },
+      { "path": "kind",
+        "source": { "kind": "literal", "value": "driver" } },
+      { "path": "canonical_name",
+        "source": { "kind": "extracted_inner",
+                    "spec": { "mode": "css_select",
+                              "selector": "td:nth-child(2)" } } }
+    ]
+  }]
+}
+```
+
+Notes on the binding shape that are specific to `entity`:
+
+- `entity_id` is bound via `extracted_inner` against the
+  row's identifier cell. Single-row sources (one driver per page)
+  would still use `extracted` from a scalar selector — but those
+  are also the cases where the classifier exemplar already covered
+  the actor, so `entity` recipes for single-row sources are
+  almost always the wrong shape.
+- `kind` is a `literal` matching the iterator's row-shape. One
+  recipe ⇄ one entity kind. When a roster mixes drivers and
+  navigators, author two `produces` bindings (or two recipes) —
+  one per kind — rather than authoring `kind` as `extracted`.
+- `canonical_name` is `extracted_inner` against the display-name
+  cell. The runtime does not normalise this string; what the source
+  publishes is what the dashboard shows.
+- `dedup_key_field` points at `entity_id` — the runtime computes
+  per-row dedup against the entity_id UNIQUE constraint, so a
+  daily-refetched roster doesn't double-count its rows on the
+  second fetch.
+
+The closed-vocabulary discipline applies: `kind` must be one of
+the plan's declared `entity_kinds[].kind` strings. A row whose
+inner extraction yields a slug that doesn't parse as an EntityId
+(e.g. "Adriano Moraes (Brazil)") will fail apply-time validation
+on `entity_id`; if the source publishes the canonical id in a
+sibling column or attribute, target that selector instead of the
+display name.
 
 ### Apply-time signals that meant you should have authored multi-leaf
 
@@ -1504,17 +1570,20 @@ The top-level shape is:
 - `extraction`: object — the extraction spec (one of the five modes).
 - `produces`: array of one or more production bindings. Each binding
   has:
-  - `record_type`: one of `"observation"`, `"event"`, `"relation"`.
-    (Not `"entity"`, `"document"`, or `"assertion"` — entities are
-    materialised from the classifier's `entity_kinds[*].exemplars[*]`
-    at plan-accept time, documents come from ingest, and assertions
-    carry a claimant + stance that field-mappings don't populate
-    and are produced by the LLM extraction layer instead.) If a
-    nomination's target list contains `entity_kind` or `relation_kind`
-    expectations that you cannot bind with a `produces` array of
-    these three record types, decline that (URL, target) pair with
-    a clear reason — the multi-target authoring path is built to
-    accept partial fulfilment.
+  - `record_type`: one of `"observation"`, `"event"`, `"relation"`,
+    or `"entity"`. (Not `"document"` or `"assertion"` — documents come
+    from ingest, and assertions carry a claimant + stance that
+    field-mappings don't populate and are produced by the LLM
+    extraction layer instead.) **`"entity"` is reserved for the
+    listing-volume path** described under "Entity production from
+    iterator-bearing recipes" below: pages that enumerate hundreds of
+    named actors (drivers in a race, ships in a fleet, mines in a
+    catalog) where each row contributes one Entity row. Single-actor
+    pages do NOT need an `entity` recipe — the classifier already
+    materialised the named exemplar at plan-accept time, and per-Document
+    Entity extraction picks up unanchored actors from prose. Use the
+    `entity` `record_type` when you can point an iterator at a list and
+    bind `entity_id` + `kind` + `canonical_name` per row.
   - `expectation`: a reference to one of the plan's expectations by
     list and index.
   - `field_mappings`: array of `{path, source}` pairs. `path` is the
@@ -1654,6 +1723,62 @@ and will fail deserialization.
   flow volume for a trade relation.
 - `valid_until` (ISO-8601 timestamp, optional) — end of the
   relation's validity window if it has one.
+
+### `entity` — fields of `Entity`
+
+A v1.25 addition. Use `entity` recipes when a source publishes a
+**listing of named actors** — one row per actor, with the row
+carrying enough information to identify the actor (a stable id, a
+canonical display name) and place it in the closed `entity_kind`
+vocabulary. Driver rosters, ship registers, mine catalogs, member
+rolls, NPI/EIN/CIK lookups: the iterator-volume path. The classifier
+already materialised the named exemplars at plan-accept time
+(Sn-76), and the per-Document Entity extractor picks up unanchored
+actors from prose; `entity` recipes complement both by harvesting
+the **hundreds-per-fetch** actor rows that an iterator over a list
+page exposes.
+
+The three required fields are:
+
+- `entity_id` (entity id) — required. The stable business id for
+  this actor. Must follow the `prefix:slug` shape and match the
+  declared `entity_kind`'s prefix vocabulary (`driver:adriano_moraes`,
+  `ship:imo_9123456`, `mine:greenbushes`). Bind via `extracted` (or
+  `extracted_inner` for multi-leaf iterators) against the row's
+  identifier column — never a `literal` and never `from_plan`
+  (an `entity` recipe that emits a single literal entity_id is
+  always wrong: the classifier exemplars already covered that case
+  at plan-accept time).
+- `kind` (string, snake_case) — required. The entity kind from the
+  plan's `entity_kinds[].kind` vocabulary (`"driver"`, `"company"`,
+  `"mine"`, `"government_agency"`). Usually a `literal` that matches
+  the row-shape the iterator is selecting; iterator-bearing recipes
+  that surface multiple kinds per fetch should still produce one
+  binding per kind rather than authoring `kind` as `extracted`
+  (cleaner per-kind dedup, cleaner per-kind selector_path).
+- `canonical_name` (string) — required. The actor's display name as
+  the source publishes it. Bind via `extracted` / `extracted_inner`
+  against the row's name column. The runtime does not normalise this
+  string; what the source publishes is what the dashboard shows.
+
+The runtime stamps `id` (UUIDv7), envelope, provenance, and dedup
+identity (via the entity_id UNIQUE constraint) automatically; you
+do not bind any of those fields.
+
+**Idempotency.** Entity rows dedup on `entity_id` at storage. The
+recipe's `dedup_key_field` (required for iterator-bearing recipes
+under ADR 0016) names the per-row entity_id binding — the runtime
+uses it to skip rows already present in the entities table on
+refetch, so a daily-refetched driver roster contributes its rows
+once and stays at the same count forever.
+
+**When NOT to use `entity`.** If the source publishes structured
+*attributes of a known entity* (an SEC filings page, a company
+profile), prefer `entity_attribute` — see below. If the source
+publishes a flow between two entities, prefer `relation`. If the
+source publishes a measurement over time, prefer `observation`. The
+`entity` `record_type` is specifically for the row-per-actor
+listing shape.
 
 ### `entity_attribute` — fields of `EntityAttributeContent`
 
@@ -2050,6 +2175,24 @@ or pick a narrower listing endpoint.
   fetch; the place for "constant records under this URL" is
   `static_payload` at the recipe level, not the binding level.
   The validator rejects all-constant bindings.
+- Do not author an `entity` recipe against a single-actor page
+  (one company profile, one driver bio, one mine homepage). The
+  classifier already materialised the named exemplar at plan-
+  accept time (Sn-76), so a single-row `entity` recipe at best
+  duplicates an existing row and at worst overwrites the
+  exemplar's canonical_name with the source's free-text rendering.
+  Use `entity_attribute` for "what is this entity" data from a
+  profile page; reserve `entity` for the row-per-actor listing
+  shape with an iterator. See "entity — fields of Entity" above.
+- Do not author an `entity` recipe whose `entity_id` binding is
+  `literal` or `from_plan`. The entity_id is identity-bearing per
+  row; binding it as a constant means N iterator rows all collapse
+  to the same entity_id, which the upsert turns into a single row
+  no matter how many times the iterator fires. The validator does
+  not catch this shape — the apply-time signal is "iterator ran
+  but only 1 entity persisted" instead of N. When the source
+  publishes the actor id in a sibling column or attribute, use
+  `extracted_inner` against that selector.
 
 ## One-shot, no follow-up
 
@@ -2061,6 +2204,41 @@ you pick.
 ---
 
 ### Changelog
+
+- **v1.25** (2026-05-18) — Session 97 Lever B, `entity` record_type
+  opened to recipe-driven production. Adds the **entity — fields of
+  Entity** content-type reference section between `relation` and
+  `entity_attribute`, plus a worked example "entity production from
+  a listing page" under multi-leaf records, plus two new "Do not"
+  rules at the end of *What NOT to produce* (single-actor page →
+  not entity; literal entity_id → silently collapses N to 1).
+  Updated the `record_type` enumeration in *What to produce* from
+  three values to four. The "324 bulls from one fetch" pattern is
+  now expressible: an iterator-bearing recipe targets a roster page
+  and emits Entity rows per row, where the classifier exemplar list
+  could only enumerate the ten or so named-in-the-plan actors.
+
+  Closed-vocabulary discipline preserved: every example uses
+  generic listings (`table.roster`, `td:nth-child(1)`); no host
+  string; `kind` must match the plan's declared `entity_kinds[]`.
+
+  Output contract change: `record_type=entity` is now a valid
+  binding. Companion runtime work in `recipe_apply.rs::build_record`
+  adds the Entity arm (entity_id + kind + canonical_name flat-field
+  assembly) and in `Store::insert_record` routes Entity through
+  `upsert_entity` (idempotent on the entity_id UNIQUE constraint,
+  matching Sn-76 `entity_synth`'s posture). Plan-accept-time
+  exemplar materialisation is unchanged; both paths converge on the
+  same write semantic.
+
+  Motivation: Sn-96 unblocked iterator-bearing recipes against list
+  pages by carving them out of the apply-time index-page detector.
+  Live verification produced 375 OWNED_BY + 375 RIDES relations from
+  one PBR fetch, but zero new Entity rows — because the prompt
+  forbade `record_type=entity` and the runtime rejected it at apply.
+  Sn-95's "Entity-population gap" framing is the headline for
+  Sn-97. Single-digit Entity counts per accepted plan become
+  hundreds where the source has a listing of named actors.
 
 - **v1.24** (2026-05-17) — Session 93, follow-the-link diagnosis-
   driven re-authoring. Adds the **Diagnosis-driven re-authoring —

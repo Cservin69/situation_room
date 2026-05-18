@@ -1611,6 +1611,281 @@ pub const EXTRACTION_CACHE_KEY_ENTITY_ATTRIBUTES: &str =
     "extraction:document_entity_attributes";
 
 // ---------------------------------------------------------------------------
+// Per-Document Entity extraction (Session 97 Lever A)
+// ---------------------------------------------------------------------------
+//
+// Fifth sibling to the assertion (Sn-77), event (Sn-78), observation
+// (Sn-79), and entity-attribute (Sn-80) per-Document extractors. Where
+// the four earlier extractors emit shapes that wrap into Assertion or
+// per-type records, the entity extractor emits Entity rows directly
+// against the same `entities.entity_id` UNIQUE constraint that
+// `entity_synth` (plan-accept-time) and `recipe_apply` (Sn-97 Lever B)
+// write through.
+//
+// Lever A is the defense-in-depth path; Lever B (recipe-driven Entity
+// production) is the iterator-volume path. The two paths converge on
+// `Store::upsert_entity` so they don't collide on shared entity_ids.
+//
+// **Closed-vocabulary `kind`.** The caller hands the extractor the
+// plan's declared `entity_kinds[].kind` list; the schema bakes those
+// as a JSON-Schema `enum` so a schema-respecting provider rejects
+// out-of-vocab kinds upstream. Validator re-checks membership.
+// Empty list short-circuits the LLM call entirely (plans without
+// declared entity_kinds don't burn workhorse tokens).
+
+/// Wire shape for one entity the LLM emits, before validation.
+/// Loosely-typed; the validator ([`validate_entity_one`]) projects
+/// to typed [`EntityDraft`] and drops malformed rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawExtractedEntity {
+    /// Entity kind. Must be one of the plan's declared
+    /// `entity_kinds[].kind` strings (see `extract_entities_from_document`'s
+    /// `allowed_kinds` arg). Lowercase snake_case.
+    pub kind: String,
+    /// Entity business id. `prefix:slug` shape consumed by
+    /// [`EntityId::new`]; rows with an invalid id are dropped (the
+    /// entity_id is the storage UNIQUE constraint).
+    pub entity_id: String,
+    /// Human-readable display name. The validator trims; empty after
+    /// trim drops the row.
+    pub canonical_name: String,
+    /// 0.0..=1.0 confidence. Clamped to range in
+    /// [`validate_entity_one`].
+    pub confidence: f64,
+}
+
+/// LLM wire envelope for the entity extractor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawExtractedEntities {
+    #[serde(default)]
+    pub entities: Vec<RawExtractedEntity>,
+}
+
+/// Typed projection of one extracted entity, ready for the pipeline
+/// orchestrator to wrap in an `Entity` envelope (see
+/// `pipeline::extract::build_extracted_entity`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityDraft {
+    pub kind: String,
+    pub entity_id: situation_room_core::vocab::EntityId,
+    pub canonical_name: String,
+    pub confidence: situation_room_core::vocab::Confidence,
+}
+
+/// Run one entity extraction pass against a Document body.
+///
+/// `allowed_kinds` is the plan's declared `entity_kinds[].kind`
+/// list. An empty slice short-circuits the LLM call entirely
+/// (plans without declared entity_kinds skip the workhorse-tier
+/// call), matching the cost-discipline posture of the event and
+/// observation extractors.
+///
+/// Returns the validated drafts only; malformed rows (invalid
+/// entity_id, empty canonical_name, out-of-vocab kind) warn-log
+/// and drop.
+pub async fn extract_entities_from_document(
+    provider: &dyn LlmProvider,
+    cfg: &ExtractionConfig,
+    prompt_template: &str,
+    topic: &str,
+    source_url: &str,
+    mime: &str,
+    body: &str,
+    allowed_kinds: &[&str],
+) -> Result<Vec<EntityDraft>, ExtractionError> {
+    if allowed_kinds.is_empty() {
+        // Closed-vocab discipline: the entity extractor only runs
+        // when the plan has named the kinds it wants. Empty list =
+        // skip the LLM call. Mirrors event / observation posture.
+        return Ok(Vec::new());
+    }
+
+    let user = build_entity_extraction_prompt(
+        prompt_template,
+        topic,
+        source_url,
+        mime,
+        body,
+        allowed_kinds,
+    );
+    let schema = entity_extraction_schema_value(allowed_kinds);
+
+    let req = CompletionRequest {
+        system: Some(
+            "You are the situation_room document-extraction layer. \
+             Read the supplied document body and emit only entities \
+             whose `kind` is one of the plan's declared entity_kinds. \
+             Output only JSON conforming to the provided schema. \
+             No prose outside the JSON."
+                .to_string(),
+        ),
+        user,
+        schema: Some(StructuredOutputSchema {
+            name: "DocumentEntities".to_string(),
+            schema,
+        }),
+        // Per-row payload is small (kind + entity_id + canonical_name
+        // + confidence); 2048 tokens covers ~30 entities comfortably.
+        max_tokens: 2048,
+        temperature: 0.0,
+        reasoning_effort: None,
+        prompt_cache_key: Some(EXTRACTION_CACHE_KEY_ENTITIES.to_string()),
+    };
+
+    let resp = provider.complete(cfg.tier, req).await?;
+    let drafts = parse_entities_response(&resp, allowed_kinds)?;
+    Ok(drafts)
+}
+
+/// Pure helper: render the entity prompt template against the call
+/// inputs. The four substitutions match the assertion / event /
+/// observation extractors, plus `{{ALLOWED_KINDS}}` for the closed
+/// vocab.
+pub fn build_entity_extraction_prompt(
+    template: &str,
+    topic: &str,
+    source_url: &str,
+    mime: &str,
+    body: &str,
+    allowed_kinds: &[&str],
+) -> String {
+    let allowed_inline = if allowed_kinds.is_empty() {
+        "(no kinds declared — emit nothing)".to_string()
+    } else {
+        allowed_kinds.join(", ")
+    };
+    // Reuse build_extraction_prompt's four-substitution machinery
+    // (passing an empty `allowed_predicates`) and then layer
+    // `{{ALLOWED_KINDS}}` on top. The relations prompt uses a
+    // distinct placeholder so the two substitutions don't collide.
+    build_extraction_prompt(template, topic, source_url, mime, body, &[])
+        .replace("{{ALLOWED_KINDS}}", &allowed_inline)
+}
+
+/// Parse a [`CompletionResponse`] into validated entity drafts. Same
+/// posture as the other parsers: warn-log and drop per-row
+/// validation failures.
+pub fn parse_entities_response(
+    resp: &CompletionResponse,
+    allowed_kinds: &[&str],
+) -> Result<Vec<EntityDraft>, ExtractionError> {
+    let raw_value = resp
+        .structured
+        .as_ref()
+        .ok_or(ExtractionError::NoStructuredOutput)?;
+
+    let parsed: RawExtractedEntities = serde_json::from_value(raw_value.clone())
+        .map_err(|e| ExtractionError::OutputParse(e.to_string()))?;
+
+    let mut drafts = Vec::with_capacity(parsed.entities.len());
+    for raw in parsed.entities {
+        match validate_entity_one(raw, allowed_kinds) {
+            Ok(draft) => drafts.push(draft),
+            Err(reason) => {
+                warn!(
+                    reason = %reason,
+                    "document extractor dropped malformed entity"
+                );
+            }
+        }
+    }
+    Ok(drafts)
+}
+
+/// Project one [`RawExtractedEntity`] to [`EntityDraft`]. Drops the
+/// row when:
+///   - `entity_id` fails [`EntityId::new`]
+///   - `canonical_name` is empty after trim
+///   - `kind` is empty after trim, or not in `allowed_kinds` when
+///     the slice is non-empty
+fn validate_entity_one(
+    raw: RawExtractedEntity,
+    allowed_kinds: &[&str],
+) -> Result<EntityDraft, String> {
+    use situation_room_core::vocab::{Confidence, EntityId};
+
+    let kind = raw.kind.trim().to_string();
+    if kind.is_empty() {
+        return Err("empty kind".into());
+    }
+    // Closed-vocab gate — only enforced when allowed_kinds is non-empty
+    // (mirroring the relation / event / observation extractors).
+    if !allowed_kinds.is_empty() && !allowed_kinds.iter().any(|k| *k == kind.as_str()) {
+        return Err(format!(
+            "entity kind `{kind}` not in plan's declared entity_kinds; \
+             dropping under closed-vocab discipline"
+        ));
+    }
+
+    let entity_s = raw.entity_id.trim();
+    if entity_s.is_empty() {
+        return Err("empty entity_id".into());
+    }
+    let entity_id = EntityId::new(entity_s)
+        .map_err(|e| format!("invalid entity_id `{entity_s}`: {e}"))?;
+
+    let canonical_name = raw.canonical_name.trim().to_string();
+    if canonical_name.is_empty() {
+        return Err("empty canonical_name".into());
+    }
+
+    let confidence = Confidence::clamp(raw.confidence as f32);
+
+    Ok(EntityDraft {
+        kind,
+        entity_id,
+        canonical_name,
+        confidence,
+    })
+}
+
+/// JSON Schema for the entity extractor's structured output. The
+/// `kind` field's allowed values are baked as a JSON-Schema `enum`
+/// — `extract_entities_from_document` early-returns when the slice
+/// is empty, so this function is only called with non-empty input.
+fn entity_extraction_schema_value(allowed_kinds: &[&str]) -> serde_json::Value {
+    let allowed_json: Vec<serde_json::Value> = allowed_kinds
+        .iter()
+        .map(|s| serde_json::Value::String((*s).to_string()))
+        .collect();
+
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "entities": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": allowed_json },
+                        "entity_id": { "type": "string" },
+                        "canonical_name": { "type": "string" },
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0
+                        }
+                    },
+                    "required": [
+                        "kind",
+                        "entity_id",
+                        "canonical_name",
+                        "confidence"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["entities"],
+        "additionalProperties": false
+    })
+}
+
+/// Session 97 — extraction cache shard for the per-Document Entity
+/// extractor. See the other four `EXTRACTION_CACHE_KEY_*` constants.
+pub const EXTRACTION_CACHE_KEY_ENTITIES: &str = "extraction:document_entities";
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2979,5 +3254,126 @@ mod tests {
         assert!(enum_arr.iter().any(|v| v == "text"));
         assert!(enum_arr.iter().any(|v| v == "number"));
         assert!(enum_arr.iter().any(|v| v == "boolean"));
+    }
+
+    // -------------------------------------------------------------------
+    // Per-Document Entity extractor (Session 97 Lever A)
+    // -------------------------------------------------------------------
+
+    fn raw_entity(kind: &str, entity_id: &str, name: &str, conf: f64) -> RawExtractedEntity {
+        RawExtractedEntity {
+            kind: kind.into(),
+            entity_id: entity_id.into(),
+            canonical_name: name.into(),
+            confidence: conf,
+        }
+    }
+
+    #[test]
+    fn validate_entity_one_builds_draft_for_well_formed_input() {
+        let raw = raw_entity("company", "company:tsla", "Tesla, Inc.", 0.85);
+        let draft = validate_entity_one(raw, &["company", "person"]).unwrap();
+        assert_eq!(draft.kind, "company");
+        assert_eq!(draft.entity_id.as_str(), "company:tsla");
+        assert_eq!(draft.canonical_name, "Tesla, Inc.");
+    }
+
+    #[test]
+    fn validate_entity_one_drops_kind_outside_closed_vocab() {
+        let raw = raw_entity("startup", "company:x", "X", 0.9);
+        let err = validate_entity_one(raw, &["company"]).unwrap_err();
+        assert!(err.contains("`startup`"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_entity_one_drops_invalid_entity_id() {
+        // EntityId::new rejects empty / structurally-malformed slugs.
+        // Whitespace-only collapses to empty after trim and surfaces
+        // as the "empty entity_id" branch (we don't hand the EntityId
+        // newtype a string we know it'll reject).
+        let raw = raw_entity("company", "   ", "Tesla", 0.9);
+        let err = validate_entity_one(raw, &["company"]).unwrap_err();
+        assert!(err.contains("empty entity_id"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_entity_one_drops_empty_canonical_name() {
+        let raw = raw_entity("company", "company:tsla", "  ", 0.9);
+        let err = validate_entity_one(raw, &["company"]).unwrap_err();
+        assert!(err.contains("empty canonical_name"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_entity_one_clamps_confidence_to_unit_range() {
+        // 1.5 → 1.0; -0.2 → 0.0 (Confidence::clamp).
+        let high = validate_entity_one(
+            raw_entity("company", "company:a", "A", 1.5),
+            &["company"],
+        )
+        .unwrap();
+        let low = validate_entity_one(
+            raw_entity("company", "company:b", "B", -0.2),
+            &["company"],
+        )
+        .unwrap();
+        assert!((high.confidence.value() - 1.0).abs() < 1e-6);
+        assert!((low.confidence.value() - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn validate_entity_one_with_empty_allow_list_is_open_vocab() {
+        // The closed-vocab gate is only enforced when allowed_kinds
+        // is non-empty (mirroring relation / event / observation).
+        // The extractor's *async* short-circuit on empty kinds keeps
+        // the LLM call from happening at all — the validator is the
+        // fallback layer and stays open-vocab so a hand-rolled call
+        // site doesn't double-gate.
+        let ok = validate_entity_one(
+            raw_entity("company", "company:x", "X", 0.9),
+            &[],
+        )
+        .expect("validator stays open-vocab when allowed_kinds is empty");
+        assert_eq!(ok.kind, "company");
+    }
+
+    #[test]
+    fn build_entity_extraction_prompt_substitutes_allowed_kinds() {
+        let template = "kinds=`{{ALLOWED_KINDS}}` topic=`{{TOPIC}}` body=`{{BODY}}`";
+        let out = build_entity_extraction_prompt(
+            template,
+            "tesla supply chain",
+            "https://example.test/p",
+            "text/html",
+            "Tesla supplied 5000 vehicles to Hertz.",
+            &["company", "person"],
+        );
+        assert!(out.contains("kinds=`company, person`"));
+        assert!(out.contains("topic=`tesla supply chain`"));
+        assert!(out.contains("Tesla supplied 5000 vehicles"));
+    }
+
+    #[test]
+    fn entity_extraction_schema_bakes_kind_enum() {
+        let schema = entity_extraction_schema_value(&["company", "person"]);
+        let kind_schema = &schema["properties"]["entities"]["items"]["properties"]["kind"];
+        assert_eq!(kind_schema["type"], "string");
+        let enum_arr = kind_schema["enum"]
+            .as_array()
+            .expect("kind enum should be present");
+        assert_eq!(enum_arr.len(), 2);
+        assert!(enum_arr.iter().any(|v| v == "company"));
+        assert!(enum_arr.iter().any(|v| v == "person"));
+        // The four required fields are pinned so a future drift
+        // shows up here, not in production.
+        let required = schema["properties"]["entities"]["items"]["required"]
+            .as_array()
+            .expect("required array");
+        assert_eq!(required.len(), 4);
+        for f in ["kind", "entity_id", "canonical_name", "confidence"] {
+            assert!(
+                required.iter().any(|v| v == f),
+                "schema must require {f}"
+            );
+        }
     }
 }

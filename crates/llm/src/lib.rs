@@ -40,14 +40,16 @@ pub use cost_ledger::{
     CostLedger, LedgerEntry, MeteredProvider, Tally, TimelineEntry, TIMELINE_CAP,
 };
 pub use extraction::{
-    extract_assertions_from_document, extract_entity_attributes_from_document,
-    extract_events_from_document, extract_observations_from_document, AssertionDraft,
-    EntityAttributeDraft, EventDraft, ExtractionConfig, ExtractionError, ObservationDraft,
-    RawExtractedAssertion, RawExtractedAssertions, RawExtractedEntityAttribute,
+    extract_assertions_from_document, extract_entities_from_document,
+    extract_entity_attributes_from_document, extract_events_from_document,
+    extract_observations_from_document, AssertionDraft, EntityAttributeDraft, EntityDraft,
+    EventDraft, ExtractionConfig, ExtractionError, ObservationDraft,
+    RawExtractedAssertion, RawExtractedAssertions, RawExtractedEntities,
+    RawExtractedEntity, RawExtractedEntityAttribute,
     RawExtractedEntityAttributes, RawExtractedEvent, RawExtractedEvents,
     RawExtractedObservation, RawExtractedObservations, EXTRACTION_CACHE_KEY_ASSERTIONS,
-    EXTRACTION_CACHE_KEY_ENTITY_ATTRIBUTES, EXTRACTION_CACHE_KEY_EVENTS,
-    EXTRACTION_CACHE_KEY_OBSERVATIONS,
+    EXTRACTION_CACHE_KEY_ENTITIES, EXTRACTION_CACHE_KEY_ENTITY_ATTRIBUTES,
+    EXTRACTION_CACHE_KEY_EVENTS, EXTRACTION_CACHE_KEY_OBSERVATIONS,
 };
 
 pub type Result<T> = std::result::Result<T, LlmError>;

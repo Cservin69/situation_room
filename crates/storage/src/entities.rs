@@ -139,6 +139,35 @@ impl Store {
         })
     }
 
+    /// Idempotent insert. Returns `Ok(())` whether the entity row was
+    /// inserted fresh or already existed (matched on the UNIQUE
+    /// `entity_id`).
+    ///
+    /// Session 97 Lever B — the recipe-driven Entity production path
+    /// (iterator-bearing recipes against `entity_kind` expectations)
+    /// reaches storage through [`Store::insert_record`] on
+    /// `Record::Entity`. Iterator runs re-emit the same entity_ids on
+    /// every refetch, and the entity_id UNIQUE constraint would
+    /// otherwise turn the second run into a recipe failure. This
+    /// method mirrors the existence-check pattern Sn-76's
+    /// `entity_synth::try_materialize_one` uses for the same idempotency
+    /// reason, so both paths (plan-accept-time exemplars and
+    /// recipe-time iterator rows) converge on the same write semantics.
+    ///
+    /// **No update on conflict.** When an entity with the given
+    /// business id already exists, this method does NOT overwrite
+    /// canonical_name / kind / geometry / envelope. Bias is toward
+    /// keeping the first-inserted row's metadata stable; a future
+    /// session can decide whether iterator-emitted attributes should
+    /// refresh exemplar-emitted rows.
+    pub fn upsert_entity(&self, ent: &Entity) -> Result<()> {
+        match self.get_entity_by_business_id(&ent.entity_id) {
+            Ok(_) => Ok(()),
+            Err(StorageError::NotFound(_)) => self.insert_entity(ent),
+            Err(other) => Err(other),
+        }
+    }
+
     /// Fetch an entity by its business key. Uses the unique index on
     /// `entities.entity_id`.
     pub fn get_entity_by_business_id(&self, entity_id: &EntityId) -> Result<Entity> {

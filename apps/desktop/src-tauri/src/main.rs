@@ -103,6 +103,17 @@ const DOCUMENT_OBSERVATIONS_PROMPT: &str =
 const DOCUMENT_ENTITY_ATTRIBUTES_PROMPT: &str =
     include_str!("../../../../config/prompts/document_entity_attributes.md");
 
+/// Session 97 Lever A — per-Document Entity extractor prompt. Fifth
+/// sibling of the four earlier extractor prompts; same loading
+/// pattern. Consumed by
+/// `pipeline::extract::extract_and_persist_entities` once per
+/// fetched article-kind Document, gated upstream on plan-declared
+/// `entity_kinds` (cost-bounded for plans that don't track actors).
+/// Defense-in-depth alongside Sn-97 Lever B's recipe-driven Entity
+/// production: the two paths converge on `Store::upsert_entity`.
+const DOCUMENT_ENTITIES_PROMPT: &str =
+    include_str!("../../../../config/prompts/document_entities.md");
+
 fn main() -> Result<()> {
     // .env is a dev convenience; the real environment always wins.
     // Walks up from CWD to find .env at the workspace root and
@@ -376,6 +387,7 @@ fn main() -> Result<()> {
         DOCUMENT_EVENTS_PROMPT,
         DOCUMENT_OBSERVATIONS_PROMPT,
         DOCUMENT_ENTITY_ATTRIBUTES_PROMPT,
+        DOCUMENT_ENTITIES_PROMPT,
         sources,
         authoritative,
     );

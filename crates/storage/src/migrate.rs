@@ -130,6 +130,13 @@ const MIGRATIONS: &[Migration] = &[
             "../../../migrations/0020_parent_type_backfill_and_sn78_cleanup.sql"
         ),
     },
+    Migration {
+        version: 21,
+        description: "Sn-97: orphan entity_exemplar + dangling parent derivation cleanup",
+        sql: include_str!(
+            "../../../migrations/0021_sn97_orphan_cleanup.sql"
+        ),
+    },
 ];
 
 /// Apply every migration whose version is not yet in

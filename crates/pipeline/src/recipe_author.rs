@@ -749,24 +749,29 @@ pub struct AuthoredProductionBinding {
     pub dedup_key_field: Option<String>,
 }
 
-/// The three record types a recipe may produce at authoring time.
+/// The record types a recipe may produce at authoring time.
 ///
-/// `Document` and `Entity` are excluded because they come from other
-/// paths: documents from per-fetch synthesis (Session 69,
-/// `pipeline::document_synth`); entities from plan-accept-time
-/// materialisation of `entity_kinds[*].exemplars[*]` (Session 76,
-/// `pipeline::entity_synth`). `Assertion` is excluded because it
-/// carries a `claimant` and `stance` that a recipe's
+/// `Document` is excluded because it comes from per-fetch synthesis
+/// (Session 69, `pipeline::document_synth`). `Assertion` is excluded
+/// because it carries a `claimant` and `stance` that a recipe's
 /// `field_mappings` don't populate — assertions are the LLM
 /// extraction layer's job (ADR 0004, ADR 0007). If we later want
 /// recipe-shaped assertions we'll need a separate binding shape
 /// for them.
+///
+/// **Session 97 Lever B — Entity opened.** Iterator-bearing recipes
+/// against `entity_kind` expectations can now emit Entity rows
+/// directly (the "324 bulls from one fetch" pattern). Plan-accept-time
+/// exemplar materialisation (Sn-76 `entity_synth`) is unchanged; both
+/// paths converge on storage via `Store::upsert_entity` (idempotent
+/// on the `entities.entity_id` UNIQUE constraint).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthoredRecordType {
     Observation,
     Event,
     Relation,
+    Entity,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1660,6 +1665,11 @@ fn convert_binding(
             AuthoredRecordType::Observation => RecordType::Observation,
             AuthoredRecordType::Event => RecordType::Event,
             AuthoredRecordType::Relation => RecordType::Relation,
+            // Session 97 Lever B — Entity opened to recipe-driven
+            // production. Apply-time assembly lives in
+            // `recipe_apply::build_record`; storage routes through
+            // `Store::upsert_entity` for idempotency.
+            AuthoredRecordType::Entity => RecordType::Entity,
         },
         expectation,
         field_mappings,

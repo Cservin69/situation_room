@@ -59,8 +59,8 @@ use situation_room_core::schema::content::{
     EventContent, ObservationContent, RelationContent,
 };
 use situation_room_core::schema::envelope::{Envelope, Provenance, Subjects};
-use situation_room_core::schema::records::{Event, Observation, Record, Relation};
-use situation_room_core::vocab::Confidence;
+use situation_room_core::schema::records::{Entity, Event, Observation, Record, Relation};
+use situation_room_core::vocab::{Confidence, EntityId};
 use situation_room_core::RecordType;
 
 use crate::recipes::{
@@ -302,11 +302,21 @@ fn path_expects_string(record_type: RecordType, path: &str) -> bool {
             "magnitude.currency",
             "magnitude.period",
         ],
-        // Document / Entity / Assertion are not recipe-producible
-        // (build_record rejects them with a Binding error before
-        // reaching this layer). Return the empty set so a future
-        // hand-rolled call site doesn't silently mis-coerce.
-        RecordType::Document | RecordType::Entity | RecordType::Assertion => &[],
+        // Session 97 Lever B — EntityContent's three required fields
+        // (entity_id, kind, canonical_name) are all schema-typed as
+        // String / String-newtype. Geometry is an object and not in
+        // this set; future versions can plumb geometry once
+        // recipe-author learns to bind it.
+        RecordType::Entity => &[
+            "entity_id",
+            "kind",
+            "canonical_name",
+        ],
+        // Document / Assertion are not recipe-producible (build_record
+        // rejects them with a Binding error before reaching this
+        // layer). Return the empty set so a future hand-rolled call
+        // site doesn't silently mis-coerce.
+        RecordType::Document | RecordType::Assertion => &[],
     };
     entries.iter().any(|e| *e == path)
 }
@@ -1900,18 +1910,84 @@ fn build_record(
                 content,
             })
         }
-        RecordType::Document | RecordType::Entity | RecordType::Assertion => {
+        RecordType::Entity => {
+            // Session 97 Lever B — open `entity` to recipe-driven
+            // production. Iterator-bearing recipes against
+            // `entity_kind` expectations can now emit Entity rows
+            // directly (the "324 bulls from one fetch" pattern from
+            // Sn-96's PBR baseline). Plan-accept-time exemplar
+            // materialisation (Sn-76 `entity_synth`) is unchanged;
+            // both paths converge on storage via
+            // `Store::upsert_entity` (idempotent on entity_id).
+            //
+            // Entity is a flat-fields record (no `content` JSON
+            // column at storage), so we hand-extract the three
+            // required strings from the assembled content_json
+            // rather than calling `serde_json::from_value` into an
+            // EntityContent type (which doesn't exist — see
+            // `crates/core/src/schema/records/entity.rs`).
+            let map = match content_value {
+                Value::Object(m) => m,
+                _ => {
+                    return Err(ApplyError::ContentAssembly {
+                        reason: truncate_content_assembly_reason(
+                            "entity content: expected JSON object".to_string(),
+                        ),
+                    });
+                }
+            };
+            let entity_id_s = map
+                .get("entity_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ApplyError::ContentAssembly {
+                    reason: truncate_content_assembly_reason(
+                        "entity content: missing or non-string `entity_id`".to_string(),
+                    ),
+                })?;
+            let entity_id = EntityId::new(entity_id_s).map_err(|e| {
+                ApplyError::ContentAssembly {
+                    reason: truncate_content_assembly_reason(format!(
+                        "entity content: invalid entity_id `{entity_id_s}`: {e}"
+                    )),
+                }
+            })?;
+            let kind = map
+                .get("kind")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ApplyError::ContentAssembly {
+                    reason: truncate_content_assembly_reason(
+                        "entity content: missing or non-string `kind`".to_string(),
+                    ),
+                })?
+                .to_string();
+            let canonical_name = map
+                .get("canonical_name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ApplyError::ContentAssembly {
+                    reason: truncate_content_assembly_reason(
+                        "entity content: missing or non-string `canonical_name`"
+                            .to_string(),
+                    ),
+                })?
+                .to_string();
+            Record::Entity(Entity {
+                id: Uuid::now_v7(),
+                entity_id,
+                kind,
+                canonical_name,
+                geometry: None,
+                envelope,
+            })
+        }
+        RecordType::Document | RecordType::Assertion => {
             return Err(ApplyError::Binding {
                 index,
                 reason: format!(
                     "record_type {:?} is not producible from a recipe. \
                      Documents come from ingest (per-fetch Document synthesis, \
-                     Session 69); entities are materialised at plan-accept time \
-                     from the classifier's entity_kinds[*].exemplars[*] \
-                     (Session 76 — see crates/pipeline/src/entity_synth.rs). \
-                     Assertions come from the LLM extraction layer (they carry a \
-                     claimant and stance that recipe field-mappings don't populate). \
-                     See ADR 0007 and ADR 0004.",
+                     Session 69). Assertions come from the LLM extraction \
+                     layer (they carry a claimant and stance that recipe \
+                     field-mappings don't populate). See ADR 0007 and ADR 0004.",
                     binding.record_type
                 ),
             });
@@ -3507,17 +3583,37 @@ mod tests {
 
     #[test]
     fn path_expects_string_empty_for_non_recipe_record_types() {
-        // Document / Entity / Assertion are not recipe-producible.
-        // The set is empty so a future hand-rolled call site can't
-        // silently rely on coercion that won't fire.
-        for record_type in [
-            RecordType::Document,
-            RecordType::Entity,
-            RecordType::Assertion,
-        ] {
+        // Document / Assertion are not recipe-producible. The set
+        // is empty so a future hand-rolled call site can't silently
+        // rely on coercion that won't fire. Entity is recipe-producible
+        // from Sn-97 Lever B onward — see its dedicated test below.
+        for record_type in [RecordType::Document, RecordType::Assertion] {
             assert!(!path_expects_string(record_type, "any_path"));
             assert!(!path_expects_string(record_type, "headline"));
         }
+    }
+
+    #[test]
+    fn path_expects_string_covers_entity_fields() {
+        // Sn-97 Lever B — `entity` opened as a recipe-producible
+        // record_type. The three Entity fields (entity_id, kind,
+        // canonical_name) are all schema-typed as String / String-
+        // newtype, so a numeric-looking leaf (entity_id `"9123456"`,
+        // kind authored as `literal "driver"`, canonical_name
+        // `"Adriano Moraes"`) must coerce to String at content
+        // assembly rather than fail with `invalid type: floating
+        // point '9123456', expected a string`.
+        for path in ["entity_id", "kind", "canonical_name"] {
+            assert!(
+                path_expects_string(RecordType::Entity, path),
+                "Entity.{path} must be in the String set"
+            );
+        }
+        // Negative: a path not on EntityContent isn't in the set —
+        // catches a future `geometry` addition that didn't get added
+        // here when the binding shape grew.
+        assert!(!path_expects_string(RecordType::Entity, "geometry"));
+        assert!(!path_expects_string(RecordType::Entity, "value"));
     }
 
     #[test]
@@ -4945,6 +5041,174 @@ C 4
             })
             .collect();
         assert!(directions.iter().all(|d| *d), "every record carries direction");
+    }
+
+    // -----------------------------------------------------------------------
+    // Session 97 Lever B — recipe-driven Entity production
+    //
+    // An iterator-bearing recipe against an entity_kind expectation
+    // emits one Entity row per iterator row. Each row pulls
+    // entity_id + canonical_name via ExtractedInner; kind is a
+    // literal. The build_record Entity arm assembles the three
+    // flat fields; the apply path returns Record::Entity values.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn css_iterator_entity_recipe_produces_one_entity_per_row_sn97_lever_b() {
+        let html = br#"
+            <html><body><table class="roster"><tbody>
+              <tr><td>driver:adriano_moraes</td><td>Adriano Moraes</td></tr>
+              <tr><td>driver:guilherme_marchi</td><td>Guilherme Marchi</td></tr>
+              <tr><td>driver:silvano_alves</td><td>Silvano Alves</td></tr>
+            </tbody></table></body></html>
+        "#;
+        let recipe = FetchRecipe {
+            id: Uuid::now_v7(),
+            dedup_key: None,
+            plan_id: Uuid::now_v7(),
+            source_id: "roster".into(),
+            source_url: Url::parse("https://example.com/roster").unwrap(),
+            // Outer extraction is required structurally for
+            // iterator-bearing recipes but unused at the FieldMap
+            // level (every FieldMap is ExtractedInner or Literal).
+            extraction: ExtractionSpec::CssSelect {
+                selector: "table.roster tbody tr td:nth-child(1)".into(),
+                attribute: None,
+            },
+            iterator: Some(ExtractionSpec::CssSelect {
+                selector: "table.roster tbody tr".into(),
+                attribute: None,
+            }),
+            produces: vec![ProductionBinding {
+                record_type: RecordType::Entity,
+                expectation: ExpectationRef::EntityKind { index: 0 },
+                field_mappings: vec![
+                    FieldMap {
+                        path: "entity_id".into(),
+                        source: FieldValueSource::ExtractedInner {
+                            spec: ExtractionSpec::CssSelect {
+                                selector: "td:nth-child(1)".into(),
+                                attribute: None,
+                            },
+                        },
+                    },
+                    FieldMap {
+                        path: "kind".into(),
+                        source: FieldValueSource::Literal {
+                            value: json!("driver"),
+                        },
+                    },
+                    FieldMap {
+                        path: "canonical_name".into(),
+                        source: FieldValueSource::ExtractedInner {
+                            spec: ExtractionSpec::CssSelect {
+                                selector: "td:nth-child(2)".into(),
+                                attribute: None,
+                            },
+                        },
+                    },
+                ],
+                dedup_key_field: Some("entity_id".into()),
+            }],
+            authored_at: Utc.with_ymd_and_hms(2026, 5, 18, 0, 0, 0).unwrap(),
+            authored_by: "xai".into(),
+            version: 1,
+            static_payload: None,
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
+        };
+        let p = iterator_plan();
+        let ctx = ApplyContext {
+            recipe: &recipe,
+            plan: &p,
+            bytes: html,
+            fetched_at: fetched_at(),
+        };
+        let records = apply(ctx).expect("entity iterator recipe must apply");
+        assert_eq!(records.len(), 3, "one Entity per iterator row");
+
+        // Each record is an Entity with the row's id + literal kind +
+        // row's display name. Sort by entity_id for deterministic
+        // assertion (iterator order matches doc order but sorting
+        // makes the test resilient to selector permutations).
+        let mut by_id: Vec<(&str, &str, &str)> = records
+            .iter()
+            .map(|r| match r {
+                Record::Entity(e) => (
+                    e.entity_id.as_str(),
+                    e.kind.as_str(),
+                    e.canonical_name.as_str(),
+                ),
+                other => panic!("expected Entity, got {other:?}"),
+            })
+            .collect();
+        by_id.sort_by_key(|t| t.0);
+        assert_eq!(by_id[0], ("driver:adriano_moraes", "driver", "Adriano Moraes"));
+        assert_eq!(by_id[1], ("driver:guilherme_marchi", "driver", "Guilherme Marchi"));
+        assert_eq!(by_id[2], ("driver:silvano_alves", "driver", "Silvano Alves"));
+    }
+
+    #[test]
+    fn entity_recipe_with_missing_required_field_fails_content_assembly_sn97_lever_b() {
+        // Negative case: a binding that omits canonical_name should
+        // surface as a ContentAssembly error pointing at the missing
+        // field — same shape Observation's missing-field error takes.
+        let html = b"<html><body><div id=\"row\"><span class=\"id\">driver:x</span></div></body></html>";
+        let recipe = FetchRecipe {
+            id: Uuid::now_v7(),
+            dedup_key: None,
+            plan_id: Uuid::now_v7(),
+            source_id: "roster".into(),
+            source_url: Url::parse("https://example.com/r").unwrap(),
+            extraction: ExtractionSpec::CssSelect {
+                selector: ".id".into(),
+                attribute: None,
+            },
+            iterator: None,
+            produces: vec![ProductionBinding {
+                record_type: RecordType::Entity,
+                expectation: ExpectationRef::EntityKind { index: 0 },
+                field_mappings: vec![
+                    FieldMap {
+                        path: "entity_id".into(),
+                        source: FieldValueSource::Extracted,
+                    },
+                    FieldMap {
+                        path: "kind".into(),
+                        source: FieldValueSource::Literal {
+                            value: json!("driver"),
+                        },
+                    },
+                    // canonical_name omitted on purpose.
+                ],
+                dedup_key_field: None,
+            }],
+            authored_at: Utc.with_ymd_and_hms(2026, 5, 18, 0, 0, 0).unwrap(),
+            authored_by: "xai".into(),
+            version: 1,
+            static_payload: None,
+            authored_from: situation_room_storage::AuthoredFrom::FetchedBytes,
+            prior_recipe_id: None,
+            reauthor_reason: None,
+        };
+        let p = iterator_plan();
+        let ctx = ApplyContext {
+            recipe: &recipe,
+            plan: &p,
+            bytes: html,
+            fetched_at: fetched_at(),
+        };
+        let err = apply(ctx).unwrap_err();
+        match err {
+            ApplyError::ContentAssembly { reason } => {
+                assert!(
+                    reason.contains("canonical_name"),
+                    "missing-field error must name canonical_name; got: {reason}"
+                );
+            }
+            other => panic!("expected ContentAssembly, got {other:?}"),
+        }
     }
 
     /// Legacy iterator recipes (no ExtractedInner) still take the

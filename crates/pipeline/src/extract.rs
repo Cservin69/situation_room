@@ -44,12 +44,13 @@ use situation_room_core::schema::content::{
     AssertedContent, EntityAttributeContent, EventContent, ObservationContent, RelationContent,
 };
 use situation_room_core::schema::envelope::{Envelope, Provenance, Subjects};
-use situation_room_core::schema::records::{Assertion, Event, Observation};
+use situation_room_core::schema::records::{Assertion, Entity, Event, Observation};
 use situation_room_core::vocab::Confidence;
 use situation_room_llm::{
-    extract_assertions_from_document, extract_entity_attributes_from_document,
-    extract_events_from_document, extract_observations_from_document, AssertionDraft,
-    EntityAttributeDraft, EventDraft, ExtractionConfig, LlmProvider, ObservationDraft,
+    extract_assertions_from_document, extract_entities_from_document,
+    extract_entity_attributes_from_document, extract_events_from_document,
+    extract_observations_from_document, AssertionDraft, EntityAttributeDraft,
+    EntityDraft, EventDraft, ExtractionConfig, LlmProvider, ObservationDraft,
 };
 use situation_room_storage::Store;
 use tracing::{info, warn};
@@ -964,6 +965,195 @@ pub fn build_entity_attribute_assertion(
 }
 
 // ---------------------------------------------------------------------------
+// Per-Document Entity extraction orchestrator (Session 97 Lever A)
+// ---------------------------------------------------------------------------
+//
+// Fifth sibling to the assertion (Sn-77), event (Sn-78), observation
+// (Sn-79), and entity-attribute (Sn-80) per-Document orchestrators.
+// Walks the plan's declared `entity_kinds[].kind` list, calls the
+// LLM extractor (cost-bounded — empty list short-circuits before the
+// provider), wraps each returned `EntityDraft` in an `Entity` record
+// provenanced to the recipe, and persists via `Store::upsert_entity`
+// (idempotent on the `entities.entity_id` UNIQUE constraint, matching
+// Sn-76 `entity_synth` and Sn-97 Lever B `recipe_apply`).
+//
+// ## Scope (v1)
+//
+// - **Strict closed-vocabulary `kind`.** The extractor only emits
+//   kinds in `plan.expectations.entity_kinds[].kind` — out-of-vocab
+//   kinds are dropped at the LLM layer.
+// - **No retry, no per-row dedup beyond entity_id.** Same posture as
+//   the four earlier extractors. Per-doc duplicates of the same
+//   `entity_id` collapse on the storage UNIQUE constraint via
+//   `upsert_entity`.
+// - **Persistence failures don't fail the recipe.** Per-entity
+//   insert failures warn-log and the loop continues.
+
+/// Per-Document entity extraction entry point. Called by each
+/// `run_X_recipe` in `fetch_executor.rs` after the entity-attribute
+/// extraction call, with the same inputs.
+///
+/// Returns an [`ExtractionReport`] for observability. Errors are
+/// absorbed; this function never returns `Err`.
+pub async fn extract_and_persist_entities(
+    store: &Store,
+    provider: &dyn LlmProvider,
+    extraction_prompt: &str,
+    plan: &crate::research::ResearchPlan,
+    recipe: &FetchRecipe,
+    bytes: &[u8],
+    response_content_type: Option<&str>,
+    fetched_at: DateTime<Utc>,
+) -> ExtractionReport {
+    let mut report = ExtractionReport::default();
+
+    let mime = response_content_type.map(normalise_mime).unwrap_or_default();
+    if !should_extract_from(&mime, bytes.len()) {
+        return report;
+    }
+
+    let allowed_owned: Vec<String> = plan
+        .expectations
+        .entity_kinds
+        .iter()
+        .map(|k| k.kind.clone())
+        .collect();
+    if allowed_owned.is_empty() {
+        // Cost-discipline: plans without declared entity_kinds don't
+        // burn workhorse tokens. Mirrors the event / observation
+        // extractor posture.
+        return report;
+    }
+    let allowed_refs: Vec<&str> = allowed_owned.iter().map(|s| s.as_str()).collect();
+
+    let body = document_synth::body_preview_for_mime(&mime, bytes);
+    if body.trim().is_empty() {
+        return report;
+    }
+
+    let cfg = ExtractionConfig::default();
+    let topic = plan.topic.as_str();
+    let source_url = recipe.source_url.as_str();
+
+    let drafts = match extract_entities_from_document(
+        provider,
+        &cfg,
+        extraction_prompt,
+        topic,
+        source_url,
+        &mime,
+        &body,
+        &allowed_refs,
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(
+                recipe_id = %recipe.id,
+                error = %e,
+                "document entity extraction LLM call failed; \
+                 skipping this Document's entities"
+            );
+            report.call_error = Some(e.to_string());
+            return report;
+        }
+    };
+
+    report.extracted = drafts.len() as u32;
+    if drafts.is_empty() {
+        info!(
+            recipe_id = %recipe.id,
+            "document entity extraction returned no entities \
+             (empty list is a legal outcome)"
+        );
+        return report;
+    }
+
+    for draft in drafts {
+        let entity = build_extracted_entity(plan, recipe, &draft, fetched_at);
+        match store.upsert_entity(&entity) {
+            Ok(()) => report.persisted += 1,
+            Err(e) => {
+                report.insert_failures += 1;
+                warn!(
+                    recipe_id = %recipe.id,
+                    entity_id = %entity.entity_id.as_str(),
+                    error = %e,
+                    "failed to persist extracted Entity; continuing with the rest of the batch"
+                );
+            }
+        }
+    }
+
+    info!(
+        recipe_id = %recipe.id,
+        extracted = report.extracted,
+        persisted = report.persisted,
+        insert_failures = report.insert_failures,
+        "document entity extraction complete"
+    );
+
+    report
+}
+
+/// Build one [`Entity`] from a validated [`EntityDraft`]. Pure
+/// function — no I/O — so tests can pin the envelope shape.
+///
+/// `source_id` follows the same `{source}#recipe:{id}@v{ver}`
+/// format as the four earlier extractors so `records_for_plan`'s
+/// LIKE join surfaces the Entity under the originating plan
+/// dashboard. Sn-76 `entity_synth` uses `plan:{plan_id}#entity_exemplar`
+/// and Sn-97 Lever B `recipe_apply` uses the recipe-shaped source_id;
+/// the dashboard's per-plan view captures both via the LIKE family.
+pub fn build_extracted_entity(
+    plan: &crate::research::ResearchPlan,
+    recipe: &FetchRecipe,
+    draft: &EntityDraft,
+    fetched_at: DateTime<Utc>,
+) -> Entity {
+    let provenance = Provenance {
+        source_id: format!(
+            "{}#recipe:{}@v{}",
+            recipe.source_id, recipe.id, recipe.version
+        ),
+        source_url: Some(recipe.source_url.to_string()),
+        source_published_at: None,
+        license: "extracted".into(),
+        derived_from: vec![],
+        selector_path: None,
+        raw_bytes_excerpt: None,
+    };
+
+    let subjects = Subjects {
+        // Sn-76's entity_synth seeds entities[*] with the subject
+        // entity id so the cross-record entity join lights up the
+        // Entity alongside Relations / Assertions that name the
+        // same actor. Match that posture here.
+        entities: vec![draft.entity_id.clone()],
+        places: vec![],
+        time: None,
+        topics: plan.topic_tags.clone(),
+    };
+
+    let envelope = Envelope {
+        provenance,
+        subjects,
+        tags: vec![],
+        valid_at: None,
+        observed_at: fetched_at,
+        confidence: draft.confidence,
+    };
+
+    Entity::new(
+        draft.entity_id.clone(),
+        draft.kind.clone(),
+        draft.canonical_name.clone(),
+        envelope,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1390,5 +1580,58 @@ mod tests {
         assert_ne!(ha, hb, "different predicate → distinct hash");
         assert_ne!(ha, hc, "different subject → distinct hash");
         assert_ne!(hb, hc, "different predicate + subject → distinct hash");
+    }
+
+    // -------------------------------------------------------------------
+    // Session 97 Lever A — Per-Document Entity extractor
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn build_extracted_entity_carries_recipe_provenance_and_envelope_metadata() {
+        let plan = sample_plan();
+        let recipe = sample_recipe(
+            &plan,
+            "https://example.test/article",
+            "example_news",
+        );
+        let fetched_at = Utc.with_ymd_and_hms(2026, 5, 18, 12, 0, 0).unwrap();
+        let draft = EntityDraft {
+            kind: "company".into(),
+            entity_id: situation_room_core::vocab::EntityId::new("company:panasonic")
+                .unwrap(),
+            canonical_name: "Panasonic Energy Corporation".into(),
+            confidence: situation_room_core::vocab::Confidence::new(0.85).unwrap(),
+        };
+
+        let entity = build_extracted_entity(&plan, &recipe, &draft, fetched_at);
+
+        // Provenance: same `{source}#recipe:{id}@v{ver}` shape the
+        // four sibling extractors use, so records_for_plan's LIKE
+        // join routes the Entity under the originating plan.
+        assert_eq!(
+            entity.envelope.provenance.source_id,
+            format!("example_news#recipe:{}@v1", recipe.id)
+        );
+        assert_eq!(
+            entity.envelope.provenance.source_url.as_deref(),
+            Some("https://example.test/article")
+        );
+        assert_eq!(entity.envelope.observed_at, fetched_at);
+
+        // Entity-specific flat fields.
+        assert_eq!(entity.entity_id.as_str(), "company:panasonic");
+        assert_eq!(entity.kind, "company");
+        assert_eq!(entity.canonical_name, "Panasonic Energy Corporation");
+
+        // Subject entities seed the cross-record entity join, same
+        // posture Sn-76 `entity_synth::build_exemplar_entity` uses.
+        assert_eq!(entity.envelope.subjects.entities.len(), 1);
+        assert_eq!(
+            entity.envelope.subjects.entities[0].as_str(),
+            "company:panasonic"
+        );
+
+        // Topics propagate from the plan.
+        assert_eq!(entity.envelope.subjects.topics.len(), 1);
     }
 }

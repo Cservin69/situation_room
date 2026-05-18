@@ -437,3 +437,37 @@ it should land an amendment rather than rewrite this ADR.
   on a Minecraft-shape plan now produces multi-claimant relation
   Assertions under v1.2 *and* the cull pass removed the Sn-91
   aluminium singletons, the prompt change is verified live.
+
+- **Session 97 (Lever A + Lever B context)**: two extraction-layer
+  changes landed in the same session but neither alters ADR 0023's
+  decision or runbook:
+
+  (e) Sn-96 `check_index_page` carved out iterator-bearing recipes
+      (`iterator: Option<&ExtractionSpec>` short-circuits the
+      detector when `Some`). The ADR 0023 cull path
+      (`cull_index_assertions_for_plan`) is unaffected because it
+      runs the SAME detector against each Document's *raw bytes*,
+      not against a recipe's iterator. Iterator-bearing fetches now
+      reach apply on list pages; their per-Document extraction
+      (Sn-77 / Sn-78 / Sn-80 / Sn-97-Lever-A) still feeds the same
+      Assertion table the consensus pass reads. The "topic-index
+      input had no attribution to extract" failure shape Sn-91
+      named stays structurally surfaced — it's just expressed
+      differently for the iterator-recipe path now (the recipe
+      itself emits records; per-Document extraction still classifies
+      via the detector).
+
+  (f) Sn-97 Lever A opened a fifth per-Document extractor (Entity).
+      Lever B opened `record_type=entity` to recipes. Neither path
+      writes to the Assertion table directly — Entities go to the
+      `entities` table via `Store::upsert_entity`. ADR 0023's
+      Stage 4 verdict reads off `assertions` + `record_subjects_*`,
+      unchanged.
+
+  The Sn-93 verify runbook continues to be the path. The Sn-97
+  refresh (`session97-adr0023-stage4.md`) wraps Stage 4 with the
+  Sn-96/97 caveats above and is the runbook to execute on the
+  current binary.
+
+  Status remains Proposed. Operator-paid Stage 4 still flips the
+  status.

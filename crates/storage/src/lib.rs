@@ -23,6 +23,7 @@ pub mod fetch_run_outcomes;
 pub mod fetch_runs;
 pub mod migrate;
 pub mod observations;
+pub mod orphan_cleanup;
 pub mod promote_history;
 pub mod queries;
 pub mod recipe_feedback;
@@ -35,6 +36,7 @@ pub mod sources_memory;
 
 pub use authority_registry::{AuthorityProvenance, AuthorityRegistryRow};
 pub use connection::Store;
+pub use orphan_cleanup::OrphanEntityCleanupReport;
 pub use fetch_run_outcomes::{
     ApplyFailureForProposer, FetchRunOutcomeKind, FetchRunOutcomeRow,
     RecipeOutcomeHistoryEntry, RecipeOutcomeHistoryRunRow, StoredFetchRunOutcome,

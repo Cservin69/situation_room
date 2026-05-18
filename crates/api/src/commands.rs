@@ -198,6 +198,12 @@ pub struct AppState {
     /// `include_str!`). v1 has no closed-vocab gate on attribute names
     /// — open-vocab matches the `EntityAttributeContent.key` schema.
     pub document_entity_attributes_prompt: &'static str,
+    /// Session 97 Lever A — per-Document Entity extraction prompt.
+    /// Fifth sibling. Threaded through to
+    /// [`ExecutorContext::document_entities_prompt`] in
+    /// `run_fetch_for_plan`. The desktop binary loads
+    /// `document_entities.md` via `include_str!`.
+    pub document_entities_prompt: &'static str,
     /// Doc-narrowed under ADR 0015 (Session 37). The classifier no
     /// longer consults this list; only the executor's `#[ignore]`
     /// live tests do (against `csv_demo` / `json_demo`). Production
@@ -324,6 +330,7 @@ impl AppState {
         document_events_prompt: &'static str,
         document_observations_prompt: &'static str,
         document_entity_attributes_prompt: &'static str,
+        document_entities_prompt: &'static str,
         sources: Vec<PipelineSourceDescriptor>,
         authoritative: LiveAuthorityRegistry,
     ) -> Self {
@@ -348,6 +355,7 @@ impl AppState {
             document_events_prompt,
             document_observations_prompt,
             document_entity_attributes_prompt,
+            document_entities_prompt,
             sources,
             authoritative,
             last_promote_summary: Arc::new(std::sync::Mutex::new(
@@ -875,6 +883,34 @@ pub async fn reject_plan(
 
     info!(plan_id = %parsed, "plan rejected");
 
+    // Sn-97 Bug 4 — sweep orphan entity_synth exemplars now that the
+    // plan's status is `Rejected`. Entity rows whose entity_id is
+    // still claimed by another accepted plan survive (closed under
+    // the LIKE-on-expectations check inside the helper). A non-zero
+    // count is INFO-logged; a failure here warn-logs but does NOT
+    // fail the reject — the status flip already succeeded and the
+    // migration 0021 path will reconcile on next boot.
+    match state.store.cleanup_orphan_entities_for_rejected_plan(parsed) {
+        Ok(report) if report.entities_deleted > 0 => {
+            info!(
+                plan_id = %parsed,
+                entities_deleted = report.entities_deleted,
+                subject_rows_deleted = report.subject_rows_deleted,
+                derivation_rows_deleted = report.derivation_rows_deleted,
+                "Sn-97 Bug 4: swept orphan entity_synth exemplars on plan-reject"
+            );
+        }
+        Ok(_) => { /* nothing to clean — silent */ }
+        Err(e) => {
+            tracing::warn!(
+                plan_id = %parsed,
+                error = %e,
+                "Sn-97 Bug 4: orphan-entity cleanup failed; migration 0021 \
+                 will reconcile on next boot"
+            );
+        }
+    }
+
     let stored = state
         .store
         .get_research_plan(parsed)
@@ -1271,6 +1307,13 @@ pub async fn run_fetch_for_plan(
         // Session 80 — per-Document EntityAttribute extraction prompt.
         // Same posture as the three earlier extractor prompts.
         document_entity_attributes_prompt: Some(state.document_entity_attributes_prompt),
+        // Session 97 Lever A — per-Document Entity extraction prompt.
+        // Fifth sibling. Same posture as the four earlier extractor
+        // prompts: production passes `Some(_)`; the eval harness
+        // composition root passes `None`. Cost-bounded — plans with
+        // no declared `entity_kinds` short-circuit before the
+        // workhorse call inside the extractor.
+        document_entities_prompt: Some(state.document_entities_prompt),
         // The same slice the classifier sees, threaded through to
         // the executor. Doc-narrowed under ADR 0015 (Session 37) and
         // further under Session 39: production authoring no longer
@@ -3611,6 +3654,7 @@ mod tests {
             "stub-doc-events",
             "stub-doc-observations",
             "stub-doc-entity-attrs",
+            "stub-doc-entities",
             vec![],
             LiveAuthorityRegistry::new(
                 AuthorityRegistry::empty(),

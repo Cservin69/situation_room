@@ -122,8 +122,9 @@ use crate::propose_source_url::{
 };
 use crate::document_synth::insert_fetch_document;
 use crate::extract::{
-    extract_and_persist_assertions, extract_and_persist_entity_attributes,
-    extract_and_persist_events, extract_and_persist_observations,
+    extract_and_persist_assertions, extract_and_persist_entities,
+    extract_and_persist_entity_attributes, extract_and_persist_events,
+    extract_and_persist_observations,
 };
 use crate::recipe_apply::{apply, ApplyContext, ApplyError, MAX_RECORDS_PER_RECIPE};
 use crate::recipe_author::{author_recipe, AuthoringContext, AuthoringError};
@@ -408,6 +409,16 @@ pub struct ExecutorContext<'a> {
     /// closed-vocab gate on attribute names — open-vocab matches the
     /// `EntityAttributeContent.key` schema.
     pub document_entity_attributes_prompt: Option<&'a str>,
+    /// Session 97 Lever A — per-Document Entity extraction prompt.
+    /// Fifth sibling. Consumed by `crate::extract::extract_and_persist_entities`,
+    /// called by each runner immediately after the entity-attribute
+    /// extraction call. Same gating posture: production passes
+    /// `Some(prompt)` so per-Document Entity rows surface in the
+    /// dashboard's Entities panel; eval harness and test contexts
+    /// pass `None`. Cost is bounded upstream — plans with no
+    /// declared `entity_kinds` short-circuit before the workhorse-
+    /// tier call.
+    pub document_entities_prompt: Option<&'a str>,
     /// Source descriptors for the executor.
     ///
     /// **Doc-narrowed under ADR 0015 (Session 37) and further under
@@ -4161,6 +4172,25 @@ async fn run_csv_recipe(
         .await;
     }
 
+    // Session 97 Lever A — per-Document Entity extraction. Fifth
+    // sibling. Skipped when `document_entities_prompt` is None
+    // (eval harness, test contexts). Cost-bounded: plans with no
+    // declared `entity_kinds` short-circuit inside
+    // `extract_and_persist_entities` before the workhorse call.
+    if let Some(prompt) = ctx.document_entities_prompt {
+        let _ = extract_and_persist_entities(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
     // Apply.
     let apply_ctx = ApplyContext {
         recipe,
@@ -4361,6 +4391,25 @@ async fn run_json_recipe(
         .await;
     }
 
+    // Session 97 Lever A — per-Document Entity extraction. Fifth
+    // sibling. Skipped when `document_entities_prompt` is None
+    // (eval harness, test contexts). Cost-bounded: plans with no
+    // declared `entity_kinds` short-circuit inside
+    // `extract_and_persist_entities` before the workhorse call.
+    if let Some(prompt) = ctx.document_entities_prompt {
+        let _ = extract_and_persist_entities(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
     // Apply.
     let apply_ctx = ApplyContext {
         recipe,
@@ -4543,6 +4592,25 @@ async fn run_css_recipe(
     // list still produce extracted attributes.
     if let Some(prompt) = ctx.document_entity_attributes_prompt {
         let _ = extract_and_persist_entity_attributes(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
+    // Session 97 Lever A — per-Document Entity extraction. Fifth
+    // sibling. Skipped when `document_entities_prompt` is None
+    // (eval harness, test contexts). Cost-bounded: plans with no
+    // declared `entity_kinds` short-circuit inside
+    // `extract_and_persist_entities` before the workhorse call.
+    if let Some(prompt) = ctx.document_entities_prompt {
+        let _ = extract_and_persist_entities(
             ctx.store,
             ctx.provider,
             prompt,
@@ -4833,6 +4901,25 @@ async fn run_regex_recipe(
         .await;
     }
 
+    // Session 97 Lever A — per-Document Entity extraction. Fifth
+    // sibling. Skipped when `document_entities_prompt` is None
+    // (eval harness, test contexts). Cost-bounded: plans with no
+    // declared `entity_kinds` short-circuit inside
+    // `extract_and_persist_entities` before the workhorse call.
+    if let Some(prompt) = ctx.document_entities_prompt {
+        let _ = extract_and_persist_entities(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
     // Apply.
     let apply_ctx = ApplyContext {
         recipe,
@@ -5012,6 +5099,25 @@ async fn run_pdf_recipe(
     // list still produce extracted attributes.
     if let Some(prompt) = ctx.document_entity_attributes_prompt {
         let _ = extract_and_persist_entity_attributes(
+            ctx.store,
+            ctx.provider,
+            prompt,
+            plan,
+            recipe,
+            &bytes,
+            response_content_type.as_deref(),
+            fetched_at,
+        )
+        .await;
+    }
+
+    // Session 97 Lever A — per-Document Entity extraction. Fifth
+    // sibling. Skipped when `document_entities_prompt` is None
+    // (eval harness, test contexts). Cost-bounded: plans with no
+    // declared `entity_kinds` short-circuit inside
+    // `extract_and_persist_entities` before the workhorse call.
+    if let Some(prompt) = ctx.document_entities_prompt {
+        let _ = extract_and_persist_entities(
             ctx.store,
             ctx.provider,
             prompt,
@@ -5501,6 +5607,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -5585,6 +5692,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -5662,6 +5770,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -5738,6 +5847,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -5806,6 +5916,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -5870,6 +5981,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -5924,6 +6036,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -5959,6 +6072,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -5999,6 +6113,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -6077,6 +6192,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -6133,6 +6249,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -6178,6 +6295,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -6238,6 +6356,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -6281,6 +6400,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -6349,6 +6469,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -6399,6 +6520,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -6487,6 +6609,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -6568,6 +6691,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -6631,6 +6755,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -6676,6 +6801,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -6876,6 +7002,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -7003,6 +7130,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -7167,6 +7295,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &sources,
         };
 
@@ -7238,6 +7367,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &sources,
         };
 
@@ -7309,6 +7439,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &sources,
         };
 
@@ -7378,6 +7509,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &sources,
         };
 
@@ -7556,6 +7688,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -7702,6 +7835,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -8288,6 +8422,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -8334,6 +8469,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &[],
         };
 
@@ -8864,6 +9000,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &sources,
         };
 
@@ -8996,6 +9133,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &sources,
         };
 
@@ -9141,6 +9279,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &sources,
         };
 
@@ -9729,6 +9868,7 @@ mod tests {
             document_events_prompt: None,
             document_observations_prompt: None,
             document_entity_attributes_prompt: None,
+            document_entities_prompt: None,
             sources: &sources,
         };
 
@@ -9807,7 +9947,7 @@ mod tests {
     /// Iterator-bearing recipes must bypass the detector — the
     /// listing IS the target.
     #[test]
-    fn iterator_some_skips_detector() {
+    fn check_index_page_skips_iterator_recipes() {
         let (bytes, url) = index_shaped_html_with_topic_url();
         let iterator = ExtractionSpec::CssSelect {
             selector: "ul > li".into(),
@@ -9833,7 +9973,7 @@ mod tests {
     /// listings, which routes the proposer into v1.24's
     /// follow-the-link path.
     #[test]
-    fn iterator_none_still_short_circuits_on_index_url() {
+    fn check_index_page_short_circuits_scalar_recipes_on_index_url() {
         let (bytes, url) = index_shaped_html_with_topic_url();
         let signal = check_index_page(
             bytes,
