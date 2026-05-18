@@ -883,21 +883,25 @@ pub async fn reject_plan(
 
     info!(plan_id = %parsed, "plan rejected");
 
-    // Sn-97 Bug 4 — sweep orphan entity_synth exemplars now that the
-    // plan's status is `Rejected`. Entity rows whose entity_id is
-    // still claimed by another accepted plan survive (closed under
-    // the LIKE-on-expectations check inside the helper). A non-zero
-    // count is INFO-logged; a failure here warn-logs but does NOT
-    // fail the reject — the status flip already succeeded and the
-    // migration 0021 path will reconcile on next boot.
+    // Sn-97 Bug 4 + Sn-98 follow-on — sweep orphan entity_synth
+    // exemplars AND rewire re-claimed entities now that the plan's
+    // status is `Rejected`. Entity rows whose entity_id is still
+    // claimed by another accepted plan survive AND get their
+    // `source_id` rewired to point at the earliest-created accepted
+    // claimer (Sn-98); rows with no other claimant are deleted
+    // (Sn-97). A non-zero count of either category is INFO-logged;
+    // a failure here warn-logs but does NOT fail the reject — the
+    // status flip already succeeded and migrations 0021 + 0022 will
+    // reconcile on next boot.
     match state.store.cleanup_orphan_entities_for_rejected_plan(parsed) {
-        Ok(report) if report.entities_deleted > 0 => {
+        Ok(report) if report.entities_deleted > 0 || report.entities_rewired > 0 => {
             info!(
                 plan_id = %parsed,
                 entities_deleted = report.entities_deleted,
+                entities_rewired = report.entities_rewired,
                 subject_rows_deleted = report.subject_rows_deleted,
                 derivation_rows_deleted = report.derivation_rows_deleted,
-                "Sn-97 Bug 4: swept orphan entity_synth exemplars on plan-reject"
+                "Sn-97/98 Bug 4: swept + rewired entity_synth exemplars on plan-reject"
             );
         }
         Ok(_) => { /* nothing to clean — silent */ }
@@ -905,8 +909,8 @@ pub async fn reject_plan(
             tracing::warn!(
                 plan_id = %parsed,
                 error = %e,
-                "Sn-97 Bug 4: orphan-entity cleanup failed; migration 0021 \
-                 will reconcile on next boot"
+                "Sn-97/98 Bug 4: orphan-entity cleanup failed; migrations \
+                 0021 + 0022 will reconcile on next boot"
             );
         }
     }

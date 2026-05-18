@@ -4,4 +4,4 @@
  * Per-failure stage on the wire. Mirrors
  * [`situation_room_pipeline::fetch_executor::FailureStage`].
  */
-export type FailureStageDto = "fetch" | "apply" | "insert";
+export type FailureStageDto = "fetch" | "apply" | "insert" | "index_page_detected";

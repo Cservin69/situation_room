@@ -137,6 +137,13 @@ const MIGRATIONS: &[Migration] = &[
             "../../../migrations/0021_sn97_orphan_cleanup.sql"
         ),
     },
+    Migration {
+        version: 22,
+        description: "Sn-98: rewire orphan-but-claimed entity_exemplar source_id",
+        sql: include_str!(
+            "../../../migrations/0022_sn98_entity_rewire.sql"
+        ),
+    },
 ];
 
 /// Apply every migration whose version is not yet in
@@ -395,13 +402,13 @@ mod tests {
     /// migration we ship today. Catches an accidental rename of the
     /// migrations array without a corresponding test update.
     #[test]
-    fn migration_sql_lookup_finds_v1_through_v20() {
-        for v in 1..=20 {
+    fn migration_sql_lookup_finds_v1_through_v22() {
+        for v in 1..=22 {
             assert!(
                 migration_sql(v).is_some(),
                 "migration version {v} should be embedded"
             );
         }
-        assert!(migration_sql(21).is_none(), "no v21 yet");
+        assert!(migration_sql(23).is_none(), "no v23 yet");
     }
 }

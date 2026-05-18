@@ -52,6 +52,13 @@ pub struct OrphanEntityCleanupReport {
     /// `record_derived_from` rows removed across both sides
     /// (`child_type='entity'` and `parent_type='entity'`).
     pub derivation_rows_deleted: u64,
+    /// Sn-98 Bug 4 follow-on: entity rows whose `source_id` was
+    /// rewired from the rejected plan to an earliest-created accepted
+    /// plan that re-claims the exemplar. Counted separately from
+    /// `entities_deleted` because the rows survived — the rewire is
+    /// load-bearing for the accepted plan's per-plan dashboard view
+    /// (`records_for_plan`'s LIKE filter on `plan:{accepted}#%`).
+    pub entities_rewired: u64,
 }
 
 impl Store {
@@ -85,6 +92,21 @@ impl Store {
     /// `entity_kinds[*].exemplars[*]`, so a literal substring
     /// match is unambiguous. False positives leave the row in
     /// place — bias toward keeping data.
+    ///
+    /// ## Sn-98 Bug 4 follow-on — rewire pass
+    ///
+    /// Before the DELETE pass, the helper now runs a REWIRE pass:
+    /// for every entity row whose `source_id` points at this
+    /// rejected plan AND at least one accepted plan claims the
+    /// same `entity_id`, UPDATE the `source_id` to point at the
+    /// earliest-created accepted claimer. This closes the Sn-97
+    /// gap where re-claimed entities stayed visible only on the
+    /// rejected plan's per-plan view. Rewire happens BEFORE the
+    /// DELETE so the delete's NOT EXISTS check sees the post-rewire
+    /// state — rewired rows survive deletion by virtue of having a
+    /// new (non-this-plan) source_id; the delete predicate
+    /// `source_id = ?` no longer matches them. Migration 0022 is
+    /// the upgrade-time twin for already-existing data.
     pub fn cleanup_orphan_entities_for_rejected_plan(
         &self,
         plan_id: Uuid,
@@ -118,6 +140,39 @@ impl Store {
 
         let mut subject_rows_deleted: u64 = 0;
         let mut derivation_rows_deleted: u64 = 0;
+
+        // Sn-98 — rewire pass. For every entity row owned by this
+        // rejected plan with at least one accepted-plan claimant,
+        // UPDATE `source_id` to point at the earliest-created
+        // claimer. The DELETE pass below sees post-rewire state, so
+        // rewired rows survive deletion automatically (their
+        // `source_id` no longer equals the bound pattern).
+        //
+        // The correlated `LIMIT 1` subquery is the deterministic
+        // tiebreaker for entity_ids claimed by more than one accepted
+        // plan; mirrors migration 0022's shape.
+        let rewire_sql = r#"
+            UPDATE entities AS e
+               SET source_id = (
+                 SELECT 'plan:' || CAST(rp_acc.id AS VARCHAR) || '#entity_exemplar'
+                   FROM research_plans rp_acc
+                  WHERE rp_acc.status = 'accepted'
+                    AND CAST(rp_acc.expectations AS VARCHAR)
+                          LIKE '%"' || e.entity_id || '"%'
+                  ORDER BY rp_acc.created_at ASC
+                  LIMIT 1
+               )
+             WHERE e.source_id = ?
+               AND EXISTS (
+                 SELECT 1 FROM research_plans rp_acc
+                  WHERE rp_acc.status = 'accepted'
+                    AND CAST(rp_acc.expectations AS VARCHAR)
+                          LIKE '%"' || e.entity_id || '"%'
+               )
+        "#;
+        let entities_rewired = tx
+            .execute(rewire_sql, params![source_id_pattern])
+            .map_err(StorageError::DuckDb)? as u64;
 
         // Subjects join rows — entity, place, topic. Sum the counts
         // for the caller; per-table breakdown isn't operator-useful.
@@ -159,6 +214,7 @@ impl Store {
             entities_deleted,
             subject_rows_deleted,
             derivation_rows_deleted,
+            entities_rewired,
         })
     }
 }
@@ -263,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_keeps_entity_when_another_accepted_plan_claims_it() {
+    fn cleanup_keeps_and_rewires_entity_when_another_accepted_plan_claims_it() {
         let store = Store::open_in_memory().unwrap();
         store.migrate().unwrap();
 
@@ -288,9 +344,110 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.entities_deleted, 0, "claimed entity must survive");
-        assert!(store
+        // Sn-98: rewire pass must have run on the claimed entity.
+        assert_eq!(
+            report.entities_rewired, 1,
+            "claimed entity must be rewired to the accepted claimer"
+        );
+        let surviving = store
             .get_entity_by_business_id(&EntityId::new("company:tsla").unwrap())
-            .is_ok());
+            .unwrap();
+        // The rewired source_id points at the accepted plan, NOT
+        // the rejected plan — so records_for_plan's LIKE filter on
+        // `plan:{accepted}#%` matches the row.
+        assert_eq!(
+            surviving.envelope.provenance.source_id,
+            format!("plan:{}#entity_exemplar", accepted_id),
+            "source_id must point at the accepted claimer post-rewire"
+        );
+    }
+
+    #[test]
+    fn rewire_picks_earliest_created_accepted_plan_when_multiple_claim() {
+        // Two accepted plans both name the same exemplar. The rewire
+        // must deterministically pick the earlier-created one. Mirrors
+        // migration 0022's `ORDER BY rp_acc.created_at ASC LIMIT 1`.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let rejected_id = Uuid::now_v7();
+        let mut rejected = plan_row(rejected_id, &["company:catl"], PlanStatus::Rejected);
+        rejected.created_at = Utc::now() - chrono::Duration::hours(5);
+        store.insert_research_plan(&rejected).unwrap();
+
+        // Older accepted plan — should win the rewire tiebreaker.
+        let older_accepted_id = Uuid::now_v7();
+        let mut older = plan_row(older_accepted_id, &["company:catl"], PlanStatus::Accepted);
+        older.created_at = Utc::now() - chrono::Duration::hours(4);
+        store.insert_research_plan(&older).unwrap();
+
+        // Younger accepted plan — must NOT win.
+        let younger_accepted_id = Uuid::now_v7();
+        let mut younger = plan_row(younger_accepted_id, &["company:catl"], PlanStatus::Accepted);
+        younger.created_at = Utc::now() - chrono::Duration::hours(1);
+        store.insert_research_plan(&younger).unwrap();
+
+        store
+            .insert_entity(&entity_for_plan(rejected_id, "company:catl"))
+            .unwrap();
+
+        let report = store
+            .cleanup_orphan_entities_for_rejected_plan(rejected_id)
+            .unwrap();
+
+        assert_eq!(report.entities_rewired, 1);
+        let surviving = store
+            .get_entity_by_business_id(&EntityId::new("company:catl").unwrap())
+            .unwrap();
+        assert_eq!(
+            surviving.envelope.provenance.source_id,
+            format!("plan:{}#entity_exemplar", older_accepted_id),
+            "rewire tiebreaker must pick the earliest-created accepted claimer"
+        );
+    }
+
+    #[test]
+    fn migration_0022_rewires_pre_existing_claimed_orphans() {
+        // Replay the Sn-98 migration against a synthesised
+        // post-Sn-97 store: a rejected plan with an entity, AND an
+        // accepted plan whose expectations name the same exemplar.
+        // Equivalent to upgrading an installation where Sn-97
+        // already ran and left a re-claimed entity un-rewired.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let rejected_id = Uuid::now_v7();
+        let rejected = plan_row(rejected_id, &["company:legacy_x"], PlanStatus::Rejected);
+        store.insert_research_plan(&rejected).unwrap();
+        let accepted_id = Uuid::now_v7();
+        let accepted = plan_row(accepted_id, &["company:legacy_x"], PlanStatus::Accepted);
+        store.insert_research_plan(&accepted).unwrap();
+
+        store
+            .insert_entity(&entity_for_plan(rejected_id, "company:legacy_x"))
+            .unwrap();
+
+        // Replay the Sn-98 migration. Strip the trailing
+        // schema_migrations INSERT to avoid PK collision (mirror of
+        // 0020's / 0021's test pattern).
+        let sql = crate::migrate::migration_sql(22).expect("0022 migration must exist");
+        let cleanup_only: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().to_lowercase().starts_with("insert into schema_migrations"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch(&cleanup_only).unwrap();
+        drop(conn);
+
+        let surviving = store
+            .get_entity_by_business_id(&EntityId::new("company:legacy_x").unwrap())
+            .unwrap();
+        assert_eq!(
+            surviving.envelope.provenance.source_id,
+            format!("plan:{}#entity_exemplar", accepted_id),
+            "migration 0022 must rewire pre-existing claimed orphans"
+        );
     }
 
     #[test]
@@ -363,10 +520,18 @@ mod tests {
             .insert_entity(&entity_for_plan(plan_id, "company:legacy"))
             .unwrap();
 
-        // Re-run the data-mutating portion of the migration.
+        // Re-run the data-mutating portion of the migration. Strip
+        // the trailing schema_migrations INSERT to avoid PK collision
+        // (store.migrate() above already stamped version 21). Mirror
+        // of the section-2 test's pattern.
         let sql = crate::migrate::migration_sql(21).expect("0021 migration must exist");
+        let cleanup_only: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().to_lowercase().starts_with("insert into schema_migrations"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let conn = store.conn.lock().unwrap();
-        conn.execute_batch(sql).unwrap();
+        conn.execute_batch(&cleanup_only).unwrap();
         drop(conn);
 
         assert!(store

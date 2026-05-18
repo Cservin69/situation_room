@@ -91,6 +91,37 @@ pub fn should_extract_from(mime: &str, body_len: usize) -> bool {
     body_len > 0 && document_synth::is_html_mime(mime)
 }
 
+/// Decide whether to run **Entity** extraction on this Document.
+///
+/// Wider gate than [`should_extract_from`] — accepts HTML *and*
+/// structured-text MIMEs (JSON / CSV / XML / TSV / spreadsheet).
+/// Iterator-bearing recipes against `entity_kind` expectations
+/// commonly hit JSON list endpoints (driver rosters, mine catalogs,
+/// ship registers) which the article-shape relation / event /
+/// observation extractors deliberately ignore.
+///
+/// Why Entity-only:
+///   - **Cost-bounded.** Entity extraction runs only when the plan
+///     declared at least one `entity_kind` (cost short-circuit
+///     inside `extract_and_persist_entities`). Relation / event /
+///     observation extractors stay on the narrow article gate
+///     because their LLM prompts assume prose body shape; feeding
+///     them raw JSON would burn workhorse tokens on
+///     prompt-shape-mismatched calls.
+///   - **Closed-vocab safe.** The widened predicate keys off public
+///     MIME helpers in `document_synth`; no host strings, no
+///     source-id heuristics. Adding a future MIME (e.g. yaml)
+///     means editing one boundary, not five.
+///
+/// Per the Sn-97 handoff Sn-98 candidate #4: this is the
+/// "widen the MIME gate" option.
+pub fn should_extract_entities_from(mime: &str, body_len: usize) -> bool {
+    if body_len == 0 {
+        return false;
+    }
+    document_synth::is_html_mime(mime) || document_synth::is_structured_text_mime(mime)
+}
+
 /// Per-Document extraction entry point. Called by each
 /// `run_X_recipe` in `fetch_executor.rs` immediately after the
 /// Session-69 `insert_fetch_document` call, with the same
@@ -1008,7 +1039,13 @@ pub async fn extract_and_persist_entities(
     let mut report = ExtractionReport::default();
 
     let mime = response_content_type.map(normalise_mime).unwrap_or_default();
-    if !should_extract_from(&mime, bytes.len()) {
+    // Sn-98 candidate #4: Entity extraction uses the WIDER gate
+    // (`should_extract_entities_from`) so iterator-bearing recipes
+    // against JSON / CSV / XML list endpoints also feed the per-Doc
+    // Entity extractor. The four sibling extractors (relation /
+    // event / observation / entity-attribute) stay on the article
+    // gate; only Entity opens up to structured-text bodies.
+    if !should_extract_entities_from(&mime, bytes.len()) {
         return report;
     }
 
@@ -1240,6 +1277,76 @@ mod tests {
         // `document_synth::body_preview`. Skip extraction even when
         // the MIME claims HTML — there's nothing to read.
         assert!(!should_extract_from("text/html", 0));
+    }
+
+    // -------------------------------------------------------------------
+    // Session 98 candidate #4 — wider gate for Entity extractor
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn should_extract_entities_from_accepts_html_like_the_narrow_gate() {
+        // Backwards-compatible with article-shape Documents.
+        assert!(should_extract_entities_from("text/html", 1024));
+        assert!(should_extract_entities_from("text/html; charset=utf-8", 1024));
+        assert!(should_extract_entities_from("application/xhtml+xml", 1024));
+    }
+
+    #[test]
+    fn should_extract_entities_from_accepts_structured_text() {
+        // The Sn-98 widening — iterator-bearing recipes against
+        // JSON / CSV / XML endpoints feed the per-Doc Entity
+        // extractor too.
+        assert!(should_extract_entities_from("application/json", 1024));
+        assert!(should_extract_entities_from("application/json; charset=utf-8", 1024));
+        assert!(should_extract_entities_from("text/csv", 1024));
+        assert!(should_extract_entities_from("text/csv; charset=utf-8", 1024));
+        assert!(should_extract_entities_from("application/xml", 1024));
+        assert!(should_extract_entities_from("text/xml", 1024));
+        assert!(should_extract_entities_from("text/tab-separated-values", 1024));
+        assert!(should_extract_entities_from("application/vnd.ms-excel", 1024));
+    }
+
+    #[test]
+    fn should_extract_entities_from_rejects_binary_and_plain() {
+        // PDF / images / octet-stream produce empty body in
+        // document_synth::body_preview anyway; reject explicitly so
+        // the LLM call never starts. text/plain reaches no useful
+        // entity yield without the LLM finding entities in raw
+        // prose, which Sn-77's relation/event extractors already
+        // do via the article gate — leaving plain off keeps the
+        // entity gate's structural shape (HTML or structured).
+        assert!(!should_extract_entities_from("application/pdf", 1024));
+        assert!(!should_extract_entities_from("image/png", 1024));
+        assert!(!should_extract_entities_from("application/octet-stream", 1024));
+        assert!(!should_extract_entities_from("text/plain", 1024));
+    }
+
+    #[test]
+    fn should_extract_entities_from_rejects_empty_body() {
+        // Empty body short-circuits regardless of MIME — same posture
+        // as the narrow gate.
+        assert!(!should_extract_entities_from("text/html", 0));
+        assert!(!should_extract_entities_from("application/json", 0));
+        assert!(!should_extract_entities_from("text/csv", 0));
+    }
+
+    #[test]
+    fn should_extract_entities_from_is_strictly_wider_than_narrow_gate() {
+        // Defensive invariant: every MIME accepted by the narrow gate
+        // is also accepted by the wider gate. If this ever breaks,
+        // article-kind Documents will stop getting per-Doc Entity
+        // extraction calls — silent regression of Sn-97 Lever A.
+        for mime in [
+            "text/html",
+            "text/html; charset=utf-8",
+            "application/xhtml+xml",
+        ] {
+            assert!(should_extract_from(mime, 1));
+            assert!(
+                should_extract_entities_from(mime, 1),
+                "narrow gate accepts `{mime}` but wider gate does not",
+            );
+        }
     }
 
     #[test]
