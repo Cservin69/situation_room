@@ -1,0 +1,62 @@
+== A1. schema_migrations applied (expect max version = 20 post-Sn-94) ==
+┌─────────────┐
+│ max_applied │
+│    int32    │
+├─────────────┤
+│          20 │
+└─────────────┘
+== B1. record_derived_from rows with parent_type = "unknown" ==
+┌──────────────┐
+│ unknown_rows │
+│    int64     │
+├──────────────┤
+│            0 │
+└──────────────┘
+== B2. record_derived_from rows by parent_type ==
+┌─────────────┬───────┐
+│ parent_type │   n   │
+│   varchar   │ int64 │
+├─────────────┼───────┤
+│ assertion   │    14 │
+└─────────────┴───────┘
+== C1. Sn-78 poison assertion row count ==
+┌─────────────┐
+│ poison_rows │
+│    int64    │
+├─────────────┤
+│           0 │
+└─────────────┘
+== C2. total assertions ==
+┌──────────────────┐
+│ total_assertions │
+│      int64       │
+├──────────────────┤
+│              160 │
+└──────────────────┘
+== D1. last 20 schema_migrations rows ==
+┌─────────┬──────────────────────────────────────────────────────────────────────────────────┬───────────────────────────────┐
+│ version │                                   description                                    │          applied_at           │
+│  int32  │                                     varchar                                      │   timestamp with time zone    │
+├─────────┼──────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────┤
+│      20 │ ADR 0024: parent_type backfill + Sn-78 poison cleanup                            │ 2026-05-18 07:42:31.288024+02 │
+│      19 │ authority_registry table                                                         │ 2026-05-17 07:55:06.176421+02 │
+│      18 │ provenance selector_path + raw_bytes_excerpt columns                             │ 2026-05-16 16:04:05.72958+02  │
+│      17 │ promote_history table                                                            │ 2026-05-16 16:04:05.713924+02 │
+│      16 │ fetch_run_outcomes table                                                         │ 2026-05-11 11:46:10.001636+02 │
+│      15 │ recipes.iterator column (ADR 0016)                                               │ 2026-05-11 11:46:09.99686+02  │
+│      14 │ recipe_fetch_attempts.response_content_type column                               │ 2026-05-11 11:46:09.994936+02 │
+│      13 │ recipe_fetch_attempts table                                                      │ 2026-05-11 11:46:09.993012+02 │
+│      12 │ recipes.reauthor_reason column                                                   │ 2026-05-11 11:46:09.989306+02 │
+│      11 │ recipes.prior_recipe_id column                                                   │ 2026-05-11 11:46:09.987459+02 │
+│      10 │ recipes.authored_from column                                                     │ 2026-05-11 11:46:09.985508+02 │
+│       9 │ recipe_feedback table                                                            │ 2026-05-11 11:46:09.983325+02 │
+│       8 │ recipes.static_payload column                                                    │ 2026-05-11 11:46:09.980538+02 │
+│       7 │ research_plans: rejection_reason and reclassified_from columns                   │ 2026-05-11 11:46:09.978517+02 │
+│       6 │ fetch_runs table                                                                 │ 2026-05-11 11:46:09.97414+02  │
+│       5 │ research_plans.status column                                                     │ 2026-05-11 11:46:09.971009+02 │
+│       4 │ research_plans table                                                             │ 2026-05-11 11:46:09.966267+02 │
+│       3 │ recipes table                                                                    │ 2026-05-11 11:46:09.961595+02 │
+│       2 │ indexes for dedup, observed_at, entity business keys, junction joins, derivation │ 2026-05-11 11:46:09.956855+02 │
+│       1 │ initial schema: six record tables + subjects + derived-from + retention          │ 2026-05-11 11:46:09.935477+02 │
+└─────────┴──────────────────────────────────────────────────────────────────────────────────┴───────────────────────────────┘
+  20 rows                                                                                                          3 columns

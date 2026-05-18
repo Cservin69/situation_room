@@ -4569,6 +4569,7 @@ async fn run_css_recipe(
         &bytes,
         response_content_type.as_deref(),
         recipe.source_url.as_str(),
+        recipe.iterator.as_ref(),
     ) {
         record_apply_failure_attempt(
             ctx.store,
@@ -4653,8 +4654,25 @@ fn check_index_page(
     bytes: &[u8],
     response_content_type: Option<&str>,
     source_url: &str,
+    iterator: Option<&ExtractionSpec>,
 ) -> Option<String> {
     use crate::index_page_detector::{classify_fetched_bytes, IndexPageSignal};
+    // Session 96 — iterator-bearing recipes are explicitly list-
+    // shaped: the listing IS the target. Sn-93's detector is meant
+    // to short-circuit article-shaped recipes against archive
+    // listings (link-density / prose-floor / `/topic/`-style URL
+    // tokens) so the proposer can re-route into the v1.24 "follow-
+    // the-link" path. Iterator recipes don't have that failure
+    // mode — they already passed Sn-67's coherence repair at
+    // authoring time, which runs the iterator against pre-fetched
+    // bytes and rejects if it matches no elements. Skip the
+    // detector here so apply() can run the iterator over the very
+    // list page the recipe was authored against. The May 18 PBR
+    // regression (316 relations + 8 entities → 0 / 0 vs May 16's
+    // pre-Sn-93 binary) was this conflation.
+    if iterator.is_some() {
+        return None;
+    }
     let mime = response_content_type.unwrap_or("");
     match classify_fetched_bytes(bytes, mime, source_url) {
         IndexPageSignal::Index => Some(format!(
@@ -9742,6 +9760,96 @@ mod tests {
             !second_prompt.contains("see warn-level log above"),
             "pre-Session-49 catch-all reason must not appear in the \
              post-Session-49 prompt; got prompt:\n{second_prompt}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Session 96 — iterator-bearing recipes bypass check_index_page.
+    //
+    // Sn-93 added the apply-time index-page detector (Sn-95 handoff
+    // diagnosed the conflation). Iterator-bearing recipes are
+    // explicitly list-shaped — the listing IS the target, and the
+    // recipe's authoring path already ran the iterator against
+    // pre-fetched bytes via Sn-67's coherence repair. The fix:
+    // `check_index_page` returns None whenever `iterator.is_some()`.
+    // Scalar recipes (iterator=None) keep the existing short-circuit
+    // so the proposer's "follow-the-link" v1.24 path stays live.
+    // -----------------------------------------------------------------
+
+    /// HTML body large enough to pass `BODY_PROSE_FLOOR_CHARS = 400`
+    /// with high anchor density. Combined with a `/topic/` URL token,
+    /// the detector unambiguously scores `Index` — so any
+    /// iterator-skip behaviour change shows up as a None return.
+    fn index_shaped_html_with_topic_url() -> (&'static [u8], &'static str) {
+        // ~600 chars of body text; ~half inside `<a>` tags. The
+        // `/topic/` URL token alone trips `url_token_signal`, so this
+        // test stays robust even if the link-density math shifts.
+        let bytes = concat!(
+            "<html><body>",
+            "<ul>",
+            "<li><a href=\"/a\">aluminium markets shift sharply this quarter</a></li>",
+            "<li><a href=\"/b\">battery production scales in chile and australia</a></li>",
+            "<li><a href=\"/c\">copper smelters reopen after maintenance windows</a></li>",
+            "<li><a href=\"/d\">demand outlook remains uneven across hemispheres</a></li>",
+            "<li><a href=\"/e\">europe revises mineral strategy framework details</a></li>",
+            "<li><a href=\"/f\">forecasts diverge as supply chains realign globally</a></li>",
+            "</ul>",
+            "<p>Browse the latest topic listings and read deeper analysis on each entry. ",
+            "Topic pages collect headline links and surface the most recent stories. ",
+            "Use the navigation above to filter by region and material category.</p>",
+            "</body></html>",
+        )
+        .as_bytes();
+        let url = "https://news.example/topic/metals";
+        (bytes, url)
+    }
+
+    /// Iterator-bearing recipes must bypass the detector — the
+    /// listing IS the target.
+    #[test]
+    fn iterator_some_skips_detector() {
+        let (bytes, url) = index_shaped_html_with_topic_url();
+        let iterator = ExtractionSpec::CssSelect {
+            selector: "ul > li".into(),
+            attribute: None,
+        };
+        let signal = check_index_page(
+            bytes,
+            Some("text/html"),
+            url,
+            Some(&iterator),
+        );
+        assert!(
+            signal.is_none(),
+            "iterator-bearing recipe against an index-shaped page \
+             must skip check_index_page (Sn-96): the listing IS the \
+             target. Got: {signal:?}"
+        );
+    }
+
+    /// Scalar recipes (iterator=None) must keep tripping the
+    /// detector on the same bytes — preserves Sn-93's intended
+    /// short-circuit for article-shaped recipes against archive
+    /// listings, which routes the proposer into v1.24's
+    /// follow-the-link path.
+    #[test]
+    fn iterator_none_still_short_circuits_on_index_url() {
+        let (bytes, url) = index_shaped_html_with_topic_url();
+        let signal = check_index_page(
+            bytes,
+            Some("text/html"),
+            url,
+            None,
+        );
+        let message = signal.expect(
+            "scalar recipe against /topic/ URL must short-circuit \
+             (Sn-93 behaviour preserved post-Sn-96)",
+        );
+        assert!(
+            message.contains("index_page_detected"),
+            "short-circuit message must carry the stable \
+             `index_page_detected` token the proposer's v1.24 \
+             prior-attempts section reads verbatim; got: {message}"
         );
     }
 }
