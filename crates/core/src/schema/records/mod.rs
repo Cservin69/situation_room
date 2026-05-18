@@ -271,6 +271,7 @@ mod tests {
         promoted_env.provenance.derived_from.push(
             crate::schema::envelope::DerivedFrom {
                 record_id: assertion.id,
+                record_type: RecordType::Assertion,
                 role: crate::schema::envelope::DerivationRole::Promotion,
             },
         );

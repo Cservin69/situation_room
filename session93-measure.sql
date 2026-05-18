@@ -71,7 +71,7 @@ WITH triple_universe AS (
 ),
 per_plan AS (
   SELECT rp.id AS plan_id,
-         json_extract_string(rp.plan_json, '$.topic') AS topic,
+         rp.topic AS topic,
          rel_kind, rel_from, rel_to,
          COUNT(DISTINCT claimant) AS n_distinct_claimants
   FROM triple_universe t
@@ -179,7 +179,7 @@ ORDER BY n DESC;
 -- E. Article-kind Document count per plan — pre-trigger cost preview
 -- for the re-extract pass. Matches Sn-92 E1 numerically.
 SELECT '== E1. article-kind document count per plan (re-extract cost preview) ==' AS section;
-SELECT json_extract_string(rp.plan_json, '$.topic')        AS topic,
+SELECT rp.topic        AS topic,
        COUNT(*)                                            AS article_docs,
        CAST(AVG(LENGTH(d.body)) AS INTEGER)                AS avg_body_chars,
        MAX(LENGTH(d.body))                                 AS max_body_chars,
@@ -190,7 +190,7 @@ JOIN research_plans rp ON EXISTS (
   WHERE r.plan_id = rp.id
     AND d.source_id LIKE '%#recipe:' || r.id || '@%'
 )
-WHERE d.kind = 'article'
+WHERE d.doc_kind = 'article'
   AND LENGTH(d.body) > 0
 GROUP BY topic, plan_id
 ORDER BY article_docs DESC
@@ -205,7 +205,7 @@ SELECT '== F1. per source_id: assertion count + most-recent document presence ==
 WITH src_docs AS (
   SELECT source_id, MAX(observed_at) AS latest_doc_at, COUNT(*) AS n_docs
   FROM documents
-  WHERE kind = 'article'
+  WHERE doc_kind = 'article'
     AND LENGTH(body) > 0
   GROUP BY source_id
 ),
@@ -233,12 +233,16 @@ LIMIT 40;
 -- the LLM-schema layer first.
 SELECT '== G1. relation predicate vocab drift (kind NOT in plan.relation_kinds) ==' AS section;
 WITH plan_predicates AS (
+  -- `expectations` is a JSON column on research_plans (Sn-04+); the
+  -- relation_kinds[].kind subset is what the closed-vocab gate
+  -- checks against. Unnest the array so each declared kind becomes
+  -- a row joinable on plan_id.
   SELECT rp.id AS plan_id,
          unnest(
-           json_extract(rp.plan_json, '$.expectations.relation_kinds[*].kind')
+           json_extract(rp.expectations, '$.relation_kinds[*].kind')
          ) AS declared_kind
   FROM research_plans rp
-  WHERE json_extract(rp.plan_json, '$.expectations.relation_kinds') IS NOT NULL
+  WHERE json_extract(rp.expectations, '$.relation_kinds') IS NOT NULL
 ),
 plan_recipe AS (
   SELECT r.plan_id, r.id AS recipe_id
@@ -253,7 +257,7 @@ rel_with_plan AS (
   WHERE a.content_kind = 'relation'
 )
 SELECT rwp.plan_id,
-       json_extract_string(rp.plan_json, '$.topic')   AS topic,
+       rp.topic   AS topic,
        rwp.rel_kind                                   AS unexpected_kind,
        COUNT(*)                                       AS n_assertions
 FROM rel_with_plan rwp

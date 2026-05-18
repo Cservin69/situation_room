@@ -345,7 +345,7 @@ mod tests {
 
     fn db_row(source_id: &str, quorum: Option<u32>) -> AuthorityRegistryRow {
         AuthorityRegistryRow {
-            id: Uuid::new_v4(),
+            id: Uuid::now_v7(),
             source_id: source_id.into(),
             metric: None,
             topic: None,

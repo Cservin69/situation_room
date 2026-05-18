@@ -294,8 +294,13 @@ impl AuthorityEntry {
     /// to convert default seed entries into storage rows before
     /// calling `Store::seed_if_empty`.
     pub fn to_seed_row(&self, provenance: AuthorityProvenance) -> AuthorityRegistryRow {
+        // ADR 0024 sibling — match the project-wide UUIDv7 convention
+        // (migration 0001 header: "UUIDv7 primary keys, chronologically
+        // orderable"). Sn-94 swapped four `Uuid::new_v4()` call sites
+        // in the authority-registry path to `Uuid::now_v7()` for
+        // consistency with the other 360+ v7 sites in the codebase.
         AuthorityRegistryRow {
-            id: Uuid::new_v4(),
+            id: Uuid::now_v7(),
             source_id: self.source_id.clone(),
             metric: self.metric.clone(),
             topic: self.topic.clone(),
@@ -1232,7 +1237,7 @@ consensus_quorom = 2
         // From<AuthorityRegistryRow> for AuthorityEntry — runtime
         // shape doesn't carry id, provenance, or timestamps.
         let row = AuthorityRegistryRow {
-            id: Uuid::new_v4(),
+            id: Uuid::now_v7(),
             source_id: "agency:document".into(),
             metric: Some("legal_name".into()),
             topic: None,

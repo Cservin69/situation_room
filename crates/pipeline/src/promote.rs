@@ -83,7 +83,7 @@ use situation_room_core::schema::content::{
     AssertedContent, EntityAttributeContent, EventContent, ObservationContent, RelationContent,
 };
 use situation_room_core::schema::envelope::{DerivationRole, DerivedFrom, Envelope, Provenance};
-use situation_room_core::schema::records::{Assertion, Event, Observation, Relation};
+use situation_room_core::schema::records::{Assertion, Event, Observation, Relation, RecordType};
 use situation_room_core::vocab::Confidence;
 use situation_room_storage::Store;
 use std::collections::{BTreeMap, BTreeSet};
@@ -306,6 +306,7 @@ fn promote_consensus_from_assertions_with_report(
             .iter()
             .map(|a| DerivedFrom {
                 record_id: a.id,
+                record_type: RecordType::Assertion,
                 role: DerivationRole::ConsensusSupport,
             })
             .collect();
@@ -509,6 +510,7 @@ fn promote_authoritative_pass(
         );
         let supports = vec![DerivedFrom {
             record_id: a.id,
+            record_type: RecordType::Assertion,
             role: DerivationRole::Promotion,
         }];
         let confidence = a.envelope.confidence;
@@ -1318,6 +1320,7 @@ mod tests {
             .iter()
             .map(|a| DerivedFrom {
                 record_id: a.id,
+                record_type: RecordType::Assertion,
                 role: DerivationRole::ConsensusSupport,
             })
             .collect();
@@ -1377,6 +1380,7 @@ mod tests {
         );
         let supports = vec![DerivedFrom {
             record_id: a.id,
+            record_type: RecordType::Assertion,
             role: DerivationRole::ConsensusSupport,
         }];
         let inner = match &content {
@@ -1572,6 +1576,7 @@ mod tests {
         let plan = plan();
         let supports = vec![DerivedFrom {
             record_id: Uuid::now_v7(),
+            record_type: RecordType::Assertion,
             role: DerivationRole::Promotion,
         }];
         let representative = obs_assertion("agency:usgs_mcs", 142_000.0, 0.9);

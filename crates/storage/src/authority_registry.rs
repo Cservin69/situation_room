@@ -172,12 +172,16 @@ impl Store {
                 .map_err(StorageError::DuckDb)?;
             }
             None => {
+                // ADR 0024 sibling — match the project-wide UUIDv7
+                // convention (migration 0001 header). Sn-94 swap of
+                // four `Uuid::new_v4()` sites in the authority-registry
+                // path.
                 tx.execute(
                     "INSERT INTO authority_registry
                        (id, source_id, metric, topic, consensus_quorum, provenance)
                      VALUES (?, ?, ?, ?, ?, ?)",
                     params![
-                        Uuid::new_v4(),
+                        Uuid::now_v7(),
                         source_id,
                         metric,
                         topic,
@@ -388,7 +392,7 @@ mod tests {
 
     fn seed_row(source_id: &str, consensus_quorum: Option<u32>) -> AuthorityRegistryRow {
         AuthorityRegistryRow {
-            id: Uuid::new_v4(),
+            id: Uuid::now_v7(),
             source_id: source_id.into(),
             metric: None,
             topic: None,
@@ -479,10 +483,12 @@ mod tests {
     #[test]
     fn seed_if_empty_preserves_row_uuids_and_provenance() {
         // Each row in the slice carries its own UUID and provenance
-        // stamp. The boot path uses fresh `Uuid::new_v4()` + TomlSeed,
-        // but other callers (operator-driven hot reseed, in some future
-        // session) may want Operator-provenance rows. The method must
-        // honour both fields verbatim.
+        // stamp. The boot path uses fresh `Uuid::now_v7()` + TomlSeed
+        // (Sn-94 ADR 0024 sibling change — was v4, swapped for project-
+        // wide UUIDv7 consistency), but other callers (operator-driven
+        // hot reseed, in some future session) may want Operator-
+        // provenance rows. The method must honour both fields
+        // verbatim.
         let store = fresh_store();
         let row = AuthorityRegistryRow {
             id: Uuid::nil(), // pinned UUID for round-trip check

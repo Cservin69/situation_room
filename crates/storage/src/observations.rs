@@ -156,6 +156,7 @@ mod tests {
     use situation_room_core::schema::envelope::{
         DerivationRole, DerivedFrom, Envelope, PlaceRef, Provenance, Subjects,
     };
+    use situation_room_core::schema::records::RecordType;
     use situation_room_core::vocab::{Confidence, CountryCode, EntityId, Topic, Unit};
 
     fn sample_observation() -> Observation {
@@ -234,6 +235,7 @@ mod tests {
         let parent_id = uuid::Uuid::now_v7();
         obs.envelope.provenance.derived_from.push(DerivedFrom {
             record_id: parent_id,
+            record_type: RecordType::Assertion,
             role: DerivationRole::Promotion,
         });
 
@@ -246,6 +248,70 @@ mod tests {
             back.envelope.provenance.derived_from[0].role,
             DerivationRole::Promotion
         );
+        // ADR 0024: record_type now round-trips through the storage
+        // layer instead of being stamped as the legacy "unknown".
+        assert_eq!(
+            back.envelope.provenance.derived_from[0].record_type,
+            RecordType::Assertion
+        );
+    }
+
+    /// ADR 0024 — verifies `parent_type` round-trips for a non-Assertion
+    /// parent (the default fallback case). An Observation derived from
+    /// another Observation (e.g. an aggregation) is rare today but the
+    /// column must carry the non-default value verbatim.
+    #[test]
+    fn observation_derived_from_non_assertion_round_trips() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let mut obs = sample_observation();
+        let parent_id = uuid::Uuid::now_v7();
+        obs.envelope.provenance.derived_from.push(DerivedFrom {
+            record_id: parent_id,
+            record_type: RecordType::Event,
+            role: DerivationRole::Aggregation,
+        });
+        store.insert_observation(&obs).unwrap();
+
+        let back = store.get_observation(obs.id).unwrap();
+        assert_eq!(
+            back.envelope.provenance.derived_from[0].record_type,
+            RecordType::Event,
+            "parent_type must round-trip verbatim — the legacy 'unknown' \
+             default would have collapsed Event to Assertion on read"
+        );
+    }
+
+    /// ADR 0024 — directly verify the storage column carries the
+    /// closed-vocab tag, not the legacy `"unknown"` literal. This
+    /// guards against the writer regressing to the pre-ADR shape.
+    #[test]
+    fn insert_subjects_and_derivation_stamps_real_parent_type() {
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let mut obs = sample_observation();
+        let parent_id = uuid::Uuid::now_v7();
+        obs.envelope.provenance.derived_from.push(DerivedFrom {
+            record_id: parent_id,
+            record_type: RecordType::Document,
+            role: DerivationRole::Extraction,
+        });
+        store.insert_observation(&obs).unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        let parent_type: String = conn
+            .query_row(
+                "SELECT parent_type FROM record_derived_from
+                  WHERE child_id = ? AND parent_id = ?",
+                duckdb::params![obs.id, parent_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_type, "document",
+            "post-ADR-0024 writer must stamp the closed-vocab tag, \
+             not the pre-Sn-94 'unknown' literal");
     }
 
     #[test]

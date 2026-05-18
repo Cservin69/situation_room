@@ -14,6 +14,7 @@ use duckdb::{params, Connection, Transaction};
 use situation_room_core::schema::envelope::{
     DerivationRole, DerivedFrom, Envelope, PlaceRef, Provenance, Subjects, TimeScope,
 };
+use situation_room_core::schema::records::RecordType;
 use situation_room_core::vocab::{Confidence, EntityId, Topic};
 use uuid::Uuid;
 
@@ -111,6 +112,12 @@ pub(crate) fn insert_subjects_and_derivation(
     }
 
     // Derivation chain
+    //
+    // ADR 0024 (Sn-94): the `parent_type` column now carries the real
+    // record-type tag from the in-memory `DerivedFrom::record_type`.
+    // Pre-Sn-94 writers stamped the literal `"unknown"`; migration
+    // 0020 rewrites those rows in place by joining the per-table
+    // tables.
     for d in &env.provenance.derived_from {
         let role = serde_json::to_value(d.role)?
             .as_str()
@@ -119,12 +126,59 @@ pub(crate) fn insert_subjects_and_derivation(
         tx.execute(
             "INSERT INTO record_derived_from (child_id, child_type, parent_id, parent_type, role)
              VALUES (?, ?, ?, ?, ?)",
-            params![record_id, record_type, d.record_id, "unknown", role],
+            params![record_id, record_type, d.record_id, d.record_type.as_str(), role],
         )
         .map_err(StorageError::DuckDb)?;
     }
 
     Ok(())
+}
+
+/// ADR 0024 (Sn-94): lenient parser for the `record_derived_from
+/// .parent_type` column.
+///
+/// New rows (post-Sn-94) carry the closed-vocab record-type tag —
+/// `"observation"`, `"event"`, …, `"assertion"`. Legacy rows
+/// (pre-ADR-0024) carry the literal `"unknown"` because the writer
+/// had no per-`DerivedFrom` record_type to stamp. Hand-edited rows
+/// could in principle carry anything.
+///
+/// The read path tolerates all three cases:
+///   - A known variant → return it.
+///   - The legacy `"unknown"` → return `Assertion` and warn-log once
+///     per row id. Migration 0020 rewrites these in place; the
+///     fallback exists to keep the read path lenient between
+///     migration boundaries.
+///   - Anything else → return `Assertion` and warn-log loudly. This
+///     should never happen in well-formed stores.
+fn parse_parent_type_lenient(s: &str, parent_id: Uuid) -> RecordType {
+    match s {
+        "observation" => RecordType::Observation,
+        "event" => RecordType::Event,
+        "entity" => RecordType::Entity,
+        "relation" => RecordType::Relation,
+        "document" => RecordType::Document,
+        "assertion" => RecordType::Assertion,
+        "unknown" => {
+            tracing::debug!(
+                parent_id = %parent_id,
+                "record_derived_from.parent_type='unknown' \
+                 (pre-ADR-0024 row); defaulting to Assertion. \
+                 Migration 0020 rewrites these in place."
+            );
+            RecordType::Assertion
+        }
+        other => {
+            tracing::warn!(
+                parent_id = %parent_id,
+                parent_type = %other,
+                "record_derived_from.parent_type is outside the closed vocab; \
+                 defaulting to Assertion. A hand-edit or a corrupted row is \
+                 the only way to reach this branch."
+            );
+            RecordType::Assertion
+        }
+    }
 }
 
 /// Session 93 — counterpart to [`insert_subjects_and_derivation`]:
@@ -259,26 +313,42 @@ pub(crate) fn reconstruct_envelope(
     };
 
     // Derivation chain
+    //
+    // ADR 0024 (Sn-94): we now SELECT `parent_type` alongside
+    // `parent_id` and `role`, and round-trip it into
+    // `DerivedFrom::record_type`. Legacy rows whose `parent_type` is
+    // still the literal `"unknown"` (a database not yet migrated past
+    // 0019, or a hand-edit) fall back to `RecordType::Assertion` —
+    // the dominant historical parent kind for promotion / consensus-
+    // support edges. Migration 0020 backfills those rows in place by
+    // joining each per-table table; the fallback here exists to keep
+    // the read path lenient between migration boundaries.
     let derived_from: Vec<DerivedFrom> = {
         let mut stmt = conn
             .prepare(
-                "SELECT parent_id, role FROM record_derived_from
+                "SELECT parent_id, parent_type, role FROM record_derived_from
                  WHERE child_id = ?",
             )
             .map_err(StorageError::DuckDb)?;
         let rows = stmt
             .query_map(params![record_id], |r| {
-                Ok((r.get::<_, Uuid>(0)?, r.get::<_, String>(1)?))
+                Ok((
+                    r.get::<_, Uuid>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
             })
             .map_err(StorageError::DuckDb)?;
         let mut out = Vec::new();
         for r in rows {
-            let (pid, role_s) = r.map_err(StorageError::DuckDb)?;
+            let (pid, parent_type_s, role_s) = r.map_err(StorageError::DuckDb)?;
             let role: DerivationRole =
                 serde_json::from_value(serde_json::Value::String(role_s))
                     .map_err(StorageError::Serde)?;
+            let record_type = parse_parent_type_lenient(&parent_type_s, pid);
             out.push(DerivedFrom {
                 record_id: pid,
+                record_type,
                 role,
             });
         }

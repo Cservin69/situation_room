@@ -16,6 +16,7 @@
 //! of whether it's rendering an Observation or an Assertion.
 
 use crate::schema::geometry::{Geometry, Position};
+use crate::schema::records::RecordType;
 use crate::vocab::{Confidence, CountryCode, EntityId, Topic};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -306,13 +307,41 @@ pub struct Provenance {
 pub const RAW_BYTES_EXCERPT_CAP: usize = 256;
 
 /// A link from a derived record back to an input record.
+///
+/// ADR 0024 (Session 94): `record_type` was added so the
+/// `record_derived_from.parent_type` storage column carries the real
+/// per-table tag instead of the legacy `"unknown"` literal. Legacy
+/// JSON without the field deserializes via [`default_legacy_record_type`]
+/// — Assertion, the dominant historical parent kind for promotion /
+/// consensus-support edges.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DerivedFrom {
     /// The input record's UUID.
     pub record_id: uuid::Uuid,
 
+    /// The input record's type — which per-table table holds the row
+    /// pointed at by `record_id`. Closed-vocabulary (ADR 0003);
+    /// callers must use the matching [`RecordType`] variant.
+    ///
+    /// ADR 0024 added this field. JSON serialized before that ADR
+    /// landed (or test fixtures that elide it) deserialize via the
+    /// serde default below.
+    #[serde(default = "default_legacy_record_type")]
+    pub record_type: RecordType,
+
     /// How did this input contribute?
     pub role: DerivationRole,
+}
+
+/// Serde default for [`DerivedFrom::record_type`]. Returns
+/// [`RecordType::Assertion`] — every pre-ADR-0024 writer of
+/// `derived_from` edges in the codebase points at an Assertion parent
+/// (promotion, consensus-support). The migration backfill
+/// (`migrations/0020_*.sql`) resolves the real type per-row by joining
+/// against each per-record table; this default only fires for legacy
+/// in-memory JSON that the migration never sees.
+fn default_legacy_record_type() -> RecordType {
+    RecordType::Assertion
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -504,9 +533,41 @@ mod tests {
         p.source_id = "derived".into();
         p.derived_from.push(DerivedFrom {
             record_id: uuid::Uuid::nil(),
+            record_type: RecordType::Assertion,
             role: DerivationRole::Promotion,
         });
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("promotion"));
+        assert!(json.contains("\"record_type\":\"assertion\""));
+    }
+
+    /// ADR 0024 — legacy JSON without `record_type` deserializes via
+    /// the serde default (Assertion). Without this the v1 wire shape
+    /// (DerivedFrom with only `record_id` + `role`) would fail to
+    /// load, breaking any read of pre-Sn-94 Provenance JSON.
+    #[test]
+    fn derived_from_legacy_json_without_record_type_defaults_to_assertion() {
+        let legacy = serde_json::json!({
+            "record_id": "00000000-0000-0000-0000-000000000000",
+            "role": "promotion"
+        });
+        let back: DerivedFrom = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.record_type, RecordType::Assertion);
+        assert_eq!(back.role, DerivationRole::Promotion);
+    }
+
+    /// ADR 0024 — round-trip preserves an explicit non-default
+    /// `record_type` (e.g. an Observation derived from an Event).
+    #[test]
+    fn derived_from_with_explicit_record_type_round_trips() {
+        let df = DerivedFrom {
+            record_id: uuid::Uuid::nil(),
+            record_type: RecordType::Event,
+            role: DerivationRole::Extraction,
+        };
+        let json = serde_json::to_string(&df).unwrap();
+        let back: DerivedFrom = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.record_type, RecordType::Event);
+        assert_eq!(back.role, DerivationRole::Extraction);
     }
 }

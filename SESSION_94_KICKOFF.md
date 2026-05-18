@@ -189,4 +189,112 @@ After Sn-94 (and Sn-95 if split):
   (sanity check that Lever B's prompt change didn't break the
   decline-rate observation that motivated the original block).
 
-End of kickoff.
+---
+
+## Sn-93 carryover (appended end-of-Sn-93)
+
+Sn-93 bundled 5 candidates (Sn-92's 1+3+4+5 + rel-noise sub-item).
+All code landed and verified at unit-test + build + frontend layer
+(verify-runbook Stages 1-3 green). What's outstanding:
+
+### ADR 0023 still Proposed — Stage 4 verdict was bogus
+
+`session93-verify.sh` Stage 4 ran end-to-end on the PBR plan but
+the AFTER snapshot tried to read `situation_room.duckdb` while the
+desktop binary still held the write lock. The script's [a][b][c][d]
+verdict was computed against an empty POST file. The actual UI
+clicks (re-extract + promote on PBR) probably did write rows; we
+can't see them.
+
+Fix already shipped: Stage 4 now (a) warns the operator to Cmd-Q
+the desktop before pressing y, (b) detects the
+`Could not set lock on file` error in the AFTER snapshot and bails
+with a clear message rather than running the verdict math.
+
+To close: open desktop → click re-extract/cull/promote → Cmd-Q
+desktop → re-run `bash session93-verify.sh`, press y at the BEFORE→
+AFTER prompt. If [a]+[b] hold, flip ADR 0023 line 3
+(`Proposed (…)` → `Accepted (Sn-93 Stage 4 verified live …)`) and
+add memory entry `project_sr_session_93_adr0023_verified`.
+
+This is independent of Lever A/B work. Sn-94 can land it as a
+side-quest in 10 minutes or defer to Sn-95.
+
+### Sn-93 modules Lever A should copy
+
+The two levers in this kickoff have direct Sn-93 precedents to
+inherit verbatim:
+
+- **`crates/pipeline/src/reextract.rs::reextract_relations_for_document`** —
+  per-Document narrower of the per-plan path. Lever A's
+  `reextract_entities_for_document` (or `_for_plan`) should be a
+  literal sibling: same source_id parsing, same recipe lookup,
+  same shape `ReextractReport`. Wire pattern shipped end-to-end:
+  Tauri command + IPC wrapper + DocumentDrawer header button +
+  RecordsDashboard toast. Lever A inherits the button shape too —
+  one re-extract control per per-Document extractor adds clutter;
+  the operator-facing affordance might be a single
+  "re-extract all" button that fans out across the per-Doc quartet
+  (and Lever A's new quintet member). UX decision at kickoff.
+
+- **`crates/pipeline/src/relation_vocab.rs::filter_drafts_against_plan`** —
+  defense-in-depth closed-vocab predicate gate. Lever A wants the
+  exact same shape over `plan.expectations.entity_kinds[].kind`:
+  drop drafts whose `kind` isn't in the declared list, warn-log the
+  drop count + sample. Lever A's `entity_vocab` would mirror
+  `relation_vocab` line-for-line; same `PredicateFilterReport`
+  shape (rename to `EntityKindFilterReport`); same place to wire
+  (after the LLM call, before persistence).
+
+- **`crates/pipeline/src/cull.rs`** — the boilerplate-Assertion
+  cleanup pass demonstrates the read-only-preview + destructive-
+  confirm UI pattern. Lever A doesn't need a cull pass on day one
+  (no false-positive Entity rows yet), but the two-step affordance
+  is the right shape for any future "remove Entities whose source
+  Document scored Index" pass once Lever A's per-Document path is
+  live.
+
+### Sn-93 candidates that didn't fit, deferred to Sn-94+
+
+These came out of Sn-93's handoff and stay open. Not blockers for
+Lever A/B but worth a beat at kickoff:
+
+1. **Index-page detector dashboard chip** — surface the per-fetch
+   `IndexPageSignal` on the Documents KindCard so the operator can
+   tune the link-density / prose-floor thresholds against live
+   traffic. Small frontend change once the wire field exists.
+
+2. **Apply the index-page detector to the other three extractors.**
+   `run_css_recipe` calls the detector pre-apply; the Event /
+   Observation / EntityAttribute extractors all face the same
+   "index page has no prose to extract" failure shape. Pipe the
+   detector into all three the same way.
+
+3. **Follow-the-link iterator (`FollowLinks { selector, max }`)** —
+   ADR 0019 amendment territory. Sn-93's v1.24 prompt teaches
+   "one re-author = one followed link"; iterator extension would
+   let one recipe fan out to N article URLs per apply pass.
+   Direct overlap with Lever B's iterator-recipe work — both
+   amend ADR 0019. Bundle them if Sn-94 takes Lever B.
+
+### Verify-runbook lessons learned (worth the 10 LOC for Sn-94's runbook)
+
+Sn-93's verify-runbook iteration produced four reusable patterns
+the Sn-94 runbook should inherit on day one:
+
+- **bash 3.2 compat throughout** — macOS ships bash 3.2; no
+  `declare -A`, no `${var,,}`. Use plain scalars + `tr`.
+- **Per-filter zero-tests guard** — when `cargo test <filter>`
+  returns 0 passes, fail loudly with a "did you rsync? did you
+  cargo clean?" diagnostic. Auto-check that the new module files
+  exist in the cargo repo and that lib.rs declares them.
+- **Stage 3 `npm test` check before invoke** — `apps/desktop`
+  doesn't define a `test` script today. Probe `npm pkg get
+  scripts.test` before invoking; skip cleanly if absent.
+- **DuckDB lock-held detection** — AFTER-snapshot ALWAYS prompts
+  to Cmd-Q the desktop first; grep the snapshot output for
+  `Could not set lock on file` and bail with a clean message
+  if it slipped through. The verdict math is worthless against
+  a half-read file.
+
+End of Sn-93 carryover. End of kickoff.
