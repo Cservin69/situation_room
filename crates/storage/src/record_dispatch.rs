@@ -8,6 +8,7 @@
 use situation_room_core::Record;
 
 use crate::connection::Store;
+use crate::entities::EntityProvenanceTier;
 use crate::Result;
 
 impl Store {
@@ -21,11 +22,22 @@ impl Store {
             // Session 97 Lever B — recipe-emitted Entity rows arrive
             // through this dispatch and re-collide on every refetch
             // (iterator-bearing recipes against entity_kind expectations
-            // re-emit the same entity_ids). `upsert_entity` swallows
-            // the UNIQUE-entity_id conflict the same way Sn-76's
-            // `entity_synth` does; plan-accept-time exemplars and
-            // recipe-time rows converge on idempotent write semantics.
-            Record::Entity(r) => self.upsert_entity(r),
+            // re-emit the same entity_ids). `upsert_entity_with_tier`
+            // swallows the UNIQUE-entity_id conflict the same way
+            // Sn-76's `entity_synth` does; plan-accept-time exemplars
+            // and recipe-time rows converge on idempotent write
+            // semantics.
+            //
+            // Session 99 #5 — pass [`EntityProvenanceTier::RecipeIterator`]
+            // explicitly rather than relying on the recipe-apply default
+            // `license = "unknown"` to derive it. `Record::Entity`
+            // through this dispatcher is always recipe-emitted (Lever B);
+            // pinning the tier at the dispatch site keeps the
+            // closed-vocab signal structural even if a future recipe
+            // path stamps a different license string.
+            Record::Entity(r) => {
+                self.upsert_entity_with_tier(r, EntityProvenanceTier::RecipeIterator)
+            }
             Record::Relation(r) => self.insert_relation(r),
             Record::Document(r) => self.insert_document(r),
             Record::Assertion(r) => self.insert_assertion(r),

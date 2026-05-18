@@ -400,6 +400,12 @@ fn main() -> Result<()> {
     // posture).
     state.hydrate_promote_history();
 
+    // Sn-100 #3 — replay persisted entity_refresh_history rows into
+    // the Store's in-memory ring buffer (migration 0023). Same
+    // posture as `hydrate_promote_history`: empty on first boot,
+    // populated on subsequent boots; non-fatal on storage failure.
+    state.store.hydrate_entity_refresh_log();
+
     // --- Tauri -------------------------------------------------------
     //
     // The capabilities file (`capabilities/default.json`) explicitly
@@ -494,6 +500,13 @@ fn main() -> Result<()> {
             // renders a CostTimelinePanel so cost spikes are visible
             // without grepping the INFO log.
             situation_room_api::commands::llm_cost_timeline,
+            // Session 99 #4 — entity-refresh-event ring buffer. Sibling
+            // to llm_cost_timeline: surfaces when Lever A's
+            // LLM-extracted prose name replaced a classifier slug (or
+            // any other tier elevation in `Store::upsert_entity_with_tier`).
+            // Operator-visible signal that Sn-98 #5's silent refresh
+            // path actually fired, without grepping the INFO log.
+            situation_room_api::commands::entity_refresh_log,
             // Session 77 — surfaces the classifier prompt version
             // currently loaded in the binary. Drives the per-plan
             // "re-classify under newer prompt" banner: the frontend

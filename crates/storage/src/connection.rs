@@ -19,9 +19,11 @@
 //! connection to DuckDB's in-memory mode with the same schema applied.
 
 use duckdb::Connection;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::entity_refresh_log::EntityRefreshEvent;
 use crate::{Result, StorageError};
 
 /// A handle to the situation_room DuckDB store.
@@ -29,8 +31,21 @@ use crate::{Result, StorageError};
 /// Clonable via `Arc<Store>` at the application layer; we don't derive
 /// `Clone` on `Store` itself because the underlying connection is not
 /// cheap to duplicate.
+///
+/// Session 99 — `Store` also owns the in-memory
+/// [`crate::entity_refresh_log::EntityRefreshEvent`] ring buffer. It
+/// lives here (not in the api crate alongside `CostLedger`) because
+/// the only writer is `Store::upsert_entity_with_tier`, and keeping
+/// the buffer adjacent to the mutation site avoids plumbing a log
+/// handle through every Entity-emitting call site.
 pub struct Store {
     pub(crate) conn: Mutex<Connection>,
+    /// Session 99 — in-memory ring buffer of recent in-place refresh
+    /// events on the `entities` table. Capped at
+    /// [`crate::entity_refresh_log::ENTITY_REFRESH_LOG_CAP`]. Reads
+    /// via [`Self::entity_refresh_log_snapshot`]; writes are private to
+    /// the entities module.
+    pub(crate) entity_refresh_log: Mutex<VecDeque<EntityRefreshEvent>>,
 }
 
 impl Store {
@@ -40,6 +55,7 @@ impl Store {
         let conn = Connection::open(path).map_err(StorageError::DuckDb)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            entity_refresh_log: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -48,6 +64,7 @@ impl Store {
         let conn = Connection::open_in_memory().map_err(StorageError::DuckDb)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            entity_refresh_log: Mutex::new(VecDeque::new()),
         })
     }
 

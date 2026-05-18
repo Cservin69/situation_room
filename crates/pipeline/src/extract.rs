@@ -52,7 +52,7 @@ use situation_room_llm::{
     extract_observations_from_document, AssertionDraft, EntityAttributeDraft,
     EntityDraft, EventDraft, ExtractionConfig, LlmProvider, ObservationDraft,
 };
-use situation_room_storage::Store;
+use situation_room_storage::{EntityProvenanceTier, Store};
 use tracing::{info, warn};
 
 use crate::document_synth;
@@ -1109,7 +1109,14 @@ pub async fn extract_and_persist_entities(
 
     for draft in drafts {
         let entity = build_extracted_entity(plan, recipe, &draft, fetched_at);
-        match store.upsert_entity(&entity) {
+        // Session 99 #5 — pass DocumentExtracted explicitly. Lever A
+        // is the LLM-extracted prose-name pipeline; pinning the tier
+        // at the call site decouples the refresh decision from the
+        // license string (which still stamps "extracted" for the
+        // audit column).
+        match store
+            .upsert_entity_with_tier(&entity, EntityProvenanceTier::DocumentExtracted)
+        {
             Ok(()) => report.persisted += 1,
             Err(e) => {
                 report.insert_failures += 1;

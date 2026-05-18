@@ -53,7 +53,9 @@ use chrono::{DateTime, Utc};
 use situation_room_core::schema::envelope::{Envelope, Provenance, Subjects};
 use situation_room_core::schema::records::Entity;
 use situation_room_core::vocab::{Confidence, EntityId, Topic};
-use situation_room_storage::{Store, StorageError};
+use situation_room_storage::{
+    entity_tier_from_license, EntityProvenanceTier, Store, StorageError,
+};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -71,8 +73,18 @@ pub struct MaterializationReport {
 
     /// Exemplars that already had an `entities.entity_id` row
     /// (from a prior accept of this plan, or from a different plan
-    /// that named the same actor). No INSERT issued.
+    /// that named the same actor) at a tier equal to or richer than
+    /// SlugHumanised. The upsert is a no-op.
     pub skipped_existing: u32,
+
+    /// Sn-100 #4 — exemplars whose existing row was at a strictly-
+    /// lower tier (today: `RecipeIterator`, from Sn-97 Lever B) and
+    /// got elevated to `SlugHumanised` by this pass. The refresh fires
+    /// an `EntityRefreshEvent` and the row's `kind`/`canonical_name`/
+    /// `license` are updated in place; the row id and entity_id stay
+    /// stable so existing `record_subjects_*` / `record_derived_from`
+    /// joins continue to resolve.
+    pub refreshed: u32,
 
     /// Per-exemplar failures. Each entry is a short human-readable
     /// string `"{entity_id_attempt}: {error}"` so the operator can
@@ -81,10 +93,13 @@ pub struct MaterializationReport {
 }
 
 impl MaterializationReport {
-    /// Total exemplars considered — sum of the three buckets.
+    /// Total exemplars considered — sum of the four buckets.
     /// Useful for logs and tests.
     pub fn total(&self) -> u32 {
-        self.materialized + self.skipped_existing + self.errors.len() as u32
+        self.materialized
+            + self.skipped_existing
+            + self.refreshed
+            + self.errors.len() as u32
     }
 }
 
@@ -128,6 +143,15 @@ pub fn materialize_entity_exemplars(
                         "entity_synth: materialised exemplar"
                     );
                 }
+                Ok(MaterializeOutcome::Refreshed) => {
+                    report.refreshed += 1;
+                    debug!(
+                        plan_id = %plan.id,
+                        entity_id = %exemplar.as_str(),
+                        kind = %kind,
+                        "entity_synth: refreshed exemplar (elevated to SlugHumanised)"
+                    );
+                }
                 Ok(MaterializeOutcome::AlreadyExists) => {
                     report.skipped_existing += 1;
                 }
@@ -148,6 +172,7 @@ pub fn materialize_entity_exemplars(
     info!(
         plan_id = %plan.id,
         materialized = report.materialized,
+        refreshed = report.refreshed,
         skipped_existing = report.skipped_existing,
         errors = report.errors.len(),
         "entity_synth: plan-accept materialisation complete"
@@ -158,13 +183,48 @@ pub fn materialize_entity_exemplars(
 
 /// Per-exemplar outcome inside the materialisation loop.
 enum MaterializeOutcome {
+    /// No prior row for this `entity_id`; the upsert wrote a fresh row.
     Inserted,
+    /// Prior row was at a strictly-lower tier (today only
+    /// `RecipeIterator`); the upsert refreshed it in place to
+    /// `SlugHumanised`.
+    Refreshed,
+    /// Prior row was at `SlugHumanised` or higher tier; the upsert was
+    /// a no-op. Mapped to `skipped_existing` for parity with the
+    /// pre-Sn-100 semantic.
     AlreadyExists,
 }
 
-/// Single-exemplar attempt: existence check, then build + insert.
-/// Split out so the loop body stays scannable and the unit tests
-/// can drive specific outcomes against an in-memory store.
+/// Single-exemplar attempt: snapshot pre-state, build the candidate,
+/// upsert with the explicit `SlugHumanised` tier, derive the outcome
+/// from the pre-state.
+///
+/// ## Sn-100 #4 — migrated to upsert_entity_with_tier
+///
+/// Pre-Sn-100 this function used existence-check-then-insert: existing
+/// rows were never touched, regardless of tier. That left a hole — a
+/// recipe-iterator (Lever B) row written at `RecipeIterator` tier
+/// stayed at that tier even after the operator accepted a plan whose
+/// exemplar names the same entity at a richer (`SlugHumanised`) tier.
+///
+/// Sn-100 #4 closes the hole. The explicit-tier upsert (Sn-99 #5)
+/// already implements the strictly-greater-tier refresh; this call
+/// site now opts in. Behavioural changes:
+///
+///   - **RecipeIterator → SlugHumanised refresh.** A re-accepted plan
+///     whose exemplar names an entity already at `RecipeIterator` tier
+///     elevates it to `SlugHumanised` (humanised slug replaces the
+///     iterator scalar). One `EntityRefreshEvent` fires per refresh.
+///   - **DocumentExtracted untouched.** Lever A's prose name never
+///     gets clobbered by a humanised slug — the upsert's same-or-lower-
+///     tier branch returns a no-op.
+///   - **Same-tier no-op preserved.** Two accepts of the same plan
+///     compute `SlugHumanised <= SlugHumanised`, no change.
+///
+/// The `AlreadyExists` outcome the report counts as `skipped_existing`
+/// is preserved by inspecting the pre-upsert row's tier; the new
+/// `Refreshed` outcome surfaces in the report's `refreshed` bucket so
+/// the operator can see how many entities were elevated by a re-accept.
 fn try_materialize_one(
     plan: &ResearchPlan,
     kind: &str,
@@ -172,19 +232,29 @@ fn try_materialize_one(
     store: &Store,
     accepted_at: DateTime<Utc>,
 ) -> Result<MaterializeOutcome, String> {
-    // Existence check: cheap indexed lookup on the UNIQUE
-    // `entities.entity_id`. If found, we're done.
-    match store.get_entity_by_business_id(entity_id) {
-        Ok(_) => return Ok(MaterializeOutcome::AlreadyExists),
-        Err(StorageError::NotFound(_)) => { /* fall through to insert */ }
+    // Snapshot pre-state. The upsert below internally repeats this
+    // lookup; we duplicate it here so the outcome (Inserted /
+    // Refreshed / AlreadyExists) is observable from this layer
+    // without changing the storage API. The cost is one extra
+    // indexed lookup on the UNIQUE `entities.entity_id`; cheap.
+    let pre_tier = match store.get_entity_by_business_id(entity_id) {
+        Ok(existing) => Some(entity_tier_from_license(
+            &existing.envelope.provenance.license,
+        )),
+        Err(StorageError::NotFound(_)) => None,
         Err(other) => return Err(format!("existence check: {other}")),
-    }
+    };
 
     let entity = build_exemplar_entity(plan, kind, entity_id, accepted_at);
     store
-        .insert_entity(&entity)
-        .map_err(|e| format!("insert: {e}"))?;
-    Ok(MaterializeOutcome::Inserted)
+        .upsert_entity_with_tier(&entity, EntityProvenanceTier::SlugHumanised)
+        .map_err(|e| format!("upsert: {e}"))?;
+
+    Ok(match pre_tier {
+        None => MaterializeOutcome::Inserted,
+        Some(t) if t < EntityProvenanceTier::SlugHumanised => MaterializeOutcome::Refreshed,
+        Some(_) => MaterializeOutcome::AlreadyExists,
+    })
 }
 
 /// Construct one [`Entity`] from `(plan, kind, entity_id, accepted_at)`.
@@ -379,8 +449,9 @@ mod tests {
         let mut r = MaterializationReport::default();
         r.materialized = 3;
         r.skipped_existing = 2;
+        r.refreshed = 1;
         r.errors.push("x: y".into());
-        assert_eq!(r.total(), 6);
+        assert_eq!(r.total(), 7);
     }
 
     #[test]
@@ -463,6 +534,7 @@ mod tests {
         assert!(report.errors.is_empty());
         assert_eq!(report.materialized, 0);
         assert_eq!(report.skipped_existing, 0);
+        assert_eq!(report.refreshed, 0);
         assert_eq!(report.total(), 0);
     }
 
@@ -475,5 +547,184 @@ mod tests {
         let report = materialize_entity_exemplars(&plan, &store, Utc::now());
 
         assert_eq!(report.total(), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Sn-100 #4 — elevate-on-re-accept semantics
+    // -------------------------------------------------------------------
+
+    /// Helper: poke a `RecipeIterator`-tier entity row into the store,
+    /// matching the shape Sn-97 Lever B (`recipe_apply::build_record`)
+    /// emits today. License = `"unknown"` is the closed-vocab signal
+    /// for that tier.
+    fn seed_recipe_iterator_entity(store: &Store, entity_id: &str, name: &str) {
+        let envelope = Envelope {
+            provenance: Provenance {
+                source_id: format!("recipe:lever-b:{entity_id}"),
+                source_url: None,
+                source_published_at: None,
+                license: "unknown".into(),
+                derived_from: vec![],
+                selector_path: None,
+                raw_bytes_excerpt: None,
+            },
+            subjects: Subjects {
+                entities: vec![EntityId::new(entity_id).unwrap()],
+                places: vec![],
+                time: None,
+                topics: vec![],
+            },
+            tags: vec![],
+            valid_at: None,
+            observed_at: Utc::now(),
+            confidence: Confidence::ONE,
+        };
+        let ent = Entity::new(
+            EntityId::new(entity_id).unwrap(),
+            "company",
+            name,
+            envelope,
+        );
+        store.insert_entity(&ent).expect("seed RecipeIterator row");
+    }
+
+    /// Helper: poke a `DocumentExtracted`-tier entity row into the
+    /// store, matching the shape Sn-97 Lever A
+    /// (`extract::build_extracted_entity`) emits. License =
+    /// `"extracted"` is the closed-vocab signal.
+    fn seed_document_extracted_entity(store: &Store, entity_id: &str, name: &str) {
+        let envelope = Envelope {
+            provenance: Provenance {
+                source_id: format!("recipe:lever-a:{entity_id}"),
+                source_url: None,
+                source_published_at: None,
+                license: "extracted".into(),
+                derived_from: vec![],
+                selector_path: None,
+                raw_bytes_excerpt: None,
+            },
+            subjects: Subjects {
+                entities: vec![EntityId::new(entity_id).unwrap()],
+                places: vec![],
+                time: None,
+                topics: vec![],
+            },
+            tags: vec![],
+            valid_at: None,
+            observed_at: Utc::now(),
+            confidence: Confidence::ONE,
+        };
+        let ent = Entity::new(
+            EntityId::new(entity_id).unwrap(),
+            "company",
+            name,
+            envelope,
+        );
+        store.insert_entity(&ent).expect("seed DocumentExtracted row");
+    }
+
+    #[test]
+    fn materialize_refreshes_recipe_iterator_to_slug_humanised() {
+        // Lever B wrote first at RecipeIterator. Plan-accept's
+        // SlugHumanised exemplar must elevate the row in place; the
+        // refresh bucket counts it.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        seed_recipe_iterator_entity(&store, "company:tsla", "tsla-noisy");
+
+        let plan = sample_plan_with_exemplars(&[("company", &["company:tsla"])]);
+        let report = materialize_entity_exemplars(&plan, &store, Utc::now());
+
+        assert_eq!(report.materialized, 0);
+        assert_eq!(report.skipped_existing, 0);
+        assert_eq!(
+            report.refreshed, 1,
+            "RecipeIterator row must elevate to SlugHumanised"
+        );
+
+        // The row's canonical_name + license reflect the refresh.
+        let back = store
+            .get_entity_by_business_id(&EntityId::new("company:tsla").unwrap())
+            .unwrap();
+        assert_eq!(
+            back.canonical_name, "tsla",
+            "SlugHumanised canonical_name wins over the iterator scalar"
+        );
+        assert_eq!(back.envelope.provenance.license, "classifier-emitted");
+
+        // The refresh-log captured exactly one event.
+        let log = store.entity_refresh_log_snapshot();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].entity_id, "company:tsla");
+        assert_eq!(log[0].previous_tier, EntityProvenanceTier::RecipeIterator);
+        assert_eq!(log[0].new_tier, EntityProvenanceTier::SlugHumanised);
+    }
+
+    #[test]
+    fn materialize_does_not_refresh_document_extracted_row() {
+        // Lever A wrote first at DocumentExtracted. Plan-accept's
+        // SlugHumanised exemplar must NOT clobber the prose name. The
+        // outcome falls into `skipped_existing` (same-or-lower-tier
+        // no-op), not `refreshed`.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        seed_document_extracted_entity(&store, "company:tsla", "Tesla, Inc.");
+
+        let plan = sample_plan_with_exemplars(&[("company", &["company:tsla"])]);
+        let report = materialize_entity_exemplars(&plan, &store, Utc::now());
+
+        assert_eq!(report.materialized, 0);
+        assert_eq!(report.refreshed, 0);
+        assert_eq!(
+            report.skipped_existing, 1,
+            "DocumentExtracted row must stay untouched; counted as skipped_existing"
+        );
+
+        let back = store
+            .get_entity_by_business_id(&EntityId::new("company:tsla").unwrap())
+            .unwrap();
+        assert_eq!(
+            back.canonical_name, "Tesla, Inc.",
+            "Lever A prose name must survive a SlugHumanised re-accept"
+        );
+        assert_eq!(back.envelope.provenance.license, "extracted");
+        assert!(store.entity_refresh_log_snapshot().is_empty());
+    }
+
+    #[test]
+    fn materialize_reaccept_at_same_slug_humanised_tier_is_no_op() {
+        // First accept: fresh insert at SlugHumanised. Second accept:
+        // same-tier upsert → no-op, no refresh event.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan = sample_plan_with_exemplars(&[("company", &["company:tsla"])]);
+        let first = materialize_entity_exemplars(&plan, &store, Utc::now());
+        let second = materialize_entity_exemplars(&plan, &store, Utc::now());
+
+        assert_eq!(first.materialized, 1);
+        assert_eq!(first.refreshed, 0);
+        assert_eq!(first.skipped_existing, 0);
+
+        assert_eq!(second.materialized, 0);
+        assert_eq!(second.refreshed, 0);
+        assert_eq!(second.skipped_existing, 1);
+        assert!(
+            store.entity_refresh_log_snapshot().is_empty(),
+            "same-tier re-accept must not push a refresh event"
+        );
+    }
+
+    #[test]
+    fn materialize_inserted_path_does_not_push_refresh_event() {
+        // Fresh insert is the common cold-cache path; the refresh log
+        // must stay empty.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let plan = sample_plan_with_exemplars(&[("company", &["company:newco"])]);
+        let report = materialize_entity_exemplars(&plan, &store, Utc::now());
+        assert_eq!(report.materialized, 1);
+        assert!(store.entity_refresh_log_snapshot().is_empty());
     }
 }

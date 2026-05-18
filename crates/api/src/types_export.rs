@@ -1668,6 +1668,77 @@ impl LlmCostTimelineEntryDto {
 }
 
 // ---------------------------------------------------------------------------
+// EntityRefreshEventDto — Session 99 #4
+// ---------------------------------------------------------------------------
+
+/// Closed-vocabulary wire shape for [`situation_room_storage::EntityProvenanceTier`].
+///
+/// Strings mirror the variant names so the frontend can switch on a
+/// stable token. `Unknown` is included for defence-in-depth: if a
+/// future row's `provenance.license` falls outside the closed three,
+/// the storage layer maps it to `Unknown` and the panel renders it as
+/// a tier transition involving an unknown bucket — better than
+/// hiding the row.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub enum EntityProvenanceTierDto {
+    Unknown,
+    RecipeIterator,
+    SlugHumanised,
+    DocumentExtracted,
+}
+
+impl From<situation_room_storage::EntityProvenanceTier> for EntityProvenanceTierDto {
+    fn from(t: situation_room_storage::EntityProvenanceTier) -> Self {
+        use situation_room_storage::EntityProvenanceTier as T;
+        match t {
+            T::Unknown => EntityProvenanceTierDto::Unknown,
+            T::RecipeIterator => EntityProvenanceTierDto::RecipeIterator,
+            T::SlugHumanised => EntityProvenanceTierDto::SlugHumanised,
+            T::DocumentExtracted => EntityProvenanceTierDto::DocumentExtracted,
+        }
+    }
+}
+
+/// One refresh event from the storage layer's ring buffer (Sn-99 #4).
+/// The `EntityRefreshPanel` renders these as a stack of recent rows
+/// so operators can see when an Entity's canonical_name was elevated
+/// from a placeholder slug to a properly-extracted display name (or
+/// any other tier elevation).
+///
+/// `at` is RFC-3339 (UTC) — same posture as `LlmCostTimelineEntryDto`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/lib/api/types/")]
+pub struct EntityRefreshEventDto {
+    pub at: String,
+    pub entity_id: String,
+    pub previous_canonical_name: String,
+    pub new_canonical_name: String,
+    pub previous_tier: EntityProvenanceTierDto,
+    pub new_tier: EntityProvenanceTierDto,
+    /// `true` iff `previous_canonical_name != new_canonical_name`.
+    /// Pre-computed Rust-side so the frontend doesn't have to do a
+    /// string compare per row at render time.
+    pub name_changed: bool,
+}
+
+impl EntityRefreshEventDto {
+    /// Lift a typed [`situation_room_storage::EntityRefreshEvent`] into wire shape.
+    pub fn from_typed(e: situation_room_storage::EntityRefreshEvent) -> Self {
+        let name_changed = e.name_changed();
+        Self {
+            at: e.at.to_rfc3339(),
+            entity_id: e.entity_id,
+            previous_canonical_name: e.previous_canonical_name,
+            new_canonical_name: e.new_canonical_name,
+            previous_tier: e.previous_tier.into(),
+            new_tier: e.new_tier.into(),
+            name_changed,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session 84 — authoritative-registry dashboard tile wire shapes
 // ---------------------------------------------------------------------------
 

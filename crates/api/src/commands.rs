@@ -2641,6 +2641,32 @@ pub async fn llm_cost_timeline(
 }
 
 // ---------------------------------------------------------------------------
+// Command 17c — entity_refresh_log (Session 99 #4)
+// ---------------------------------------------------------------------------
+
+/// Return the storage layer's in-memory entity-refresh-event ring
+/// buffer (50 newest in-place refreshes on the `entities` table,
+/// oldest-first). Sn-98 #5 added the tier-aware refresh mutation;
+/// Sn-99 #4 surfaces it so the operator can see when a Lever A prose
+/// name replaced a classifier slug (or any other tier elevation)
+/// without grepping logs or diffing two snapshots.
+///
+/// Pure read; no LLM call. The storage layer's
+/// [`situation_room_storage::Store::entity_refresh_log_snapshot`] is
+/// `&self` and clones internally, so this is allocation cost only.
+#[tauri::command]
+pub async fn entity_refresh_log(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<crate::types_export::EntityRefreshEventDto>, CommandError> {
+    Ok(state
+        .store
+        .entity_refresh_log_snapshot()
+        .into_iter()
+        .map(crate::types_export::EntityRefreshEventDto::from_typed)
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // Command 18 — classifier_prompt_version (Session 77)
 // ---------------------------------------------------------------------------
 

@@ -144,6 +144,13 @@ const MIGRATIONS: &[Migration] = &[
             "../../../migrations/0022_sn98_entity_rewire.sql"
         ),
     },
+    Migration {
+        version: 23,
+        description: "Sn-100 #3: entity_refresh_history table",
+        sql: include_str!(
+            "../../../migrations/0023_sn100_entity_refresh_history.sql"
+        ),
+    },
 ];
 
 /// Apply every migration whose version is not yet in
@@ -402,13 +409,13 @@ mod tests {
     /// migration we ship today. Catches an accidental rename of the
     /// migrations array without a corresponding test update.
     #[test]
-    fn migration_sql_lookup_finds_v1_through_v22() {
-        for v in 1..=22 {
+    fn migration_sql_lookup_finds_v1_through_v23() {
+        for v in 1..=23 {
             assert!(
                 migration_sql(v).is_some(),
                 "migration version {v} should be embedded"
             );
         }
-        assert!(migration_sql(23).is_none(), "no v23 yet");
+        assert!(migration_sql(24).is_none(), "no v24 yet");
     }
 }

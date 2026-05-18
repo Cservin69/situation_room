@@ -84,6 +84,7 @@
   import RecordsDashboard from '$components/RecordsDashboard.svelte';
   import CostByTierPanel from '$components/CostByTierPanel.svelte';
   import CostTimelinePanel from '$components/CostTimelinePanel.svelte';
+  import EntityRefreshPanel from '$components/EntityRefreshPanel.svelte';
   import PromoteStatusPanel from '$components/PromoteStatusPanel.svelte';
   import RunFetchButton from '$components/RunFetchButton.svelte';
   import FetchReport from '$components/FetchReport.svelte';
@@ -788,6 +789,13 @@
          coherent. -->
     <CostByTierPanel />
     <CostTimelinePanel />
+    <!-- Session 99 #4 — Entity tier-refresh ring buffer. Sibling tile
+         to the cost panels: surfaces when Sn-98 #5's silent in-place
+         refresh path actually fired (e.g. Lever A replacing a
+         classifier slug with an LLM-extracted prose name). Empty
+         until an Entity row receives a strictly-richer tier upsert
+         this session. -->
+    <EntityRefreshPanel />
     <!-- Session 84 — authoritative-registry + last-promote tile.
          Slots next to the cost panels so the operator sees promote
          status alongside spend status. The component polls on its own

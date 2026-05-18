@@ -17,6 +17,7 @@ pub mod authority_registry;
 pub mod connection;
 pub mod documents;
 pub mod entities;
+pub mod entity_refresh_log;
 pub mod envelope_io;
 pub mod events;
 pub mod fetch_run_outcomes;
@@ -37,6 +38,10 @@ pub mod sources_memory;
 pub use authority_registry::{AuthorityProvenance, AuthorityRegistryRow};
 pub use connection::Store;
 pub use entities::{entity_tier_from_license, EntityProvenanceTier};
+pub use entity_refresh_log::{
+    tier_as_str, tier_from_str, EntityRefreshEvent, ENTITY_REFRESH_LOG_CAP,
+    TIER_STRINGS as ENTITY_REFRESH_TIER_STRINGS,
+};
 pub use orphan_cleanup::OrphanEntityCleanupReport;
 pub use fetch_run_outcomes::{
     ApplyFailureForProposer, FetchRunOutcomeKind, FetchRunOutcomeRow,

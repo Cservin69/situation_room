@@ -29,6 +29,7 @@ import type { HostBackoffSnapshotDto } from './types/HostBackoffSnapshotDto';
 import type { SourcesMemoryEntryDto } from './types/SourcesMemoryEntryDto';
 import type { LlmCostLedgerEntryDto } from './types/LlmCostLedgerEntryDto';
 import type { LlmCostTimelineEntryDto } from './types/LlmCostTimelineEntryDto';
+import type { EntityRefreshEventDto } from './types/EntityRefreshEventDto';
 import type { ClassifierPromptVersionDto } from './types/ClassifierPromptVersionDto';
 import type { PromoteReportDto } from './types/PromoteReportDto';
 import type { AuthorityRegistrySummaryDto } from './types/AuthorityRegistrySummaryDto';
@@ -509,6 +510,20 @@ export async function llmCostLedger(): Promise<LlmCostLedgerEntryDto[]> {
  */
 export async function llmCostTimeline(): Promise<LlmCostTimelineEntryDto[]> {
   return invoke<LlmCostTimelineEntryDto[]>('llm_cost_timeline');
+}
+
+/**
+ * Session 99 #4 — entity-refresh-event ring buffer. Sibling to
+ * `llmCostTimeline`: surfaces the 50 newest in-place refreshes on
+ * the `entities` table so operators can see when Sn-98 #5's silent
+ * refresh path actually fired (e.g. Lever A's LLM-extracted prose
+ * name replacing a classifier slug).
+ *
+ * Pure read; no LLM call. The ring buffer caps at 50 entries
+ * server-side (`ENTITY_REFRESH_LOG_CAP` on the Rust side).
+ */
+export async function entityRefreshLog(): Promise<EntityRefreshEventDto[]> {
+  return invoke<EntityRefreshEventDto[]>('entity_refresh_log');
 }
 
 /**
