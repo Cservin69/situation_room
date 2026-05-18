@@ -112,7 +112,7 @@ impl Store {
               AND NOT EXISTS (
                 SELECT 1 FROM research_plans rp2
                 WHERE rp2.status = 'accepted'
-                  AND rp2.expectations LIKE '%"' || e.entity_id || '"%'
+                  AND CAST(rp2.expectations AS VARCHAR) LIKE '%"' || e.entity_id || '"%'
               )
         "#;
 

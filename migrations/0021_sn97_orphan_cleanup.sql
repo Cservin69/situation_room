@@ -85,7 +85,7 @@ DELETE FROM record_subjects_entities
        AND NOT EXISTS (
          SELECT 1 FROM research_plans rp2
          WHERE rp2.status = 'accepted'
-           AND rp2.expectations LIKE '%"' || e.entity_id || '"%'
+           AND CAST(rp2.expectations AS VARCHAR) LIKE '%"' || e.entity_id || '"%'
        )
    );
 
@@ -100,7 +100,7 @@ DELETE FROM record_subjects_places
        AND NOT EXISTS (
          SELECT 1 FROM research_plans rp2
          WHERE rp2.status = 'accepted'
-           AND rp2.expectations LIKE '%"' || e.entity_id || '"%'
+           AND CAST(rp2.expectations AS VARCHAR) LIKE '%"' || e.entity_id || '"%'
        )
    );
 
@@ -115,7 +115,7 @@ DELETE FROM record_subjects_topics
        AND NOT EXISTS (
          SELECT 1 FROM research_plans rp2
          WHERE rp2.status = 'accepted'
-           AND rp2.expectations LIKE '%"' || e.entity_id || '"%'
+           AND CAST(rp2.expectations AS VARCHAR) LIKE '%"' || e.entity_id || '"%'
        )
    );
 
@@ -130,7 +130,7 @@ DELETE FROM record_derived_from
        AND NOT EXISTS (
          SELECT 1 FROM research_plans rp2
          WHERE rp2.status = 'accepted'
-           AND rp2.expectations LIKE '%"' || e.entity_id || '"%'
+           AND CAST(rp2.expectations AS VARCHAR) LIKE '%"' || e.entity_id || '"%'
        )
    );
 
@@ -145,7 +145,7 @@ DELETE FROM record_derived_from
        AND NOT EXISTS (
          SELECT 1 FROM research_plans rp2
          WHERE rp2.status = 'accepted'
-           AND rp2.expectations LIKE '%"' || e.entity_id || '"%'
+           AND CAST(rp2.expectations AS VARCHAR) LIKE '%"' || e.entity_id || '"%'
        )
    );
 
@@ -159,7 +159,7 @@ DELETE FROM entities
      AND NOT EXISTS (
        SELECT 1 FROM research_plans rp2
        WHERE rp2.status = 'accepted'
-         AND rp2.expectations LIKE '%"' || e.entity_id || '"%'
+         AND CAST(rp2.expectations AS VARCHAR) LIKE '%"' || e.entity_id || '"%'
      )
  );
 
