@@ -1355,8 +1355,37 @@ async fn author_for_nomination(
     };
 
     let mut recipes: Vec<FetchRecipe> = Vec::new();
-    let mut declines: Vec<ExpectationDecline> = Vec::new();
     let mut prior_attempts: Vec<PriorAttempt> = Vec::new();
+
+    // Session 101 Lever 1 — lift lock-on-first-success. The pre-Sn-101
+    // behaviour returned from this function as soon as ANY target
+    // authored against the locked URL+bytes, even when other targets
+    // declined and the attempt budget still had room. The cost of that
+    // shape was visible end-of-Sn-100: TESLA stock-price plan landed
+    // closing_price + trading_volume on Yahoo's chart endpoint and
+    // then permanently declined market_cap (which lives on Yahoo's
+    // quoteSummary endpoint), 4 event_types, and 1 entity_kind — all
+    // honest declines on chart bytes, all blocked from re-attempting
+    // on a different URL within the same nomination.
+    //
+    // Sn-101 lifts that lock. Per-attempt, we narrow author_recipe
+    // calls to *still-unfilled* targets only; recipes from prior
+    // attempts stay accumulated in `recipes`. Decline reasons stay
+    // tentative in `pending_declines` until the outer loop exits;
+    // a target that authored on attempt N+1 erases its tentative
+    // decline from attempt N. The per-source deadline and the
+    // `MAX_AUTHORING_ATTEMPTS_PER_SOURCE` cap are unchanged — Lever 1
+    // is about USING the budget the executor already had, not
+    // expanding it. Worst-case LLM bill is identical to pre-Sn-101's
+    // ceiling (3 propose × ≤6 authors); typical-case is lower because
+    // each subsequent attempt's inner loop has fewer targets.
+    //
+    // Closed-vocab: `filled_targets` keys on `ExpectationRef` (a
+    // small Copy enum, four variants); `pending_declines` carries
+    // free-text reasons from the LLM — no host strings, no source-
+    // routing logic here.
+    let mut filled_targets: Vec<ExpectationRef> = Vec::new();
+    let mut pending_declines: Vec<(ExpectationRef, String)> = Vec::new();
 
     // Session 53 Piece C: cross-run apply-stage failures flow into
     // the next run's prior_attempts log. Pre-Session-53, an
@@ -1522,6 +1551,22 @@ async fn author_for_nomination(
                 attempt_num - 1,
                 summarize_attempts(&prior_attempts)
             );
+            // Sn-101 Lever 1: same exit shape as the function-end
+            // fallthrough below — emit per-target ExpectationDeclines
+            // only when at least one target authored (partial-
+            // success); on full failure drop tentative declines and
+            // emit one nomination-level row.
+            let declines: Vec<ExpectationDecline> = if recipes.is_empty() {
+                Vec::new()
+            } else {
+                pending_declines
+                    .into_iter()
+                    .map(|(expectation, reason)| ExpectationDecline {
+                        expectation,
+                        reason,
+                    })
+                    .collect()
+            };
             return Ok((recipes, declines, Some(reason)));
         }
 
@@ -1546,6 +1591,38 @@ async fn author_for_nomination(
         // `propose_source_url` await and dropped at the closing brace
         // before prefetch begins — prefetch is HTTP, not LLM, and
         // doesn't need a permit.
+        // Session 101 Lever 3 — derive the distinct still-unfilled
+        // record-type kinds from this attempt's outstanding slots.
+        // First attempt: filled_targets is empty, so this evaluates
+        // to the full set of buckets the plan declared — passing
+        // them in would change the proposer's first-attempt prompt
+        // shape (and lose cache parity with the pre-Sn-101 path).
+        // We deliberately pass `&[]` on the FIRST attempt to keep
+        // the first-attempt prompt byte-identical to today; on
+        // later attempts we narrow to the buckets that still need
+        // URLs after prior attempts' authoring.
+        //
+        // Closed-vocab: the kind labels come from
+        // `expectation_ref_parts` (which already projects
+        // ExpectationRef → {observation_metric, event_type,
+        // entity_kind, relation_kind}). De-duping happens inside
+        // `render_target_kinds_needed`.
+        let remaining_kind_strings: Vec<&'static str> = if attempt_num == 1 {
+            Vec::new()
+        } else {
+            let mut kinds: Vec<&'static str> = Vec::new();
+            for t in targets.iter().copied() {
+                if filled_targets.contains(&t) {
+                    continue;
+                }
+                let (label, _idx) = expectation_ref_parts(t);
+                if !kinds.contains(&label) {
+                    kinds.push(label);
+                }
+            }
+            kinds
+        };
+
         let proposal = {
             let _permit = llm_semaphore
                 .acquire()
@@ -1559,6 +1636,7 @@ async fn author_for_nomination(
                 nomination,
                 &prior_attempts,
                 propose_effort_override,
+                &remaining_kind_strings,
             )
             .await
             .map_err(map_proposal_error)?
@@ -1588,6 +1666,20 @@ async fn author_for_nomination(
                     decline_reason = %reason,
                     "url proposer declined; surfacing as nomination-level decline"
                 );
+                // Sn-101 Lever 1: same partial-vs-full split as the
+                // deadline branch above. Drop tentative declines on
+                // full failure; emit per-target declines on partial.
+                let declines: Vec<ExpectationDecline> = if recipes.is_empty() {
+                    Vec::new()
+                } else {
+                    pending_declines
+                        .into_iter()
+                        .map(|(expectation, reason)| ExpectationDecline {
+                            expectation,
+                            reason,
+                        })
+                        .collect()
+                };
                 return Ok((recipes, declines, Some(composed)));
             }
         };
@@ -1634,9 +1726,10 @@ async fn author_for_nomination(
             };
 
         // Step 3: iterate targets, calling author_recipe per
-        // (target, locked URL+bytes). The first target that authors
-        // locks the URL — subsequent targets that decline surface as
-        // ExpectationDecline entries against the same locked URL.
+        // (target, locked URL+bytes). Session 101 Lever 1 narrows
+        // this attempt's authoring to targets not yet filled by a
+        // prior attempt; the first attempt sees every target, later
+        // attempts see only what's still missing.
         //
         // Session 54 Stage 1 — per-target parallelism. The N targets
         // share immutable inputs (same proposed URL, same prefetched
@@ -1651,9 +1744,20 @@ async fn author_for_nomination(
         // `Send` bound. Concurrency cap at this layer is the target
         // count (≤4 today); the cross-nomination semaphore in Stage 2
         // gates the global Workhorse-tier in-flight count.
+        let unfilled_targets: Vec<ExpectationRef> = targets
+            .iter()
+            .copied()
+            .filter(|t| !filled_targets.contains(t))
+            .collect();
+        if unfilled_targets.is_empty() {
+            // Fast path — every target has already been filled by a
+            // prior attempt. Break out of the outer loop so the
+            // function returns with the accumulated recipes.
+            break;
+        }
         let mut authored_this_attempt: Vec<FetchRecipe> = Vec::new();
         let mut declined_this_attempt: Vec<(ExpectationRef, String)> = Vec::new();
-        let auth_futures = targets.iter().map(|&target| {
+        let auth_futures = unfilled_targets.iter().map(|&target| {
             let auth_ctx = AuthoringContext {
                 source_id: candidate_source_id.clone(),
                 sample_url: proposed_url.clone(),
@@ -1749,25 +1853,72 @@ async fn author_for_nomination(
             }
         }
 
-        if !authored_this_attempt.is_empty() {
-            // At least one target authored against this URL — lock
-            // and finish. Surface declined-this-attempt entries as
-            // per-expectation declines.
-            recipes.extend(authored_this_attempt);
-            for (t, r) in declined_this_attempt {
-                declines.push(ExpectationDecline {
-                    expectation: t,
-                    reason: r,
-                });
+        // Session 101 Lever 1 — accumulate authored recipes and
+        // tentative declines; decide on continuation based on
+        // whether the targets bucket is still partially uncovered.
+        //
+        // `recipes` accumulates across attempts; once a target
+        // authors, it stays in `filled_targets` so subsequent
+        // attempts skip it.
+        //
+        // `pending_declines` carries the LATEST decline reason per
+        // target. A target's decline is tentative — if a later
+        // attempt fills it, the entry is removed (we treat the
+        // tentative decline as "no decline" when reporting). If no
+        // later attempt fills it, the entry surfaces at function
+        // exit as the per-target `ExpectationDecline`.
+        // Push this attempt's authored recipes into the accumulated
+        // `recipes` vector. Per-recipe logging already happened above
+        // in the auth_results match arm; the target → filled-targets
+        // mapping is computed below from `unfilled_targets \
+        // declined_this_attempt` (recipes don't carry the target back
+        // through the AuthoringContext, but the difference identifies
+        // the authored targets unambiguously since the inner loop
+        // narrowed to `unfilled_targets`).
+        let mut targets_filled_this_attempt: Vec<ExpectationRef> = Vec::new();
+        for recipe in authored_this_attempt.drain(..) {
+            recipes.push(recipe);
+        }
+        // Compute targets that authored on this attempt = unfilled_targets minus declined.
+        for t in unfilled_targets.iter().copied() {
+            let declined_now = declined_this_attempt.iter().any(|(d, _)| *d == t);
+            if !declined_now {
+                targets_filled_this_attempt.push(t);
+                if !filled_targets.contains(&t) {
+                    filled_targets.push(t);
+                }
+                // Clear any stale tentative decline for this target.
+                pending_declines.retain(|(pd, _)| *pd != t);
             }
-            return Ok((recipes, declines, None));
+        }
+        // Update tentative declines for targets that declined this attempt.
+        for (t, r) in declined_this_attempt.iter() {
+            if let Some(entry) = pending_declines.iter_mut().find(|(pd, _)| pd == t) {
+                entry.1 = r.clone();
+            } else {
+                pending_declines.push((*t, r.clone()));
+            }
         }
 
-        // No target authored against this URL. Record a prior-
-        // attempts entry summarising every target's decline, then
-        // try a different URL on the next iteration.
-        let summary = if declined_this_attempt.is_empty() {
-            "no targets attempted (empty target list — should not reach here)".to_string()
+        // If every target the plan declared is now filled, exit early.
+        let still_unfilled_after: Vec<ExpectationRef> = targets
+            .iter()
+            .copied()
+            .filter(|t| !filled_targets.contains(t))
+            .collect();
+        if still_unfilled_after.is_empty() {
+            break;
+        }
+
+        // Record a prior-attempts entry summarising this attempt's
+        // outcome so the next propose-URL pass can pivot to a URL
+        // that might serve the still-unfilled slots. Reason text
+        // distinguishes the three shapes (full success → break above;
+        // partial → "partial: …"; full decline → "no target authored: …")
+        // so the proposer prompt can reason on the closed-vocab
+        // signal even without a new class.
+        let declined_summary = if declined_this_attempt.is_empty() {
+            "(none)".to_string()
         } else {
             declined_this_attempt
                 .iter()
@@ -1780,32 +1931,91 @@ async fn author_for_nomination(
         };
         // Session 57 / ADR 0017 Piece B: the fetch succeeded (we
         // got bytes) and the recipe author saw them but declined
-        // every target. From the proposer's routing perspective
-        // this is the same shape as an apply-stage failure: the
-        // host is responsive, the URL just isn't the right page
-        // for the question. Class as `UrlShapeMismatch` so the
-        // proposer pivots URL on the same host or moves to a
-        // different host within the same priority tier; the
-        // free-text `summary` carries the per-target decline
-        // reasons for any finer-grained reasoning.
+        // at least one target. From the proposer's routing
+        // perspective this is the same shape as an apply-stage
+        // failure: the host is responsive, the URL just isn't the
+        // right page for the still-unfilled slots. Class as
+        // `UrlShapeMismatch` so the proposer pivots URL on the
+        // same host or moves to a different host within the same
+        // priority tier; the free-text `reason` carries the
+        // per-target decline reasons + partial-success state for
+        // any finer-grained reasoning the proposer wants to do.
+        let attempt_reason = if targets_filled_this_attempt.is_empty() {
+            format!("no target authored: {declined_summary}")
+        } else {
+            format!(
+                "partial: authored {} target(s) this attempt; declined slots: {}",
+                targets_filled_this_attempt.len(),
+                declined_summary,
+            )
+        };
         prior_attempts.push(PriorAttempt {
             url: proposed_url.to_string(),
             class: FetchOutcomeClass::UrlShapeMismatch,
-            reason: format!("no target authored: {summary}"),
+            reason: attempt_reason,
         });
     }
 
-    // Outer loop exhausted MAX_AUTHORING_ATTEMPTS_PER_SOURCE without
-    // any URL producing a recipe for any target. Surface as a single
-    // nomination-level decline with the attempt history baked into
-    // the reason — the operator sees the full URL-discovery story
-    // in the fetch report.
-    let composed = format!(
-        "exhausted {} attempts without authoring against any target; attempts: {}",
-        MAX_AUTHORING_ATTEMPTS_PER_SOURCE,
-        summarize_attempts(&prior_attempts)
-    );
-    Ok((recipes, declines, Some(composed)))
+    // Session 101 Lever 1 — split the post-loop decision by whether
+    // ANY target authored across all attempts.
+    //
+    // - If at least one target authored, the nomination is a
+    //   partial-success: surface per-target declines for the slots
+    //   that no attempt filled, and DO NOT emit a nomination-level
+    //   decline (the operator sees the partial coverage as the
+    //   honest outcome — same shape as the Sn-47 lock path's
+    //   per-expectation declines, just composed across attempts).
+    //
+    // - If zero targets authored across every attempt, surface as a
+    //   single nomination-level decline with the attempt history
+    //   baked into the reason — preserves the pre-Sn-101 shape on
+    //   the path where the lock-on-first-success had nothing to
+    //   lock onto.
+    //
+    // `pending_declines` is the post-loop view of per-target declines:
+    // any target that authored at least once on any attempt was
+    // removed from this list at the time of authoring. The remaining
+    // entries are the slots that no attempt filled, each with the
+    // LATEST decline reason from the per-attempt loop (latest = the
+    // attempt that came nearest to authoring, or the only attempt
+    // that even tried — both interpretations are honest).
+    // Sn-101 Lever 1 — split function-exit shape by whether any
+    // target authored.
+    //
+    // recipes empty (full failure): preserve the pre-Sn-101 contract
+    // of ONE nomination-level decline row. The caller projects
+    // `nomination_decline_reason` into a `RecipeOutcome::Declined`
+    // with the legacy `nom:{nomination_id}` source_id; emitting N
+    // per-target ExpectationDeclines in the same response would
+    // double-cover (existing tests assert exactly 1 outcome on the
+    // all-decline path — see `prefetch_excerpt_for_*` and Session 40
+    // uniqueness invariant). The per-target reasons remain visible
+    // in the warn-level per-target logs the inner loop already
+    // emits; they're not lost, just not re-surfaced as outcomes.
+    //
+    // recipes non-empty (partial success): emit one
+    // ExpectationDecline per still-unfilled target with the latest
+    // decline reason. No nomination-level reason — partial success
+    // means the nomination DID produce coverage, just not for every
+    // slot. This is the new shape Lever 1 introduces; it's where the
+    // operator sees the per-target prose on the dashboard.
+    if recipes.is_empty() {
+        let composed = format!(
+            "exhausted {} attempts without authoring against any target; attempts: {}",
+            MAX_AUTHORING_ATTEMPTS_PER_SOURCE,
+            summarize_attempts(&prior_attempts)
+        );
+        return Ok((recipes, Vec::new(), Some(composed)));
+    }
+
+    let declines: Vec<ExpectationDecline> = pending_declines
+        .into_iter()
+        .map(|(expectation, reason)| ExpectationDecline {
+            expectation,
+            reason,
+        })
+        .collect();
+    Ok((recipes, declines, None))
 }
 
 /// Translate a [`ProposalError`] into a [`FetchExecutorError`].
@@ -1976,7 +2186,46 @@ async fn prefetch_excerpt(
     // and inherit the shared `http` client. See `ExecutorContext`'s
     // doc-block for the rationale.
     let prefetch_fetcher: &dyn HttpFetcher = ctx.prefetch_http.unwrap_or(ctx.http);
-    let bytes = match fetch_with_backoff(prefetch_fetcher, url.as_str(), "prefetch").await {
+
+    // Session 101 / Lever 2a — UA-policy parity with `fetch_recipe_bytes`.
+    //
+    // Pre-Sn-101, prefetch routed through bare `fetch_with_backoff`
+    // (no UA override). With `HOST_CLASS_OVERRIDES` empty (closed-
+    // vocab discipline; activation is evidence-gated via the
+    // `host_probe` diagnostic), the behavioural delta against the
+    // pre-Sn-101 prefetch is zero on every host. The wire-up exists
+    // so that the moment overrides are populated (operator runs
+    // `host_probe` + `host_probe_to_overrides` to emit a snippet),
+    // prefetch starts honouring them too — same as runtime fetch
+    // already does in `fetch_recipe_bytes`. Without this parity,
+    // override activation would unblock recipe-execution-time
+    // fetches but leave authoring-time prefetches still 403-ing,
+    // and the recipe author would never see the bytes that the
+    // runtime *would* succeed on. Closed-vocab: tier-aware UA
+    // policy via `ua_policy_for_host`; no host strings here.
+    let prefetch_host = host_of(url.as_str());
+    let prefetch_policy = crate::ua_policies::ua_policy_for_host(&prefetch_host);
+    let prefetch_ua_override: Option<String> = match prefetch_policy {
+        crate::ua_policies::UaPolicy::Default => None,
+        non_default => Some(non_default.resolve("")),
+    };
+    if prefetch_ua_override.is_some() {
+        info!(
+            source_id = %source_id,
+            host = %prefetch_host,
+            ua_label = %prefetch_policy.label(),
+            "ua_policy: applying per-request override at prefetch (Sn-101 Lever 2a)"
+        );
+    }
+
+    let bytes = match fetch_with_backoff_ua(
+        prefetch_fetcher,
+        url.as_str(),
+        "prefetch",
+        prefetch_ua_override.as_deref(),
+    )
+    .await
+    {
         // Session 32: prefetch builds an excerpt for the LLM author;
         // the response Content-Type isn't part of that excerpt's
         // shape (the recipe author infers structure from the bytes

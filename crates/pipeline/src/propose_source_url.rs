@@ -158,8 +158,24 @@ pub async fn propose_source_url(
     nomination: &DocumentSourceNomination,
     prior_attempts: &[PriorAttempt],
     effort_override: Option<ReasoningEffort>,
+    // Session 101 Lever 3 — target-aware proposer. The slice carries
+    // the distinct record-type buckets that are still unfilled inside
+    // the nomination's `author_for_nomination` loop. First attempt:
+    // empty slice = no constraint (preserves pre-Sn-101 cache shape).
+    // Subsequent attempts: the kinds whose slot(s) declined on prior
+    // attempts. The proposer's prompt biases endpoint shape toward
+    // serving those kinds — closed-vocab structural patterns only,
+    // never host strings. Allowed values: "observation_metric",
+    // "event_type", "entity_kind", "relation_kind".
+    target_kinds_needed: &[&str],
 ) -> Result<ProposalOutcome, ProposalError> {
-    let user = build_prompt(prompt_template, plan, nomination, prior_attempts)?;
+    let user = build_prompt(
+        prompt_template,
+        plan,
+        nomination,
+        prior_attempts,
+        target_kinds_needed,
+    )?;
 
     let schema = schema_for!(ProposedUrl);
     let schema_value = serde_json::to_value(&schema)
@@ -248,6 +264,7 @@ pub fn build_prompt(
     plan: &ResearchPlan,
     nomination: &DocumentSourceNomination,
     prior_attempts: &[PriorAttempt],
+    target_kinds_needed: &[&str],
 ) -> Result<String, ProposalError> {
     let interpretation = plan.interpretation.as_str();
 
@@ -284,6 +301,15 @@ pub fn build_prompt(
 
     let prior = render_prior_attempts(prior_attempts);
 
+    // Session 101 Lever 3 — render the still-unfilled record-type
+    // bucket(s) for retry attempts. Empty slice (first attempt) →
+    // "(no specific record-type focus)" so the proposer behaves
+    // exactly like the pre-Sn-101 target-agnostic path. Non-empty →
+    // bullet list naming the closed-vocab kind labels; the prompt
+    // prose pairs each kind with structural endpoint shapes that
+    // typically serve it.
+    let target_kinds = render_target_kinds_needed(target_kinds_needed);
+
     let out = template
         .replace("{{PLAN_INTERPRETATION}}", interpretation)
         .replace("{{TOPIC_TAGS}}", &topic_tags)
@@ -291,7 +317,8 @@ pub fn build_prompt(
         .replace("{{HISTORICAL_WINDOW}}", &window)
         .replace("{{NOMINATION_DESCRIPTION}}", description)
         .replace("{{PRIORITY_TIER}}", tier)
-        .replace("{{PRIOR_ATTEMPTS}}", &prior);
+        .replace("{{PRIOR_ATTEMPTS}}", &prior)
+        .replace("{{TARGET_KINDS_NEEDED}}", &target_kinds);
 
     // Bound the assembled prompt so an unusually long description
     // can't blow LLM_PROMPT_BODY downstream.
@@ -312,6 +339,59 @@ fn priority_tier_to_str(t: PriorityTier) -> &'static str {
         PriorityTier::IndustryTradePress => "industry_trade_press",
         PriorityTier::GeneralNews => "general_news",
     }
+}
+
+/// Session 101 Lever 3 — render the still-unfilled record-type bucket
+/// list for the propose-URL prompt's `{{TARGET_KINDS_NEEDED}}` slot.
+///
+/// `kinds` carries the distinct closed-vocab record-type labels from
+/// the set {"observation_metric", "event_type", "entity_kind",
+/// "relation_kind"} that the calling nomination's
+/// `author_for_nomination` loop still needs URLs for. The first
+/// outer-attempt iteration passes an empty slice (no constraint;
+/// target-agnostic shape preserved); subsequent attempts pass the
+/// kinds whose slots declined on prior attempts.
+///
+/// Output shape:
+/// - empty slice → `"(no specific record-type focus; propose any URL
+///   that satisfies the nomination's description)"`.
+/// - non-empty → newline-bulleted list of kind labels with a one-line
+///   reminder that the prompt's per-record-type structural-pattern
+///   section names endpoint shapes that typically serve each kind.
+///
+/// Closed-vocab discipline: never names a host; the prompt's
+/// structural-pattern section teaches generic endpoint shapes
+/// (`/stats/`, `/standings/`, `/roster/`, `/filings/`, etc.) per
+/// record_type and lets the LLM bind them to the nomination's
+/// description.
+fn render_target_kinds_needed(kinds: &[&str]) -> String {
+    if kinds.is_empty() {
+        return "(no specific record-type focus; propose any URL \
+                that satisfies the nomination's description)"
+            .to_string();
+    }
+    // De-dup while preserving order via a small Vec — typical
+    // cardinality is 1-4; a HashSet/BTreeSet would be overkill.
+    let mut seen: Vec<&str> = Vec::new();
+    for k in kinds {
+        if !seen.iter().any(|s| s == k) {
+            seen.push(*k);
+        }
+    }
+    let bullets = seen
+        .iter()
+        .map(|k| format!("- `{}`", k))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "The following record-type bucket(s) still need URLs after \
+         prior attempts on this nomination:\n{bullets}\n\nBias your \
+         next URL toward an endpoint shape that the structural-\
+         patterns section above names as a typical fit for these \
+         kinds. A URL that serves multiple still-unfilled kinds in \
+         one fetch is fine; one that serves none of them is a poor \
+         use of this attempt."
+    )
 }
 
 fn render_prior_attempts(attempts: &[PriorAttempt]) -> String {
@@ -435,7 +515,7 @@ mod tests {
         ";
         let plan = sample_plan();
         let nom = sample_nomination();
-        let out = build_prompt(template, &plan, &nom, &[]).unwrap();
+        let out = build_prompt(template, &plan, &nom, &[], &[]).unwrap();
 
         for ph in [
             "{{PLAN_INTERPRETATION}}",
@@ -498,6 +578,71 @@ mod tests {
         let class_idx = s.find("Class: ").unwrap();
         let reason_idx = s.find("Reason: ").unwrap();
         assert!(class_idx < reason_idx);
+    }
+
+    #[test]
+    fn render_target_kinds_needed_empty_yields_no_constraint_marker_sn101_lever3() {
+        let s = render_target_kinds_needed(&[]);
+        assert!(
+            s.contains("no specific record-type focus"),
+            "empty slice should produce the no-constraint marker; got: {s}"
+        );
+    }
+
+    #[test]
+    fn render_target_kinds_needed_single_kind_lists_it_as_bullet_sn101_lever3() {
+        let s = render_target_kinds_needed(&["observation_metric"]);
+        assert!(s.contains("- `observation_metric`"));
+        assert!(s.contains("still need URLs"));
+    }
+
+    #[test]
+    fn render_target_kinds_needed_dedupes_repeated_kinds_sn101_lever3() {
+        let s = render_target_kinds_needed(&[
+            "observation_metric",
+            "observation_metric",
+            "event_type",
+        ]);
+        let occ = s.matches("- `observation_metric`").count();
+        assert_eq!(
+            occ, 1,
+            "repeated observation_metric kind should appear once after dedup"
+        );
+        assert!(s.contains("- `event_type`"));
+    }
+
+    #[test]
+    fn render_target_kinds_needed_preserves_insertion_order_sn101_lever3() {
+        let s = render_target_kinds_needed(&["entity_kind", "observation_metric"]);
+        let i_entity = s.find("- `entity_kind`").unwrap();
+        let i_obs = s.find("- `observation_metric`").unwrap();
+        assert!(
+            i_entity < i_obs,
+            "insertion order should be preserved in bullet list"
+        );
+    }
+
+    #[test]
+    fn build_prompt_substitutes_target_kinds_needed_placeholder_sn101_lever3() {
+        let template = "TARGET_KINDS: {{TARGET_KINDS_NEEDED}}\n\
+                        PLAN: {{PLAN_INTERPRETATION}}\n\
+                        TAGS: {{TOPIC_TAGS}}\n\
+                        SCOPE: {{GEOGRAPHIC_SCOPE}}\n\
+                        WINDOW: {{HISTORICAL_WINDOW}}\n\
+                        DESC: {{NOMINATION_DESCRIPTION}}\n\
+                        TIER: {{PRIORITY_TIER}}\n\
+                        PRIOR: {{PRIOR_ATTEMPTS}}";
+        let plan = sample_plan();
+        let nom = sample_nomination();
+        // Empty slice → no-constraint marker present.
+        let empty = build_prompt(template, &plan, &nom, &[], &[]).unwrap();
+        assert!(empty.contains("no specific record-type focus"));
+        // Non-empty slice → kind bullets present.
+        let with_kinds =
+            build_prompt(template, &plan, &nom, &[], &["event_type", "entity_kind"]).unwrap();
+        assert!(with_kinds.contains("- `event_type`"));
+        assert!(with_kinds.contains("- `entity_kind`"));
+        assert!(with_kinds.contains("still need URLs"));
     }
 
     #[test]
@@ -630,7 +775,7 @@ mod tests {
         plan.topic_tags = vec![];
         plan.geographic_scope = vec![];
         let nom = sample_nomination();
-        let out = build_prompt(template, &plan, &nom, &[]).unwrap();
+        let out = build_prompt(template, &plan, &nom, &[], &[]).unwrap();
         assert!(out.contains("(none)"));
         assert!(out.contains("global"));
     }

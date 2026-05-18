@@ -1,4 +1,4 @@
-# Propose Source URL Prompt — v1.5
+# Propose Source URL Prompt — v1.6
 
 <!--
     This file is the Level-2 propose-URL prompt for situation_room.
@@ -130,6 +130,82 @@ The test: if you typed your URL into a browser and saw View Source,
 would the data be in the HTML? If yes, the recipe author has a
 chance. If not (the source view is a near-empty `<div id="root">`
 with one `<script>` tag), the recipe author will decline.
+
+## Record-type structural patterns — bias your URL toward shapes that serve the slot kind
+
+**New in v1.6 (Session 101 Lever 3).** The nomination's description
+names a class of source; the plan's expectations name *what kinds of
+records* the recipe author will try to bind from the bytes you propose.
+The downstream loop authors **one recipe per (target_expectation,
+URL) pair** against the same prefetched bytes — closing_price and
+market_cap may each get their own author call against your URL, and
+each evaluates the bytes against its own slot. **Your URL should
+carry the structural shape the slot needs.**
+
+The `{{TARGET_KINDS_NEEDED}}` section below names the record-type
+buckets the inner loop is still trying to fill on this attempt. On
+the first attempt the section reads `(no specific record-type
+focus)` and you reason from the nomination alone (today's behaviour).
+On retry attempts after the inner loop authored some slots but
+declined others, the section names *what's still missing* — bias
+your URL toward shapes that typically serve those kinds.
+
+The kind → typical-shape map (closed-vocabulary; no host strings,
+no per-publisher rules):
+
+- **`observation_metric` → time-series / quote / indicator endpoint
+  shapes.** Examples of generic shapes (NOT host strings): a
+  `*/chart`, `*/quote`, `*/quoteSummary`, `*/indicators`,
+  `*/timeseries`, `*/api/v?/?ticker?`, `*/series/?id?`,
+  `*/data/?metric?/?period?` path. CSV downloads of historical
+  prices. Statistical-agency catalog endpoints keyed by an
+  indicator code. The URL identifies one or several numeric
+  values laid out as a series or per-instrument response — not an
+  article *about* the number.
+
+- **`event_type` → filings indexes / press-release archives /
+  schedule pages / regulatory-action logs.** Examples of generic
+  shapes: a `*/filings/`, `*/press-releases/`, `*/news-releases/`,
+  `*/disclosures/`, `*/schedule/`, `*/events/`, `*/calendar/`,
+  `*/announcements/`, `*/8-k/`, `*/results-archive/` path. RSS or
+  Atom feeds of an issuer's announcements. The URL identifies a
+  listing-shape page where each row is one event-like item.
+  Iterator-bearing recipes are the apply-time shape for these,
+  so a *listing* page is the right shape — not a single article.
+
+- **`entity_kind` → rosters / directories / member lists.**
+  Examples of generic shapes: a `*/roster/`, `*/athletes/`,
+  `*/members/`, `*/team/`, `*/staff/`, `*/directory/`,
+  `*/signatories/`, `*/participants/`, `*/teams/?id?/roster`
+  path. A page that lists N named actors of the requested kind.
+  Iterator-bearing recipes parse one Entity per row; a single
+  bio page is the wrong shape (it's one entity, not a roster).
+
+- **`relation_kind` → mentions feeds / ownership tables / results
+  pages / transactions logs / matchup pages.** Examples of
+  generic shapes: a `*/results/`, `*/matchups/`, `*/scores/`,
+  `*/mentions/`, `*/ownership/`, `*/transactions/`,
+  `*/citations/`, `*/affiliations/` path. A page that lists
+  N (from-entity, to-entity, predicate) triples — or a results
+  table where each row pairs two named actors plus an outcome
+  the predicate maps onto. Iterator-bearing recipes parse one
+  triple per row.
+
+**When the still-unfilled kinds list has multiple entries**: a URL
+that serves several kinds in one fetch is the highest-yield move
+(an athletics results page often carries both `event_type` =
+competition_event and `relation_kind` = match-pairings; a quarterly
+earnings filing's index carries both `event_type` = earnings_release
+and `entity_kind` = company). Prefer those. A URL that serves
+zero of the still-unfilled kinds is a poor use of the attempt —
+the inner loop will likely decline every still-unfilled slot
+against bytes that don't carry their shape.
+
+**Closed-vocabulary discipline preserved**: every shape named above
+is *structural* (a path-suffix pattern, an endpoint role, a content
+shape). No host string, no publisher name, no domain. The
+intuition is portable across publishers within the same source
+class.
 
 ## Machine-readable endpoints first for structured nominations
 
@@ -605,6 +681,10 @@ move *within* the class:
 ```
 
 **Priority tier:** `{{PRIORITY_TIER}}`
+
+### Record-type buckets still needing URLs (Session 101 Lever 3)
+
+{{TARGET_KINDS_NEEDED}}
 
 ### Prior attempts for this nomination
 
